@@ -4067,9 +4067,21 @@ unsafe extern "C" fn h_for_iter_rest(
             // SAFETY: as above.
             return unsafe { for_iter_lane(st, it, pc) };
         }
-        // A file (its own iterator): a line read, through the lane.
-        // SAFETY: the caller's contract.
-        Object::File(_) => return unsafe { for_iter_lane(st, it, pc) },
+        // A file (its own iterator): a line waiting in its buffer in place,
+        // and a line read that may fill the buffer (and so run a signal
+        // handler) through the lane.
+        Object::File(f) => {
+            if let Some(line) = f.next_line_pure() {
+                if !f.binary {
+                    f.telling.set(false);
+                }
+                // SAFETY: the slot above the iterator is free.
+                unsafe { out.write(line) };
+                return 1;
+            }
+            // SAFETY: the caller's contract.
+            return unsafe { for_iter_lane(st, it, pc) };
+        }
         _ => return 3,
     };
     let unique = Rc::strong_count(rc) == 1;
@@ -12836,13 +12848,38 @@ unsafe fn call_leaf_in_place(
         let base = s.stack;
         let hit =
             matches!(&*base.add(start), Object::Builtin(b) if std::ptr::eq(Rc::as_ptr(b), site.f));
-        if hit && !s.sw.is_null() {
-            let first = if matches!(&*base.add(start + 1), Object::Unbound) {
-                start + 2
-            } else {
-                start + 1
+        // A bound method of the builtin held in a local (`write = f.write`):
+        // its receiver ahead of the arguments, as bitwise views that are
+        // never dropped.
+        let mut bound = std::mem::ManuallyDrop::new([const { Object::Unbound }; 4]);
+        let bound_args = match (&*base.add(start), &*base.add(start + 1)) {
+            (Object::BoundMethod(bm), Object::Unbound)
+                if site.argc < bound.len()
+                    && !bm.redispatch_descriptor
+                    && matches!(&bm.function, Object::Builtin(b) if std::ptr::eq(Rc::as_ptr(b), site.f)) =>
+            {
+                let slots = bound.as_mut_ptr();
+                slots.write((&raw const bm.receiver).read());
+                std::ptr::copy_nonoverlapping(base.add(start + 2), slots.add(1), site.argc);
+                Some(std::slice::from_raw_parts(
+                    slots.cast_const(),
+                    site.argc + 1,
+                ))
+            }
+            _ => None,
+        };
+        if (hit || bound_args.is_some()) && !s.sw.is_null() {
+            let args = match bound_args {
+                Some(args) => args,
+                None => {
+                    let first = if matches!(&*base.add(start + 1), Object::Unbound) {
+                        start + 2
+                    } else {
+                        start + 1
+                    };
+                    std::slice::from_raw_parts(base.add(first), lenu - first)
+                }
             };
-            let args = std::slice::from_raw_parts(base.add(first), lenu - first);
             let b = &*site.f;
             // (A body that runs no Python code for any arguments, or for
             // scalar ones: as `h_call` and `leaf_builtin_call` run them.)

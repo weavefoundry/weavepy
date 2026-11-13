@@ -6573,12 +6573,17 @@ impl ReadAhead {
     /// Hand out the next `n` waiting bytes.
     fn take(&mut self, n: usize) -> Vec<u8> {
         let out = self.buf[self.pos..self.pos + n].to_vec();
+        self.consume(n);
+        out
+    }
+
+    /// Drop the next `n` waiting bytes.
+    fn consume(&mut self, n: usize) {
         self.pos += n;
         if self.pos == self.buf.len() {
             self.buf.clear();
             self.pos = 0;
         }
-        out
     }
 
     /// Hand out everything that's waiting, keeping no storage.
@@ -6607,8 +6612,83 @@ impl ReadAhead {
     }
 }
 
+/// The longest prefix of `buf` that is at most `want` whole UTF-8 characters:
+/// its length in bytes and in characters. A character whose bytes `buf` ends
+/// inside is left out; a stray continuation or invalid lead byte counts as a
+/// character of its own, for the stream's error handler to deal with.
+fn utf8_prefix(buf: &[u8], want: usize) -> (usize, usize) {
+    let ascii = want.min(buf.len());
+    if buf[..ascii].is_ascii() {
+        return (ascii, ascii);
+    }
+    let (mut at, mut count) = (0, 0);
+    while count < want && at < buf.len() {
+        let width = match buf[at] {
+            0xC0..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF7 => 4,
+            _ => 1,
+        };
+        if at + width > buf.len() {
+            break;
+        }
+        at += width;
+        count += 1;
+    }
+    (at, count)
+}
+
+/// What a text stream's configuration means for the text passing through
+/// it, so that the per-line and per-write paths needn't read the encoding,
+/// error handler and newline strings again.
+#[derive(Debug, Clone, Copy)]
+struct TextPlan {
+    /// The bytes are UTF-8 and no incremental decoder is in the way.
+    utf8: bool,
+    /// The error handler is `strict`: valid UTF-8 is the text. Under any
+    /// other handler only ASCII is known to pass unchanged.
+    strict: bool,
+    /// Where a line ends on a read.
+    end: LineEnd,
+    /// A write's `\n` stays as it is.
+    write_untouched: bool,
+}
+
+impl TextPlan {
+    /// The packed form of "not worked out yet".
+    const UNKNOWN: u8 = 0;
+
+    /// One byte for the stream's cell: a set low bit, then the fields.
+    fn pack(self) -> u8 {
+        let end = match self.end {
+            LineEnd::Lf => 0,
+            LineEnd::Cr => 1,
+            LineEnd::CrLf => 2,
+            LineEnd::Universal => 3,
+        };
+        1 | u8::from(self.utf8) << 1
+            | u8::from(self.strict) << 2
+            | u8::from(self.write_untouched) << 3
+            | end << 4
+    }
+
+    fn unpack(bits: u8) -> Option<Self> {
+        (bits & 1 != 0).then(|| Self {
+            utf8: bits & 2 != 0,
+            strict: bits & 4 != 0,
+            write_untouched: bits & 8 != 0,
+            end: match bits >> 4 & 3 {
+                0 => LineEnd::Lf,
+                1 => LineEnd::Cr,
+                2 => LineEnd::CrLf,
+                _ => LineEnd::Universal,
+            },
+        })
+    }
+}
+
 /// Where a line ends, for [`PyFile::read_line_bytes`].
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LineEnd {
     Lf,
     Cr,
@@ -6905,6 +6985,10 @@ pub struct PyFile {
     /// The address this stream is listed under in [`PENDING_WRITERS`], or
     /// zero when it isn't listed.
     write_listed: crate::sync::Cell<usize>,
+    /// How this text stream's configuration lets text through, worked out by
+    /// [`PyFile::text_plan`] and dropped whenever the encoding, error
+    /// handler, newline mode or io layer changes.
+    text_plan: crate::sync::Cell<u8>,
     /// The buffer-full threshold for [`PyFile::write_buf`] (`open(...,
     /// buffering=N)`; `DEFAULT_BUFFER_SIZE` otherwise).
     pub buf_size: crate::sync::Cell<usize>,
@@ -6994,6 +7078,7 @@ impl PyFile {
             write_buf: RefCell::new(Vec::new()),
             line_buffering: crate::sync::Cell::new(LINE_BUFFER_UNDECIDED),
             write_listed: crate::sync::Cell::new(0),
+            text_plan: crate::sync::Cell::new(TextPlan::UNKNOWN),
             buf_size: crate::sync::Cell::new(DEFAULT_BUFFER_SIZE),
             text_start_of_stream: crate::sync::Cell::new(true),
             telling: crate::sync::Cell::new(true),
@@ -7228,6 +7313,13 @@ impl PyFile {
     /// `io.BytesIO()` → `BytesIO`, `open(..., buffering=0)` → `Raw`).
     pub fn set_io_kind(&self, kind: IoKind) {
         self.io_kind.set(kind);
+        self.text_plan.set(TextPlan::UNKNOWN);
+    }
+
+    /// Forget what [`PyFile::text_plan`] worked out: the stream's text
+    /// configuration is changing.
+    pub fn text_config_changed(&self) {
+        self.text_plan.set(TextPlan::UNKNOWN);
     }
 
     /// The Python-visible `name` *object*: `str` normally, `bytes` when the
@@ -7569,6 +7661,7 @@ impl PyFile {
         } else {
             Some(enc.to_owned())
         };
+        self.text_plan.set(TextPlan::UNKNOWN);
     }
 
     /// Set the text-mode error handler (`open(..., errors=...)`). A
@@ -7579,12 +7672,223 @@ impl PyFile {
         } else {
             Some(errors.to_owned())
         };
+        self.text_plan.set(TextPlan::UNKNOWN);
     }
 
     /// Set the text-mode newline policy (`open(..., newline=...)`). The
     /// Python value `None` leaves the field unset (universal newlines).
     pub fn set_newline(&self, newline: Option<&str>) {
         *self.newline.borrow_mut() = newline.map(str::to_owned);
+        self.text_plan.set(TextPlan::UNKNOWN);
+    }
+
+    /// This text stream's [`TextPlan`], worked out on first use. Deciding
+    /// whether a codec needs the incremental decoder can run Python code, so
+    /// only the general paths call this; the pure steps read the cell.
+    fn text_plan(&self) -> TextPlan {
+        if let Some(plan) = TextPlan::unpack(self.text_plan.get()) {
+            return plan;
+        }
+        let utf8_named = matches!(
+            self.encoding.borrow().as_deref(),
+            None | Some("utf-8" | "UTF-8" | "utf8")
+        );
+        let utf8 = utf8_named && !self.text_incr_active_gate();
+        let strict = self
+            .errors
+            .borrow()
+            .as_deref()
+            .is_none_or(|e| e == "strict");
+        let (end, write_untouched) = match self.newline.borrow().as_deref() {
+            None => (LineEnd::Universal, self.io_kind.get() != IoKind::StringIO),
+            Some("") => (LineEnd::Universal, true),
+            Some("\n") => (LineEnd::Lf, true),
+            Some("\r") => (LineEnd::Cr, false),
+            Some("\r\n") => (LineEnd::CrLf, false),
+            Some(_) => (LineEnd::Universal, false),
+        };
+        let plan = TextPlan {
+            utf8,
+            strict,
+            end,
+            write_untouched,
+        };
+        // (The gate above drops the cell when it first decides.)
+        self.text_plan.set(plan.pack());
+        plan
+    }
+
+    /// Work out this text stream's plan, for the pure steps to read.
+    pub(crate) fn prepare_text_plan(&self) {
+        if self.text_plan.get() == TextPlan::UNKNOWN {
+            self.text_plan();
+        }
+    }
+
+    /// The next line, when handing it out is nothing but a copy: it's whole
+    /// in the read-ahead (or the in-memory buffer), and its bytes are its
+    /// text. `None` otherwise, having touched nothing: the stream is closed
+    /// or exhausted, the line needs the next block, a decoder, or newline
+    /// translation, or this stream hasn't been through the general path yet.
+    /// Runs no code, so a loop can take it without publishing its frame.
+    pub(crate) fn next_line_pure(&self) -> Option<Object> {
+        let plan = if self.binary {
+            None
+        } else {
+            let plan = TextPlan::unpack(self.text_plan.get())?;
+            if !plan.utf8 {
+                return None;
+            }
+            Some(plan)
+        };
+        let end = plan.map_or(LineEnd::Lf, |p| p.end);
+        // A line's object: `bytes`, or the `str` its bytes spell. A `\r` in a
+        // text line means translating or tallying, which the general path
+        // does.
+        let make = |line: &[u8]| -> Option<Object> {
+            let Some(plan) = plan else {
+                // (Never empty: a line is at least its terminator, and an
+                // exhausted stream isn't asked.)
+                return Some(Object::Bytes(SharedSlice::from(line)));
+            };
+            if memchr::memchr(b'\r', line).is_some() {
+                return None;
+            }
+            let text = if plan.strict {
+                std::str::from_utf8(line).ok()?
+            } else if line.is_ascii() {
+                // SAFETY: ASCII is UTF-8.
+                unsafe { std::str::from_utf8_unchecked(line) }
+            } else {
+                return None;
+            };
+            if self.seennl.get() & 2 == 0 && line.last() == Some(&b'\n') {
+                self.seennl.set(self.seennl.get() | 2);
+            }
+            Some(Object::from_str(text))
+        };
+        let mut backend = self.backend.try_borrow_mut().ok()?;
+        match &mut *backend {
+            FileBackend::Disk(_) | FileBackend::Stdin => {
+                // Bytes wait here only on an open stream that has been read.
+                let mut ra = self.read_ahead.try_borrow_mut().ok()?;
+                let n = line_take(ra.rest(), end, None)?;
+                let line = make(&ra.rest()[..n])?;
+                ra.consume(n);
+                Some(line)
+            }
+            FileBackend::MemBytes { data, pos } => {
+                if *self.closed.borrow() {
+                    return None;
+                }
+                let d = data.try_borrow().ok()?;
+                let rest = d.get(*pos..).filter(|r| !r.is_empty())?;
+                let n = line_take(rest, end, None).unwrap_or(rest.len());
+                let line = make(&rest[..n])?;
+                *pos += n;
+                Some(line)
+            }
+            FileBackend::MemText { data, pos } => {
+                if *self.closed.borrow() || self.mem_bridged.get() {
+                    return None;
+                }
+                let rest = data.as_bytes().get(*pos..).filter(|r| !r.is_empty())?;
+                let n = line_take(rest, end, None).unwrap_or(rest.len());
+                let line = make(&rest[..n])?;
+                *pos += n;
+                Some(line)
+            }
+            _ => None,
+        }
+    }
+
+    /// `write(s)` on a text stream, when that's nothing but appending `s` to
+    /// a buffer that already holds writes: the stream is block-buffered,
+    /// its bytes are its text, and the buffer has room. `false` otherwise,
+    /// having touched nothing.
+    pub(crate) fn write_str_pure(&self, s: &str) -> bool {
+        // Listed: an open, buffered stream over a descriptor with writes
+        // pending, so nothing is read ahead either.
+        if self.write_listed.get() == 0
+            || self.binary
+            || self.line_buffering.get() != LINE_BUFFER_OFF
+            || self.io_kind.get() != IoKind::Text
+            || *self.closed.borrow()
+        {
+            return false;
+        }
+        let Some(plan) = TextPlan::unpack(self.text_plan.get()) else {
+            return false;
+        };
+        if !plan.utf8 || !plan.write_untouched || !(plan.strict || s.is_ascii()) {
+            return false;
+        }
+        let Ok(mut held) = self.write_buf.try_borrow_mut() else {
+            return false;
+        };
+        if held.is_empty() || held.len() + s.len() >= self.buf_size.get() {
+            return false;
+        }
+        held.extend_from_slice(s.as_bytes());
+        true
+    }
+
+    /// `write(data)` on a binary stream, when that's nothing but appending to
+    /// a buffer that already holds writes and has room. `false` otherwise,
+    /// having touched nothing.
+    pub(crate) fn write_bytes_pure(&self, data: &[u8]) -> bool {
+        if self.write_listed.get() == 0
+            || !self.binary
+            || !matches!(
+                self.io_kind.get(),
+                IoKind::BufferedWriter | IoKind::BufferedRandom
+            )
+            || *self.closed.borrow()
+        {
+            return false;
+        }
+        let Ok(mut held) = self.write_buf.try_borrow_mut() else {
+            return false;
+        };
+        if held.is_empty() || held.len() + data.len() >= self.buf_size.get() {
+            return false;
+        }
+        held.extend_from_slice(data);
+        true
+    }
+
+    /// `sys.stdout.write(s)` when the text's bytes go to the shared sink as
+    /// they are: `None` for any other stream or text, having touched nothing.
+    /// Runs no Python code (a full buffer is written out with the handlers
+    /// waiting, as the general path writes it).
+    #[cfg(not(windows))]
+    pub(crate) fn stdout_write_pure(&self, s: &str) -> Option<Result<(), RuntimeError>> {
+        let plan = TextPlan::unpack(self.text_plan.get())?;
+        if self.binary
+            || !plan.utf8
+            || !plan.write_untouched
+            || !(plan.strict || s.is_ascii())
+            || *self.closed.borrow()
+            || crate::vm_singletons::stdio_unbuffered()
+        {
+            return None;
+        }
+        let backend = self.backend.try_borrow().ok()?;
+        let FileBackend::Stdout(sink) = &*backend else {
+            return None;
+        };
+        let mut sink = sink.try_borrow_mut().ok()?;
+        let res = sink
+            .write_all(s.as_bytes())
+            .map_err(|e| crate::error::io_error_to_py(&e));
+        crate::vm_singletons::note_stdout_write(s.as_bytes());
+        Some(res)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn stdout_write_pure(&self, _s: &str) -> Option<Result<(), RuntimeError>> {
+        // A console takes the UTF-16 bridge: the general path's.
+        None
     }
 
     /// Whether `text` passes between `str` and this stream's bytes unchanged:
@@ -7620,6 +7924,9 @@ impl PyFile {
     /// and returns `true`. `false` touches nothing; the general path then
     /// runs (overwrites, newline translation, an explicit codec).
     pub fn mem_text_append(&self, s: &str) -> bool {
+        if self.io_kind.get() != IoKind::StringIO || *self.closed.borrow() {
+            return false;
+        }
         if self.encoding.borrow().is_some()
             || self
                 .errors
@@ -7747,15 +8054,8 @@ impl PyFile {
         use std::borrow::Cow;
         // Strict UTF-8 with nothing to translate (what `open(path, "w")`
         // gives): the string's own bytes.
-        if self.utf8_identity(s.as_bytes()) {
-            let untouched = match self.newline.borrow().as_deref() {
-                None => self.io_kind.get() != IoKind::StringIO,
-                Some("" | "\n") => true,
-                Some(_) => false,
-            };
-            if untouched {
-                return Ok(Cow::Borrowed(s.as_bytes()));
-            }
+        if self.utf8_identity(s.as_bytes()) && self.text_plan().write_untouched {
+            return Ok(Cow::Borrowed(s.as_bytes()));
         }
         let translated = self.translate_newlines_write(s);
         let errors = self.errors_name();
@@ -7876,29 +8176,26 @@ impl PyFile {
         if let Some(bytes) = mem_text_bytes {
             return self.decode_text(bytes);
         }
+        // Whole characters come out of the read-ahead, which the backend
+        // fills a block at a time.
         let mut bytes: Vec<u8> = Vec::new();
         let mut chars = 0usize;
         while chars < n {
-            let lead = self.read_bytes(Some(1))?;
-            let Some(&b0) = lead.first() else {
-                break; // EOF
-            };
-            // UTF-8 lead byte → number of trailing continuation bytes. A stray
-            // continuation/invalid lead is taken as a lone byte; `decode_text`
-            // then applies the stream's configured error handler.
-            let extra = match b0 {
-                0x00..=0x7F => 0,
-                0xC0..=0xDF => 1,
-                0xE0..=0xEF => 2,
-                0xF0..=0xF7 => 3,
-                _ => 0,
-            };
-            bytes.extend_from_slice(&lead);
-            if extra > 0 {
-                let cont = self.read_bytes(Some(extra))?;
-                bytes.extend_from_slice(&cont);
+            {
+                let mut ra = self.read_ahead.borrow_mut();
+                let (len, count) = utf8_prefix(ra.rest(), n - chars);
+                if len > 0 {
+                    bytes.extend_from_slice(&ra.rest()[..len]);
+                    ra.consume(len);
+                    chars += count;
+                    continue;
+                }
             }
-            chars += 1;
+            // Nothing waiting, or only the front of a character.
+            if !self.fill_read_ahead()? {
+                bytes.extend(self.read_ahead.borrow_mut().take_all());
+                break;
+            }
         }
         self.decode_text(bytes)
     }
@@ -7965,6 +8262,7 @@ impl PyFile {
             }
         };
         self.text_incr_gate.set(Some(decided));
+        self.text_plan.set(TextPlan::UNKNOWN);
         decided
     }
 
@@ -8608,7 +8906,9 @@ impl PyFile {
         self.closefd.set(closefd);
         *self.closed.borrow_mut() = false;
         self.write_buf.borrow_mut().clear();
+        self.unlist_writer();
         self.read_ahead.borrow_mut().take_all();
+        self.text_plan.set(TextPlan::UNKNOWN);
         self.text_start_of_stream.set(true);
         *self.binary_buffer_cache.borrow_mut() = None;
     }
@@ -8629,8 +8929,11 @@ impl PyFile {
             self.check_open()?;
             self.flush_write_buf()?;
             self.rewind_read_ahead();
-            if let Some(parked) = self.take_pushback(n) {
-                return Ok(Some(parked));
+            let parked = self.take_pushback(n);
+            // A sized read is served by what's parked alone; a read to the
+            // end goes on to the backend's remainder.
+            if parked.is_some() && n.is_some() {
+                return Ok(parked);
             }
             let raw_fd = match &*self.backend.borrow() {
                 FileBackend::Disk(f) => Some(f.as_raw_fd()),
@@ -8638,10 +8941,24 @@ impl PyFile {
             };
             if let Some(fd) = raw_fd {
                 if fd_is_nonblocking(fd) {
-                    return read_fd_nonblock(fd, n, &self.fd_syscall_lock);
+                    let more = read_fd_nonblock(fd, n, &self.fd_syscall_lock)?;
+                    return Ok(match (parked, more) {
+                        (Some(mut parked), Some(more)) => {
+                            parked.extend(more);
+                            Some(parked)
+                        }
+                        (parked @ Some(_), None) => parked,
+                        (None, more) => more,
+                    });
                 }
             }
+            if let Some(mut parked) = parked {
+                parked.extend(self.read_backend(None)?);
+                return Ok(Some(parked));
+            }
+            self.read_backend(n).map(Some)
         }
+        #[cfg(not(unix))]
         self.read_bytes(n).map(Some)
     }
 
@@ -8710,8 +9027,8 @@ impl PyFile {
     /// descriptor asks for a buffer's worth in one `read(2)` and takes what
     /// comes, as CPython's `BufferedReader` does; a raw `FileIO` reads a byte,
     /// because its `readline` must leave the rest of a pipe to other readers.
-    /// Standard input takes a line at most from the process's shared buffer,
-    /// which `input()` and `sys.stdin.buffer` read too.
+    /// Standard input takes what the process's buffer for it holds: one
+    /// `read(2)`'s worth, a line on a terminal.
     fn fill_read_ahead(&self) -> Result<bool, RuntimeError> {
         self.check_open()?;
         self.flush_write_buf()?;
@@ -8751,10 +9068,10 @@ impl PyFile {
                     if avail.is_empty() {
                         return Ok(false);
                     }
-                    let take = memchr::memchr(b'\n', avail).map_or(avail.len(), |i| i + 1);
+                    let take = avail.len();
                     let mut ra = self.read_ahead.borrow_mut();
                     let mut buf = ra.take_all();
-                    buf.extend_from_slice(&avail[..take]);
+                    buf.extend_from_slice(avail);
                     ra.put_back(buf);
                     handle.consume(take);
                     return Ok(true);

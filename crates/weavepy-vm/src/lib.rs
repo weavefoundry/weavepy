@@ -18543,6 +18543,19 @@ impl Interpreter {
         if ins.op != OpCode::ForIter {
             return false;
         }
+        // A line waiting in a file's buffer runs nothing: no publishing.
+        if let Object::File(f) = &source {
+            if let Some(line) = f.next_line_pure() {
+                if !f.binary {
+                    f.telling.set(false);
+                }
+                frame.stack.push(line);
+                frame.pc = pc as u32 + 1;
+                // SAFETY: the running activation's last-pc slot.
+                unsafe { *sw.last = pc };
+                return true;
+            }
+        }
         let globals = frame.globals.clone();
         frame.pc = pc as u32 + 1;
         let pending = self.core_pending_enter(sw, frame, pc);
@@ -31973,8 +31986,10 @@ impl Interpreter {
             return None;
         };
         // (An opaque leaf, one the registry vouches runs no Python code,
-        // reads its receiver as the others do: `random.random()`.)
-        if !kind.retains_bound_receiver() && !matches!(kind, LeafKind::Opaque) {
+        // reads its receiver as the others do: `random.random()`. So does a
+        // registered fast half: `readline = f.readline`.)
+        let fast = matches!(kind, LeafKind::Fast(_));
+        if !fast && !kind.retains_bound_receiver() && !matches!(kind, LeafKind::Opaque) {
             slot.set_non_leaf(bm);
             return None;
         }
@@ -31983,7 +31998,13 @@ impl Interpreter {
             // The same builtin can serve an exact receiver or an excluded
             // subclass. Key rejection by this immutable bound method,
             // not by its function, so a later exact receiver can specialize.
-            slot.set_non_leaf(bm);
+            // (A fast half declines by the moment, not by the receiver: a
+            // line that needs the next block. The site stays a leaf.)
+            if !fast {
+                slot.set_non_leaf(bm);
+            } else if cached.is_none() {
+                slot.set_leaf(b, kind);
+            }
             return None;
         };
         if cached.is_none() {
@@ -42737,6 +42758,29 @@ impl Interpreter {
             // `print(..., file=f)` calls `f.write(...)` piece by piece so any
             // file-like object works: `sys.stderr`, an open file, an
             // `io.StringIO`, or a user type with a `write` method.
+            // A native stream with no `write` of its own set on it: its
+            // write, without a method object or a call per piece.
+            // The line goes in one write when it's all plain text, so that
+            // an unbuffered stream (`sys.stderr`) takes it in one piece, as
+            // CPython's line-buffered text layer hands it over.
+            Some(Object::File(f)) if f.extra_attrs.borrow().is_empty() => {
+                let mut args = [Object::File(f), Object::None];
+                if pieces.len() > 1 && pieces.iter().all(|p| matches!(p, Object::Str(_))) {
+                    let mut line = String::new();
+                    for p in &pieces {
+                        if let Object::Str(s) = p {
+                            line.push_str(s);
+                        }
+                    }
+                    args[1] = Object::from_str(line);
+                    crate::builtins::file_write(&args)?;
+                } else {
+                    for p in pieces {
+                        args[1] = p;
+                        crate::builtins::file_write(&args)?;
+                    }
+                }
+            }
             Some(sink_obj) => {
                 let write = self.load_attr(&sink_obj, "write")?;
                 for p in &pieces {
@@ -66072,9 +66116,12 @@ impl Interpreter {
                     let text = Object::from_str(prompt.to_str());
                     let write = self.load_attr_public(&stdout, "write")?;
                     self.call(&write, &[text], &[], outer_globals)?;
-                    if let Ok(flush) = self.load_attr_public(&stdout, "flush") {
-                        let _ = self.call(&flush, &[], &[], outer_globals);
-                    }
+                }
+                // CPython's `builtin_input` flushes `sys.stdout` before it
+                // reads, prompt or no prompt: whoever answers on the other
+                // end of a pipe has to see what was printed first.
+                if let Ok(flush) = self.load_attr_public(&stdout, "flush") {
+                    let _ = self.call(&flush, &[], &[], outer_globals);
                 }
                 let readline = self.load_attr_public(&stdin, "readline")?;
                 let line_obj = self.call(&readline, &[], &[], outer_globals)?;
@@ -66100,9 +66147,9 @@ impl Interpreter {
         }
         // Fallback: raw process stdio (sys module unavailable).
         use std::io::Write;
+        let _ = crate::vm_singletons::flush_host_stdout();
         if let Some(prompt) = args.first() {
             let s = prompt.to_str();
-            let _ = crate::vm_singletons::flush_host_stdout();
             print!("{}", s);
             let _ = std::io::stdout().flush();
         }

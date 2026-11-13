@@ -471,6 +471,15 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
     // (Built without the memo borrowed: nothing here reaches it, but a
     // builder is free to.)
     let found = lookup_method_uncached(obj, name);
+    // A stream's `write` and `readline` have halves that only touch its
+    // buffer, which a call site runs in place.
+    if let (Object::File(_), Some(Object::Builtin(b))) = (obj, &found) {
+        match name {
+            "write" => crate::leaf_builtins::register_fast(b, file_write_fast),
+            "readline" => crate::leaf_builtins::register_fast(b, file_readline_fast),
+            _ => {}
+        }
+    }
     let mut memo = memo.borrow_mut();
     if memo.len() <= usize::from(tag) {
         memo.resize_with(usize::from(tag) + 1, Default::default);
@@ -17385,6 +17394,9 @@ pub(crate) fn file_readinto(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 pub(crate) fn file_readline(args: &[Object]) -> Result<Object, RuntimeError> {
+    if let Some(line) = file_readline_fast(args) {
+        return line;
+    }
     let f = file_self(args)?;
     file_check_open(&f)?;
     if !f.readable() {
@@ -17430,6 +17442,11 @@ fn file_read_line(
     if !f.binary && f.text_incr_active_gate() {
         return Ok(stream_text_object(f, f.readline_text_incr(limit)?));
     }
+    if !f.binary {
+        // What the pure step reads: worked out here, where a codec lookup
+        // may run code.
+        f.prepare_text_plan();
+    }
     // Where a line ends depends on the stream's newline policy; the shared
     // `PyFile::read_line_bytes` scans raw bytes for the right terminator
     // (binary/`\n`/`\r`/`\r\n`/universal) and `decode_text` then applies any
@@ -17456,6 +17473,9 @@ pub(crate) fn file_iter_next(
     let is_text = !f.binary;
     if is_text {
         f.telling.set(false);
+    }
+    if let Some(line) = f.next_line_pure() {
+        return Ok(Some(line));
     }
     file_check_open(f)?;
     if !f.readable() {
@@ -17525,7 +17545,40 @@ pub(crate) fn file_readlines(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::new_list(lines))
 }
 
+/// `f.write(data)` when the write only appends to a buffer: text or bytes
+/// into a file's buffer that already holds writes, text onto the end of a
+/// `StringIO`, or text to standard output's shared buffer. `None` for
+/// anything else, having touched nothing. (A leaf half: see
+/// `leaf_builtins::register_fast`.)
+fn file_write_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    match args {
+        [Object::File(f), Object::Str(s)] => {
+            let count = || Object::Int(crate::object::str_char_len(s) as i64);
+            if f.write_str_pure(s) || f.mem_text_append(s) {
+                return Some(Ok(count()));
+            }
+            f.stdout_write_pure(s).map(|r| r.map(|()| count()))
+        }
+        [Object::File(f), Object::Bytes(b)] => f
+            .write_bytes_pure(b)
+            .then(|| Ok(Object::Int(b.len() as i64))),
+        _ => None,
+    }
+}
+
+/// `f.readline()` when a whole line waits in the stream's buffer (see
+/// `PyFile::next_line_pure`). A leaf half, like [`file_write_fast`].
+fn file_readline_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    match args {
+        [Object::File(f)] => f.next_line_pure().map(Ok),
+        _ => None,
+    }
+}
+
 pub(crate) fn file_write(args: &[Object]) -> Result<Object, RuntimeError> {
+    if let Some(done) = file_write_fast(args) {
+        return done;
+    }
     let f = file_self(args)?;
     // Arity before state: `f.write()` with no data is a TypeError even on a
     // closed file (CPython's clinic parses first; test_fileio `testMethods`).
@@ -17754,6 +17807,7 @@ pub(crate) fn file_reconfigure(
     if let Some(nl) = newline {
         *f.newline.borrow_mut() = nl;
     }
+    f.text_config_changed();
     Ok(Object::None)
 }
 
