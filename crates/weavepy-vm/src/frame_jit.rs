@@ -2342,8 +2342,11 @@ unsafe extern "C" fn h_binop_num(st: *mut State, site: *const BinopSite) -> u32 
     }
 }
 
-/// `COMPARE_OP` at `site` through [`h_compare_bool`], then a comparison
-/// method that's a warm pure leaf: the answer (`0` or `1`), or a status (see
+/// `COMPARE_OP` at `site` through [`h_compare_bool`], then a plain
+/// instance's comparison method (see
+/// `Interpreter::compare_instance_dunder`): a warm pure leaf evaluated in
+/// place ([`compare_leaf`]), any other with native code called directly
+/// ([`compare_method`]). The answer (`0` or `1`), or a status (see
 /// [`LEFT_INTERP`]).
 unsafe extern "C" fn h_compare_site(st: *mut State, site: *const BinopSite) -> u32 {
     // SAFETY: as `h_binop_site`'s.
@@ -2353,17 +2356,237 @@ unsafe extern "C" fn h_compare_site(st: *mut State, site: *const BinopSite) -> u
             h_copies(st, s.copies.as_ptr(), s.copies.len() as u64);
         }
         let at = (*st).stack.add(s.slot as usize);
+        // An operand only the comparison held dies with it, and what it
+        // owned may have a finalizer: that runs before the next
+        // instruction.
+        let answered = |r: bool| {
+            if (*(*st).maybe_dead).get() {
+                at.write(Object::Bool(r));
+                return left_marked(st, s.pc, s.slot as usize + 1);
+            }
+            u32::from(r)
+        };
+        let kind: CompareKind = std::mem::transmute((s.arg & !COMPARE_OP_TO_BOOL_FLAG) as u8);
+        // An instance's own method first, where the site has seen
+        // instances (no plain shape answers for one that has a method).
+        if s.dunder && matches!(&*at, Object::Instance(_)) {
+            if let Some(f) = Interpreter::compare_instance_dunder(&*at, &*at.add(1), kind) {
+                let r = compare_leaf(st, at, &f);
+                if r <= 1 {
+                    return answered(r != 0);
+                }
+                if !s.direct.is_null() && !(*st).sw.is_null() {
+                    let r = compare_method(&mut *st, s, f);
+                    if r != CALL_DECLINED {
+                        return r;
+                    }
+                }
+                return left(st, s.pc, s.last, s.slot as usize + 2);
+            }
+        }
         let r = h_compare_bool(at, s.arg);
         if r <= 1 {
             return r;
         }
-        if s.dunder {
-            let r = h_compare_dunder(st, at, s.arg);
-            if r <= 1 {
-                return r;
+        // The plain shapes again, for operands whose release
+        // `h_compare_bool` leaves alone (two tuples built for the
+        // comparison, as a dataclass's `__eq__` builds them).
+        if droppable(&*at) && droppable(&*at.add(1)) {
+            if let Some(r) = crate::plain_compare(&*at, &*at.add(1), kind) {
+                crate::drop_hot_at(at.add(1));
+                crate::drop_hot_at(at);
+                return answered(r);
             }
         }
         left(st, s.pc, s.last, s.slot as usize + 2)
+    }
+}
+
+/// [`h_compare_site`]'s comparison method `f`, called directly
+/// ([`direct_call`]) as `f(a, b)` on copies of the operands above them:
+/// the operands wait in their slots, as the full handler holds them across
+/// the call, for what an answer of `NotImplemented` goes on to (see
+/// `Interpreter::compare_finish`). A `bool` answer comes back as `0` or
+/// `1`, the operands released; any other is settled by [`compare_rest`].
+/// `CALL_DECLINED` touched nothing (a method without native code, which
+/// warms as [`dunder_call`]'s does); `RAISED` or `RELOAD` as [`h_call`]'s,
+/// the operands still on the frame's stack under the call.
+///
+/// # Safety
+///
+/// As [`h_compare_site`]'s, with a non-null switch and the site's direct
+/// cache (nothing virtual lies below the operands, and three slots are
+/// free above them: see [`stack_need`]).
+#[inline(never)]
+unsafe fn compare_method(st: &mut State, s: &BinopSite, f: Rc<crate::object::PyFunction>) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let (pc, slot) = (s.pc as usize, s.slot as usize);
+        let at = st.stack.add(slot);
+        at.add(2).write(Object::Function(f));
+        at.add(3).write(crate::clone_hot(&*at));
+        at.add(4).write(crate::clone_hot(&*at.add(1)));
+        let op = Some(records::MethodOp::Compare(s.arg));
+        match direct_call_out(st, pc, slot + 2, slot + 5, &mut *s.direct, op) {
+            None => {
+                // (The operands' own slots still hold them.)
+                crate::drop_hot_at(at.add(4));
+                crate::drop_hot_at(at.add(3));
+                let f = at.add(2).read();
+                if let Object::Function(f) = &f {
+                    let code = f.code();
+                    if let Some(ext) = crate::code_vm_ext(&code) {
+                        ext.frame_jit
+                            .warm_switched(&code, ext, code.varnames.len().max(2));
+                    }
+                }
+                drop(f);
+                CALL_DECLINED
+            }
+            Some(0) => {
+                let kind: CompareKind =
+                    std::mem::transmute((s.arg & !COMPARE_OP_TO_BOOL_FLAG) as u8);
+                let r = match &*at.add(2) {
+                    Object::Bool(r) => *r,
+                    // `NotImplemented` against `None`, a number or a string,
+                    // none of which answers for an instance either: `==`
+                    // and `!=` come down to identity, and the two aren't
+                    // one object.
+                    v if matches!(kind, CompareKind::Eq | CompareKind::NotEq)
+                        && matches!(
+                            &*at.add(1),
+                            Object::None
+                                | Object::Int(_)
+                                | Object::Float(_)
+                                | Object::Bool(_)
+                                | Object::Str(_)
+                        )
+                        && v.is_same(&crate::vm_singletons::not_implemented()) =>
+                    {
+                        // (The singleton's reference is a plain count.)
+                        crate::drop_hot_at(at.add(2));
+                        matches!(kind, CompareKind::NotEq)
+                    }
+                    _ => return compare_rest(st, s),
+                };
+                // The operands leave as the full handler's do (the right
+                // one first), a dying one through the interpreter's release.
+                let interp = &mut *st.interp.cast_mut();
+                for k in [1, 0] {
+                    if !plain_release(&*at.add(k)) {
+                        interp.release(at.add(k).read());
+                    }
+                }
+                if (*st.maybe_dead).get() {
+                    at.write(Object::Bool(r));
+                    return left_marked(st, s.pc, slot + 1);
+                }
+                st.len = slot;
+                u32::from(r)
+            }
+            Some(r) => r,
+        }
+    }
+}
+
+/// [`compare_method`] whose method answered something other than a `bool`
+/// (`NotImplemented`, or a value whose truth the instruction's fused
+/// `TO_BOOL` takes), the operands and the answer in the three slots from
+/// the site's: the rest of the comparison
+/// (`Interpreter::compare_finish`), which may run Python code (the
+/// reflected method, a `__bool__`), so the caller's frame is synced and its
+/// shell built first, as a clean return's finalizers find it
+/// ([`records::finalizers_after`]). A `bool` result comes back as `0` or
+/// `1`; any other leaves for the core loop past the instruction, the
+/// result on the stack.
+#[cold]
+#[inline(never)]
+unsafe fn compare_rest(st: &mut State, s: &BinopSite) -> u32 {
+    // SAFETY: as `compare_method`'s, the method's answer above the operands.
+    unsafe {
+        let (pc, slot) = (s.pc as usize, s.slot as usize);
+        let interp = &mut *st.interp.cast_mut();
+        let frame = &mut *st.frame;
+        frame.stack.set_len(slot + 3);
+        frame.pc = s.pc + 1;
+        settle(st);
+        let sw = &mut *st.sw;
+        let mut tmp = None;
+        let (cf, _, cshell) = sw.activation((*sw.inl).len(), &mut tmp);
+        interp.flush_lean(&mut *cf, &mut *cshell.cast::<crate::QuietShell<'_>>());
+        let v = frame.stack.pop().expect("the method's answer");
+        let r = interp.compare_finish(frame, s.arg, v);
+        *sw.last = pc;
+        let in_place = |sw: &crate::CoreSwitch| {
+            sw.pending.is_none()
+                && std::ptr::eq(sw.cur, st.frame)
+                && crate::hot_gates::loop_gen() == st.snap_gen
+        };
+        let r = match r {
+            Ok(r) => r,
+            Err(e) if in_place(sw) => {
+                st.len = slot;
+                st.pc = pc + 1;
+                st.err = Some(e);
+                return RAISED;
+            }
+            Err(e) => {
+                sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Raised(e)));
+                return RELOAD;
+            }
+        };
+        let answer = match &r {
+            Object::Bool(b) => Some(*b),
+            _ => None,
+        };
+        frame.stack.push(r);
+        if interp.drain_if_maybe_dead() && crate::hot_gates::loop_gen() != st.snap_gen {
+            sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Breaker));
+        }
+        if !in_place(sw) {
+            return RELOAD;
+        }
+        match answer {
+            Some(b) => {
+                st.len = slot;
+                u32::from(b)
+            }
+            None => left(st, s.pc + 1, s.pc, slot + 1),
+        }
+    }
+}
+
+/// A clean direct return that left the rest to the core loop (`RELOAD`,
+/// something pending) with the method's raw result atop the caller's
+/// synced stack: what the operator `op` owes that result, as
+/// `Interpreter::inline_deliver` settles one for an activation the core
+/// loop finishes.
+#[cold]
+#[inline(never)]
+unsafe fn op_after_reload(st: &mut State, op: records::MethodOp<'_>) {
+    // SAFETY: the caller's state, its frame synced with the result atop its
+    // stack and its switch non-null.
+    unsafe {
+        let interp = &mut *st.interp.cast_mut();
+        let frame = &mut *st.frame;
+        let Some(v) = frame.stack.pop() else {
+            return;
+        };
+        let r = match op {
+            records::MethodOp::Binary(op, inplace, l, r)
+                if v.is_same(&crate::vm_singletons::not_implemented()) =>
+            {
+                Err(crate::binop_type_error(op, inplace, l, r))
+            }
+            records::MethodOp::Binary(..) => Ok(v),
+            records::MethodOp::Compare(arg) => interp.compare_finish(frame, arg, v),
+        };
+        match r {
+            Ok(v) => frame.stack.push(v),
+            Err(e) => {
+                (*st.sw).pending = Some(crate::CoreExit::Stop(crate::LeafStop::Raised(e)));
+            }
+        }
     }
 }
 
@@ -6112,25 +6335,28 @@ unsafe extern "C" fn h_compare_bool(at: *mut Object, arg: u32) -> u32 {
     }
 }
 
-/// `COMPARE_OP` with oparg `arg` over the plain instance and the operand
-/// at `at` and above it, whose class's comparison method (see
+/// A `COMPARE_OP` over the plain instance and the operand at `at` and
+/// above it, whose class's comparison method `f` (see
 /// `Interpreter::compare_instance_dunder`) is a warm pure leaf: evaluated
 /// in place, `0` or `1` its `bool` answer (the operands released), anything
 /// else declined untouched (another answer, `NotImplemented` among them,
 /// leaves the comparison to the core loop, which may run the method again:
 /// a pure leaf has no effects).
-unsafe extern "C" fn h_compare_dunder(st: *const State, at: *mut Object, arg: u32) -> u32 {
-    // SAFETY: the code passes its live state, two initialized stack slots,
-    // and the oparg the compiler emitted (as `compare_op_step` reads it).
+///
+/// # Safety
+///
+/// `st` is a live state, and `at` two initialized stack slots.
+unsafe fn compare_leaf(
+    st: *const State,
+    at: *mut Object,
+    f: &Rc<crate::object::PyFunction>,
+) -> u32 {
+    // SAFETY: the caller's contract.
     unsafe {
         let (a, b) = (&*at, &*at.add(1));
         if !droppable(a) || !droppable(b) {
             return 2;
         }
-        let kind: CompareKind = std::mem::transmute((arg & !COMPARE_OP_TO_BOOL_FLAG) as u8);
-        let Some(f) = Interpreter::compare_instance_dunder(a, b, kind) else {
-            return 2;
-        };
         // SAFETY: GIL-serialized raw read of the function's code cell.
         let code = &*f.code.as_ptr();
         if code.arg_count != 2
@@ -6141,7 +6367,7 @@ unsafe extern "C" fn h_compare_dunder(st: *const State, at: *mut Object, arg: u3
             return 2;
         }
         let ptrs = [at.cast_const(), at.add(1).cast_const()];
-        match (*(*st).interp).pure_leaf_eval::<false, false>(code, &f, &ptrs) {
+        match (*(*st).interp).pure_leaf_eval::<false, false>(code, f, &ptrs) {
             Some(Object::Bool(r)) => {
                 crate::drop_hot_at(at.add(1));
                 crate::drop_hot_at(at);
@@ -8669,6 +8895,32 @@ fn instance_class_read(site: &AttrSite, inst: &Rc<crate::types::PyInstance>) -> 
         .then(|| Object::Type(inst.cls()))
 }
 
+/// `x.__class__` of the value at `src` into the stack slot `dst` (the same
+/// slot for a receiver on the stack, whose reference goes by a plain
+/// decrement), where [`instance_class_read`]'s conditions hold: `0` done,
+/// anything else declined untouched.
+unsafe extern "C" fn h_class_read(dst: *mut Object, src: *const Object) -> u32 {
+    // SAFETY: the code passes an initialized value and a stack slot that is
+    // free, or the value's own.
+    unsafe {
+        let Object::Instance(inst) = &*src else {
+            return 1;
+        };
+        let cls = inst.cls_raw();
+        if inst.c_body.get() != 0 || cls.flags.is_builtin || !cls.class_attr_is_plain() {
+            return 1;
+        }
+        let ty = Object::Type(inst.cls());
+        if std::ptr::eq(dst.cast_const(), src) && !plain_release(&*src) {
+            // (The receiver's last reference: its release is the helper's.)
+            drop(ty);
+            return 1;
+        }
+        dst.write(ty);
+        0
+    }
+}
+
 /// Whether `site` reads one of the names every class answers with a string
 /// of its own (`cls.__name__`, as logging, reprs and error messages read
 /// it), which [`type_name_note`] memoizes. (Not `__qualname__`: assigning
@@ -10393,7 +10645,15 @@ unsafe extern "C" fn h_binop_dunder(
             Object::Instance(_) => cls.clone(),
             b => crate::builtins::class_of(b),
         };
-        dunder_call(st, pc, slot, 2, f, site, Some((op, inplace, &cls, &right)))
+        dunder_call(
+            st,
+            pc,
+            slot,
+            2,
+            f,
+            site,
+            Some(records::MethodOp::Binary(op, inplace, &cls, &right)),
+        )
     }
 }
 
@@ -10476,8 +10736,8 @@ unsafe extern "C" fn h_slice_dunder(
 
 /// The `n` (at most three) operands from stack slot `slot` up, as the
 /// instruction at `pc` leaves them, called as `f(*operands)` for a class's
-/// Python special method `f` (an instance operator's, `binop` its
-/// operator; see `InlineAct::binop`): a warm pure leaf evaluated in place,
+/// Python special method `f` (an instance operator's, `op` its
+/// operator; see `InlineAct::op`): a warm pure leaf evaluated in place,
 /// as the core loop's arms evaluate one, any other function through a
 /// direct call ([`direct_call`]); the result at `slot`. A callee without
 /// native code declines, and warms as a compiled caller's switched call
@@ -10498,19 +10758,16 @@ unsafe fn dunder_call(
     n: usize,
     f: Rc<crate::object::PyFunction>,
     site: *mut DirectSite,
-    binop: Option<(
-        BinOpKind,
-        bool,
-        &Rc<crate::types::TypeObject>,
-        &Rc<crate::types::TypeObject>,
-    )>,
+    op: records::Op<'_>,
 ) -> u32 {
     debug_assert!((1..=3).contains(&n));
     // SAFETY: the caller's contract.
     unsafe {
         let at = st.stack.add(slot);
-        let not_implemented = |st: &mut State, v: &Object| match binop {
-            Some((op, inplace, a, b)) if v.is_same(&crate::vm_singletons::not_implemented()) => {
+        let not_implemented = |st: &mut State, v: &Object| match op {
+            Some(records::MethodOp::Binary(op, inplace, a, b))
+                if v.is_same(&crate::vm_singletons::not_implemented()) =>
+            {
                 st.len = slot;
                 st.pc = pc + 1;
                 st.err = Some(crate::binop_type_error(op, inplace, a, b));
@@ -10550,7 +10807,7 @@ unsafe fn dunder_call(
             at.add(k + 1).write(at.add(k).read());
         }
         at.write(Object::Function(f));
-        match direct_call_out(st, pc, slot, slot + n + 1, &mut *site, binop) {
+        match direct_call_out(st, pc, slot, slot + n + 1, &mut *site, op) {
             None => {
                 let f = at.read();
                 for k in 0..n {
@@ -11276,15 +11533,10 @@ unsafe fn direct_call_out(
     start: usize,
     len: usize,
     site: &mut DirectSite,
-    binop: Option<(
-        BinOpKind,
-        bool,
-        &Rc<crate::types::TypeObject>,
-        &Rc<crate::types::TypeObject>,
-    )>,
+    op: records::Op<'_>,
 ) -> Option<u32> {
     // SAFETY: the caller's contract.
-    unsafe { direct_call::<false>(st, pc, start, len, site, binop, None) }
+    unsafe { direct_call::<false>(st, pc, start, len, site, op, None) }
 }
 
 /// The `CALL` at `pc` (its operands from `start` up a `len`-deep stack) of
@@ -11295,8 +11547,8 @@ unsafe fn direct_call_out(
 /// without the core loop's switch back. `Some(0)` leaves the result at
 /// `start`, `Some(RELOAD)` leaves the rest to the core loop (the switch's
 /// state synced), `None` touched nothing. An instance operator's method
-/// (`binop`) that leaves the direct return to the core loop carries the
-/// operator, whose `TypeError` its `NotImplemented` becomes there. A
+/// (`op`) that leaves the direct return to the core loop carries the
+/// operator, which settles its result there (see [`crate::MethodOp`]). A
 /// `functools.lru_cache` miss's function takes its store (`lru`, left in
 /// place by `None`) to its activation.
 #[inline(always)]
@@ -11306,12 +11558,7 @@ unsafe fn direct_call<const CALL: bool>(
     start: usize,
     len: usize,
     site: &mut DirectSite,
-    binop: Option<(
-        BinOpKind,
-        bool,
-        &Rc<crate::types::TypeObject>,
-        &Rc<crate::types::TypeObject>,
-    )>,
+    op: records::Op<'_>,
     lru: Option<&mut Option<crate::stdlib::functools_mod::LruPending>>,
 ) -> Option<u32> {
     // SAFETY: `h_call`'s contract, with a non-null switch.
@@ -11477,7 +11724,7 @@ unsafe fn direct_call<const CALL: bool>(
             cells,
             native,
             nested,
-            binop,
+            op,
             lru,
         )
     }
@@ -11488,7 +11735,7 @@ unsafe fn direct_call<const CALL: bool>(
 /// `fp` running `code_rc`, its checks passed: the callee bound on the
 /// level's record ([`records::enter`]: its arguments as `args` says, its
 /// cells when `cells`), then run through its native body `native` from its
-/// start ([`records::run`]). `nested` is the direct-call depth, and `binop`
+/// start ([`records::run`]). `nested` is the direct-call depth, and `op`
 /// an instance operator's (see [`direct_call`]). `None` touched nothing.
 ///
 /// # Safety
@@ -11508,7 +11755,7 @@ unsafe fn direct_enter(
     cells: bool,
     native: &Native,
     nested: *mut records::DirectRec,
-    binop: records::Binop<'_>,
+    op: records::Op<'_>,
     lru: Option<&mut Option<crate::stdlib::functools_mod::LruPending>>,
 ) -> Option<u32> {
     // SAFETY: the caller's contract.
@@ -11530,7 +11777,7 @@ unsafe fn direct_enter(
         if !bound {
             return None;
         }
-        Some(records::run(st, nested, native, binop))
+        Some(records::run(st, nested, native, op))
     }
 }
 
@@ -11563,7 +11810,7 @@ unsafe fn run_pushed_directly(
         let callee = sw.cur;
         let top = inl.last_mut()?;
         if top.gen.is_some()
-            || top.binop.is_some()
+            || top.op.is_some()
             || top.discard
             || top.direct
             || !std::ptr::eq(&raw const *top.frame, callee)
@@ -11684,12 +11931,7 @@ unsafe fn direct_done<const PUSHED: bool>(
     callee: *mut crate::Frame,
     depth: usize,
     saved_last: *mut usize,
-    binop: Option<(
-        BinOpKind,
-        bool,
-        &Rc<crate::types::TypeObject>,
-        &Rc<crate::types::TypeObject>,
-    )>,
+    op: records::Op<'_>,
     status: u32,
     cst: &mut State,
 ) -> u32 {
@@ -11720,11 +11962,11 @@ unsafe fn direct_done<const PUSHED: bool>(
                         .last()
                         .is_some_and(|a| a.direct && std::ptr::eq(&raw const *a.frame, callee)))
         );
-        // The activation goes on as any other (see `InlineAct::binop`).
+        // The activation goes on as any other (see `InlineAct::op`).
         let leave = |a: &mut crate::InlineAct| {
             a.direct = false;
-            if let Some((op, inplace, l, r)) = binop {
-                a.binop = Some((op, inplace, l.clone(), r.clone()));
+            if let Some(op) = op {
+                a.op = Some(op.owned());
             }
         };
         if status == DIRECT_RET {
@@ -11796,6 +12038,9 @@ unsafe fn direct_done<const PUSHED: bool>(
                 // error to drop.)
                 debug_assert!(cst.err.is_none());
                 if sw.pending.is_some() {
+                    if let Some(op) = op {
+                        op_after_reload(st, op);
+                    }
                     return RELOAD;
                 }
                 st.len = start + 1;
@@ -20477,24 +20722,27 @@ impl<'a> Lower<'a> {
         if crate::native_site(self.ext, pc) {
             return self.compare_helper(pc, arg, ai, bi);
         }
-        let (Some(a), Some(b)) = (self.operand(ai), self.operand(bi)) else {
-            // A string or other heap constant: through the helper.
-            let other = self.b.create_block();
-            let done = self.b.create_block();
-            self.b.append_block_param(done, types::I8);
-            self.b.ins().jump(other, &[]);
-            self.compare_fallback(pc, arg, ai, bi, other, done);
-            self.b.switch_to_block(done);
-            let r = self.b.block_params(done)[0];
-            self.push(Item::Bool(r));
-            self.set_last(pc);
-            return true;
+        let known = |o: &Option<Opnd>| {
+            o.as_ref()
+                .is_some_and(|o| !matches!(o.kind, Kind::Bool | Kind::None))
         };
-        if matches!(a.kind, Kind::Bool | Kind::None) || matches!(b.kind, Kind::Bool | Kind::None) {
-            let slow = self.exit_with(pc, &[ai, bi], INTERP);
-            self.b.ins().jump(slow, &[]);
-            return false;
-        }
+        let (a, b) = match (self.operand(ai), self.operand(bi)) {
+            (a, b) if known(&a) && known(&b) => (a.expect("known"), b.expect("known")),
+            _ => {
+                // A string or other heap constant, `None` or a `bool`:
+                // through the helper.
+                let other = self.b.create_block();
+                let done = self.b.create_block();
+                self.b.append_block_param(done, types::I8);
+                self.b.ins().jump(other, &[]);
+                self.compare_fallback(pc, arg, ai, bi, other, done);
+                self.b.switch_to_block(done);
+                let r = self.b.block_params(done)[0];
+                self.push(Item::Bool(r));
+                self.set_last(pc);
+                return true;
+            }
+        };
         let ia = self.is_kind(a, Kind::Int, self.tags.int);
         let ib = self.is_kind(b, Kind::Int, self.tags.int);
         let fa = self.is_kind(a, Kind::Float, self.tags.float);
@@ -21016,7 +21264,33 @@ impl<'a> Lower<'a> {
         self.attr_sites.push(site);
         // A field of an instance local the site settled on: read in line,
         // its guards falling back on the helper.
+        let class_read = self
+            .code
+            .names
+            .get(self.code.instructions[pc].arg as usize)
+            .is_some_and(|name| name == "__class__");
         let in_line_field = match (item, field.map(FieldSlot::get), self.layout) {
+            // `x.__class__`: the instance's class where `object`'s
+            // descriptor answers ([`h_class_read`]), anything else through
+            // the site's helper.
+            (Item::Local(_) | Item::Mem(_), ..)
+                if class_read && !matches!(item, Item::Mem(s) if s != slot) =>
+            {
+                let helper_block = self.b.create_block();
+                let done = self.b.create_block();
+                let dst = self.slot_addr(slot);
+                let src = match item {
+                    Item::Local(i) => self.local_addr(i),
+                    _ => dst,
+                };
+                let r = self
+                    .call(h_class_read as *const () as usize, &[dst, src], true)
+                    .expect("returns");
+                self.b.ins().brif(r, helper_block, &[], done, &[]);
+                self.b.set_cold_block(helper_block);
+                self.b.switch_to_block(helper_block);
+                Some(done)
+            }
             (Item::Local(i), Some((ver, idx)), Some(l))
                 if !in_line
                     && ver != 0

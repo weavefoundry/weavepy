@@ -7512,9 +7512,16 @@ impl Interpreter {
             // (`NormalDist.__eq__` declines, so `nd == A()` yields `A`'s
             // `10`). Native/identity fallbacks already yield a bool.
             let r_res = self.rich_compare_obj(&a, &b, kind, &frame.globals);
-            // RFC 0059 WS1b: same operand accounting (and ordering)
-            // as BINARY_OP above.
-            let r = r_res?;
+            // (A raise releases the operands in the order a result does:
+            // see below.)
+            let r = match r_res {
+                Ok(r) => r,
+                Err(e) => {
+                    self.retire_operand(b);
+                    self.retire_operand(a);
+                    return Err(e);
+                }
+            };
             let r = if to_bool && !matches!(r, Object::Bool(_)) {
                 let truthy = if r.truth_dispatches() {
                     let g = frame.globals.clone();
@@ -7527,9 +7534,11 @@ impl Interpreter {
                 r
             };
             frame.push(r);
-            // Operand retirement, as for BINARY_OP above.
-            self.retire_operand(a);
+            // Operand retirement, as for BINARY_OP above, the right
+            // operand first (CPython's `COMPARE_OP` closes its inputs in
+            // that order, which two dying temporaries' finalizers show).
             self.retire_operand(b);
+            self.retire_operand(a);
         }
         Ok(())
     }
@@ -8718,7 +8727,7 @@ impl Interpreter {
         act.parked = true;
         act.clean = false;
         act.direct = false;
-        act.binop = None;
+        act.op = None;
         act.discard = false;
         act.act.shell = None;
         act.guard = None;
@@ -8749,7 +8758,7 @@ impl Interpreter {
         act.parked = true;
         act.clean = false;
         act.direct = false;
-        act.binop = None;
+        act.op = None;
         act.discard = false;
         act.guard = None;
         act.caller_pending = None;
@@ -8767,7 +8776,7 @@ impl Interpreter {
         debug_assert!(
             act.frame.stack.is_empty()
                 && !act.owns_cells
-                && act.binop.is_none()
+                && act.op.is_none()
                 && !act.discard
                 && act.guard.is_none()
                 && act.init_inst.is_none()
@@ -9283,12 +9292,13 @@ impl Interpreter {
                 Err(e) => Err(e),
             },
         };
-        let result = match (done.binop.take(), result) {
-            (Some((op, inplace, l, r)), Ok(v))
+        let result = match (done.op.take(), result) {
+            (Some(MethodOp::Binary(op, inplace, l, r)), Ok(v))
                 if v.is_same(&crate::vm_singletons::not_implemented()) =>
             {
                 Err(binop_type_error(op, inplace, &l, &r))
             }
+            (Some(MethodOp::Compare(arg)), Ok(v)) => self.compare_finish(frame, arg, v),
             (_, result) => result,
         };
         // A `functools.lru_cache` miss's function returned: its result is
@@ -26537,7 +26547,7 @@ impl Interpreter {
         let (cframe, clast, cshell, entry);
         if clean
             && (done.init_inst.is_none() || matches!(v, Object::None))
-            && done.binop.is_none()
+            && done.op.is_none()
             && !done.discard
         {
             // A constructor's `__init__` returned `None`: the caller takes
@@ -52685,6 +52695,21 @@ impl Interpreter {
                 }
             }
         }
+        self.rich_compare_rest(a, b, op, globals, forward_ran)
+    }
+
+    /// [`Self::rich_compare_obj`] past its first steps: the whole protocol,
+    /// or, with `forward_ran`, what follows `a`'s own method (a plain
+    /// function, see [`Self::cmp_function`]) having answered
+    /// `NotImplemented`.
+    fn rich_compare_rest(
+        &mut self,
+        a: &Object,
+        b: &Object,
+        op: CompareKind,
+        globals: &Rc<RefCell<DictData>>,
+        forward_ran: bool,
+    ) -> Result<Object, RuntimeError> {
         // An object-backed `mappingproxy` compares as the wrapped mapping
         // (CPython `mappingproxy_richcompare` delegates unconditionally).
         if matches!(a, Object::MappingProxyObj(_)) || matches!(b, Object::MappingProxyObj(_)) {
@@ -53451,6 +53476,51 @@ impl Interpreter {
             }
             _ => Ok(false),
         }
+    }
+
+    /// The end of a `COMPARE_OP` (oparg `arg`) whose first method (see
+    /// [`Self::compare_instance_dunder`]) ran as an activation of its own
+    /// and answered `v`, the operands still atop `frame`'s stack:
+    /// `NotImplemented` goes on with the protocol past that method, and
+    /// the instruction's fused `TO_BOOL` takes the answer's truth, as
+    /// [`Self::compare_op_step`] ends one. The operands leave the stack
+    /// and are released; the result is the instruction's.
+    pub(crate) fn compare_finish(
+        &mut self,
+        frame: &mut Frame,
+        arg: u32,
+        v: Object,
+    ) -> Result<Object, RuntimeError> {
+        let to_bool = arg & COMPARE_OP_TO_BOOL_FLAG != 0;
+        // SAFETY: the compiler emits only `CompareKind`s under the flag.
+        let kind: CompareKind =
+            unsafe { std::mem::transmute((arg & !COMPARE_OP_TO_BOOL_FLAG) as u8) };
+        let b = frame.pop()?;
+        let a = frame.pop()?;
+        let r = if v.is_same(&crate::vm_singletons::not_implemented()) {
+            let globals = frame.globals.clone();
+            self.rich_compare_rest(&a, &b, kind, &globals, true)
+        } else {
+            Ok(v)
+        };
+        let r = match r {
+            Ok(r) if to_bool && !matches!(r, Object::Bool(_)) => {
+                if r.truth_dispatches() {
+                    let globals = frame.globals.clone();
+                    let truth = self.obj_truthy(&r, &globals);
+                    self.release(r);
+                    truth.map(Object::Bool)
+                } else {
+                    let truth = r.is_truthy();
+                    self.release(r);
+                    Ok(Object::Bool(truth))
+                }
+            }
+            r => r,
+        };
+        self.retire_operand(b);
+        self.retire_operand(a);
+        r
     }
 
     /// Deopt a `COMPARE_OP` cache.
@@ -74042,6 +74112,22 @@ const INLINE_POOL_CAP: usize = 64;
 /// The most parked boxes [`Interpreter::lazy_coro_bind`] keeps.
 const LAZY_BOXES_CAP: usize = 64;
 
+/// The operator whose method an activation runs, called directly from
+/// compiled code (see `frame_jit::direct_call`): what the method's result
+/// owes it when the activation returns through the core loop.
+pub(crate) enum MethodOp {
+    /// A `BINARY_OP`'s method that runs alone (see
+    /// `Interpreter::binop_instance_dunder`): its `NotImplemented` becomes
+    /// the operator's `TypeError` (the operator, whether augmented, and
+    /// the left and right operands' classes).
+    Binary(BinOpKind, bool, Rc<TypeObject>, Rc<TypeObject>),
+    /// A `COMPARE_OP`'s first method (see
+    /// `Interpreter::compare_instance_dunder`), the instruction's oparg:
+    /// the operands wait under the call on the caller's stack, and the
+    /// result goes through [`Interpreter::compare_finish`].
+    Compare(u32),
+}
+
 /// A lean activation the quiet loop runs *inline*: its frame lives in
 /// this box instead of on a nested native activation, and
 /// `Interpreter::quiet_run` switches to it at the caller's `CALL` and
@@ -74102,11 +74188,9 @@ struct InlineAct {
     /// `None`, and registering makes the coroutine
     /// (`Interpreter::lazy_coro_materialize`).
     lazy_coro: bool,
-    /// An instance operator's method (see
-    /// `Interpreter::binop_instance_dunder`): its `NotImplemented` becomes
-    /// the operator's `TypeError` (the operator, whether augmented, and
-    /// the left and right operands' classes).
-    binop: Option<(BinOpKind, bool, Rc<TypeObject>, Rc<TypeObject>)>,
+    /// An instance operator's method, called directly: what its result
+    /// owes the operator (see [`MethodOp`]).
+    op: Option<MethodOp>,
     /// The caller takes no result (a property setter's activation for a
     /// `STORE_ATTR`, see `Interpreter::try_inline_setter`).
     discard: bool,
@@ -74258,7 +74342,7 @@ impl InlineAct {
             direct: false,
             lazy_caller: std::ptr::null_mut(),
             lazy_coro: false,
-            binop: None,
+            op: None,
             discard: false,
             chain: None,
             lru: None,
