@@ -455,6 +455,17 @@ branch and pull request.
   - `cls.__name__` and `cls.__module__` are remembered at a compiled
     site for the class's version: 1,180 to 200 instructions (CPython
     440), `type(obj).__name__` 1,446 to 496 (672).
+  - `obj.__class__` took the general attribute path at a compiled site:
+    1,360 to 438 instructions (CPython 433), and `other.__class__ is
+    self.__class__` 2,507 to 681 (363). A tuple or list holding lists
+    compares natively, as ones holding only scalars and tuples did:
+    `(1, 2, []) == (1, 2, [])` 2,819 to 627 (580). Both are in every
+    dataclass comparison (`==` 6,820 to 5,230 against 1,910: the rest is
+    the `__eq__` call itself, which only a pure-leaf body avoids).
+  - A metaclass's Python `__getitem__` (`Color["RED"]`) runs as an
+    inline activation, as an instance's class's does (3,860 to 3,465
+    against 620: its body's `cls._member_map_` read and the exit from
+    compiled code to reach it are what's left).
   - The csv reader re-read its dialect's eight attributes for every
     row, allocated a key string per state access, and stepped a
     character at a time: 3.4 to 2.0 times CPython.
@@ -3249,8 +3260,12 @@ moved in this PR, and the list below is from its first run.
 - `enum`: member lookup by name and by value, `.name` and `.value`, flag
   arithmetic. All go through the metaclass and `DynamicClassAttribute`
   on general paths.
-- `dataclasses`: generated `__eq__` and ordering (tuple builds of the
-  fields compared through general calls), `asdict` and `replace`.
+- Comparison dunders written in Python (`__eq__`, `__lt__`): a body that
+  isn't a pure leaf runs as a nested general call from `COMPARE_OP` (6,600
+  instructions against 1,760 for a two-field `__eq__`), where arithmetic
+  dunders are noted at the site and called directly. This is most of what
+  a dataclass's `==` and ordering still cost.
+- `dataclasses`: `asdict` and `replace`.
 - `__setattr__` hooks and `object.__setattr__(self, name, value)`, which
   a frozen dataclass's `__init__` calls once a field: the store-side twin
   of this PR's attribute-read hooks.

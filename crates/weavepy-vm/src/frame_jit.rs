@@ -8342,7 +8342,9 @@ unsafe extern "C" fn attr_local_slow(st: *mut State, site: *const AttrSite) -> u
             }
             // (A class attribute the site has read before.)
             Object::Instance(inst) => {
-                if let Some(v) = class_poly_hit(site, inst) {
+                if let Some(v) =
+                    class_poly_hit(site, inst).or_else(|| instance_class_read(site, inst))
+                {
                     (*st).stack.add(slot).write(v);
                     return 0;
                 }
@@ -8646,6 +8648,25 @@ fn type_attr_memo(site: &AttrSite, cls: &Rc<crate::types::TypeObject>) -> Option
         }
         _ => None,
     }
+}
+
+/// `inst.__class__` at `site`, where `object`'s descriptor is what answers
+/// (no `__class__` or `__getattribute__` anywhere on the class, which isn't
+/// a builtin's, and no extension body): the instance's class. This is
+/// every `self.__class__`, and both sides of the `other.__class__ is
+/// self.__class__` a dataclass's comparisons open with.
+fn instance_class_read(site: &AttrSite, inst: &Rc<crate::types::PyInstance>) -> Option<Object> {
+    // SAFETY: the site's code is live (the caller's code runs it).
+    let code = unsafe { &*site.code };
+    let name = code
+        .names
+        .get(code.instructions[site.pc as usize].arg as usize)?;
+    if name != "__class__" {
+        return None;
+    }
+    let cls = inst.cls_raw();
+    (inst.c_body.get() == 0 && !cls.flags.is_builtin && cls.class_attr_is_plain())
+        .then(|| Object::Type(inst.cls()))
 }
 
 /// Whether `site` reads one of the names every class answers with a string
@@ -8969,12 +8990,14 @@ unsafe extern "C" fn attr_stack_slow(st: *mut State, site: *const AttrSite) -> u
             }
             // (A class attribute the site has read before.)
             Object::Instance(inst) => {
-                let v = class_poly_hit(site, inst).or_else(|| {
-                    site.class_attr.get().then(|| {
-                        let (code, ext) = (&*site.code, &*site.ext);
-                        crate::inst_class_attr_quick(code, ext, inst, &*at, site.pc as usize)
-                    })?
-                });
+                let v = class_poly_hit(site, inst)
+                    .or_else(|| instance_class_read(site, inst))
+                    .or_else(|| {
+                        site.class_attr.get().then(|| {
+                            let (code, ext) = (&*site.code, &*site.ext);
+                            crate::inst_class_attr_quick(code, ext, inst, &*at, site.pc as usize)
+                        })?
+                    });
                 if let Some(v) = v {
                     if plain_release(&*at) {
                         at.write(v);

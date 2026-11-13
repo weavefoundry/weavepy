@@ -11040,11 +11040,19 @@ impl Interpreter {
         pc: usize,
     ) -> Option<Box<InlineAct>> {
         let n = frame.stack.len();
-        let Some(Object::Instance(inst)) = frame.stack.get(n.checked_sub(2)?) else {
-            return None;
+        // The class whose `__getitem__` answers: an instance's class, or a
+        // class's metaclass (`Color["RED"]`, which `EnumType` serves), where
+        // that isn't `type` itself.
+        let meta;
+        let cls: &TypeObject = match frame.stack.get(n.checked_sub(2)?) {
+            Some(Object::Instance(inst)) => inst.cls_raw(),
+            Some(Object::Type(t)) if !t.metaclass_is_type() => {
+                meta = t.metaclass_or_type();
+                &meta
+            }
+            _ => return None,
         };
         // The site remembers the function by the class's attribute version.
-        let cls = inst.cls_raw();
         let ver = cls.attr_version.get();
         let slot = code_method_slot(&frame.code, pc as u32);
         let f = match slot.and_then(|s| s.get_held(ver)) {
@@ -88718,7 +88726,8 @@ fn long_cmp_int(x: &num_bigint::BigInt, y: i64) -> std::cmp::Ordering {
 }
 
 /// `a <op> b` for two exact tuples (or two exact lists) whose compared
-/// elements are machine ints, floats, `str`s, or such tuples in turn: the
+/// elements are machine ints, floats, `str`s, or such tuples or lists in
+/// turn: the
 /// sequence comparison CPython runs (the first unequal pair decides,
 /// else the lengths), with no element able to run Python code. `None`
 /// for any other operands, or nesting past a small depth.
@@ -88748,7 +88757,13 @@ fn native_seq_compare(a: &Object, b: &Object, op: CompareKind, depth: u32) -> Op
         }
         let eq = match native_scalar_compare(x, y, CompareKind::Eq) {
             Some(eq) => eq,
-            None if matches!((x, y), (Object::Tuple(_), Object::Tuple(_))) => {
+            // (A list among a tuple's items, as a dataclass's field tuple
+            // holds one, compares the same way.)
+            None if matches!(
+                (x, y),
+                (Object::Tuple(_), Object::Tuple(_)) | (Object::List(_), Object::List(_))
+            ) =>
+            {
                 native_seq_compare(x, y, CompareKind::Eq, depth + 1)?
             }
             None => return None,
