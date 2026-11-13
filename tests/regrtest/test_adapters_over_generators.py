@@ -139,8 +139,70 @@ def shared_source(n):
     return firsts
 
 
+import itertools
+
+
+def chained(n):
+    acc = 0
+    for x in itertools.chain(count(n), squares(3), count(n)):
+        acc += x
+    return acc
+
+
+def chained_mixed(n):
+    out = []
+    for x in itertools.chain([7], count(2), (), squares(3), "ab"):
+        out.append(x)
+    return out
+
+
+def sliced(n):
+    g = count(10 * n)
+    acc = 0
+    for x in itertools.islice(g, n):
+        acc += x
+    for x in itertools.islice(g, 3, n, 2):
+        acc += x
+    return acc, next(g)
+
+
+def sliced_short(n):
+    # The source ends inside the gap and inside the run.
+    a = [x for x in itertools.islice(count(5), 2, 100, 3)]
+    b = []
+    for x in itertools.islice(count(4), 10, 20):
+        b.append(x)
+    g = count(8)
+    c = []
+    for x in itertools.islice(g, 3, 3):
+        c.append(x)
+    return a, b, c, next(g)
+
+
+def sliced_failing(n):
+    seen = []
+    try:
+        for x in itertools.islice(failing(3), 10):
+            seen.append(x)
+    except ValueError as e:
+        seen.append(e.args)
+    try:
+        for x in itertools.chain(count(2), failing(1), count(2)):
+            seen.append(x)
+    except ValueError as e:
+        seen.append(e.args)
+    return seen
+
+
 N = 2000
 for _ in range(3):
+    assert chained(N) == 2 * sum(range(N)) + 5
+    assert chained_mixed(N) == [7, 0, 1, 0, 1, 4, "a", "b"]
+    # (The second slice stops asking once its next index would pass its
+    # stop, so the source stands at the last item it gave, plus one.)
+    assert sliced(N) == (4996999, 4000), sliced(N)
+    assert sliced_short(N) == ([2], [], [], 3)
+    assert sliced_failing(N) == [0, 1, 2, (3,), 0, 1, 0, (1,)]
     assert enum_sum(N) == sum(i * i for i in range(N))
     assert enum_started(N) == sum(i + 5 + i * i for i in range(N))
     assert enum_tuples(N) == (N - 1, N - 1)

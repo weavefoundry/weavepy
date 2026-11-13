@@ -50516,7 +50516,19 @@ impl Interpreter {
         {
             return None;
         }
-        match self.gen_fast_next(gen, snap_gen, 0, crate::gc_trace::maybe_dead_flag()) {
+        // (The single-pass resume where there's native code to run; it
+        // falls back to `gen_fast_next` itself.)
+        #[cfg(feature = "jit")]
+        let stepped = self.gen_native_next(
+            gen,
+            snap_gen,
+            crate::gc_trace::maybe_dead_flag(),
+            crate::recursion::depth_cell(),
+            0,
+        );
+        #[cfg(not(feature = "jit"))]
+        let stepped = self.gen_fast_next(gen, snap_gen, 0, crate::gc_trace::maybe_dead_flag());
+        match stepped {
             gen_fast::GenNext::Yielded(v) => Some(Ok(v)),
             gen_fast::GenNext::Exhausted(v) => Some(Self::generator_returned(v, raw_return)),
             gen_fast::GenNext::Declined | gen_fast::GenNext::Partial => None,

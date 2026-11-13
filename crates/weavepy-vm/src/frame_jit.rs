@@ -4057,6 +4057,12 @@ unsafe extern "C" fn h_for_iter_rest(
                     unsafe { out.write(Object::new_tuple_array([a, b])) };
                     return 1;
                 }
+                // `chain` and `islice` over a generator, likewise.
+                if let Some(v) = interp.lazy_gen_one(l, st.snap_gen, st.maybe_dead, st.depth_cell) {
+                    // SAFETY: as above.
+                    unsafe { out.write(v) };
+                    return 1;
+                }
             }
             // SAFETY: as above.
             return unsafe { for_iter_lane(st, it, pc) };

@@ -2316,6 +2316,68 @@ impl Interpreter {
         }
     }
 
+    /// One step of `itertools.chain` whose current iterable is a generator,
+    /// or of `itertools.islice` over one, from a running activation (see
+    /// [`Self::lazy_gen_pair`]): the item, the generator stepped by its
+    /// native code where it stands. `None` for any other adapter, and
+    /// whenever the generator doesn't yield: the general step finds it, and
+    /// the adapter, as they are (an `islice`'s skipped items are counted as
+    /// they're taken).
+    #[cfg(feature = "jit")]
+    pub(crate) fn lazy_gen_one(
+        &mut self,
+        l: &Rc<PyLazyIter>,
+        snap_gen: u64,
+        dead: *const std::cell::Cell<bool>,
+        depth_cell: *const std::cell::Cell<usize>,
+    ) -> Option<Object> {
+        // (The source is copied out: its body may reach this adapter.)
+        // SAFETY: a read that runs no code; the view ends with the match.
+        let (source, skip) = match unsafe { l.state.peek() }? {
+            LazyIterKind::Chain {
+                active: Some(g @ Object::Generator(_)),
+                ..
+            } => (g.clone(), None),
+            LazyIterKind::Islice {
+                source: g @ Object::Generator(_),
+                next_idx,
+                pos,
+                stop,
+                done: false,
+                ..
+            } if *pos <= *next_idx && stop.is_none_or(|s| *next_idx < s) => {
+                (g.clone(), Some(*next_idx - *pos))
+            }
+            _ => return None,
+        };
+        let Some(skip) = skip else {
+            return self.lazy_gen_pull(&source, snap_gen, dead, depth_cell);
+        };
+        // `islice`: the items before the next one to give are taken first.
+        for _ in 0..skip {
+            drop(self.lazy_gen_pull(&source, snap_gen, dead, depth_cell)?);
+            if let LazyIterKind::Islice { pos, .. } = &mut *l.state.borrow_mut() {
+                *pos += 1;
+            }
+        }
+        let item = self.lazy_gen_pull(&source, snap_gen, dead, depth_cell)?;
+        if let LazyIterKind::Islice {
+            next_idx,
+            pos,
+            stop,
+            step,
+            ..
+        } = &mut *l.state.borrow_mut()
+        {
+            *pos += 1;
+            *next_idx = next_idx.saturating_add(*step);
+            if let Some(s) = stop {
+                *next_idx = (*next_idx).min(*s);
+            }
+        }
+        Some(item)
+    }
+
     /// One step of a native adapter that runs no Python code, for every
     /// `FOR_ITER` (the core loop's, the frame JIT's, tier 2's) and ahead of
     /// the interpreter's general step: [`lazy_pure_next`]'s state machines,
