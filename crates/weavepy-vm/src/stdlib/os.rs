@@ -3737,6 +3737,7 @@ struct EntryKeys {
     fs: DictKey,
     /// The directory's descriptor, for an `os.scandir(fd)` entry (whose
     /// `path` is the bare name, resolved against it).
+    #[cfg(unix)]
     dir_fd: DictKey,
     /// One of the `ENTRY_*` kinds.
     kind: DictKey,
@@ -3756,6 +3757,7 @@ fn entry_keys() -> &'static EntryKeys {
             name: key("name"),
             path: key("path"),
             fs: key("_fs"),
+            #[cfg(unix)]
             dir_fd: key("_dir_fd"),
             kind: key("_kind"),
             ino: key("_ino"),

@@ -6605,6 +6605,7 @@ impl ReadAhead {
 
     /// Storage to read the next block into: the waiting bytes, moved to the
     /// front, with room for `room` more.
+    #[cfg(unix)]
     fn begin_fill(&mut self, room: usize) -> Vec<u8> {
         let mut buf = self.take_all();
         buf.reserve(room);
