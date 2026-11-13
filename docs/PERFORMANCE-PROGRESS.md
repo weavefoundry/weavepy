@@ -474,6 +474,14 @@ branch and pull request.
     leaves for the core loop to do it), and `hash()` of a tuple of any
     plain scalars, or of `bytes`, is a leaf (`hash((1, 2.5))` 1,386 to
     500 against 580, `hash(b"...")` 1,497 to 370 against 560).
+  - Builtin constructors at a call site. A sweep of every builtin called
+    with plain arguments found the ones still taking the general call:
+    `bool(container)` 3,020 to 860 instructions (CPython 910),
+    `slice(a, b)` 3,070 to 1,060 (1,160), `set(xs)` 3,510 to 1,980
+    (1,640), `frozenset(xs)` 4,110 to 2,490 (1,660). Still general:
+    `globals()` 7.9 times CPython, three-argument `pow` 7, `vars(obj)` 6,
+    `object()` 3.4, `bytes(n)` 3, `dict(a=1)` and `dict(d)` 2.9 and 2.6,
+    `setattr` 2.4.
   - A metaclass's Python `__getitem__` (`Color["RED"]`) runs as an
     inline activation, as an instance's class's does (3,860 to 3,465
     against 620: its body's `cls._member_map_` read and the exit from

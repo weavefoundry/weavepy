@@ -1560,6 +1560,14 @@ pub(crate) fn builtin_ctor_pure(cls: &Rc<TypeObject>, args: &[Object]) -> Option
                 Object::Bool(b) => Some(Object::Bool(*b)),
                 Object::None => Some(Object::Bool(false)),
                 Object::Str(s) => Some(Object::Bool(!s.is_empty())),
+                // An exact container is true when it holds anything
+                // (`bool(items)`, as `if items:` reads it).
+                Object::Bytes(b) => Some(Object::Bool(!b.is_empty())),
+                Object::Tuple(t) => Some(Object::Bool(!t.is_empty())),
+                Object::List(l) => Some(Object::Bool(!l.try_borrow().ok()?.is_empty())),
+                Object::Dict(d) => Some(Object::Bool(!d.try_borrow().ok()?.is_empty())),
+                Object::Set(s) => Some(Object::Bool(!s.try_borrow().ok()?.is_empty())),
+                Object::FrozenSet(s) => Some(Object::Bool(s.iter().next().is_some())),
                 _ => None,
             };
         }
@@ -1570,6 +1578,55 @@ pub(crate) fn builtin_ctor_pure(cls: &Rc<TypeObject>, args: &[Object]) -> Option
                 Object::Bool(b) => Some(Object::from_static(if *b { "True" } else { "False" })),
                 _ => None,
             };
+        }
+    }
+    // `slice(stop)`, `slice(start, stop)` and `slice(start, stop, step)`
+    // of ints and `None`s: the slice object, which holds them as they are.
+    if Rc::ptr_eq(cls, &bt.slice_)
+        && (1..=3).contains(&args.len())
+        && args
+            .iter()
+            .all(|a| matches!(a, Object::Int(_) | Object::None))
+    {
+        let part = |i: usize| args.get(i).cloned().unwrap_or(Object::None);
+        let (start, stop, step) = match args.len() {
+            1 => (Object::None, part(0), Object::None),
+            _ => (part(0), part(1), part(2)),
+        };
+        return Some(Object::Slice(Rc::new(crate::object::PySlice {
+            start,
+            stop,
+            step,
+        })));
+    }
+    // `set(xs)` and `frozenset(xs)` of an exact list or tuple of plain
+    // hashable values: no element's hash or comparison runs any code.
+    if let [src @ (Object::List(_) | Object::Tuple(_))] = args {
+        let frozen = Rc::ptr_eq(cls, &bt.frozenset_);
+        if frozen || Rc::ptr_eq(cls, &bt.set_) {
+            if crate::stdlib::tracemalloc_real::is_tracking() || crate::gc_trace::auto_collect_due()
+            {
+                return None;
+            }
+            let borrowed;
+            let items: &[Object] = match src {
+                Object::Tuple(t) => t,
+                Object::List(l) => {
+                    borrowed = l.try_borrow().ok()?;
+                    &borrowed
+                }
+                _ => return None,
+            };
+            if !items.iter().all(|x| plain_hashable(x, 0)) {
+                return None;
+            }
+            let obj = if frozen {
+                Object::new_frozenset_from(items.iter().cloned())
+            } else {
+                Object::new_set_from(items.iter().cloned())
+            };
+            crate::gc_trace::track(&obj);
+            return Some(obj);
         }
     }
     // `int(x)` of an exact int, bool, or a finite float whose truncation
