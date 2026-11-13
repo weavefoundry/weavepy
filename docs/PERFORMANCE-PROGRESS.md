@@ -437,11 +437,16 @@ branch and pull request.
     ten items ran 7,400 instructions a pass through its entries against
     the frame JIT's 3,400. The minimum now scales with the compiled
     code's size (`osr_min_trips`: 64 iterations for an empty body, eight
-    from fifteen statements), so such loops are left to the frame JIT. A
-    keyword call of a pure leaf (`f(i, c=4)` with a keyword-only
-    parameter) ran 1,040 instructions in tier 2's frameless evaluation
-    against 220 at the frame JIT's call site, uncounted; it counts
-    against the loop now (320 an iteration after the hand-over).
+    from fifteen statements), so such loops are left to the frame JIT.
+  - Tried and reverted: counting a keyword call of a pure leaf against
+    its loop (`f(i, c=4)` with a keyword-only parameter runs 1,040
+    instructions in tier 2's frameless evaluation against 220 at the
+    frame JIT's call site, so a loop of only that call went from 1,040 to
+    320). A loop that makes one such call among six other calls still
+    runs better in tier 2: the bench gate's `call_overhead` took 15% more
+    instructions once the call retired its loop, and 45% more time on
+    CI's Linux runner. The frameless evaluation itself is what to make
+    cheaper.
   - The frame JIT's `FOR_ITER` helper steps a dict's and a dict view's
     keys and values and a reversed list's items itself, instead of
     through the general step's second helper: ten of a dict's keys 3,140
@@ -470,6 +475,14 @@ branch and pull request.
     `*args`), and skipping the tuple pool's clearing walk when its bucket
     is full (35 instructions an element less for `zip`, as many more for
     `enumerate`, which borrows the pool once more).
+  - A module that names `__spec__` or `__loader__` in its own code gets
+    the pair before its body runs. The lazy pair of the commit before
+    (see "A program's own modules import without `importlib`") covered
+    attribute reads, but a module that read `__spec__` as a global found
+    the `builtins` module's, since a name its dict lacks is looked up
+    there next: pydantic's `__init__` builds its lazy imports from
+    `__spec__.parent`, and failed to import (CI's ecosystem shards had
+    been failing on it and on Pillow's self-test since that commit).
   - Two bugs the new tests found: `list.sort` ignored an unknown keyword,
     and raised `TypeError` for a `list` subclass's instance when called
     with keywords (`super().sort(reverse=True)`).

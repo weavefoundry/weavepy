@@ -69956,13 +69956,23 @@ impl Interpreter {
         // 0.6. A program that never asks leaves them unbuilt, as CPython's
         // modules loaded before `_bootstrap._setup` have none; an
         // attribute read still builds them.
+        //
+        // A module whose own code names either one gets them now, whatever
+        // is loaded: its body or its functions may read the name as a
+        // global (`__spec__.parent` in pydantic's `__init__`), and a global
+        // the module's dict lacks is looked up in `builtins`, whose own
+        // `__spec__` would answer.
         if let Object::Module(m) = &module_obj {
             let has_both = {
                 let d = m.dict.borrow();
                 d.contains_key(&DictKey(Object::from_static("__spec__")))
                     && d.contains_key(&DictKey(Object::from_static("__loader__")))
             };
-            if !has_both && self.import_machinery_loaded() {
+            if !has_both
+                && (self.import_machinery_loaded()
+                    || code_names_anywhere(&code, "__spec__")
+                    || code_names_anywhere(&code, "__loader__"))
+            {
                 let _ = self.ensure_module_spec(m);
             }
         }
