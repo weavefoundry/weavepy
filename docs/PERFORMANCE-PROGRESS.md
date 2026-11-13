@@ -3275,6 +3275,11 @@ moved in this PR, and the list below is from its first run.
   `super()`, `issubclass` against an ABC.
 - `f.read(n)` in a loop and large single writes; `os.stat` and
   `os.path.exists`.
+- Block reads off Unix: the read-ahead's fill asks a descriptor for a
+  block only under `cfg(unix)`, so a line read on Windows still takes a
+  byte per read (as it did everywhere before this PR). The generic fill
+  can ask a disk file for a block the same way; it needs a Windows
+  machine to test on.
 - `bytes` `%` formatting; `dict(zip(a, b))`; `*args` forwarding.
 - Exceptions raised in a callee and caught in its caller (12,400
   instructions against 6,800 for `os.environ[missing]`), which `argparse`
