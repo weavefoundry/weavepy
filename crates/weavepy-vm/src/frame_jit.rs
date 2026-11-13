@@ -2572,7 +2572,7 @@ unsafe extern "C" fn h_for_iter_gen(
     // SAFETY: the running thread's interpreter, dormant while the helper
     // runs; the stack slot keeps `g` alive.
     let interp = unsafe { &mut *st.interp.cast_mut() };
-    match interp.gen_native_next(g, st.snap_gen, st.maybe_dead, st.depth_cell) {
+    match interp.gen_native_next(g, st.snap_gen, st.maybe_dead, st.depth_cell, 0) {
         crate::gen_fast::GenNext::Yielded(v) => {
             // SAFETY: the slot above the iterator is free.
             unsafe { out.write(v) };
@@ -3545,7 +3545,7 @@ unsafe fn lazy_step(
     unsafe {
         let interp = &mut *st.interp.cast_mut();
         if crate::gen_fast::may_step(gen) {
-            match interp.gen_native_next(gen, st.snap_gen, st.maybe_dead, st.depth_cell) {
+            match interp.gen_native_next(gen, st.snap_gen, st.maybe_dead, st.depth_cell, 0) {
                 GenNext::Yielded(v) => return LazyGen::Yielded(v),
                 GenNext::Exhausted(r) => return LazyGen::Returned(r),
                 GenNext::Declined | GenNext::Partial => {}
@@ -12170,7 +12170,7 @@ unsafe extern "C" fn h_call(
             if let (Object::Generator(g), true) =
                 (&*base.add(start + 2), Interpreter::core_drops_plain())
             {
-                match interp.gen_native_next(g, st.snap_gen, st.maybe_dead, st.depth_cell) {
+                match interp.gen_native_next(g, st.snap_gen, st.maybe_dead, st.depth_cell, 0) {
                     crate::gen_fast::GenNext::Yielded(v) => {
                         // The builtin and the generator (the stack's own
                         // slots hold them past the step) leave by plain
@@ -12226,7 +12226,7 @@ unsafe extern "C" fn h_call(
             if let (Object::Generator(g), true) =
                 (&*base.add(start + 2), Interpreter::core_drops_plain())
             {
-                match interp.gen_native_next(g, st.snap_gen, st.maybe_dead, st.depth_cell) {
+                match interp.gen_native_next(g, st.snap_gen, st.maybe_dead, st.depth_cell, 0) {
                     crate::gen_fast::GenNext::Yielded(v) => {
                         crate::release_run(base.add(start), 4);
                         base.add(start).write(v);
@@ -14203,13 +14203,14 @@ unsafe fn h_send_step(st: &mut State, pc: u64, len: usize) -> Option<u32> {
             return None;
         };
         let interp = &mut *st.interp.cast_mut();
-        let (v, exit) = match interp.gen_native_next(g, st.snap_gen, st.maybe_dead, st.depth_cell) {
-            crate::gen_fast::GenNext::Yielded(v) => (v, false),
-            crate::gen_fast::GenNext::Exhausted(v) => (v, true),
-            crate::gen_fast::GenNext::Declined | crate::gen_fast::GenNext::Partial => {
-                return None;
-            }
-        };
+        let (v, exit) =
+            match interp.gen_native_next(g, st.snap_gen, st.maybe_dead, st.depth_cell, 0) {
+                crate::gen_fast::GenNext::Yielded(v) => (v, false),
+                crate::gen_fast::GenNext::Exhausted(v) => (v, true),
+                crate::gen_fast::GenNext::Declined | crate::gen_fast::GenNext::Partial => {
+                    return None;
+                }
+            };
         // The sent `None`'s slot (no drop glue owed).
         st.stack.add(len - 1).write(v);
         let to = pc as usize + 1 + if exit { arg as usize } else { 0 };

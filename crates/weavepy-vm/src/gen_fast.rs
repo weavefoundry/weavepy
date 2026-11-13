@@ -404,6 +404,11 @@ fn scalar_truth(v: &Object) -> Option<bool> {
     })
 }
 
+/// How deep a chain of `yield from` delegations steps directly (see
+/// `Interpreter::gen_chain_step`).
+#[cfg(feature = "jit")]
+const CHAIN_LEVELS: u8 = 8;
+
 impl Interpreter {
     /// Whether `frame`, a suspended generator's (whose code's extension
     /// table is `ext`), may take fast steps: a body a fast step runs (see
@@ -1207,6 +1212,7 @@ impl Interpreter {
         snap_gen: u64,
         dead: *const std::cell::Cell<bool>,
         depth_cell: *const std::cell::Cell<usize>,
+        level: u8,
     ) -> GenNext {
         use std::sync::atomic::Ordering;
         'lean: {
@@ -1235,6 +1241,15 @@ impl Interpreter {
                 break 'lean;
             };
             let pc = frame.pc as usize;
+            // Resting in a `yield from` over a generator (its delegate tops
+            // its stack): the delegate steps directly (see
+            // `gen_chain_step`).
+            if level < CHAIN_LEVELS
+                && matches!(frame.stack.last(), Some(Object::Generator(_)))
+                && crate::yield_from_resend(&code.instructions, pc).is_some()
+            {
+                return self.gen_chain_step(g, snap_gen, dead, depth_cell, level);
+            }
             let Some(native) = ext.frame_jit.get(frame.locals.len()) else {
                 break 'lean;
             };
@@ -1304,6 +1319,98 @@ impl Interpreter {
             };
         }
         self.gen_fast_next(g, snap_gen, 0, dead)
+    }
+
+    /// [`Self::gen_native_next`] for a generator resting in a `yield from`
+    /// over another generator: the delegate steps directly (itself through
+    /// `gen_native_next`, one level deeper), and what it yields is what `g`
+    /// yields, `g`'s frame untouched but for being marked running
+    /// meanwhile. Resuming `g` itself for that runs its native code up to
+    /// the `SEND`, which a generator's own activation can't take, and then
+    /// the lazy resume: 360 instructions an item more than this.
+    ///
+    /// A delegate that returns leaves `g` as its `SEND` leaves it at the
+    /// delegate's end (the value above the delegate, at the `SEND`'s jump
+    /// target, to continue with nothing sent): a step stopped partway,
+    /// which the caller's general resume continues. A delegate that
+    /// doesn't step this way leaves `g` as it was, for the ordinary steps.
+    #[cfg(feature = "jit")]
+    #[inline(never)]
+    fn gen_chain_step(
+        &mut self,
+        g: &Rc<PyGenerator>,
+        snap_gen: u64,
+        dead: *const std::cell::Cell<bool>,
+        depth_cell: *const std::cell::Cell<usize>,
+        level: u8,
+    ) -> GenNext {
+        use std::sync::atomic::Ordering;
+        'chain: {
+            if g.chain.get() != 0 {
+                break 'chain;
+            }
+            // SAFETY: as in `gen_native_next`.
+            let Some(state) = (unsafe { g.state_raw().peek_mut() }) else {
+                break 'chain;
+            };
+            let GeneratorState::Suspended(gf) = &*state else {
+                break 'chain;
+            };
+            let pc = gf.pc as usize;
+            let Some(send) = crate::yield_from_resend(&gf.code.instructions, pc) else {
+                break 'chain;
+            };
+            let arg = gf.code.instructions[send].arg;
+            let Some(Object::Generator(d)) = gf.stack.last() else {
+                break 'chain;
+            };
+            if arg & crate::GEN_SEND != 0
+                || gf.sent_consumed
+                || gf.py_frame.is_some()
+                || gf.has_saved_exc_info()
+                || gf.parked_native.is_some()
+                || gf
+                    .shell_cache
+                    .as_ref()
+                    .is_some_and(|c| c.has_materialized.load(Ordering::Relaxed))
+                || crate::trace::eval_frame_record_active()
+                || Rc::ptr_eq(d, g)
+                || !may_step(d)
+            {
+                break 'chain;
+            }
+            let d = d.clone();
+            // `g` is running while its delegate is (a body that reaches for
+            // it finds it so).
+            let prev = std::mem::replace(state, GeneratorState::Running);
+            let GeneratorState::Suspended(mut boxed) = prev else {
+                unreachable!("checked above");
+            };
+            let stepped = self.gen_native_next(&d, snap_gen, dead, depth_cell, level + 1);
+            let ended = match stepped {
+                GenNext::Yielded(v) => {
+                    Self::park_stepped(g, boxed);
+                    return GenNext::Yielded(v);
+                }
+                // The delegate's end, as `SEND` leaves it.
+                GenNext::Exhausted(ret) => {
+                    boxed.stack.push(ret);
+                    boxed.pc = (send + 1 + arg as usize) as u32;
+                    boxed.sent_consumed = true;
+                    true
+                }
+                GenNext::Declined | GenNext::Partial => false,
+            };
+            Self::park_stepped(g, boxed);
+            // `g` goes on past the delegation by the caller's general
+            // resume, which runs whatever comes next (a call, as often as
+            // not, which a step from here couldn't make) and any finalizer
+            // the delegate's end queued before it.
+            if ended {
+                return GenNext::Partial;
+            }
+        }
+        self.gen_native_next(g, snap_gen, dead, depth_cell, CHAIN_LEVELS)
     }
 
     /// [`Self::gen_fast_send`] once the body's verdict admits fast steps

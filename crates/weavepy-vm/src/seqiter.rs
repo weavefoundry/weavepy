@@ -2216,7 +2216,7 @@ impl Interpreter {
         depth_cell: *const std::cell::Cell<usize>,
     ) -> Option<Object> {
         match source {
-            Object::Generator(g) => match self.gen_native_next(g, snap_gen, dead, depth_cell) {
+            Object::Generator(g) => match self.gen_native_next(g, snap_gen, dead, depth_cell, 0) {
                 crate::gen_fast::GenNext::Yielded(v) => Some(v),
                 _ => None,
             },
