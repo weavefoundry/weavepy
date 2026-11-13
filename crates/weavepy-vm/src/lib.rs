@@ -21326,7 +21326,11 @@ impl Interpreter {
         // empty in the method form.
         if let (Object::Type(c), Object::Type(k)) = (cls_obj, self_obj) {
             if k.is_subclass_of(c) {
-                let f = Self::leaf_super_type_attr(code, c, k, pc as u32, ins.arg >> 2)?;
+                let Some(f) = Self::leaf_super_type_attr(code, c, k, pc as u32, ins.arg >> 2)
+                else {
+                    // SAFETY: the caller's contract.
+                    return unsafe { Self::core_super_class_method(code, ins, base, len) };
+                };
                 // SAFETY: all three operands leave the stack, the receiver
                 // too (a class, held by its module or its caller's frame
                 // besides): each was checked droppable or is plain.
@@ -21346,7 +21350,11 @@ impl Interpreter {
                 }
             }
         }
-        let f = Self::leaf_load_super_attr(code, cls_obj, self_obj, pc as u32, ins.arg >> 2)?;
+        let Some(f) = Self::leaf_load_super_attr(code, cls_obj, self_obj, pc as u32, ins.arg >> 2)
+        else {
+            // SAFETY: the caller's contract.
+            return unsafe { Self::core_super_other(code, ins, base, len) };
+        };
         // SAFETY: all three operands leave the stack; the two released ones
         // were checked droppable, and `self` moves into the shape the
         // `CALL` expects.
@@ -21362,6 +21370,161 @@ impl Interpreter {
                 base.add(len - 3)
                     .write(Object::BoundMethod(Rc::new(BoundMethod::new(self_v, f))));
                 Some(len - 2)
+            }
+        }
+    }
+
+    /// [`Self::core_super_attr`] for `super().name` inside a class method
+    /// (the receiver a subclass of the class) where the name is a class
+    /// method further along the MRO: its function, bound to the receiver
+    /// class. Returns the new stack length, or `None`, having touched
+    /// nothing.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::core_super_attr`]'s, its operand checks passed.
+    #[inline(never)]
+    unsafe fn core_super_class_method(
+        code: &CodeObject,
+        ins: weavepy_compiler::Instruction,
+        base: *mut Object,
+        len: usize,
+    ) -> Option<usize> {
+        // SAFETY: `len >= 3` (the caller checked).
+        let (cls_obj, self_obj) = unsafe { (&*base.add(len - 2), &*base.add(len - 1)) };
+        let (Object::Type(cls), Object::Type(k)) = (cls_obj, self_obj) else {
+            return None;
+        };
+        let name = code.names.get((ins.arg >> 2) as usize)?;
+        if name.starts_with("__") {
+            return None;
+        }
+        let f = {
+            let mro = k.mro.try_borrow().ok()?;
+            let start = mro.iter().position(|t| Rc::ptr_eq(t, cls))? + 1;
+            let key = crate::object::StrKey(name.as_str());
+            let mut found = None;
+            for owner in &mro[start..] {
+                if owner.c_ext_ptr.get() != 0 {
+                    return None;
+                }
+                let d = owner.dict.try_borrow().ok()?;
+                if let Some(v) = d.get(&key) {
+                    found = Some(v.clone());
+                    break;
+                }
+            }
+            match found? {
+                Object::ClassMethod(w) => match w.func() {
+                    f @ Object::Function(_) => f,
+                    _ => return None,
+                },
+                _ => return None,
+            }
+        };
+        // SAFETY: the class and the `super` global leave the stack (checked
+        // droppable by the caller); the receiver class moves into the
+        // shape the `CALL` expects, or into the bound method.
+        unsafe {
+            let receiver = base.add(len - 1).read();
+            drop_hot_at(base.add(len - 2));
+            drop_hot_at(base.add(len - 3));
+            if ins.arg & 1 != 0 {
+                base.add(len - 3).write(f);
+                base.add(len - 2).write(receiver);
+                Some(len - 1)
+            } else {
+                base.add(len - 3)
+                    .write(Object::BoundMethod(Rc::new(BoundMethod::new(receiver, f))));
+                Some(len - 2)
+            }
+        }
+    }
+
+    /// [`Self::core_super_attr`] for an instance's `super().name` that isn't
+    /// a method: a plain value a base class holds (`super().limit`), read
+    /// as it is, or a class method (`super().create()`), bound to the
+    /// receiver's class. Returns the new stack length, or `None`, having
+    /// touched nothing (a property, a descriptor, a dunder: the full
+    /// lookup's).
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::core_super_attr`]'s, its operand checks passed.
+    #[inline(never)]
+    unsafe fn core_super_other(
+        code: &CodeObject,
+        ins: weavepy_compiler::Instruction,
+        base: *mut Object,
+        len: usize,
+    ) -> Option<usize> {
+        // SAFETY: `len >= 3` (the caller checked).
+        let (cls_obj, self_obj) = unsafe { (&*base.add(len - 2), &*base.add(len - 1)) };
+        let (Object::Type(cls), Object::Instance(inst)) = (cls_obj, self_obj) else {
+            return None;
+        };
+        let name = code.names.get((ins.arg >> 2) as usize)?;
+        if name.starts_with("__") || !Self::core_droppable(self_obj) {
+            return None;
+        }
+        let found = {
+            let mro = inst.cls_raw().mro.try_borrow().ok()?;
+            let start = mro.iter().position(|t| Rc::ptr_eq(t, cls))? + 1;
+            let key = crate::object::StrKey(name.as_str());
+            let mut found = None;
+            for owner in &mro[start..] {
+                if owner.c_ext_ptr.get() != 0 {
+                    return None;
+                }
+                let d = owner.dict.try_borrow().ok()?;
+                if let Some(v) = d.get(&key) {
+                    if owner.flags.is_builtin && crate::descr_registry::is_surface_only(v) {
+                        return None;
+                    }
+                    found = Some(v.clone());
+                    break;
+                }
+            }
+            found?
+        };
+        let method_form = ins.arg & 1 != 0;
+        let (value, receiver) = match found {
+            v @ (Object::Int(_)
+            | Object::Float(_)
+            | Object::Bool(_)
+            | Object::None
+            | Object::Str(_))
+                if !method_form =>
+            {
+                (v, None)
+            }
+            Object::ClassMethod(w) => match w.func() {
+                f @ Object::Function(_) => (f, Some(Object::Type(inst.cls()))),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        // SAFETY: all three operands leave the stack, each checked
+        // droppable (the receiver here, the other two by the caller).
+        unsafe {
+            drop_hot_at(base.add(len - 1));
+            drop_hot_at(base.add(len - 2));
+            drop_hot_at(base.add(len - 3));
+            match receiver {
+                None => {
+                    base.add(len - 3).write(value);
+                    Some(len - 2)
+                }
+                Some(owner) if method_form => {
+                    base.add(len - 3).write(value);
+                    base.add(len - 2).write(owner);
+                    Some(len - 1)
+                }
+                Some(owner) => {
+                    base.add(len - 3)
+                        .write(Object::BoundMethod(Rc::new(BoundMethod::new(owner, value))));
+                    Some(len - 2)
+                }
             }
         }
     }

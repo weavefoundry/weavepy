@@ -462,6 +462,12 @@ branch and pull request.
     `(1, 2, []) == (1, 2, [])` 2,819 to 627 (580). Both are in every
     dataclass comparison (`==` 6,820 to 5,230 against 1,910: the rest is
     the `__eq__` call itself, which only a pure-leaf body avoids).
+  - Zero-argument `super().name` was fast only for plain methods. A
+    plain value a base class holds is read in place (5,540 to 1,630
+    instructions against CPython's 1,020) and a class method is bound to
+    the receiver's class in place, from an instance method or a class
+    method (`super().create()` 6,970 to 2,640 against 1,710). A property
+    through `super()` still takes the full path (6,370 against 1,190).
   - A metaclass's Python `__getitem__` (`Color["RED"]`) runs as an
     inline activation, as an instance's class's does (3,860 to 3,465
     against 620: its body's `cls._member_map_` read and the exit from
