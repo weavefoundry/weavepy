@@ -2007,7 +2007,7 @@ fn get_command(_args: &[Object]) -> Result<Object, RuntimeError> {
 #[cfg(unix)]
 fn mp_exit(args: &[Object]) -> Result<Object, RuntimeError> {
     let code = arg_int(args, 0, 0)? as i32;
-    std::process::exit(code);
+    crate::vm_singletons::exit_process(code);
 }
 
 #[cfg(unix)]

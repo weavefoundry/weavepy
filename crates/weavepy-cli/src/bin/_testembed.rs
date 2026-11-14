@@ -62,7 +62,7 @@ fn main() {
             1
         }
     };
-    std::process::exit(code);
+    weavepy::vm::vm_singletons::exit_process(code);
 }
 
 // ---------------------------------------------------------------------------

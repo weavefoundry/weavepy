@@ -7,6 +7,108 @@ plan, what's done, and what's next, so a new session can pick up the work.
 
 ## Where WeavePy stands
 
+Measured on November 13, 2026, at `4e230310` (this PR), a PGO build from a
+fresh training run against CPython 3.14.8 on the same idle host. The
+benchmark suite: warm time 0.850, cold time 0.959, peak RSS 1.137, and
+0.996 of the time of the last PGO build measured here (`d1f48c5c`) in the
+same run, so nothing in between cost the suite anything. WeavePy is ahead
+on 22 of the 33 workloads warm and 17 cold; the best warm times are
+`scimark` 0.51, `pickle_roundtrip` 0.57 and `raytrace` 0.60, the worst
+`async_tree` 1.25, `sudoku` 1.14, `context_managers` 1.12 and `deepcopy`
+1.11. Whole processes take 0.90 of CPython's time, `-c pass` 0.70 to 0.75
+(see "Measurement notes" for why that is a range), peak RSS is 1.14 and
+peak footprint 1.22 of CPython's (1.14 and 1.22 for the earlier build in
+the same run).
+
+The everyday battery (`tools/pybench/everyday.py`, 54 cases), which is
+where this part of the PR worked: 1.44 times CPython's time on average
+over two runs (1.45 and 1.43), against 1.79 for the earlier build in the
+same session. WeavePy is ahead on 12 cases (9 before), past twice
+CPython's time on 14 (18 before) and past three times on 5 (11 before):
+`threading_queue_ops` 4.2, `inspect_typing_ops` 3.9, `weakref_gc_ops`
+3.3, `class_features` 3.3 and `enum_dataclass_ops` 3.3. The cases this PR
+went after moved the most: reading a file's lines 117 to 0.88, writing
+them 13.6 to 0.84, `os_listdir_walk` 3.6 to 1.5, `print_to_buffer` 1.9 to
+1.0, `csv_ops` 3.3 to 1.9, `threading_queue_ops` 5.8 to 4.2,
+`enum_dataclass_ops` 4.1 to 3.3, `datetime_time_ops` 2.6 to 2.0,
+`argparse_ops` 3.2 to 2.5, `math_ops` 1.4 to 0.93. The library cases
+nobody has broken down yet (`inspect` and `typing`, `weakref`, `email`,
+`configparser`, `asyncio`) are where they were. So: ahead of CPython on
+the suite, still well behind it on a good part of ordinary library code,
+and "Next" below is ordered by that.
+
+Measured earlier on November 13, 2026 (this PR, quick builds, no fresh PGO run):
+the benchmark suite's figures below still hold, but they aren't the whole
+picture. A battery of 53 everyday operations
+(`tools/pybench/everyday.py`: file and directory work, text, data
+formats, containers, classes, threads, common library modules) put
+WeavePy at 1.83 times CPython's time on average when it was first run,
+with `class_features` and `enum_dataclass_ops` near 8 times,
+`threading_queue_ops` 5.8, `os_listdir_walk` 4.8 and a dozen more past 3.
+Before that, reading a file a line at a time was 360 times slower than
+CPython and writing one 45 times, which no benchmark here had touched.
+The I/O gaps are closed (see "Done"), as are the first few of the
+battery's; most of it is still open and is the work's next target (see
+"Next"). The battery hasn't been rerun as a whole since those fixes, and
+its first run was on a loaded machine, so treat its ratios as a ranking.
+
+Measured later on November 12, 2026, at `d1f48c5c` (this PR), a PGO build
+from a fresh training run under Rust 1.100 against CPython 3.14.8 on the
+same host: warm time 0.845, cold time 0.947, peak RSS 1.140. Against the
+build below (`11c293b4`) in the same run the suite's time is 0.996: the
+commits since are about operations the suite doesn't run (see "Done"), and
+it shows. Whole processes take 0.90 of CPython's time (0.899 against
+0.907 for the earlier build in one interleaved run), `-c pass` 0.70 (19.5
+ms against 27.7). Peak RSS is 1.131 of CPython's and peak footprint 1.208
+in one run of all three, against 1.112 and 1.199 for the earlier build:
+all of that difference is `async_tree`, whose peak footprint reads 49 MB
+in this build and 40 MB in the earlier one (see "What the measurements
+say"). WeavePy is ahead on 22 of the 33 workloads warm and 18 cold. The
+best warm times are `scimark` 0.52, `pickle_roundtrip` 0.55,
+`json_roundtrip` and `unpack_sequence` 0.62, `raytrace` 0.63 and
+`float_points` 0.64; the worst `async_tree` 1.28, `context_managers`
+1.14, `collections_mix` 1.09, `deepcopy` 1.07 and `logging_mix` 1.06. The
+worst cold times are `async_tree` 1.42, `stdlib_utils` 1.35,
+`logging_mix` 1.24 and `tomllib_loads` 1.23.
+
+Measured on November 12, 2026, at `11c293b4` (this PR), a PGO build from a
+fresh training run against CPython 3.14.8 on the same host: warm time
+0.854, cold time 0.961, peak RSS 1.124. The build two commits earlier
+(`3765dc75`, the same training, before the early release of finished
+code) read 0.845, 0.945 and 1.215 an hour before: the times differ by
+what two runs do, and an interleaved A/B of the release puts them level.
+Whole processes (start-up, import, the first call and three more) take
+0.90 of CPython's time, `-c pass` 0.74, and a script that imports a
+module of its own 0.75 (0.86 before: see "Done"). Peak footprint is 1.22
+of CPython's (1.23 for `3765dc75` in the same session; CPython's own
+footprint read lower when the ratio was first measured, at 1.29).
+Against the build this PR started the day with (`672cca59`) the cold
+time moved (0.977 then), with whole processes (0.95 then); peak RSS was
+1.08 there for a release that cost short processes time (see "Done"),
+1.22 without it, and is 1.12 now. WeavePy is ahead on 23 of the 33
+workloads warm and 18 cold. The best warm times are `scimark` 0.50,
+`pickle_roundtrip` 0.57, `raytrace` and `unpack_sequence` 0.60, and
+`float_points` and `json_roundtrip` 0.62; the worst `async_tree` 1.19 to
+1.25, `context_managers` 1.13, `class_creation` 1.08 to 1.10, and
+`deepcopy` and `closures_decorators` 1.07 to 1.10. The worst cold times
+are `async_tree` 1.38, `logging_mix` 1.37, `stdlib_utils` 1.30,
+`tomllib_loads` 1.27 and `mini_interpreter` 1.25.
+
+Measured earlier on November 12, 2026, at `672cca59` (this PR), a PGO build against
+CPython 3.14.8 on the same host: warm time 0.854, cold time 0.977, peak RSS
+1.081 (1.266 on November 10). Whole processes (start-up, import, the first
+call and three more) take 0.95 of CPython's time, and `-c pass` 0.73. Peak
+footprint, the private memory a process dirties, is 1.29 of CPython's and
+is the memory figure to watch from here: see "Done". Against the build
+this PR started from, in the same session, warm time is 0.858 against
+0.863 and cold 0.973 against 0.978, so the time ratios moved little; what
+changed is where the memory and the first-call time are known to go. The
+best warm times are `scimark` 0.50, `pickle_roundtrip` 0.54, `raytrace`
+0.62, `json_roundtrip` and `unpack_sequence` 0.63; the worst `async_tree`
+1.25, `context_managers` 1.14, `deepcopy` 1.13 and `closures_decorators`
+1.07. The worst cold times are `async_tree` 1.53, `stdlib_utils` 1.29,
+`logging_mix` 1.26, `class_creation` and `tomllib_loads` 1.25.
+
 Measured on November 10, 2026, at `57960cea` (PR #107, merged into `main`
 as `0d8f6b62` on November 11), a PGO build against CPython 3.14.8 on the
 same host: warm time 0.873, cold time 0.980, peak memory 1.266. The best
@@ -325,6 +427,455 @@ branch and pull request.
 
 ## Done
 
+- **Comparison methods, descriptors, thread-locals and queues** (this PR,
+  November 13). The everyday battery's class and thread cases, taken one
+  operation at a time:
+  - Comparison methods. A `COMPARE_OP` whose left operand's class has a
+    Python `__eq__`, `__lt__` or other comparison method ran it as a
+    nested general call unless the body was a pure leaf. Compiled code
+    now calls a method that has native code as a direct activation, the
+    way `BINARY_OP` calls an operator method. The operands wait on the
+    caller's stack under the call, so `NotImplemented` goes on to the
+    reflected method, identity or the `TypeError` without the method
+    running twice, and the instruction's fused `TO_BOOL` takes the truth
+    of an answer that isn't a `bool`. `NotImplemented` against `None`, a
+    number or a string is settled in the helper (`x == None` for a
+    dataclass). `a == b` with a dataclass-shaped `__eq__`: 6,860 to
+    2,200 instructions (CPython 1,920); a dataclass's `==` 5,190 to
+    2,070 (1,980) and `<` 6,470 to 2,320 (2,020); `a == None` 4,780 to
+    1,450 (1,060).
+  - The same bodies elsewhere. Two tuples built for a comparison left
+    compiled code every time (the helper answered only for operands
+    something else still held): `(a.x, a.y) == (b.x, b.y)` 2,040 to
+    1,040 instructions (1,010). `x.__class__` is one helper call, in
+    inlined bodies too, where it took the attribute-miss path at about
+    700 instructions a read: `a.__class__ is b.__class__` 640 to 360
+    (330), and a plain call of the `__eq__` body above 3,990 to 1,550
+    (1,410), `a + b` with that body 4,650 to 1,520 (1,770).
+  - Python descriptors. A data descriptor written in Python has its
+    `__get__` called directly from the compiled attribute site, where
+    the read went through the miss path, the property path and the core
+    loop's lane first: `Color.RED.name` 3,810 to 1,790 instructions
+    (1,500).
+  - Enum classes. A metaclass's `__getitem__` is called directly from
+    the compiled subscript site, and a class's own containers read
+    through a class under a metaclass (`cls._member_map_`) are
+    remembered per site under both versions: `Color["RED"]` 3,470 to
+    1,480 instructions (610), `Color(1)` 6,270 to 4,660 (2,670).
+  - `threading.local`. Its attribute hooks are builtins. Each thread
+    remembers, weakly, the namespace the shim gave it for a `local`
+    object, so only a thread's first touch runs Python; compiled code
+    calls the read hook in place. A read 4,330 to 1,020 instructions
+    (850), a store 5,650 to 2,260 (960).
+  - `queue.SimpleQueue`. `get`, `get_nowait` and `put_nowait` are
+    builtins beside `put`, and all of them read the queue's fields and
+    its deque in place instead of through six general attribute reads a
+    call. Put and get 13,850 to 3,040 instructions (900), the `nowait`
+    pair 19,100 to 3,140 (800). An empty queue or a timeout still goes
+    to the shim's Python.
+  - `datetime` methods written in Python. `astimezone()` took 333,000
+    instructions a call (CPython 24,500). `_pydatetime`'s methods read
+    `self._year`, `self._tzinfo` and the rest by their slot names, and a
+    natively packed value has no slot to read, so some fifty reads a
+    call missed every compiled path and took the general handler. The
+    native field read serves the slot names as it serves the public ones:
+    337,000 to 200,000 instructions, `replace(tzinfo=...).timestamp()`
+    15,500 to 11,900 (4,700), and the battery's datetime case retires
+    27% fewer. What's left of `astimezone` is the Python around seven
+    `localtime` calls, with no single cost past 10%.
+  - A regression sweep of the battery by instruction count, with the
+    compiler synchronous so that a background compile's timing doesn't
+    move a case (it moved `bytes_ops` by 5% between builds that are
+    identical with it synchronous), found two regressions from earlier
+    in this PR. A compiled attribute site asked on every miss whether its
+    read was a Python descriptor's (it asks once a class version now),
+    and `set(xs)` of a long list went through the pure-constructor path,
+    which built the set unsized: 142,800 instructions against 116,600
+    before for `set(xs) & set(ys)` of 300 and 200 ints (119,600 now; the
+    path sizes its set and leaves inputs past 64 items to the general
+    constructor). Left alone: `xs.sort(key=lambda x: -x)` retires 4%
+    more than at the start of the phase (179,000 against 172,700 for 300
+    items; CPython 199,800).
+  - Fixed on the way, each found by a new test checked against CPython:
+    `COMPARE_OP` releases its right operand first, as CPython does (two
+    dying temporaries' finalizers show the order); a pure-leaf
+    comparison whose operand died with a finalizer ran it late; a class
+    that gains or loses `__get__`, `__set__` or `__delete__` after its
+    instances are other classes' attributes left stale instance-field
+    caches behind (every class's version moves now: CPython's
+    specializer refuses such descriptors instead); a `threading.local`
+    subclass ran `__init__` twice on the creating thread.
+- **File objects, standard streams and the first everyday cliffs** (this
+  PR, November 12 and 13). Found by timing ordinary scripts instead of
+  the suite:
+  - Buffered reads. A line read took one `read(2)` per byte. Lines now
+    come out of a read-ahead the backend fills a block at a time (any
+    stream but a raw `FileIO`); a seekable descriptor gets the unread
+    bytes back before anything else looks at its offset, `tell()`
+    subtracts them, and a pipe keeps them parked. `StringIO` and
+    `BytesIO` scan their buffer in place. Reading 20,000 lines: 1,049 ms
+    to 2.7 ms (CPython 2.9).
+  - Buffered writes. Text files and read/write binary files hold their
+    writes as binary writers already did; a text stream on a terminal or
+    opened with `buffering=1` flushes at each line end. Streams still
+    holding bytes at shutdown are flushed then (a file kept alive by a
+    reference cycle lost its tail before). Writing 20,000 lines: 72 ms
+    to 2.1 ms (CPython 1.6).
+  - Standard output holds a 128 KiB block when it isn't a terminal, as
+    CPython's does, flushed at `flush()`, by `input()`, after each
+    interactive statement and at exit. 300,000 `print` calls into a
+    file: 1.38 s to 0.23 s (CPython 0.20). A broken pipe now reports as
+    in CPython (`Exception ignored while flushing sys.stdout`, status
+    120). `sys.stdin` iteration: 0.39 s to 0.10 s for 300,000 lines.
+  - Lines and writes handed over in place. A stream works out once what
+    its encoding, error handler and newline mode mean; a line whole in
+    the buffer is copied out once with no decoder, without publishing
+    the loop's frame, and `write()` appends to a buffer that already
+    holds writes. Both are leaf halves, and a leaf site now serves a
+    bound method held in a local (`write = f.write`). Per line, less the
+    loop: iterating a text file 960 instructions (CPython 838),
+    `f.write(s)` 556 (579), `print(a, b, file=f)` 4,054 (5,214). Text
+    `read(n)` read a byte per call: 39,000 to 2,150 for five characters
+    (1,200).
+  - The shapes those halves declined, and what a decline cost. A leaf
+    whose fast half declines used to fall to the full call handler,
+    where an unregistered builtin's body runs in the core loop's lane:
+    registering `write` and `readline` halves made every stream they
+    didn't cover slower (a CRLF file's `readline()` 3,630 to 5,620
+    instructions, a latin-1 file's `write()` 4,330 to 5,820). A declined
+    leaf now runs its body through the lane, and the halves cover what
+    they declined: line ends of every kind under every newline mode
+    (translated and tallied in place), latin-1 and ASCII text, writes
+    whose `\n` becomes `\r\n` or `\r`, and `readline(limit)`. A CRLF
+    `readline()` is 1,510 instructions (CPython 1,040), a latin-1
+    `write()` 990 (990), a `newline="\r\n"` `write()` 1,090 (2,670).
+    A text `readline(n)` also counts characters now, as CPython's does;
+    it counted bytes, and a limit inside a multi-byte character raised
+    `UnicodeDecodeError`.
+  - `os.DirEntry` built seven closures per entry and ran a `stat` for
+    every `is_dir()`, `is_file()` and `is_symlink()`. Its methods are
+    the type's, it answers from the directory read's `d_type`, and it
+    keeps the `stat()` results it has fetched. `os.scandir` and
+    `os.walk`: 4.3 to 1.5 times CPython's instructions, and no `stat`
+    per entry.
+  - A native method under a dunder name read through an instance
+    (`lock.__enter__`) took the full attribute path every time, which is
+    what `threading.Condition` does on each `with`, under every
+    `queue.Queue` and `threading.Event`. `lock.__enter__()` 4,415 to 375
+    instructions (CPython 730), `with cond:` 13,050 to 4,600 (2,400), a
+    queue's put and get 49,600 to 32,200 (11,800).
+  - Attribute hooks. A class's Python `__getattribute__`, or its
+    `__getattr__` once the default lookup certainly misses, runs as an
+    inline activation (CPython's `LOAD_ATTR_GETATTRIBUTE_OVERRIDDEN`),
+    and `object.__getattribute__(obj, name)` has a leaf half for a plain
+    instance's own attributes and slots. A constant hook 3,466 to 1,845
+    instructions (CPython 590), one that delegates to
+    `object.__getattribute__` 9,844 to 2,786 (1,240), the bare call
+    4,019 to 657 (950), a `threading.local` read 11,400 to 4,160 (740).
+    A Python `__setattr__` runs inline the same way (6,790 to 5,190
+    against 2,000: what's left is the `object.__setattr__` call inside
+    it, which still takes the general path).
+  - `cls.__name__` and `cls.__module__` are remembered at a compiled
+    site for the class's version: 1,180 to 200 instructions (CPython
+    440), `type(obj).__name__` 1,446 to 496 (672).
+  - `obj.__class__` took the general attribute path at a compiled site:
+    1,360 to 438 instructions (CPython 433), and `other.__class__ is
+    self.__class__` 2,507 to 681 (363). A tuple or list holding lists
+    compares natively, as ones holding only scalars and tuples did:
+    `(1, 2, []) == (1, 2, [])` 2,819 to 627 (580). Both are in every
+    dataclass comparison (`==` 6,820 to 5,230 against 1,910: the rest is
+    the `__eq__` call itself, which only a pure-leaf body avoids).
+  - Zero-argument `super().name` was fast only for plain methods. A
+    plain value a base class holds is read in place (5,540 to 1,630
+    instructions against CPython's 1,020) and a class method is bound to
+    the receiver's class in place, from an instance method or a class
+    method (`super().create()` 6,970 to 2,640 against 1,710). A property
+    through `super()` still takes the full path (6,370 against 1,190).
+  - Float keys and plain tuples. A dict or set probe by a finite float
+    takes the native probe that `str` and small `int` keys had (`d[2.5]`
+    2,455 to 1,050 instructions against 600; a compiled site still
+    leaves for the core loop to do it), and `hash()` of a tuple of any
+    plain scalars, or of `bytes`, is a leaf (`hash((1, 2.5))` 1,386 to
+    500 against 580, `hash(b"...")` 1,497 to 370 against 560).
+  - Builtin constructors at a call site. A sweep of every builtin called
+    with plain arguments found the ones still taking the general call:
+    `bool(container)` 3,020 to 860 instructions (CPython 910),
+    `slice(a, b)` 3,070 to 1,060 (1,160), `set(xs)` 3,510 to 1,980
+    (1,640), `frozenset(xs)` 4,110 to 2,490 (1,660), `vars(obj)` 4,520
+    to 905 (1,390), `pow(b, e, m)` 9,020 to 700 (1,290). Still general:
+    `globals()` 7.9 times CPython, `object()` 3.4, `bytes(n)` 3,
+    `dict(a=1)` and `dict(d)` 2.9 and 2.6, `setattr` 2.4. (A leaf half
+    that declines costs more than no leaf half: the call then takes the
+    general path, not the native-body lane. `pow`'s covers every plain
+    numeric shape for that reason. It also fixed `pow(10.0, 400)`, which
+    returned `inf` where `10.0 ** 400` raised `OverflowError`.)
+  - A metaclass's Python `__getitem__` (`Color["RED"]`) runs as an
+    inline activation, as an instance's class's does (3,860 to 3,465
+    against 620: its body's `cls._member_map_` read and the exit from
+    compiled code to reach it are what's left).
+  - The csv reader re-read its dialect's eight attributes for every
+    row, allocated a key string per state access, and stepped a
+    character at a time: 3.4 to 2.0 times CPython.
+  - Also: `input()` flushes standard output whether or not it has a
+    prompt, and a read to the end after a sized read no longer stops at
+    what was read ahead (both found by CPython's tests once output was
+    buffered).
+- **Everyday shapes the suite doesn't run** (this PR, November 12). The
+  33 workloads are tuned to: the general interpreter's `step` is under
+  0.25% of any of them. `tools/pybench/microops.py --instructions
+  --locals` runs 153 single operations, and there WeavePy's geometric
+  mean is 0.97 of CPython's instructions with 61 operations above 1.3
+  (see "What the measurements say"). Fixed so far:
+  - Keyword calls of native callees. A builtin type's method called with
+    keywords (`xs.sort(reverse=True)`, `s.split(maxsplit=1)`) or a builtin
+    type (`int(s, base=2)`, `enumerate(xs, start=1)`) left compiled code
+    for the general interpreter on every call: 3,700 instructions for the
+    `sort` against CPython's 1,080. The builtin keyword lane
+    (`Interpreter::core_builtin_kw_lane`) takes them as it took builtin
+    functions, and keeps its keyword pairs in a pooled vector whose name
+    strings a site's next call finds already written (it allocated a
+    `String` per keyword per call). On a build without PGO the `sort` now
+    takes 2,540 instructions, `split` 2,780 (3,940), `min(xs, key=abs)`
+    3,270 (4,240). The rest is the general call's dispatch by builtin
+    name and the natives' own argument handling.
+  - Tier 2 kept loops it ran badly. It didn't count a keyword call of a
+    class or of a native callee against a loop, on the premise that tier
+    1 paid the same generic binder. The frame JIT has since learned to
+    bind a class's `__init__` directly and to run native keyword calls in
+    place, so a loop of `Point(i, y=2, z=3)` stayed in tier 2 at 7,100
+    instructions an iteration, against 2,400 in the frame JIT and
+    CPython's 3,400. Those calls are charged like any other round trip
+    now, and a loop dense in them retires to the frame JIT within one
+    poll interval.
+  - Locked instructions. `Rc`'s counts are plain loads and stores while
+    one thread runs, but `get_mut`, `make_mut`, `try_unwrap` and
+    `into_inner` still went through `Arc`'s locked compare-and-swap, and
+    a weak handle's clone and drop through its locked increment and
+    decrement: about twenty cycles each on this x86, counted as one
+    instruction. With the bias held a sole owner now reads its two counts
+    and a weak handle updates its count in place (`rc::sole_owner`,
+    `Weak`'s `Drop`); `ThinArc::get_mut`, a frame slot's upgrade and a
+    traceback's hold on its frame shell do the same. Instance recycling,
+    the tuple pool, frame shell recycling, sequence unpacking and the
+    deferred-container list each ran one or two per operation: a warm
+    call of `mini_interpreter` executed 261,000 locked instructions and
+    now executes 900, `sudoku` 196,000 and 400, `tomllib_loads` 207,000
+    and 4,700. A loop over `enumerate()` ran two per element (the tuple
+    pool's), a seventh of its cycles.
+    `target/wt/target/pc-cg/lockcount.py` counts them per function
+    (callgrind per instruction, against the binary's disassembly).
+  - Loops tier 2 ran worse than the frame JIT. A compiled loop over a
+    dict or one of its views took the general iterator step for every key
+    (the iterator cloned, a checkpoint, the checked step: 640 instructions
+    a key); it takes the core loop's in-place step now, as list, tuple and
+    range iterators did, and `for k in d` over ten keys went from 7,900
+    instructions a pass to 4,500. An OSR entry and its exit cost about
+    4,000 instructions, and the verdict on a loop's entries asked only
+    that they average eight iterations: `for x in sorted(xs): pass` over
+    ten items ran 7,400 instructions a pass through its entries against
+    the frame JIT's 3,400. The minimum now scales with the compiled
+    code's size (`osr_min_trips`: 64 iterations for an empty body, eight
+    from fifteen statements), so such loops are left to the frame JIT.
+  - Tried and reverted: counting a keyword call of a pure leaf against
+    its loop (`f(i, c=4)` with a keyword-only parameter runs 1,040
+    instructions in tier 2's frameless evaluation against 220 at the
+    frame JIT's call site, so a loop of only that call went from 1,040 to
+    320). A loop that makes one such call among six other calls still
+    runs better in tier 2: the bench gate's `call_overhead` took 15% more
+    instructions once the call retired its loop, and 45% more time on
+    CI's Linux runner. The frameless evaluation itself is what to make
+    cheaper.
+  - The frame JIT's `FOR_ITER` helper hands a dict's and a dict view's
+    keys and values and a reversed list's items to a step of their own
+    (`h_for_iter_view`) instead of the general step: ten of a dict's keys
+    3,370 instructions a pass (3,590 before, CPython 1,950), its values
+    3,690 (3,920), `reversed(xs)` 3,840 (4,140). Stepped in the first
+    helper itself they ran 230 fewer still, but that helper's larger
+    frame cost every other loop: a string's 11% more instructions an
+    item, `enumerate`'s 3%. The battery caught it after the push.
+  - Over the battery's 153 operations the geometric mean of WeavePy's
+    instructions over CPython's went from 1.045 to 1.030 on builds
+    without PGO (`OrderedDict` iteration 36,000 to 18,600, a tuple
+    literal 590 to 460, `list.sort` of ten 4,070 to 3,380, `Color(1)`
+    7,000 to 6,150). Most of what these commits fix isn't among its
+    cases.
+  - A dying tuple whose items other owners keep (`enumerate`'s `(i, x)`,
+    a call's `*args`, `zip`'s pairs) gives their counts up in place and
+    frees its allocation, instead of going through the trashcan that
+    guards deep recursion and the slice's drop glue (about 100
+    instructions before its items). An item the tuple is the last owner
+    of ends the walk and the nested release takes over, so deep nests and
+    finalizers go as before. `(i, i, i)` built and dropped: 540
+    instructions to 450 without PGO (CPython 480); `zip` over ten pairs
+    11,430 to 10,720.
+  - A function's keyword-only defaults are matched to its parameters
+    once. A positional call of a function with keyword-only parameters
+    asked twice whether its compiled defaults line up with them,
+    comparing every name each time (250 instructions a call for five).
+    The answer is kept in a byte of the function's padding
+    (`PyFunction::kwonly_memo`), reset with its code. `f(i)` of `def f(a,
+    *rest, x=1, y=2, z=3, w=4, v=5)`: 1,650 instructions to 1,170 (CPython
+    1,240); `Color(1)` on an `Enum`, whose metaclass's `__call__` has
+    five: 8,850 to 7,920; `json.dumps` of a small dict 6% fewer.
+  - Tried and dropped: a tuple allocated and filled directly instead of
+    through `Arc`'s slice constructor (no fewer instructions for a call's
+    `*args`), and skipping the tuple pool's clearing walk when its bucket
+    is full (35 instructions an element less for `zip`, as many more for
+    `enumerate`, which borrows the pool once more).
+  - A module that names `__spec__` or `__loader__` in its own code gets
+    the pair before its body runs. The lazy pair of the commit before
+    (see "A program's own modules import without `importlib`") covered
+    attribute reads, but a module that read `__spec__` as a global found
+    the `builtins` module's, since a name its dict lacks is looked up
+    there next: pydantic's `__init__` builds its lazy imports from
+    `__spec__.parent`, and failed to import (CI's ecosystem shards had
+    been failing on it and on Pillow's self-test since that commit).
+  - Two bugs the new tests found: `list.sort` ignored an unknown keyword,
+    and raised `TypeError` for a `list` subclass's instance when called
+    with keywords (`super().sort(reverse=True)`).
+
+- **The binary's one-time code leaves the resident set** (this PR).
+  Peak RSS on macOS, PGO builds, against CPython 3.14.8.
+  - A run executes far more code than it keeps running. Traced on Linux
+    with callgrind, `deepcopy` executes 3.2 MB of code in all, on 7.0 MB of
+    pages, and one warm call 0.28 MB of it: start-up alone runs 1.5 MB (on
+    3.5 MB of pages), and imports and compiles most of the rest. Every such
+    page stayed resident. On a PGO build the process had 8.8 MB of the
+    binary's code resident after a small workload, against CPython's 4.8
+    MB, which was most of the gap in peak RSS.
+  - The process now releases its code and constants' pages
+    (`crates/weavepy-cli/src/text_trim.rs`): on macOS it maps the binary's
+    file over its `__TEXT` segment again, on Linux it advises the image's
+    read-only segments away. What the program still runs comes back a soft
+    fault a page, about 2.3 microseconds each (5,000 instructions, most of
+    them the kernel's), so a release costs two or three milliseconds. A
+    traced process is left alone (a debugger's breakpoints are private
+    copies of code pages), and `WEAVEPY_TEXT_TRIM=0` turns it off.
+  - When to release took two tries. The first rule was a timer: at 10 MB,
+    then after waits that doubled from 2 ms. In a 160 ms process that was
+    six releases, each in the middle of start-up or an import, where nearly
+    all of the 5 MB it dropped came straight back: 3,500 more page faults a
+    process, 2,400 of them before the first call. The suite's whole
+    processes took 1.5% longer for it, the benchmark modules' imports 28%,
+    and a script that only imports 3% to 8% (`import logging` 64.5 ms
+    against 60.5).
+  - The rule now waits for imports to be over: no module body running and
+    none started or finished for a millisecond (the runtime stamps each,
+    `weavepy_vm::import_activity`), the resident set within a sixteenth of
+    its highest, and 3 MB of file-backed memory gained, over what the last
+    release left if imports ran since and otherwise over what had come
+    back. Waits that double between releases, from 16 ms, bound a program
+    that keeps importing. Most programs release once, a millisecond or two
+    after their last import, and a script that only imports never does.
+    Whole processes take about 1% longer than with no release, first calls
+    1% to 2%, warm calls the same, and peak RSS is 0.87 of theirs (the
+    timer's was 0.765, for the costs above).
+  - And it waits for the process to be 100 ms old. The rule above fired a
+    millisecond after a short script's last import, which is where CI's
+    bench gate times its kernels: those of a millisecond or two ran 15%
+    longer on Linux (`sumvm` 1.1 to 1.5 ms, `nested_loops` 2.2 to 2.6),
+    and on Apple Silicon start-up took a quarter longer (12.9 to 16.1 ms).
+    A release is two or three milliseconds for memory a short process is
+    about to give back anyway, so the first one now waits until that's a
+    fiftieth of the time the process has taken. Over the suite's
+    half-second processes the release then takes 4% off peak RSS instead
+    of 13% (most of them peak in their first 100 ms); a process that
+    lives longer releases as before.
+  - Peak RSS came to 1.12 of CPython's before the wait (1.30 with no
+    release, and 0.99 with the timer), but RSS counts clean, file-backed
+    pages the kernel can drop at no cost. By peak footprint (`/usr/bin/time -l`'s
+    figure: private, dirty memory) WeavePy takes 1.29 of CPython's whatever
+    the rule, and that's the gap that is left: see "What the measurements
+    say".
+  - The runtime ticks for it (`set_memory_tick_hook`): when a cycle
+    collection comes due, every sixteenth time the eval breaker's countdown
+    runs out, and when the JIT's worker goes idle
+    (`crates/weavepy-cli/src/memory.rs`).
+  - `tools/pgo/order.py` writes the linker's order file for a PGO build
+    from its own training run. The checked-in file's names matched 5,291
+    of the PGO build's 23,600 functions, and some of the hottest (the
+    generic drop of an `Object`) weren't in it. The trainer runs each
+    benchmark twice, for three calls and for seven: what the longer run
+    executed at least 1,000 times more is what a program keeps running
+    (2,523 functions), and comes first, the functions most benchmarks share
+    ahead of each benchmark's own. The rest of what the training ran
+    follows, start-up's in its first-use order.
+  - `tools/pgo/build.sh` builds only the `weavepy` binary: the
+    `_testembed` twin was a second fat-LTO link in each of its two builds.
+  - A process past 32 MB keeps freed arena ranges resident for 500 ms
+    instead of 50: `async_tree` builds and drops about 13 MB a call, which
+    was purged and faulted back in every time.
+- **Tier 2 analyzes a large body only after work in proportion to its
+  length** (this PR). Tier 2 tries code after fifty calls or loop
+  iterations, whatever its size, and an analysis costs four to seven
+  microseconds an instruction, more when it carves loops out and starts
+  over. Over the suite's first calls that's 741 attempts, 140 of which
+  compile, and 3.7% of the time; with tier 2 off the first calls take the
+  same time in all (1.002: `scimark` 1.51, `tomllib_loads` 1.37 and
+  `nqueens` 1.19 against `float_points` 0.90, `regex_mix` 0.91 and
+  `chaos` 0.92) and the imports 0.96 of it. The largest single costs were
+  bodies it then rejects: `regex_mix` spent 15 of its first call's 64 ms
+  on `re`'s compiler (`_parse`'s 1,700 instructions, `_optimize_charset`
+  six times over), and `dataclasses._process_class` took 3 ms. A body
+  past 256 instructions now needs sixteen calls or iterations for each
+  instruction past that, in any phase. `class_creation`'s first call
+  retires 13.5% fewer instructions and `regex_mix`'s 6.6%; the other
+  workloads and the bench fixtures retire what they did. Asking every
+  body for work in proportion to its length (eight an instruction) saved
+  more there (20% and 7%) but moved which entries tier 2 compiled and
+  when the frame JIT took over elsewhere: `chaos` retired 4% more
+  instructions over four calls, `tomllib_loads` and `stdlib_utils` 2% to
+  3%.
+- **Code a program is done with is released at once, off its thread**
+  (this PR). The 100 ms wait above gave back most of what the release
+  had bought on short processes, because a full release costs the
+  program: the system call, then a fault for every page of code it still
+  runs. A profile-ordered binary knows which code that is.
+  `tools/pgo/order.py` now puts its hot group (what the training's
+  programs keep running: 2,583 functions, 7.8 MB) between two marker
+  functions, `weavepy_text_steady_start` and `weavepy_text_steady_end`,
+  and the runtime releases only what lies past the second, with the
+  constants: what start-up, imports and compiles ran. That needs no
+  wait. It happens once, a millisecond after imports go quiet, on a
+  short-lived thread of its own (the call takes 0.16 ms there, 0.6 on
+  Linux), and the full releases follow by their own rule, counting from
+  what this one left. Over the suite it frees about 3.6 MB a process:
+  peak RSS is 0.92 of what it is without, and wall time, first calls and
+  warm calls are the same to within three parts in a thousand, in two
+  interleaved pairs. A binary linked without such an order (a plain
+  release build, whose checked-in order file has no markers) has the two
+  functions side by side and is left as it was;
+  `WEAVEPY_TEXT_TRIM_REST=0` turns it off.
+- **A program's own modules import without `importlib`** (this PR). The
+  native importer loads a source file itself, but then built the module's
+  `__spec__` and `__loader__` before running its body, and building them
+  is what imports the machinery: `importlib`, its two bootstrap halves,
+  `zipimport` (and `time`), `importlib.util` and `types`. That was 4.9 ms
+  on a program's first import of a file of its own, where the import
+  itself takes 0.4 (CPython takes 0.3 for all of it: its machinery is part
+  of start-up). `-c pass` doesn't show it, and the suite's harness paid
+  it in every process. The pair is now built before the body only when
+  `importlib.machinery` is already loaded (then it's a call); otherwise
+  it's built when something reads `module.__spec__` or
+  `module.__loader__`, as the frozen standard library's modules have
+  theirs built and as `__main__`'s loader already was. Until then the
+  module's `__dict__` holds neither name, where CPython's holds both: a
+  program that reads them as dictionary entries without ever importing
+  `importlib` (or `inspect`, `pkgutil`, `unittest`, ..., which do) sees
+  the difference. A script that imports one module of its own starts in
+  0.75 of CPython's time, where it took 0.86 (22.1 ms against 25.4, with
+  CPython at 29.7).
+- **A busy worker is noticed before a compile's worth is weighed** (this
+  PR). The frame JIT keeps one compile in flight, so while the worker
+  generates code every other hot function's trigger comes back a
+  twentieth of its heat later. Each of those weighed the code first, a
+  pass over every instruction: nothing on an idle machine, but where the
+  worker gets no core of its own (under valgrind, `go` weighed code
+  39,000 times a call, 4% of its instructions) the interpreter's thread
+  spent its time deciding again. Two compiles in flight instead of one
+  would have code ready sooner (first calls retire 0.3% to 0.9% fewer
+  instructions), for 1.2 MB more peak footprint on `go` and 0.4 MB on
+  `tomllib_loads`: left at one.
 - **f-strings compiled, frameless property setters, and big ints in
   compiled arithmetic** (PR #107). Instructions on Linux.
   - The frame JIT runs `CONVERT_VALUE`, spec-less `FORMAT_VALUE` and
@@ -2300,6 +2851,236 @@ slowdown in that run was the even-sized chunks, since fixed.
 
 ## What the measurements say
 
+- **A call from native code into Python costs four or five times a call
+  from compiled code** (November 13). The same `__eq__` body costs 2,200
+  instructions called directly from a compiled `COMPARE_OP`, 4,080 when
+  tier 2 runs the loop and compares through its generic helper, and
+  about 400 an element in `x in xs` against CPython's 160. The nested
+  entry is `call` to `call_python` to `call_python_bound` (190
+  instructions), tier 2's direct-entry probes (`try_call_native_direct`,
+  `direct_entry_for`, `callee_guards_hold`, `guards_hold`: 310),
+  `pooled_locals_from_args` and `lean_frame` (120), `run_frame_lean_impl`
+  (190), `quiet_native_step` (170) and `retire_lean_frame` (140): about
+  1,500 instructions around a body a direct call enters in 300.
+  Everything native that calls back pays it: `list.__contains__`,
+  `sorted(key=...)`, `min` and `max`, `map`, dict lookups through a
+  Python `__hash__` or `__eq__`, and tier 2's generic operations.
+- **Tier 2 takes loops it runs slower than the frame JIT would.** `if a
+  == b: k += 1` over two instances: 4,080 instructions an iteration
+  with tier 2, 2,400 with `WEAVEPY_TIER2=0`. The counter makes the loop
+  tier 2's, and the instance work in it then goes through helpers that
+  make nested calls. The same loop without the counter was the frame
+  JIT's all along.
+- **`dataclasses.asdict` and `replace` have no cliff.** 43,600 and
+  32,200 instructions a call against CPython's 15,600 and 12,000, and
+  the profile is flat: fourteen class-attribute lookups by name at 115
+  instructions each (`hasattr(type(obj), "__dataclass_fields__")` and
+  its kin), thirty-five global reads at 39, four general calls at 370, a
+  generator and three comprehensions. Nothing is past 4% of the total.
+- **The suite is not the workload** (November 13). The everyday battery's
+  first run, WeavePy's time over CPython's, best of three runs a case, on
+  a loaded machine:
+
+  | Case | Ratio | Case | Ratio |
+  | --- | ---: | --- | ---: |
+  | `class_features` | 7.9 | `os_stat_exists` | 2.7 |
+  | `enum_dataclass_ops` | 7.6 | `csv_ops` | 2.5 |
+  | `threading_queue_ops` | 5.8 | `bigint_ops` | 2.2 |
+  | `os_listdir_walk` | 4.8 | `glob_fnmatch` | 2.2 |
+  | `file_read_binary_chunks` | 4.8 | `collections_ops` | 2.2 |
+  | `context_managers_generators` | 4.0 | `asyncio_ops` | 1.9 |
+  | `inspect_typing_ops` | 3.8 | `shlex_ops` | 1.9 |
+  | `email_html_ops` | 3.6 | `decimal_fraction_ops` | 1.7 |
+  | `configparser_ops` | 3.5 | `math_ops` | 1.7 |
+  | `exceptions_ops` | 3.5 | `difflib_ops` | 1.6 |
+  | `datetime_time_ops` | 3.4 | `heapq_bisect` | 1.5 |
+  | `bytes_ops` | 3.4 | `urllib_parse_ops` | 1.5 |
+  | `pathlib_ops` | 3.2 | `logging_ops` | 1.4 |
+  | `argparse_ops` | 3.0 | `pickle_copy_ops` | 1.3 |
+  | `uuid_secrets_ops` | 2.8 | `sort_ops` | 1.2 |
+  | `weakref_gc_ops` | 2.7 | `str_format_ops` | 1.1 |
+  | `itertools_functools` | 2.7 | `json_ops` | 0.72 |
+
+  Ahead: `re_ops` 0.74, `json_ops` 0.72, `xml_etree_ops` 0.66,
+  `subprocess_ops` 0.61, `list_dict_basics` 0.87, `sqlite_ops` 0.90.
+  Geometric mean over 53: 1.83.
+- **Where a slow case's time goes is usually one operation.** Broken down
+  by instruction count against CPython, a case's loop is mostly at 1.0 to
+  1.5 with one or two operations far out: for `class_features`,
+  two-argument `super(C, o).attr` (8 times), `getattr(o, "prop")` (3.4),
+  `type(o).__name__` (3.2), `issubclass` against an ABC (2.5); for the
+  threading case, `lock.__enter__` read by name; for directory walks, a
+  `stat` per entry. Each was a general path taken where a cached or
+  direct one was missing, 3,000 to 10,000 instructions flat across the
+  attribute and call machinery with no hot function.
+- **The battery's wall-clock ratios are worse than its instruction
+  ratios.** `class_features`' loop, measured directly after this PR's
+  fixes: 35,500 instructions and 27,000 cycles an iteration against
+  CPython's 14,600 and 5,800 (2.4 times the instructions, 4.6 times the
+  cycles; 1.32 instructions a cycle against 2.51). It isn't warm-up: the
+  eighth run of the loop takes what the first does. And it's more than
+  the sum of its parts: each of its seventeen operations alone runs at
+  2 to 3 instructions a cycle and they add up to 13,600 cycles, half of
+  what the loop takes with all of them in it. The general paths are
+  where the instruction-cache footprint is (see the next entries), so a
+  loop that crosses several of them pays again for each. By cycles
+  against CPython, alone: two-argument `super(C, o).attr` 14 times
+  (10,100 instructions), `type(o).__name__` of a class with an ABC base
+  4.9, `getattr(o, "prop")` 4.0, `o.prop = v` through a setter into a
+  slot 3.1, `3 in o` 2.5, `issubclass(C, AnABC)` 2.4.
+- A second run of the battery after this PR's fixes (also on a loaded
+  machine): 1.81 over 54 cases. `os_listdir_walk` 4.8 to 1.6,
+  `class_features` 7.9 to 5.1, `enum_dataclass_ops` 7.6 to 5.7,
+  `context_managers_generators` 4.0 to 2.8, `exceptions_ops` 3.5 to 2.7,
+  `file_read_binary_chunks` 4.8 to 2.9; the library cases
+  (`configparser`, `inspect` and `typing`, `email`, `datetime`,
+  `weakref`) didn't move, as nothing here touched them.
+- Per-operation instruction counts still open after this PR's fixes
+  (WeavePy against CPython): `Color["RED"]` 3,860 against 620, `Color(1)`
+  6,180 against 2,660, a dataclass `==` 6,820 against 1,850 and `<` 8,170
+  against 2,040, `dataclasses.asdict` 47,200 against 15,100, a
+  `__setattr__` hook 6,790 against 1,830, `queue.SimpleQueue` put and get
+  13,500 against 830 (CPython's is C, ours the Python fallback), a
+  thread's start and join 11,900 against 1,850, `f.read(8192)` 2.6
+  times, `b"%d" % n` formatting 2.5 times, `dict(zip(a, b))` 2.1 times,
+  `*args` forwarding 2.1 times, `os.stat` 1.6 times.
+- **A libc `atexit` hook costs a short process 800 page faults on macOS.**
+  Registering one for standard output's buffer added 5% to a small
+  script's instructions (3 MB more resident at exit); the bench fixtures
+  showed it as 4.6% across the board. The interpreter's exits flush
+  explicitly instead (`vm_singletons::exit_process`).
+
+- **The suite is saturated; single operations aren't** (November 12, the
+  PGO build at `11c293b4`).
+  - Every workload that trails CPython warm retires fewer instructions
+    than CPython and more cycles: `async_tree` 0.85 of the instructions
+    at 1.62 instructions a cycle against 2.37, `class_creation` 0.73 at
+    0.73 against 1.06, `tomllib_loads` 0.88 at 1.48 against 1.88,
+    `context_managers` 0.91 at 1.92 against 2.43, `exceptions` 0.86 at
+    1.99 against 2.49, `sudoku` 1.01 at 2.08 against 2.33
+    (`target/pc/warmic.py`). So instruction work on those workloads has
+    run out; what's left is how much code and data a unit of work
+    touches.
+  - A simulation with this machine's second-level cache (256 KB, 4-way)
+    as the last level puts numbers on it for a build without PGO: a warm
+    call of `async_tree` takes 3.2 million instruction misses there
+    against CPython 3.13's 0.25, `tomllib_loads` 6.7 against 0.8,
+    `class_creation` 5.9 against 1.4, with the data misses level except
+    `async_tree`'s third-level ones (0.55 million against 0.08). A
+    machine with a larger second-level cache (most newer ones) pays less
+    of this.
+  - `async_tree`'s third-level misses are memory: its peak footprint is
+    39.7 MB against 28.6, about 3.2 KB a task against 1.8. A coroutine is
+    five allocations (the object 80 bytes, the frame 112, the shared
+    locals cell 48, the locals and the operand stack), a future 336 bytes
+    against 187, an event-loop handle 440 against 193, a task 1,082
+    against 704. One allocation per frame, and a future's task-only
+    fields kept apart, are what would close it.
+  - `async_tree`'s peak footprint has two values, and the PGO build at
+    `d1f48c5c` reads the high one: 49 MB in most runs against 40 MB for
+    the build at `11c293b4`, for the same code built without PGO (quick
+    and plain release builds: 40), and for a PGO build of the earlier
+    code with the same profile and toolchain (40 to 41). The difference
+    is transient (the regions read alike once the calls are over) and
+    goes away with `WEAVEPY_TEXT_TRIM_REST=0` (39.8), with tier 2 off
+    (41.5), or with a purge delay of 50 ms or less (38.9, for 13% more
+    cycles and half again the page faults). So it's the allocator taking
+    fresh arena ranges while freed ones wait out the 500 ms a large
+    heap's ranges stay resident (see `alloc::note_resident`), tipped by
+    when this build's first calls allocate. `float_points` reads 5%
+    higher the same way. Not understood further than that.
+  - Locked instructions aren't the suite's gap: 1 in 1,200 to 1 in
+    650,000 instructions a warm call before the fix above, at most 3% of
+    a workload's cycles (`context_managers`, most of it `threading`'s
+    locks, which CPython pays too).
+  - Single operations are where WeavePy is still behind. Over the 153
+    operations the geometric mean is 0.97 of CPython's instructions.
+    The largest gaps, in instructions an operation over CPython's:
+    `zip` over two tuples 440 an element, `Color(1)` on an `Enum` 3,960,
+    a dict comprehension of 20 items 2,400, `enumerate` 180 an element,
+    `dict.update` and `dict.copy` of 20 items 1,800 and 1,360, a
+    `functools.partial` call 890, `Color.RED.value` 1,850, an
+    `OrderedDict` store 730 in tier 2 (150 in the frame JIT),
+    `str.lower()` of 176 characters 640, `f(*t)` 620, a list
+    comprehension 600, a raise caught in the same frame 570, a `*args`
+    call 310. What several share: a small tuple costs about 250
+    instructions to build and free (CPython about 100), a new container's
+    registration with the collector 126 (`GcState::defer_container`), an
+    attribute read that finds a Python descriptor takes the full miss
+    path every time (about 700 instructions before `__get__` runs), and
+    tier 2's `for` over a value it has no type for calls a 66-instruction
+    helper an element.
+
+- **Where an object-heavy program loses to CPython** (November 12,
+  `deltablue`, the one bench fixture that does: 1.5 times CPython's time
+  in CI). On a quiet machine a run of 50 iterations takes 99 ms against
+  68, in two parts.
+  - Steady state is 1.63 ms an iteration against 1.33, on 0.93 of the
+    instructions: 2.3 instructions a cycle against 3.0. Cachegrind's
+    simulation gives 287,000 instruction-cache misses an iteration
+    against 14,000 (CPython's whole loop fits its first-level cache, a
+    0.08% miss rate), and 185,000 data-cache misses against 53,000.
+    Compiled code is 38% of the instructions and 44% of those misses: the
+    program's 1,064 bytecode instructions become 47,000 IR instructions
+    and 220 KB of machine code, since a callee's whole tree is lowered
+    again into each caller (each of three `__init__`s carries 13 to 17
+    KB). Inlining still pays for itself: without it the program retires
+    44% more instructions, because a call that isn't in line costs about
+    250.
+  - A quarter of the instructions are attribute reads that go through a
+    helper: 53,000 calls an iteration at about 72 instructions each. They
+    are reads in inlined bodies at sites that have seen several classes
+    (160 of 252 field sites: a base class's methods run on four
+    subclasses), which the in-line read declines, though the site's
+    one-entry cache hits 98% of the time in the helper; and class
+    constants (`Strength.REQUIRED`: a global read's 37 instructions, then
+    69 in `h_attr_stack`'s class memo).
+  - The first 50 iterations cost 17.5 ms over steady state. With compiles
+    synchronous the run retires 1,121 million instructions, of which
+    code generation is 106 million (the worker's, natively), lowering
+    about 33 million and tier-2 attempts 25 million: 2,250 instructions
+    of code generation an IR instruction, spread over simplification,
+    liveness, the generator's own loop and 35,000 reallocations.
+- **A whole-program view of the same thing** (`context_managers`, a quick
+  build): 5.6 times CPython's instruction-cache misses a call and 5.4
+  times its data-cache misses, at similar branch misprediction rates. The
+  code run at least 1,000 times a call covers 208 KB in 390 functions
+  (compiled code about 30 KB of it), and no source line has more than
+  2.4% of the data misses: they're reads of per-site records, code
+  objects' side tables, counts and free lists.
+- **The frame JIT's first-call page faults are heap growth, not churn.**
+  `chaos`'s first call takes 1,955 page faults; 452 with the frame JIT
+  off and 1,320 with its compiles synchronous. Neither a ten-second purge
+  delay nor keeping large blocks in the arenas changes that, and the heap
+  ends 2.7 MB larger for nine functions' 97 KB of code. The worker's
+  forced collection when it goes idle is 400 of the faults, for 1 MB less
+  resident. Handing each lowered function's tables back for the next
+  lowering saved 95 faults and no instructions, and was dropped.
+- **A fifth of an import is a code object's first use.** `import
+  logging` retires 139 million instructions over start-up's 20 million
+  (Linux, a quick build; CPython 3.13, whose `traceback` doesn't build
+  dataclasses, retires 48 million over its 35). The profile is flat
+  (the core loop 7%, then nothing above 2%), but two inclusive costs
+  stand out: decoding the 966 bodies the import runs, 15,200 instructions
+  each (570 a constant, 1,350 a name table), and building their VM
+  extensions, 15,300 each (each constant made an object, each name
+  hashed, then interned at 240 instructions). Names and string constants
+  are decoded into the compiler's form and then made objects one code
+  object at a time; a table of interned objects per module, indexed as
+  the cache file indexes its identifiers, would do it once. Class
+  creation is 40% inclusive (441 classes, with what their bodies and
+  metaclasses run).
+- **Tried and dropped: an in-line field read at polymorphic sites.**
+  Reading the class version and position from the site's cache as the
+  code runs (the helper for anything else) took `deltablue`'s helper
+  calls from 33,000 to 3,700 an iteration, but the in-line read is itself
+  about 43 instructions (nine guards and a counted copy), so the program
+  retired 3.3% fewer instructions at equal inlining and, at the default
+  budget, 4.5% more: the larger IR put twelve more callees over the
+  inlining budget. What a field read needs first is fewer guards (one
+  word on the instance that says "split, over the class's names,
+  unborrowed, no `__dict__` published" in place of five loads).
+
 - **The gap is spread thin.** A direct call costs about 480 instructions,
   a core-loop call and return about 400, generator creation and teardown
   about 1,200, a dict subscript from compiled code about 200, a young
@@ -2515,6 +3296,106 @@ slowdown in that run was the even-sized chunks, since fixed.
   What remains of the heap is thin: `PyFunction` (216 bytes, about 1,300 to
   3,300 of them), code stubs, the VM's per-code extension (672 bytes), the
   type cache and the collector's tracked list are 100 to 300 KB each.
+- **Tier-2 analyses keep the loops a plan can't compile** (this PR).
+  Carving finds the loops tier 2 doesn't compile one re-analysis at a time,
+  and each attempt on a code object (unseeded, seeded, with and without
+  typed list accumulators, from each loop that asks) found the same ones
+  again: `dataclasses._init_fn` was carved 58 times in one
+  `class_creation` process, and half of the suite's 1,300 analysis passes
+  were repeats. The plan reads the code and its globals, not the
+  requesting activation, so its leading failures are the same for every
+  attempt: the code's cache entry keeps them (`weavepy_jit::Carved`) and
+  each analysis starts from there. A signature tier 2 doesn't compile is
+  rejected before the loop forest is built. The suite's compile outcomes
+  are unchanged, and the time in compile attempts is down by a fifth
+  (`class_creation` 18.7 to 11.3 ms, traced). On callgrind those attempts
+  were 40 of the 50 million instructions `class_creation`'s first call
+  retires over a warm one.
+- **Module and class bodies bind their names in the fast loop** (this
+  PR). The core loop took `STORE_NAME` only to rebind a module-level name
+  and `LOAD_NAME` only at module scope; a new name, and every name in a
+  class body, ended the burst: one full step and a fresh entry each. A
+  module-level `x = 1; y = x` pair took 2,900 instructions against
+  CPython's 730 and takes 850; a class with two methods goes from 43,400
+  to 39,200 (CPython 64,000). The leaf arms that make a function also hand
+  the `STORE_NAME` after it back to the core loop now, a quarter off a
+  `def` (3,970 to 2,880 instructions on a plain release build). The
+  imports measured retire 3% fewer instructions in all. `itertools`, a Python module over native cores here, also
+  stopped defining its nineteen pure-Python fallback classes when the
+  native ones exist (1.3 ms to import, now 0.85).
+- **Wall time trails instructions through instructions per cycle.** On a
+  PGO build WeavePy retires fewer instructions than CPython on all but
+  three workloads (`nqueens`, `sudoku`, `logging_mix`), yet takes longer on
+  about ten. Whole runs, both interpreters, on a quiet machine:
+  `class_creation` 0.78 of CPython's instructions at 0.74 instructions a
+  cycle against 1.09; `async_tree` 0.93 at 1.46 against 1.98;
+  `context_managers` 0.92 at 1.81 against 2.20; `deepcopy` 0.98 at 1.77
+  against 1.98. `async_tree` also takes 46,000 page faults against 10,000.
+  So what moves wall time on those is how much distinct code and data a
+  unit of work touches, more than how many instructions it retires.
+- **Footprint, not RSS, is the memory gap.** Peak RSS counts the binary's
+  clean code pages, which the release above moves in and out at will;
+  `/usr/bin/time -l`'s peak footprint counts what a process dirties. At
+  `-c pass` WeavePy's is 3.6 MB against CPython's 5.0, but each import adds
+  more: `import logging` 6.7 MB against 4.3, `import json` 2.2 against 1.3,
+  `import decimal` (a Python module here) 3.0 against 0.6. After `import
+  logging` the allocation profile (`WEAVEPY_ALLOC_PROFILE`) has 7.5 MB
+  live: strings 11%, dict tables 13%, decoded code objects 16% and their
+  VM extensions 5%, inline-cache tables 11%, functions 7%, types 5%, with
+  no single owner above that. In the suite, though, most of the gap opens
+  in the first call, and it's the baseline JIT's: when a benchmark's
+  module is imported the footprints are close (`chaos` 6.7 MB against 6.5,
+  `stdlib_utils` 9.4 against 8.3, `class_creation` 8.5 against 8.1), and
+  the first call then adds 3.0, 2.6 and 5.4 MB where CPython's adds 0.0,
+  0.1 and 1.2. With `WEAVEPY_FRAME_JIT=0` it adds 0.9, 0.8 and 3.5, and
+  takes 690, 600 and 1,340 page faults instead of 2,200, 3,000 and 3,060.
+  `chaos` compiles nine functions into 97 KB of machine code; the 2 MB is
+  what compiling them passes through: 1.2 MB of heap that is gone again
+  afterwards (0.7 MB of it the IR builder's instruction vectors, grown by
+  doubling), 0.5 MB that stays (records and tables), and the rest pages
+  the allocator and the worker thread touched once.
+- **A soft page fault costs 2.3 microseconds here** (5,000 instructions,
+  7,300 cycles, measured as the difference the release makes). A
+  workload's first call takes 1,900 of them against CPython's 480 with no
+  release at all (text first touched, a heap that grows 5.6 MB against
+  1.9 in `class_creation`), about 3 ms of an 80 to 100 ms call. Warm calls
+  take about as many as CPython's over the suite.
+- **Imports cost about 1.4 times CPython's instructions**, hidden by a
+  start-up that costs 0.6 of them. Module by module (`-X importtime`),
+  the common set `collections, functools, re, os, json, typing,
+  dataclasses, enum, logging, argparse, subprocess, pathlib` takes 72 ms
+  of import time against 53: `_colorize` 11.3 against 5.2 (its
+  dataclasses), `typing` 5.6 against 3.0, `ast` 2.7 against 0.5, `enum` 3.1
+  against 1.8. A code object's first use costs about 30,000 instructions
+  (decoding its body from the cache 15,000, building its constants and
+  name tables 15,000), a fifth of `import logging`; a `def` cost 3,000
+  instructions against 1,500 before the change above, and an annotated one
+  still costs 11,400 against 3,900.
+  Modules that are C in CPython and Python here add their own
+  (`itertools`, `_collections`, `_stat`, `codecs`).
+- **Tried and dropped in the memory work (November 11)**:
+  - *Hot-cold splitting* (`-hot-cold-split`, with and without a threshold
+    of 0 and eight parameters): 8,194 regions leave their functions, and
+    the functions programs keep running shrink from 7.9 to 7.6 MB (6.9 with
+    the aggressive settings), with peak RSS level or slightly up. The
+    profile says 65% of the blocks in executed functions never ran, but
+    they're small and scattered (a bounds check's panic, an error return),
+    not regions worth a call.
+  - *Releasing only the code after a hot group* in the order file, between
+    two marker functions. Start-up and imports run plenty of the hot
+    functions' code once too, so the group stayed 70% resident (5.6 of 7.8
+    MB); releasing everything and letting the working set fault back does
+    better (`go` 15.4 against 13.7 MB) and needs no layout.
+  - *A last-in-first-out cache of small blocks in front of mimalloc*, owned
+    by the interpreter's thread. A hit saves 1.7% to 2.9% of a workload's
+    instructions over `mi_malloc` and `mi_free`, but the checks every
+    allocation and release then make cost 3% to 4%, so the suite retired
+    more with it (`comprehensions` 3.5%). mimalloc already extends a page's
+    free list 4 KiB at a time, so a steady churn stays within a few
+    kilobytes of a size class without it.
+  - *A longer purge delay for every process* (1,000 ms against 50): warm
+    time 0.994 and peak RSS 1.005 over the suite. It's now 500 ms, past 32
+    MB only.
 - **Tried and dropped again (November 4)**: allocating a code object's inline
   cache table only when one of its instructions asks for a cache a second
   time, so run-once code never allocates it (174 KB of `import re, json`'s 399
@@ -2561,6 +3442,125 @@ slowdown in that run was the even-sized chunks, since fixed.
   generators (below noise).
 
 ## Next
+
+What the everyday battery points at (`tools/pybench/everyday.py`; see
+"What the measurements say"):
+
+- A lean entry for a call from native code into Python (see "What the
+  measurements say"): a callee with native code bound and run as a
+  compiled caller's direct call binds and runs it, for
+  `list.__contains__` and the other element comparisons, key functions,
+  `map` and `filter`, hashing, and tier 2's generic operations. It is
+  about 1,500 instructions a call today against 300.
+- Tier 2 leaving a loop to the frame JIT when the loop's work is on
+  instances (or calling comparison and operator methods directly, as
+  the frame JIT does).
+- `enum`: `Color(1)` (4,660 instructions against 2,670: the metaclass's
+  `__call__` and `__new__`'s value lookup) and flag arithmetic (13,300
+  against 7,700).
+- `dataclasses.asdict` and `replace`, which need the pieces rather than
+  a path: class-attribute lookups by name (`hasattr(cls, name)`,
+  `getattr(obj, name)` with a computed name), global reads in compiled
+  code, comprehensions.
+- `__setattr__` hooks and `object.__setattr__(self, name, value)`, which
+  a frozen dataclass's `__init__` calls once a field: the store-side twin
+  of the attribute-read hooks. A `threading.local` store from compiled
+  code is the same gap (2,260 instructions against 960: it leaves for
+  the core loop).
+- Builtin methods a Python class holds (`SimpleQueue.put` and `get`: 3,040
+  instructions a pair against 900): the method load and the call take
+  the general dispatch. And a `threading.local`'s creation (28,900
+  against 3,900), thread start and join.
+- `getattr(obj, name)` of a property, two-argument `super()`,
+  `issubclass` against an ABC, a property through `super()`.
+- `f.read(n)` in a loop (1.6 times CPython after this PR dropped an
+  `fcntl` per read: the bytes are still read into a vector and copied
+  into the `bytes` object) and large single writes, which go through the
+  write buffer instead of past it; `os.stat` and `os.path.exists`.
+- Block reads off Unix: the read-ahead's fill asks a descriptor for a
+  block only under `cfg(unix)`, so a line read on Windows still takes a
+  byte per read (as it did everywhere before this PR). The generic fill
+  can ask a disk file for a block the same way; it needs a Windows
+  machine to test on.
+- `bytes` `%` formatting; `dict(zip(a, b))`; `*args` forwarding.
+- Exceptions raised in a callee and caught in its caller (12,400
+  instructions against 6,800 for `os.environ[missing]`), which `argparse`
+  does 25 to 50 times a parse.
+- Then the library cases the battery ranks next, each of which needs its
+  own breakdown: `inspect` and `typing`, `email`, `configparser`,
+  `datetime` (`strptime`, `strftime`, `astimezone`), `pathlib`,
+  `argparse`, `uuid`, `weakref`.
+
+What the single-operation battery points at (see "What the measurements
+say"), in the order the gaps would close the most:
+
+- A class whose metaclass defines `__call__` in Python (`Color(1)`):
+  4,660 instructions against 2,670.
+- Small tuples: an allocation written in place and a release that
+  doesn't go through the nested-release trashcan when every element is a
+  scalar or shared; `zip` and `enumerate` reusing their result tuple
+  when the loop has dropped it, as CPython's do.
+- `zip`'s per-element iterator steps (about 450 instructions against
+  `enumerate`'s 135).
+- `dict.copy` and `dict.update`: a copy of a dict whose values can't be
+  part of a cycle needn't scan them again, and the entries' releases
+  could run as one loop.
+- Calls with `*args` and `**kwargs` (wrappers and decorators): the call
+  site's gate cascade (`h_call_site` 336 instructions) and the argument
+  tuple.
+- Tier 2's generic `for`: tuple and list iterators stepped in the
+  helper's first lines.
+- The heap's peak when a large one is rebuilt (`async_tree`: 40 or 49 MB
+  by the build): either the allocator reuses a freed range ahead of a
+  fresh one while its purge is pending, or the long purge delay applies
+  only once a range has been reused.
+- The locked instructions that remain: a function's name is a
+  `std::sync::Arc<str>` cloned at every `def` (`closures_decorators`
+  150,000 a call), a closure's cells sit in a `OnceLock`, and
+  `threading`'s locks take two a call where CPython's take one.
+
+What the `deltablue` measurements above point at, ahead of the list below:
+
+- Compiled code that is smaller and does less per operation: a field
+  read's guards in one compare, class constants and module globals read
+  in line as borrowed values (a global is 37 instructions through its
+  helper in an inlined body), and inlining by how hot a call site is
+  rather than by size alone, so that a constructor's tree isn't lowered
+  into every subclass's `__init__`.
+- Tier 2's compiles of loop-free callees wait for a native caller: 26 of
+  `deltablue`'s and most of `class_creation`'s 128 attempts are methods
+  compiled in case a tier-2 loop calls them, in programs with no such
+  loop. (A caller's analysis would have to ask for the callee and try
+  again, since it types a call from the callee's compiled return lane.)
+- A tighter steady group for the early release: 4.2 MB of its 7.8 MB is
+  resident when a program's imports end, since it's the union of what
+  33 programs keep running and start-up runs much of it too. Profiles
+  dumped at the end of the imports would tell what only start-up and
+  imports run from what a program goes on running.
+
+Two items the November 12 measurements put ahead of the list below:
+
+- Footprint (1.29 of CPython's). First what a baseline compile passes
+  through, about 2 MB a process and 1,500 to 2,400 page faults in the
+  first call: IR vectors sized for the function instead of grown by
+  doubling, a smaller IR instruction, scratch kept between compiles
+  rather than faulted in again, and less set-up per compile. Then what an
+  import leaves behind: code objects (8-byte instructions, a line and a
+  column table per body, a constants vector and its object twin),
+  inline-cache tables allocated at first miss for code that runs once, and
+  strings held both as compiler names and as interned objects.
+- The import path: a code object's first use (30,000 instructions),
+  `def` (twice CPython's instructions, three times with annotations) and
+  the modules that are Python here and C there. `_colorize`'s dataclasses
+  are 6 ms of every program that imports `traceback`. An annotated `def`
+  retires 8,150 instructions where a plain one retires 2,000: attaching
+  `__annotate__` builds the function's attribute dict (three seeded
+  entries and two interned names) and renaming the annotate function
+  builds a second one, so a field for it, and a name computed when it's
+  read, would take about half of that and 300 bytes a function.
+- Much of the footprint is representation: a dict entry is 40 bytes
+  against CPython's 24 (16-byte values), and a code object's strings live
+  twice, as the compiler's constants and names and as the VM's objects.
 
 1. Exceptions, which explain most of `exceptions`, `context_managers` and
    `collections_mix` (140,000, 80,000 and 20,000 raises a call). A raise
@@ -2673,6 +3673,20 @@ slowdown in that run was the even-sized chunks, since fixed.
 
 ## Measurement notes
 
+- Start-up timings of two binaries differ by up to 8% for reasons that
+  aren't in them. The same PGO binary read 21.5 ms for `-c pass` in one
+  interleaved run and 19.7 ms two hours later, while the binary beside
+  it went from 19.6 to 21.6 across a later pair of runs; a build's
+  instruction count for the same start-up didn't move. Non-PGO builds
+  of the commits in between were flat (75.3 M to 75.6 M instructions,
+  cycles within 1.5%). Compare start-up by instructions and cycles
+  (`/usr/bin/time -l`, least of fifteen runs), and treat a wall-clock
+  gap under 10% between two binaries as unmeasured.
+- A regression sweep of the everyday battery runs each case with
+  `WEAVEPY_FRAME_JIT_SYNC=1` and compares raw instruction totals between
+  two builds. With the background compiler on, the moment a compile
+  lands moves a case by 5% between builds that are identical with it
+  synchronous.
 - Instruction counts (`/usr/bin/time -l`, or callgrind in the `wp-cg:latest`
   container) guide the work; wall time on a PGO build decides it. Pin
   `PYTHONHASHSEED=0` and unset `PYTHONDONTWRITEBYTECODE` for whole-process

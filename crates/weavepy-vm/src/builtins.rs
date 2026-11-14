@@ -471,6 +471,15 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
     // (Built without the memo borrowed: nothing here reaches it, but a
     // builder is free to.)
     let found = lookup_method_uncached(obj, name);
+    // A stream's `write` and `readline` have halves that only touch its
+    // buffer, which a call site runs in place.
+    if let (Object::File(_), Some(Object::Builtin(b))) = (obj, &found) {
+        match name {
+            "write" => crate::leaf_builtins::register_fast(b, file_write_fast),
+            "readline" => crate::leaf_builtins::register_fast(b, file_readline_fast),
+            _ => {}
+        }
+    }
     let mut memo = memo.borrow_mut();
     if memo.len() <= usize::from(tag) {
         memo.resize_with(usize::from(tag) + 1, Default::default);
@@ -5381,6 +5390,7 @@ fn attr_set(obj: &Object, name: &str, value: Object) -> Result<(), RuntimeError>
                     // SAFETY: this thread's running interpreter.
                     unsafe { (*interp).settle_lazy() };
                 }
+                f.kwonly_memo.set(0);
                 crate::frame_jit::retire_code(f.code.replace(c));
                 f.names_kept.set(0);
             } else if crate::object::is_function_slot(name) {
@@ -10730,6 +10740,7 @@ fn b_mark_iterable_coroutine(args: &[Object]) -> Result<Object, RuntimeError> {
         // The copied slot store carries any override along.
         defaults_override: crate::object::OverrideFlag::new(f.defaults_maybe_overridden()),
         names_kept: crate::sync::Cell::new(0),
+        kwonly_memo: crate::sync::Cell::new(0),
         gc_slot: crate::gc_trace::GcSlot::new(),
     };
     Ok(Object::Function(Rc::new(marked)))
@@ -17383,6 +17394,9 @@ pub(crate) fn file_readinto(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 pub(crate) fn file_readline(args: &[Object]) -> Result<Object, RuntimeError> {
+    if let Some(line) = file_readline_fast(args) {
+        return line;
+    }
     let f = file_self(args)?;
     file_check_open(&f)?;
     if !f.readable() {
@@ -17412,12 +17426,26 @@ pub(crate) fn file_readline(args: &[Object]) -> Result<Object, RuntimeError> {
             }
         },
     };
+    file_read_line(&f, limit)
+}
+
+/// One line of an open, readable stream: `readline(limit)` past its argument
+/// checks, and a loop's step over the stream.
+fn file_read_line(
+    f: &Rc<crate::object::PyFile>,
+    limit: Option<usize>,
+) -> Result<Object, RuntimeError> {
     // A byte-backed text stream on a newline-unsafe codec (UTF-16/32) or a
     // custom incremental-only codec must find the line boundary in *decoded*
     // text — raw byte scanning would split multi-byte code units and corrupt
     // the decode. Route these through the faithful `TextIOWrapper` readline.
     if !f.binary && f.text_incr_active_gate() {
-        return Ok(stream_text_object(&f, f.readline_text_incr(limit)?));
+        return Ok(stream_text_object(f, f.readline_text_incr(limit)?));
+    }
+    if !f.binary {
+        // What the pure step reads: worked out here, where a codec lookup
+        // may run code.
+        f.prepare_text_plan();
     }
     // Where a line ends depends on the stream's newline policy; the shared
     // `PyFile::read_line_bytes` scans raw bytes for the right terminator
@@ -17429,14 +17457,16 @@ pub(crate) fn file_readline(args: &[Object]) -> Result<Object, RuntimeError> {
     if f.binary {
         Ok(Object::new_bytes(out))
     } else {
-        Ok(stream_text_object(&f, f.decode_text(out)?))
+        Ok(stream_text_object(f, f.decode_text(out)?))
     }
 }
 
-/// `next(file)` — return the next line, or raise StopIteration at EOF.
-/// Backs both the `__next__` method and the VM's native file iteration.
-pub(crate) fn file_next(args: &[Object]) -> Result<Object, RuntimeError> {
-    let f = file_self(args)?;
+/// A `for` loop's step over the stream `f` itself (a file is its own
+/// iterator): the next line, or `None` when the stream is exhausted. What
+/// [`file_next`] does, without the call.
+pub(crate) fn file_iter_next(
+    f: &Rc<crate::object::PyFile>,
+) -> Result<Option<Object>, RuntimeError> {
     // CPython's `TextIOWrapper.__next__` disables `tell()` for the duration of
     // the iteration (the readahead snapshot makes the position ambiguous); a
     // binary stream keeps `tell()` live (`test_io.test_telling`).
@@ -17444,7 +17474,14 @@ pub(crate) fn file_next(args: &[Object]) -> Result<Object, RuntimeError> {
     if is_text {
         f.telling.set(false);
     }
-    let line = file_readline(args)?;
+    if let Some(line) = f.next_line_pure(None) {
+        return Ok(Some(line));
+    }
+    file_check_open(f)?;
+    if !f.readable() {
+        return Err(crate::stdlib::io::unsupported_op("read"));
+    }
+    let line = file_read_line(f, None)?;
     let empty = match &line {
         Object::Str(s) => s.is_empty(),
         // A `WStr` always holds >= 1 lone surrogate, so it is never empty.
@@ -17453,15 +17490,21 @@ pub(crate) fn file_next(args: &[Object]) -> Result<Object, RuntimeError> {
         _ => true,
     };
     if empty {
-        // Iterator exhausted: CPython restores `telling` to `seekable` and
-        // raises `StopIteration`.
+        // Iterator exhausted: CPython restores `telling` to `seekable`.
         if is_text {
             f.telling.set(f.seekable());
         }
-        Err(stop_iteration())
+        Ok(None)
     } else {
-        Ok(line)
+        Ok(Some(line))
     }
+}
+
+/// `next(file)` — return the next line, or raise StopIteration at EOF.
+/// Backs both the `__next__` method and the VM's native file iteration.
+pub(crate) fn file_next(args: &[Object]) -> Result<Object, RuntimeError> {
+    let f = file_self(args)?;
+    file_iter_next(&f)?.ok_or_else(stop_iteration)
 }
 
 pub(crate) fn file_readlines(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -17502,7 +17545,42 @@ pub(crate) fn file_readlines(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::new_list(lines))
 }
 
+/// `f.write(data)` when the write only appends to a buffer: text or bytes
+/// into a file's buffer that already holds writes, text onto the end of a
+/// `StringIO`, or text to standard output's shared buffer. `None` for
+/// anything else, having touched nothing. (A leaf half: see
+/// `leaf_builtins::register_fast`.)
+fn file_write_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    match args {
+        [Object::File(f), Object::Str(s)] => {
+            let count = || Object::Int(crate::object::str_char_len(s) as i64);
+            if f.write_str_pure(s) || f.mem_text_append(s) {
+                return Some(Ok(count()));
+            }
+            f.stdout_write_pure(s).map(|r| r.map(|()| count()))
+        }
+        [Object::File(f), Object::Bytes(b)] => f
+            .write_bytes_pure(b)
+            .then(|| Ok(Object::Int(b.len() as i64))),
+        _ => None,
+    }
+}
+
+/// `f.readline()` when a whole line waits in the stream's buffer (see
+/// `PyFile::next_line_pure`). A leaf half, like [`file_write_fast`].
+fn file_readline_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    match args {
+        [Object::File(f)] | [Object::File(f), Object::None] => f.next_line_pure(None).map(Ok),
+        // (A negative size is no limit.)
+        [Object::File(f), Object::Int(n)] => f.next_line_pure(usize::try_from(*n).ok()).map(Ok),
+        _ => None,
+    }
+}
+
 pub(crate) fn file_write(args: &[Object]) -> Result<Object, RuntimeError> {
+    if let Some(done) = file_write_fast(args) {
+        return done;
+    }
     let f = file_self(args)?;
     // Arity before state: `f.write()` with no data is a TypeError even on a
     // closed file (CPython's clinic parses first; test_fileio `testMethods`).
@@ -17523,6 +17601,9 @@ pub(crate) fn file_write(args: &[Object]) -> Result<Object, RuntimeError> {
             if f.binary {
                 return Err(type_error("a bytes-like object is required, not 'str'"));
             }
+            // What the in-place write reads next time: worked out here,
+            // where a codec lookup may run code.
+            f.prepare_text_plan();
             // Text writes commit fully and report the *character* count
             // (CPython `TextIOWrapper.write`), never a partial byte tally.
             if !f.mem_text_append(s) {
@@ -17695,7 +17776,11 @@ pub(crate) fn file_reconfigure(
             }
             "line_buffering" | "write_through" => {
                 if !matches!(v, Object::None) {
-                    f.set_extra_attr(k, Object::Bool(v.is_truthy()));
+                    let on = v.is_truthy();
+                    f.set_extra_attr(k, Object::Bool(on));
+                    if k == "line_buffering" {
+                        f.set_line_buffering(on);
+                    }
                 }
             }
             other => {
@@ -17727,6 +17812,7 @@ pub(crate) fn file_reconfigure(
     if let Some(nl) = newline {
         *f.newline.borrow_mut() = nl;
     }
+    f.text_config_changed();
     Ok(Object::None)
 }
 

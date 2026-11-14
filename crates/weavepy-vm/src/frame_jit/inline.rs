@@ -2447,6 +2447,9 @@ impl<'a> Lower<'a> {
             kernel,
             recv_tag,
             via_call,
+            // (An inlined body's declined call leaves through its caller's
+            // paths.)
+            lane: None,
         });
         self.held.push(f);
         let at = self
@@ -3285,7 +3288,7 @@ unsafe fn bind_levels(
             );
             act.owns_cells = false;
             // An operator method's `NotImplemented` becomes the operator's
-            // `TypeError` (see `InlineAct::binop`).
+            // `TypeError` (see `InlineAct::op`).
             if let Some((_, Some(arg))) = &s.method {
                 let locals = fr.locals.storage();
                 if let Object::Instance(a) = &locals[0] {
@@ -3296,7 +3299,7 @@ unsafe fn bind_levels(
                     };
                     let op: BinOpKind = std::mem::transmute(*arg as u8);
                     let inplace = arg & weavepy_compiler::BINARY_OP_INPLACE_FLAG != 0;
-                    act.binop = Some((op, inplace, cls, right));
+                    act.op = Some(crate::MethodOp::Binary(op, inplace, cls, right));
                 }
             }
             // Its operands: up to its callee's callable, or its depth.

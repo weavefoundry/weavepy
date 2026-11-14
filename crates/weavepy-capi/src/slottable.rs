@@ -340,8 +340,8 @@ mod tests {
         t.install(0, p);
         t.install(SLOT_TABLE_SIZE as c_int, p);
         t.install(SLOT_TABLE_SIZE as c_int + 7, p);
-        for i in 0..SLOT_TABLE_SIZE {
-            assert!(t.slots[i].is_null());
+        for slot in &t.slots[..SLOT_TABLE_SIZE] {
+            assert!(slot.is_null());
         }
     }
 

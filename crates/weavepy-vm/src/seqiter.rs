@@ -250,6 +250,7 @@ impl Interpreter {
                     iters,
                     strict: false,
                     result: None,
+                    held: Vec::new(),
                 })
             }
         })
@@ -338,6 +339,7 @@ impl Interpreter {
                     iters,
                     strict,
                     result: None,
+                    held: Vec::new(),
                 }))
             }
         }
@@ -498,8 +500,15 @@ impl Interpreter {
                 _ => None,
             }
         };
-        let mut items = Vec::with_capacity(n);
-        for i in 0..n {
+        // (What the frame JIT's direct step already took from the first
+        // sources of this step, if it stopped partway: see
+        // `Self::lazy_gen_pair`. Taken before anything runs, so a raise
+        // below drops it, as CPython drops a step's items.)
+        let mut items = match &mut *l.state.borrow_mut() {
+            LazyIterKind::Zip { held, .. } if !held.is_empty() => std::mem::take(held),
+            _ => Vec::with_capacity(n),
+        };
+        for i in items.len()..n {
             let Some(it) = source(l, i) else {
                 return Ok(None);
             };
@@ -932,10 +941,15 @@ pub(crate) fn lazy_pure_next(l: &PyLazyIter) -> Option<Option<Object>> {
         iters,
         strict: false,
         result,
+        held,
     } = st
     else {
         return itertools_pure_next(l);
     };
+    // (A step in progress is the general step's to finish.)
+    if !held.is_empty() {
+        return None;
+    }
     // Two plain sequence cursors (`zip(xs, ys)`), the commonest shape.
     if let [a, b] = iters.as_slice() {
         if let Some((x, y)) = cursor_pair(a, b) {
@@ -992,11 +1006,15 @@ pub(crate) fn lazy_pure_pair(l: &PyLazyIter) -> Option<(Object, Object)> {
     let LazyIterKind::Zip {
         iters,
         strict: false,
+        held,
         ..
     } = st
     else {
         return None;
     };
+    if !held.is_empty() {
+        return None;
+    }
     let [a, b] = iters.as_slice() else {
         return None;
     };
@@ -1542,6 +1560,14 @@ pub(crate) fn builtin_ctor_pure(cls: &Rc<TypeObject>, args: &[Object]) -> Option
                 Object::Bool(b) => Some(Object::Bool(*b)),
                 Object::None => Some(Object::Bool(false)),
                 Object::Str(s) => Some(Object::Bool(!s.is_empty())),
+                // An exact container is true when it holds anything
+                // (`bool(items)`, as `if items:` reads it).
+                Object::Bytes(b) => Some(Object::Bool(!b.is_empty())),
+                Object::Tuple(t) => Some(Object::Bool(!t.is_empty())),
+                Object::List(l) => Some(Object::Bool(!l.try_borrow().ok()?.is_empty())),
+                Object::Dict(d) => Some(Object::Bool(!d.try_borrow().ok()?.is_empty())),
+                Object::Set(s) => Some(Object::Bool(!s.try_borrow().ok()?.is_empty())),
+                Object::FrozenSet(s) => Some(Object::Bool(s.iter().next().is_some())),
                 _ => None,
             };
         }
@@ -1552,6 +1578,73 @@ pub(crate) fn builtin_ctor_pure(cls: &Rc<TypeObject>, args: &[Object]) -> Option
                 Object::Bool(b) => Some(Object::from_static(if *b { "True" } else { "False" })),
                 _ => None,
             };
+        }
+    }
+    // `slice(stop)`, `slice(start, stop)` and `slice(start, stop, step)`
+    // of ints and `None`s: the slice object, which holds them as they are.
+    if Rc::ptr_eq(cls, &bt.slice_)
+        && (1..=3).contains(&args.len())
+        && args
+            .iter()
+            .all(|a| matches!(a, Object::Int(_) | Object::None))
+    {
+        let part = |i: usize| args.get(i).cloned().unwrap_or(Object::None);
+        let (start, stop, step) = match args.len() {
+            1 => (Object::None, part(0), Object::None),
+            _ => (part(0), part(1), part(2)),
+        };
+        return Some(Object::Slice(Rc::new(crate::object::PySlice {
+            start,
+            stop,
+            step,
+        })));
+    }
+    // `set(xs)` and `frozenset(xs)` of an exact list or tuple of plain
+    // hashable values: no element's hash or comparison runs any code.
+    if let [src @ (Object::List(_) | Object::Tuple(_))] = args {
+        let frozen = Rc::ptr_eq(cls, &bt.frozenset_);
+        if frozen || Rc::ptr_eq(cls, &bt.set_) {
+            if crate::stdlib::tracemalloc_real::is_tracking() || crate::gc_trace::auto_collect_due()
+            {
+                return None;
+            }
+            let borrowed;
+            let items: &[Object] = match src {
+                Object::Tuple(t) => t,
+                Object::List(l) => {
+                    borrowed = l.try_borrow().ok()?;
+                    &borrowed
+                }
+                _ => return None,
+            };
+            // (What this saves is the general call around the build, which
+            // a long input doesn't notice: that one keeps the general
+            // constructor's own bulk path.)
+            let simple = |x: &Object| {
+                matches!(
+                    x,
+                    Object::Int(_) | Object::Str(_) | Object::Bool(_) | Object::None
+                ) || plain_hashable(x, 0)
+            };
+            if items.len() > 64 || !items.iter().all(simple) {
+                return None;
+            }
+            // (Sized once, as the general constructor's simple-key path
+            // sizes it: a set grown an item at a time rehashes as it goes.)
+            let mut data = crate::object::SetData::with_capacity(items.len());
+            for v in items {
+                data.insert(crate::object::DictKey(v.clone()));
+            }
+            let obj = if !frozen {
+                Object::Set(Rc::new(crate::sync::RefCell::new(data)))
+            } else if data.is_empty() {
+                // (The shared empty frozenset.)
+                Object::new_frozenset_from(std::iter::empty())
+            } else {
+                Object::FrozenSet(Rc::new(crate::object::FrozenSetObj::new(data)))
+            };
+            crate::gc_trace::track(&obj);
+            return Some(obj);
         }
     }
     // `int(x)` of an exact int, bool, or a finite float whose truncation
@@ -1837,8 +1930,20 @@ pub(crate) fn abs_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> 
     }))
 }
 
-/// `hash(x)` of a value whose hash runs no Python code and can't fail: a
-/// native scalar, a `str`, or a tuple of `int`s and `str`s.
+/// Whether hashing `x` runs no Python code and can't fail: a native
+/// scalar, a `str` or `bytes`, or a tuple of such (nested a few levels at
+/// most). A NaN is left out: it hashes by identity.
+pub(crate) fn plain_hashable(x: &Object, depth: u32) -> bool {
+    match x {
+        Object::Int(_) | Object::Bool(_) | Object::None | Object::Str(_) | Object::Bytes(_) => true,
+        Object::Float(f) => !f.is_nan(),
+        Object::Tuple(t) => depth < 4 && t.iter().all(|e| plain_hashable(e, depth + 1)),
+        _ => false,
+    }
+}
+
+/// `hash(x)` of a value whose hash runs no Python code and can't fail
+/// ([`plain_hashable`]), or an instance's where that holds.
 pub(crate) fn hash_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let [x] = args else {
         return None;
@@ -1858,19 +1963,91 @@ pub(crate) fn hash_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>>
         let interp = unsafe { &*crate::vm_singletons::current_interpreter_ptr()? };
         return interp.leaf_instance_hash(x).map(|h| Ok(Object::Int(h)));
     }
-    let native = match x {
-        Object::Int(_) | Object::Bool(_) | Object::None | Object::Str(_) => true,
-        // (A NaN hashes by identity.)
-        Object::Float(f) => !f.is_nan(),
-        Object::Tuple(t) => t
-            .iter()
-            .all(|e| matches!(e, Object::Int(_) | Object::Str(_))),
-        _ => false,
-    };
-    if !native {
+    if !plain_hashable(x, 0) {
         return None;
     }
     Some(Ok(Object::Int(crate::object::py_hash_value(x)?)))
+}
+
+/// `vars(obj)` of a plain instance whose `__dict__` nothing but the
+/// default lookup answers: its attribute dictionary. (A class with a
+/// `__dict__` of its own, attribute hooks, or `__slots__` alone takes the
+/// attribute protocol, as the full call does.)
+pub(crate) fn vars_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Instance(inst)] = args else {
+        return None;
+    };
+    let cls = inst.cls_raw();
+    if cls.forbids_dict
+        || cls.flags.is_builtin
+        || inst.native.get().is_some()
+        || inst.c_body.get() != 0
+        || cls.native_kind.get() != 0
+        || cls.is_super_proxy_type()
+        || !Interpreter::default_getattribute(cls)
+        || cls.dunder(crate::types::Dunder::GetAttr).present()
+        // (Every class with instance dictionaries holds the `__dict__`
+        // member descriptor; anything else under that name is the class's
+        // own.)
+        || !matches!(cls.lookup("__dict__"), Some(Object::SlotDescriptor(d)) if d.name == "__dict__")
+    {
+        return None;
+    }
+    Some(Ok(Object::Dict(inst.dict_shared())))
+}
+
+/// `pow` of plain numbers: `pow(base, exp)` of machine ints while the
+/// power fits (a negative exponent's is a float), or with a float operand,
+/// as `**` computes them; and `pow(base, exp, mod)` of machine ints with a
+/// non-negative exponent and a nonzero modulus (modular exponentiation by
+/// squaring, the result taking the modulus's sign as `%` does).
+pub(crate) fn pow_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    // `pow(base, exp)` of machine ints with a non-negative exponent, where
+    // the power fits a machine int too.
+    if let [Object::Int(base), Object::Int(exp)] = args {
+        if *exp < 0 {
+            // A negative exponent's power is the floats' (zero to one
+            // raises there).
+            return Some(crate::float_pow(*base as f64, *exp as f64));
+        }
+        let exp = u32::try_from(*exp).ok()?;
+        return base.checked_pow(exp).map(|v| Ok(Object::Int(v)));
+    }
+    // A float operand: `float ** float`, with its errors and its complex
+    // results.
+    if let [x, y] = args {
+        let (x, y) = match (x, y) {
+            (Object::Float(x), Object::Float(y)) => (*x, *y),
+            (Object::Float(x), Object::Int(y)) => (*x, *y as f64),
+            (Object::Int(x), Object::Float(y)) => (*x as f64, *y),
+            _ => return None,
+        };
+        return Some(crate::float_pow(x, y));
+    }
+    let [Object::Int(base), Object::Int(exp), Object::Int(modulus)] = args else {
+        return None;
+    };
+    if *exp < 0 || *modulus == 0 {
+        return None;
+    }
+    let m = i128::from(*modulus).unsigned_abs();
+    let mut b = i128::from(*base).rem_euclid(m as i128) as u128;
+    let mut e = *exp as u64;
+    let mut r: u128 = 1 % m;
+    while e != 0 {
+        if e & 1 != 0 {
+            r = r * b % m;
+        }
+        b = b * b % m;
+        e >>= 1;
+    }
+    let r = r as i128;
+    let r = if *modulus < 0 && r != 0 {
+        r + i128::from(*modulus)
+    } else {
+        r
+    };
+    Some(Ok(Object::Int(r as i64)))
 }
 
 /// `ord(c)` of a one-character `str`.
@@ -2181,6 +2358,183 @@ impl Interpreter {
         };
         cursor_advance(c)?;
         Some((value, key))
+    }
+
+    /// One item of `source` for [`Self::lazy_gen_pair`]: a generator's
+    /// next yield by its native code ([`Self::gen_native_next`]), or a
+    /// plain cursor's next item. `None` for anything else, and for a
+    /// generator that didn't yield (finished, raised, stopped partway, or
+    /// turned away untouched: the general step finds it as it is).
+    #[cfg(feature = "jit")]
+    #[inline]
+    fn lazy_gen_pull(
+        &mut self,
+        source: &Object,
+        snap_gen: u64,
+        dead: *const std::cell::Cell<bool>,
+        depth_cell: *const std::cell::Cell<usize>,
+    ) -> Option<Object> {
+        match source {
+            Object::Generator(g) => match self.gen_native_next(g, snap_gen, dead, depth_cell, 0) {
+                crate::gen_fast::GenNext::Yielded(v) => Some(v),
+                _ => None,
+            },
+            Object::Iter(c) => {
+                let v = cursor_peek(c)?;
+                cursor_advance(c)?;
+                Some(v)
+            }
+            _ => None,
+        }
+    }
+
+    /// One step of `enumerate(gen)`, or of a two-source `zip` with a
+    /// generator among its sources (the other a generator or a plain
+    /// cursor), from a running activation whose recursion depth is at
+    /// `depth_cell`: the pair's two items, each generator stepped by its
+    /// native code where it stands. The general step of such an adapter
+    /// runs in the core loop's lane, with the calling activation published
+    /// and the generator resumed through three more layers: about 1,600
+    /// instructions an item for `for i, x in enumerate(gen)`, against 550
+    /// this way.
+    ///
+    /// `None` when the step isn't one of these or a source didn't give an
+    /// item. Nothing is lost then: a `zip` holds what its first source gave
+    /// (`LazyIterKind::Zip::held`) for the general step, which goes on
+    /// from the second, and a generator that finished, raised or stopped
+    /// partway is found as it is by that step.
+    #[cfg(feature = "jit")]
+    pub(crate) fn lazy_gen_pair(
+        &mut self,
+        l: &Rc<PyLazyIter>,
+        snap_gen: u64,
+        dead: *const std::cell::Cell<bool>,
+        depth_cell: *const std::cell::Cell<usize>,
+    ) -> Option<(Object, Object)> {
+        let direct = |s: &Object| matches!(s, Object::Generator(_)) || matches!(s, Object::Iter(_));
+        // The sources are copied out: a generator's body may reach this
+        // very adapter, so no view of its state survives a step.
+        let (a, b) = {
+            // SAFETY: a read that runs no code; the view ends with the block.
+            match unsafe { l.state.peek() }? {
+                LazyIterKind::Enumerate {
+                    source: source @ Object::Generator(_),
+                    count,
+                    count_big: None,
+                } if *count < i64::MAX => (source.clone(), None),
+                LazyIterKind::Zip {
+                    iters,
+                    strict: false,
+                    held,
+                    ..
+                } if held.is_empty() => match iters.as_slice() {
+                    [a, b]
+                        if direct(a)
+                            && direct(b)
+                            && (matches!(a, Object::Generator(_))
+                                || matches!(b, Object::Generator(_))) =>
+                    {
+                        (a.clone(), Some(b.clone()))
+                    }
+                    _ => return None,
+                },
+                _ => return None,
+            }
+        };
+        let x = self.lazy_gen_pull(&a, snap_gen, dead, depth_cell)?;
+        let Some(b) = b else {
+            // `enumerate`: the index, counted now that the item is in hand.
+            let mut st = l.state.borrow_mut();
+            let LazyIterKind::Enumerate {
+                count,
+                count_big: None,
+                ..
+            } = &mut *st
+            else {
+                // (The body replaced the adapter's state under the step:
+                // the general pairing's.)
+                drop(st);
+                let pair = Self::enumerate_advance(l, x);
+                let Object::Tuple(t) = &pair else {
+                    return None;
+                };
+                return Some((t[0].clone(), t[1].clone()));
+            };
+            let i = *count;
+            *count += 1;
+            return Some((Object::Int(i), x));
+        };
+        match self.lazy_gen_pull(&b, snap_gen, dead, depth_cell) {
+            Some(y) => Some((x, y)),
+            None => {
+                if let LazyIterKind::Zip { held, .. } = &mut *l.state.borrow_mut() {
+                    held.push(x);
+                }
+                None
+            }
+        }
+    }
+
+    /// One step of `itertools.chain` whose current iterable is a generator,
+    /// or of `itertools.islice` over one, from a running activation (see
+    /// [`Self::lazy_gen_pair`]): the item, the generator stepped by its
+    /// native code where it stands. `None` for any other adapter, and
+    /// whenever the generator doesn't yield: the general step finds it, and
+    /// the adapter, as they are (an `islice`'s skipped items are counted as
+    /// they're taken).
+    #[cfg(feature = "jit")]
+    pub(crate) fn lazy_gen_one(
+        &mut self,
+        l: &Rc<PyLazyIter>,
+        snap_gen: u64,
+        dead: *const std::cell::Cell<bool>,
+        depth_cell: *const std::cell::Cell<usize>,
+    ) -> Option<Object> {
+        // (The source is copied out: its body may reach this adapter.)
+        // SAFETY: a read that runs no code; the view ends with the match.
+        let (source, skip) = match unsafe { l.state.peek() }? {
+            LazyIterKind::Chain {
+                active: Some(g @ Object::Generator(_)),
+                ..
+            } => (g.clone(), None),
+            LazyIterKind::Islice {
+                source: g @ Object::Generator(_),
+                next_idx,
+                pos,
+                stop,
+                done: false,
+                ..
+            } if *pos <= *next_idx && stop.is_none_or(|s| *next_idx < s) => {
+                (g.clone(), Some(*next_idx - *pos))
+            }
+            _ => return None,
+        };
+        let Some(skip) = skip else {
+            return self.lazy_gen_pull(&source, snap_gen, dead, depth_cell);
+        };
+        // `islice`: the items before the next one to give are taken first.
+        for _ in 0..skip {
+            drop(self.lazy_gen_pull(&source, snap_gen, dead, depth_cell)?);
+            if let LazyIterKind::Islice { pos, .. } = &mut *l.state.borrow_mut() {
+                *pos += 1;
+            }
+        }
+        let item = self.lazy_gen_pull(&source, snap_gen, dead, depth_cell)?;
+        if let LazyIterKind::Islice {
+            next_idx,
+            pos,
+            stop,
+            step,
+            ..
+        } = &mut *l.state.borrow_mut()
+        {
+            *pos += 1;
+            *next_idx = next_idx.saturating_add(*step);
+            if let Some(s) = stop {
+                *next_idx = (*next_idx).min(*s);
+            }
+        }
+        Some(item)
     }
 
     /// One step of a native adapter that runs no Python code, for every

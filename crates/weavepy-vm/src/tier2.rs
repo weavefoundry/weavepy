@@ -520,6 +520,10 @@ struct CacheEntry {
     /// (it would observe the same frame state); other entries still
     /// do, with their own live values.
     probe_misses: Vec<u32>,
+    /// What the analyses so far carved out of the code for reasons of its
+    /// own, for the next attempt to start from (see
+    /// [`weavepy_jit::Carved`]): kept while the code stays cold.
+    carved: weavepy_jit::Carved,
     /// A compiled frame took a cold exit (see `CompiledFrame::cold_exits`):
     /// the code after it was unsupported *with the values live when it was
     /// compiled* (typically a later loop's receiver, still unbound when an
@@ -625,6 +629,7 @@ impl CacheEntry {
             no_interp_entry: false,
             generic_dyn_calls: 0,
             probe_misses: Vec::new(),
+            carved: weavepy_jit::Carved::default(),
             recompile_at_osr: false,
             cold_recompiles: 0,
             osr_absent: Vec::new(),
@@ -957,12 +962,17 @@ pub(crate) fn note_frameless_calls(code: &CodeObject, n: u32) -> Option<bool> {
             return None;
         }
         let threshold = st.threshold;
+        let sized = if st.range_budget {
+            size_budget(code)
+        } else {
+            0
+        };
         match st.cache.get_mut(&std::ptr::from_ref(code)) {
             None => Some(true),
             Some(entry) if matches!(entry.tier, Tier::Cold) => {
                 entry.counter = entry.counter.saturating_add(n);
                 let next = entry.counter.saturating_add(1);
-                let due = next >= threshold && compile_allowed(next, threshold);
+                let due = next >= threshold.max(sized) && compile_allowed(next, threshold);
                 if !due {
                     // The caller restarts the lean count.
                     entry.calls = entry.calls.wrapping_add(n);
@@ -1089,6 +1099,30 @@ fn import_size_budget(code: &CodeObject, admit_at: u32) -> u32 {
     }
     let scale = u32::try_from(len / IMPORT_LARGE_BODY + 1).unwrap_or(u32::MAX);
     admit_at.saturating_mul(scale)
+}
+
+/// Bodies longer than this many instructions need work in proportion to
+/// their length before tier 2 analyzes them, whatever the phase (see
+/// [`size_budget`]). What tier 2 is for (a kernel, a scanner's loop, a
+/// small method) is shorter.
+const LARGE_BODY: usize = 256;
+
+/// The work (calls and loop iterations) a large body needs for each
+/// instruction past [`LARGE_BODY`].
+const WORK_PER_INSTRUCTION: u32 = 16;
+
+/// The counter a code object needs before tier 2 analyzes it, for its
+/// length. An analysis costs four to seven microseconds an instruction,
+/// more when it carves loops out and starts over, and what it buys is a
+/// fraction of a microsecond an iteration: at the threshold alone, fifty
+/// iterations, `regex_mix`'s first call spent 15 of its 64 ms analyzing
+/// `re`'s compiler (`_parse`, 1,700 instructions; `_optimize_charset`, six
+/// times over) and `dataclasses._process_class` cost 3 ms, all rejected.
+fn size_budget(code: &CodeObject) -> u32 {
+    let over = code.instructions.len().saturating_sub(LARGE_BODY);
+    u32::try_from(over)
+        .unwrap_or(u32::MAX)
+        .saturating_mul(WORK_PER_INSTRUCTION)
 }
 
 /// [`compile_allowed`] for the frame compiler (see `frame_jit`), which
@@ -1250,6 +1284,7 @@ impl JitState {
         // a native entry to pay for the general call, and how many.
         let long_calls;
         let iters_per_call;
+        let mut carved = weavepy_jit::Carved::default();
         {
             let entry = cache_entry(&mut self.cache, &mut self.sweep_at, code);
             if entry_pc == 0 {
@@ -1309,6 +1344,7 @@ impl JitState {
                     if entry.counter < self.threshold
                         || !compile_allowed(entry.counter, self.threshold)
                         || entry.counter < import_size_budget(code, admit_at(self.threshold))
+                        || (self.range_budget && entry.counter < size_budget(code))
                     {
                         return None;
                     }
@@ -1328,6 +1364,7 @@ impl JitState {
                     if entry.probe_misses.contains(&entry_pc) {
                         return None;
                     }
+                    carved = std::mem::take(&mut entry.carved);
                 }
             }
             let calls = entry
@@ -1589,6 +1626,7 @@ impl JitState {
                 pairs: &mut **pairs,
                 entry_pc: Some(entry_pc),
                 carve_env: seed_params,
+                carved: Some(&mut carved),
                 paths: &mut path_arena,
             };
             let t0 = std::env::var_os("WEAVEPY_JIT_TRACE")
@@ -1868,6 +1906,7 @@ impl JitState {
                     // RFC 0073 WS1 — retriable: stay Cold, charge this
                     // entry pc so only *other* entries re-attempt.
                     if let Some(entry) = self.cache.get_mut(&key) {
+                        entry.carved = carved;
                         if !entry.probe_misses.contains(&entry_pc) {
                             entry.probe_misses.push(entry_pc);
                         }
@@ -2125,6 +2164,7 @@ impl JitState {
                 }
                 entry.counter = entry.counter.saturating_add(stride);
                 entry.counter >= self.threshold
+                    && (!self.range_budget || entry.counter >= size_budget(code))
             }
             Tier::Compiled(..) => {
                 if entry.osr_failures < OSR_FAILURE_BUDGET {
@@ -2682,6 +2722,7 @@ fn method_ret_info(
         pairs: &mut |_| None,
         entry_pc: None,
         carve_env: false,
+        carved: None,
         paths: &mut path_arena,
     };
     match weavepy_jit::analyze_frame(fcode, &mut classify, &mut probes) {
@@ -4068,6 +4109,7 @@ fn inline_method_body(
         pairs: &mut |_| None,
         entry_pc: None,
         carve_env: false,
+        carved: None,
         paths: &mut path_arena,
     };
     let tf = weavepy_jit::analyze_frame(code, &mut classify, &mut probes).ok()?;
@@ -4305,19 +4347,30 @@ pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::F
         let st = &mut *st;
         let entry = cache_entry(&mut st.cache, &mut st.sweep_at, &frame.code);
         if matches!(entry.tier, Tier::Cold) {
-            if phase != CompilationPhase::Normal {
-                // A loop-free body gains nothing from native code until
-                // compiled callers exist to take its direct lanes, while
-                // compiling one during start-up or an import costs time and
-                // memory the program may never recover (`ABCMeta.register`
-                // while `_collections_abc` loads). The lean path has no
-                // ordinary frame-entry counter: account for the interval
-                // just completed and count another, so only sustained work
-                // compiles (the checkpoint stays reachable afterwards, even
-                // when pure-leaf calls skip frames).
-                let interval = lean_warm_at();
+            // A loop-free body gains nothing from native code until
+            // compiled callers exist to take its direct lanes, while
+            // compiling one during start-up or an import costs time and
+            // memory the program may never recover (`ABCMeta.register`
+            // while `_collections_abc` loads); and any body needs work in
+            // proportion to its length first (see [`size_budget`]). The
+            // lean path has no ordinary frame-entry counter: account for
+            // the interval just completed and count another, so only
+            // sustained work compiles (the checkpoint stays reachable
+            // afterwards, even when pure-leaf calls skip frames).
+            let interval = lean_warm_at();
+            let sized = if st.range_budget {
+                size_budget(&frame.code)
+            } else {
+                0
+            };
+            let need = if phase == CompilationPhase::Normal {
+                sized
+            } else {
+                sized.max(interval.saturating_mul(IMPORT_THRESHOLD_FACTOR))
+            };
+            if need > warm || phase != CompilationPhase::Normal {
                 entry.counter = entry.counter.saturating_add(interval);
-                if entry.counter < interval.saturating_mul(IMPORT_THRESHOLD_FACTOR) {
+                if entry.counter < need {
                     let hint = &frame.code.jit_hint;
                     entry.calls = entry.calls.wrapping_add(hint.lean_entries());
                     hint.defer_lean_compile();
@@ -9807,10 +9860,16 @@ unsafe extern "C" fn wpjit_get_iter(frame: *mut JitFrame, pin: i64) -> i64 {
     }
 }
 
-/// One step of a list, tuple or range iterator, without the generic
+/// One step of a list, tuple, range or dict iterator, without the generic
 /// dispatch: the next item, or `None` once exhausted (the iterator then
 /// detached as [`PyIterator::next_value`] leaves it). `None` outside for
 /// any other iterator, or one already borrowed.
+///
+/// A dict or dict-view iterator steps as the core loop's `FOR_ITER` steps
+/// it (`Interpreter::core_dict_next`: a key, a value, or an item's tuple,
+/// read in place); its end, and a dict that changed size, are the general
+/// step's, which reports them. (The general step is three times this
+/// one's instructions a key.)
 #[inline]
 fn builtin_seq_step(cell: &Rc<GilRefCell<crate::object::PyIterator>>) -> Option<Option<Object>> {
     use crate::object::PyIterator;
@@ -9818,6 +9877,12 @@ fn builtin_seq_step(cell: &Rc<GilRefCell<crate::object::PyIterator>>) -> Option<
     match &*it {
         PyIterator::List { .. } | PyIterator::Tuple { .. } | PyIterator::Range { .. } => {
             Some(it.next_value())
+        }
+        PyIterator::DictKeys { .. } => {
+            match super::Interpreter::core_dict_next(&mut it, false, false) {
+                crate::DictStep::Item(v, _) => Some(Some(v)),
+                crate::DictStep::Exhausted | crate::DictStep::Decline => None,
+            }
         }
         _ => None,
     }
@@ -12068,6 +12133,12 @@ unsafe fn call_dyn_impl(
     }
     // A keyword call of a warm pure leaf evaluates frameless on its
     // marshaled values (no Python runs, so nothing needs revalidating).
+    // It isn't counted against the native driver, though the frame JIT
+    // evaluates the same leaf at its call site in a fifth of this round
+    // trip's instructions (`f(i, c=4)` 220 against 1,040): a loop that
+    // makes one such call among other calls still runs better here (the
+    // bench gate's `call_overhead` took 15% more instructions, and 45%
+    // more time on Linux, when the call retired its loop).
     if kwc > 0 {
         // SAFETY: per the function contract — same live buffers.
         if let Some(v) = unsafe { dyn_kw_pure_leaf(jf, ctx, interp, &callee, argc, kwc, names) } {
@@ -12216,15 +12287,15 @@ unsafe fn call_dyn_impl(
         }
     }
     // Arbitrary Python runs on behalf of this activation (RFC 0067
-    // WS1's dirtiness discipline). A keyword call of a builtin or a class
-    // pays the same generic binder in tier-1, so it doesn't count against
-    // the native driver; every other call does.
+    // WS1's dirtiness discipline), and the call counts against the native
+    // driver. A keyword call of a builtin or a class counts too: the frame
+    // JIT runs one in place (`Interpreter::core_builtin_kw_lane`) or binds
+    // a class's `__init__` directly (`ctor_direct_kw`) at a third to a half
+    // of this round trip's instructions, so a loop dense in them runs
+    // better there.
     let native_callee = matches!(&callee, Object::Builtin(_))
         || matches!(&callee, Object::BoundMethod(bm) if matches!(bm.function, Object::Builtin(_)));
-    let charged = kwc == 0 || !(native_callee || matches!(&callee, Object::Type(_)));
-    if charged {
-        note_generic_dyn_call(ctx);
-    }
+    note_generic_dyn_call(ctx);
     ctx.dirty = true;
     let called = call_with_activation_shell(interp, ctx, jf, |i| {
         i.call_object_with_globals(&callee, &args, &kwargs, &ctx.globals)
@@ -12241,7 +12312,7 @@ unsafe fn call_dyn_impl(
         }
     }
     // SAFETY: as above.
-    unsafe { dyn_call_result(jf, ctx, called, native_callee, charged, int_result) }
+    unsafe { dyn_call_result(jf, ctx, called, native_callee, true, int_result) }
 }
 
 /// `call_dyn_impl`'s result protocol: park a raise, or deliver the
@@ -14815,13 +14886,24 @@ const OSR_VERDICT_ENTRIES: u32 = 16;
 /// its last rows).
 const OSR_MIN_TRIPS: u64 = 8;
 
+/// [`OSR_MIN_TRIPS`] for compiled code of `stmts` statements. Small code
+/// gains little an iteration over the frame JIT's loop, while the
+/// hand-off costs the same (about 4,000 instructions: `for x in
+/// sorted(xs): pass` over ten items ran 7,400 a pass through its entries
+/// against the frame JIT's 3,400), so its entries must run longer to
+/// repay it: 64 iterations for an empty body, down to the floor at
+/// fifteen statements.
+fn osr_min_trips(stmts: u32) -> u64 {
+    (128 / (u64::from(stmts) + 1)).clamp(OSR_MIN_TRIPS, 64)
+}
+
 /// Count an OSR entry of `code` at `pc` that ran `trips` loop iterations
 /// natively before handing the frame back. An entry whose runs average
 /// too few to pay for themselves (a scanner's inner `while`, run a few
 /// characters per token; a loop over a node's few neighbors) is taken no
 /// more, and the code's back edges are left to the frame JIT, which runs
 /// its loops without the hand-off.
-fn note_osr_trips(code: &Rc<CodeObject>, pc: u32, trips: u64) {
+fn note_osr_trips(code: &Rc<CodeObject>, pc: u32, trips: u64, stmts: u32) {
     let key = Rc::as_ptr(code).cast::<CodeObject>();
     let short = JIT.with(|cell| {
         let mut st = cell.borrow_mut();
@@ -14841,7 +14923,7 @@ fn note_osr_trips(code: &Rc<CodeObject>, pc: u32, trips: u64) {
         if r.1 < OSR_VERDICT_ENTRIES {
             return false;
         }
-        let short = r.2 < u64::from(r.1) * OSR_MIN_TRIPS;
+        let short = r.2 < u64::from(r.1) * osr_min_trips(stmts);
         if crate::hot_gates::env_flags::jit_trace() {
             eprintln!(
                 "jit osr trips {:?} pc {} average {}",
@@ -15343,7 +15425,7 @@ fn enter_compiled(
         let left = jf.poll_left.clamp(0, weavepy_jit::JIT_POLL_STRIDE);
         let trips = u64::from(ctx.polls) * weavepy_jit::JIT_POLL_STRIDE as u64
             + (weavepy_jit::JIT_POLL_STRIDE - left) as u64;
-        note_osr_trips(&frame.code, entry_pc, trips);
+        note_osr_trips(&frame.code, entry_pc, trips, cf.op_mix().1);
     }
     // A cold exit is an expected hand-off, never a deopt charge.
     let cold_exit = matches!(status, JitStatus::Deopt) && cf.cold_exits.contains(&jf.deopt_pc);

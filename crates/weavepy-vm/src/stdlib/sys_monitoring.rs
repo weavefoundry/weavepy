@@ -388,8 +388,8 @@ fn mon_all_events(_args: &[Object]) -> Result<Object, RuntimeError> {
         for &(name, idx) in EVENT_NAMES {
             let bit = crate::trace::event_mask(idx);
             let mut tools_mask: i64 = 0;
-            for tool in 0..6 {
-                if m.events[tool] & bit != 0 {
+            for (tool, events) in m.events.iter().enumerate().take(6) {
+                if events & bit != 0 {
                     tools_mask |= 1 << tool;
                 }
             }

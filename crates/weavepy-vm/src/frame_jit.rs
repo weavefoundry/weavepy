@@ -817,16 +817,18 @@ impl Slot {
             let _ = self.native.set(None);
             return;
         }
-        if !worth_compiling(code, ext, at) {
-            // (Another loop may yet get hot.)
-            return;
-        }
         // (A busy worker: the code compiles at its heat's next trigger, a
-        // twentieth of the way on.)
+        // twentieth of the way on. Asked before the code's worth, which
+        // reads every instruction: on a machine with no core to spare the
+        // worker stays busy, and each trigger would weigh the code again.)
         if background::saturated() {
             let n = code.instructions.len() as u32;
             let at_hot = hot().saturating_mul(n);
             self.heat.store(at_hot - at_hot / 20, Ordering::Relaxed);
+            return;
+        }
+        if !worth_compiling(code, ext, at) {
+            // (Another loop may yet get hot.)
             return;
         }
         let t0 = stats::enabled().then(std::time::Instant::now);
@@ -2340,8 +2342,11 @@ unsafe extern "C" fn h_binop_num(st: *mut State, site: *const BinopSite) -> u32 
     }
 }
 
-/// `COMPARE_OP` at `site` through [`h_compare_bool`], then a comparison
-/// method that's a warm pure leaf: the answer (`0` or `1`), or a status (see
+/// `COMPARE_OP` at `site` through [`h_compare_bool`], then a plain
+/// instance's comparison method (see
+/// `Interpreter::compare_instance_dunder`): a warm pure leaf evaluated in
+/// place ([`compare_leaf`]), any other with native code called directly
+/// ([`compare_method`]). The answer (`0` or `1`), or a status (see
 /// [`LEFT_INTERP`]).
 unsafe extern "C" fn h_compare_site(st: *mut State, site: *const BinopSite) -> u32 {
     // SAFETY: as `h_binop_site`'s.
@@ -2351,17 +2356,237 @@ unsafe extern "C" fn h_compare_site(st: *mut State, site: *const BinopSite) -> u
             h_copies(st, s.copies.as_ptr(), s.copies.len() as u64);
         }
         let at = (*st).stack.add(s.slot as usize);
+        // An operand only the comparison held dies with it, and what it
+        // owned may have a finalizer: that runs before the next
+        // instruction.
+        let answered = |r: bool| {
+            if (*(*st).maybe_dead).get() {
+                at.write(Object::Bool(r));
+                return left_marked(st, s.pc, s.slot as usize + 1);
+            }
+            u32::from(r)
+        };
+        let kind: CompareKind = std::mem::transmute((s.arg & !COMPARE_OP_TO_BOOL_FLAG) as u8);
+        // An instance's own method first, where the site has seen
+        // instances (no plain shape answers for one that has a method).
+        if s.dunder && matches!(&*at, Object::Instance(_)) {
+            if let Some(f) = Interpreter::compare_instance_dunder(&*at, &*at.add(1), kind) {
+                let r = compare_leaf(st, at, &f);
+                if r <= 1 {
+                    return answered(r != 0);
+                }
+                if !s.direct.is_null() && !(*st).sw.is_null() {
+                    let r = compare_method(&mut *st, s, f);
+                    if r != CALL_DECLINED {
+                        return r;
+                    }
+                }
+                return left(st, s.pc, s.last, s.slot as usize + 2);
+            }
+        }
         let r = h_compare_bool(at, s.arg);
         if r <= 1 {
             return r;
         }
-        if s.dunder {
-            let r = h_compare_dunder(st, at, s.arg);
-            if r <= 1 {
-                return r;
+        // The plain shapes again, for operands whose release
+        // `h_compare_bool` leaves alone (two tuples built for the
+        // comparison, as a dataclass's `__eq__` builds them).
+        if droppable(&*at) && droppable(&*at.add(1)) {
+            if let Some(r) = crate::plain_compare(&*at, &*at.add(1), kind) {
+                crate::drop_hot_at(at.add(1));
+                crate::drop_hot_at(at);
+                return answered(r);
             }
         }
         left(st, s.pc, s.last, s.slot as usize + 2)
+    }
+}
+
+/// [`h_compare_site`]'s comparison method `f`, called directly
+/// ([`direct_call`]) as `f(a, b)` on copies of the operands above them:
+/// the operands wait in their slots, as the full handler holds them across
+/// the call, for what an answer of `NotImplemented` goes on to (see
+/// `Interpreter::compare_finish`). A `bool` answer comes back as `0` or
+/// `1`, the operands released; any other is settled by [`compare_rest`].
+/// `CALL_DECLINED` touched nothing (a method without native code, which
+/// warms as [`dunder_call`]'s does); `RAISED` or `RELOAD` as [`h_call`]'s,
+/// the operands still on the frame's stack under the call.
+///
+/// # Safety
+///
+/// As [`h_compare_site`]'s, with a non-null switch and the site's direct
+/// cache (nothing virtual lies below the operands, and three slots are
+/// free above them: see [`stack_need`]).
+#[inline(never)]
+unsafe fn compare_method(st: &mut State, s: &BinopSite, f: Rc<crate::object::PyFunction>) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let (pc, slot) = (s.pc as usize, s.slot as usize);
+        let at = st.stack.add(slot);
+        at.add(2).write(Object::Function(f));
+        at.add(3).write(crate::clone_hot(&*at));
+        at.add(4).write(crate::clone_hot(&*at.add(1)));
+        let op = Some(records::MethodOp::Compare(s.arg));
+        match direct_call_out(st, pc, slot + 2, slot + 5, &mut *s.direct, op) {
+            None => {
+                // (The operands' own slots still hold them.)
+                crate::drop_hot_at(at.add(4));
+                crate::drop_hot_at(at.add(3));
+                let f = at.add(2).read();
+                if let Object::Function(f) = &f {
+                    let code = f.code();
+                    if let Some(ext) = crate::code_vm_ext(&code) {
+                        ext.frame_jit
+                            .warm_switched(&code, ext, code.varnames.len().max(2));
+                    }
+                }
+                drop(f);
+                CALL_DECLINED
+            }
+            Some(0) => {
+                let kind: CompareKind =
+                    std::mem::transmute((s.arg & !COMPARE_OP_TO_BOOL_FLAG) as u8);
+                let r = match &*at.add(2) {
+                    Object::Bool(r) => *r,
+                    // `NotImplemented` against `None`, a number or a string,
+                    // none of which answers for an instance either: `==`
+                    // and `!=` come down to identity, and the two aren't
+                    // one object.
+                    v if matches!(kind, CompareKind::Eq | CompareKind::NotEq)
+                        && matches!(
+                            &*at.add(1),
+                            Object::None
+                                | Object::Int(_)
+                                | Object::Float(_)
+                                | Object::Bool(_)
+                                | Object::Str(_)
+                        )
+                        && v.is_same(&crate::vm_singletons::not_implemented()) =>
+                    {
+                        // (The singleton's reference is a plain count.)
+                        crate::drop_hot_at(at.add(2));
+                        matches!(kind, CompareKind::NotEq)
+                    }
+                    _ => return compare_rest(st, s),
+                };
+                // The operands leave as the full handler's do (the right
+                // one first), a dying one through the interpreter's release.
+                let interp = &mut *st.interp.cast_mut();
+                for k in [1, 0] {
+                    if !plain_release(&*at.add(k)) {
+                        interp.release(at.add(k).read());
+                    }
+                }
+                if (*st.maybe_dead).get() {
+                    at.write(Object::Bool(r));
+                    return left_marked(st, s.pc, slot + 1);
+                }
+                st.len = slot;
+                u32::from(r)
+            }
+            Some(r) => r,
+        }
+    }
+}
+
+/// [`compare_method`] whose method answered something other than a `bool`
+/// (`NotImplemented`, or a value whose truth the instruction's fused
+/// `TO_BOOL` takes), the operands and the answer in the three slots from
+/// the site's: the rest of the comparison
+/// (`Interpreter::compare_finish`), which may run Python code (the
+/// reflected method, a `__bool__`), so the caller's frame is synced and its
+/// shell built first, as a clean return's finalizers find it
+/// ([`records::finalizers_after`]). A `bool` result comes back as `0` or
+/// `1`; any other leaves for the core loop past the instruction, the
+/// result on the stack.
+#[cold]
+#[inline(never)]
+unsafe fn compare_rest(st: &mut State, s: &BinopSite) -> u32 {
+    // SAFETY: as `compare_method`'s, the method's answer above the operands.
+    unsafe {
+        let (pc, slot) = (s.pc as usize, s.slot as usize);
+        let interp = &mut *st.interp.cast_mut();
+        let frame = &mut *st.frame;
+        frame.stack.set_len(slot + 3);
+        frame.pc = s.pc + 1;
+        settle(st);
+        let sw = &mut *st.sw;
+        let mut tmp = None;
+        let (cf, _, cshell) = sw.activation((*sw.inl).len(), &mut tmp);
+        interp.flush_lean(&mut *cf, &mut *cshell.cast::<crate::QuietShell<'_>>());
+        let v = frame.stack.pop().expect("the method's answer");
+        let r = interp.compare_finish(frame, s.arg, v);
+        *sw.last = pc;
+        let in_place = |sw: &crate::CoreSwitch| {
+            sw.pending.is_none()
+                && std::ptr::eq(sw.cur, st.frame)
+                && crate::hot_gates::loop_gen() == st.snap_gen
+        };
+        let r = match r {
+            Ok(r) => r,
+            Err(e) if in_place(sw) => {
+                st.len = slot;
+                st.pc = pc + 1;
+                st.err = Some(e);
+                return RAISED;
+            }
+            Err(e) => {
+                sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Raised(e)));
+                return RELOAD;
+            }
+        };
+        let answer = match &r {
+            Object::Bool(b) => Some(*b),
+            _ => None,
+        };
+        frame.stack.push(r);
+        if interp.drain_if_maybe_dead() && crate::hot_gates::loop_gen() != st.snap_gen {
+            sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Breaker));
+        }
+        if !in_place(sw) {
+            return RELOAD;
+        }
+        match answer {
+            Some(b) => {
+                st.len = slot;
+                u32::from(b)
+            }
+            None => left(st, s.pc + 1, s.pc, slot + 1),
+        }
+    }
+}
+
+/// A clean direct return that left the rest to the core loop (`RELOAD`,
+/// something pending) with the method's raw result atop the caller's
+/// synced stack: what the operator `op` owes that result, as
+/// `Interpreter::inline_deliver` settles one for an activation the core
+/// loop finishes.
+#[cold]
+#[inline(never)]
+unsafe fn op_after_reload(st: &mut State, op: records::MethodOp<'_>) {
+    // SAFETY: the caller's state, its frame synced with the result atop its
+    // stack and its switch non-null.
+    unsafe {
+        let interp = &mut *st.interp.cast_mut();
+        let frame = &mut *st.frame;
+        let Some(v) = frame.stack.pop() else {
+            return;
+        };
+        let r = match op {
+            records::MethodOp::Binary(op, inplace, l, r)
+                if v.is_same(&crate::vm_singletons::not_implemented()) =>
+            {
+                Err(crate::binop_type_error(op, inplace, l, r))
+            }
+            records::MethodOp::Binary(..) => Ok(v),
+            records::MethodOp::Compare(arg) => interp.compare_finish(frame, arg, v),
+        };
+        match r {
+            Ok(v) => frame.stack.push(v),
+            Err(e) => {
+                (*st.sw).pending = Some(crate::CoreExit::Stop(crate::LeafStop::Raised(e)));
+            }
+        }
     }
 }
 
@@ -2477,6 +2702,13 @@ unsafe extern "C" fn h_for_iter(st: *mut State, it: *mut Object, out: *mut Objec
                         }
                         _ => return h_for_iter_rest(st, it, out, pc),
                     },
+                    // A reversed list, or a dict or one of its views: stepped
+                    // out of line, so this helper's frame stays what the
+                    // steps above need (in line here, they cost a string's
+                    // loop 11% more instructions an item).
+                    PyIterator::Reversed { .. } | PyIterator::DictKeys { .. } => {
+                        return h_for_iter_view(st, it, out, pc)
+                    }
                     _ => return h_for_iter_rest(st, it, out, pc),
                 };
                 if let Object::Int(i) = *v {
@@ -2489,6 +2721,55 @@ unsafe extern "C" fn h_for_iter(st: *mut State, it: *mut Object, out: *mut Objec
         }
         if matches!(&*it, Object::Generator(_)) && !(*st).sw.is_null() {
             return h_for_iter_gen(st, it, out, pc);
+        }
+        h_for_iter_rest(st, it, out, pc)
+    }
+}
+
+/// [`h_for_iter`] of a reversed list's iterator, or a dict's or dict
+/// view's: the next item, key or value read in place, as the general step
+/// takes it (the end, a list that shrank and a dict that changed are that
+/// step's, through [`h_for_iter_rest`]).
+#[inline(never)]
+unsafe extern "C" fn h_for_iter_view(
+    st: *mut State,
+    it: *mut Object,
+    out: *mut Object,
+    pc: u64,
+) -> u32 {
+    // SAFETY: as `h_for_iter_rest`'s; nothing here runs code while the
+    // iterator is borrowed.
+    unsafe {
+        if let Object::Iter(rc) = &*it {
+            if let Some(iter) = rc.peek_mut() {
+                match iter {
+                    PyIterator::Reversed { items, index, .. } if *index >= 0 => {
+                        if let Some(v) = items.peek().and_then(|xs| xs.get(*index as usize)) {
+                            *index -= 1;
+                            if let Object::Int(i) = *v {
+                                (*st).out = i as u64;
+                                return 0;
+                            }
+                            out.write(crate::clone_hot(v));
+                            return 1;
+                        }
+                    }
+                    view @ PyIterator::DictKeys { .. } => {
+                        match Interpreter::core_dict_next(view, false, false) {
+                            crate::DictStep::Item(Object::Int(i), _) => {
+                                (*st).out = i as u64;
+                                return 0;
+                            }
+                            crate::DictStep::Item(v, _) => {
+                                out.write(v);
+                                return 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
         h_for_iter_rest(st, it, out, pc)
     }
@@ -2514,7 +2795,7 @@ unsafe extern "C" fn h_for_iter_gen(
     // SAFETY: the running thread's interpreter, dormant while the helper
     // runs; the stack slot keeps `g` alive.
     let interp = unsafe { &mut *st.interp.cast_mut() };
-    match interp.gen_fast_next(g, st.snap_gen, 0, st.maybe_dead) {
+    match interp.gen_native_next(g, st.snap_gen, st.maybe_dead, st.depth_cell, 0) {
         crate::gen_fast::GenNext::Yielded(v) => {
             // SAFETY: the slot above the iterator is free.
             unsafe { out.write(v) };
@@ -3487,7 +3768,7 @@ unsafe fn lazy_step(
     unsafe {
         let interp = &mut *st.interp.cast_mut();
         if crate::gen_fast::may_step(gen) {
-            match interp.gen_fast_next(gen, st.snap_gen, 0, st.maybe_dead) {
+            match interp.gen_native_next(gen, st.snap_gen, st.maybe_dead, st.depth_cell, 0) {
                 GenNext::Yielded(v) => return LazyGen::Yielded(v),
                 GenNext::Exhausted(r) => return LazyGen::Returned(r),
                 GenNext::Declined | GenNext::Partial => {}
@@ -3987,7 +4268,41 @@ unsafe extern "C" fn h_for_iter_rest(
                 unsafe { out.write(v) };
                 return 1;
             }
+            // `enumerate(gen)` and a two-source `zip` over a generator, as
+            // `h_for_iter_pair` steps them, here with the pair's tuple.
+            if !st.sw.is_null() {
+                // SAFETY: as above.
+                let interp = unsafe { &mut *st.interp.cast_mut() };
+                if let Some((a, b)) =
+                    interp.lazy_gen_pair(l, st.snap_gen, st.maybe_dead, st.depth_cell)
+                {
+                    // SAFETY: the slot above the iterator is free.
+                    unsafe { out.write(Object::new_tuple_array([a, b])) };
+                    return 1;
+                }
+                // `chain` and `islice` over a generator, likewise.
+                if let Some(v) = interp.lazy_gen_one(l, st.snap_gen, st.maybe_dead, st.depth_cell) {
+                    // SAFETY: as above.
+                    unsafe { out.write(v) };
+                    return 1;
+                }
+            }
             // SAFETY: as above.
+            return unsafe { for_iter_lane(st, it, pc) };
+        }
+        // A file (its own iterator): a line waiting in its buffer in place,
+        // and a line read that may fill the buffer (and so run a signal
+        // handler) through the lane.
+        Object::File(f) => {
+            if let Some(line) = f.next_line_pure(None) {
+                if !f.binary {
+                    f.telling.set(false);
+                }
+                // SAFETY: the slot above the iterator is free.
+                unsafe { out.write(line) };
+                return 1;
+            }
+            // SAFETY: the caller's contract.
             return unsafe { for_iter_lane(st, it, pc) };
         }
         _ => return 3,
@@ -4217,7 +4532,7 @@ unsafe extern "C" fn h_for_iter_rest(
 /// `out` and its first above it (as the unpacking leaves them, no tuple
 /// built), anything else declined untouched (the unfused helpers take it,
 /// exhaustion included).
-unsafe extern "C" fn h_for_iter_pair(it: *mut Object, out: *mut Object) -> u32 {
+unsafe extern "C" fn h_for_iter_pair(st: *mut State, it: *mut Object, out: *mut Object) -> u32 {
     // SAFETY: the code passes an initialized slot with two free ones above
     // it; nothing below runs code while the iterator is borrowed.
     unsafe {
@@ -4272,6 +4587,16 @@ unsafe extern "C" fn h_for_iter_pair(it: *mut Object, out: *mut Object) -> u32 {
             }
             Object::LazyIter(l) => match crate::seqiter::lazy_pure_pair(l) {
                 Some(pair) => pair,
+                // `enumerate(gen)`, or a `zip` with a generator among its
+                // two sources: each generator stepped by its native code.
+                None if !(*st).sw.is_null() => {
+                    let s = &mut *st;
+                    let interp = &mut *s.interp.cast_mut();
+                    match interp.lazy_gen_pair(l, s.snap_gen, s.maybe_dead, s.depth_cell) {
+                        Some(pair) => pair,
+                        None => return 3,
+                    }
+                }
                 None => return 3,
             },
             _ => return 3,
@@ -5135,6 +5460,48 @@ unsafe extern "C" fn h_container(
     unsafe {
         let st = &mut *st;
         let (ins, len) = (*ins, len as usize);
+        // `import m` and `from m import x` of a module that's already
+        // imported (a function-level import, on every call but the first):
+        // the module from the import cache, the name from its dict. Any
+        // other import is the interpreter's. (Not in an inlined body, whose
+        // builtins aren't this frame's to check.)
+        if ins.op == OpCode::ImportName {
+            if can_raise == 0 || len < 2 {
+                return u64::MAX;
+            }
+            let frame = &*st.frame;
+            let Some(name) = (&*code).names.get(ins.arg as usize) else {
+                return u64::MAX;
+            };
+            let (level, fromlist) = (&*st.stack.add(len - 2), &*st.stack.add(len - 1));
+            let Some(module) = (*st.interp).cached_import(frame, name, level, fromlist) else {
+                return u64::MAX;
+            };
+            // (The level is an int; the from-list a constant.)
+            crate::drop_hot_at(st.stack.add(len - 1));
+            st.stack.add(len - 2).write(module);
+            return len as u64 - 1;
+        }
+        if ins.op == OpCode::ImportFrom {
+            if len == 0 || len >= st.cap {
+                return u64::MAX;
+            }
+            let (Object::Module(m), Some(name)) = (
+                &*st.stack.add(len - 1),
+                (&*code).names.get(ins.arg as usize),
+            ) else {
+                return u64::MAX;
+            };
+            let found = m
+                .dict
+                .peek()
+                .and_then(|d| d.get(&crate::object::StrKey(name)).map(crate::clone_hot));
+            let Some(v) = found else {
+                return u64::MAX;
+            };
+            st.stack.add(len).write(v);
+            return len as u64 + 1;
+        }
         if ins.op == OpCode::LoadSpecial {
             return Interpreter::core_load_special(&*code, ins, pc as usize, st.stack, len, st.cap)
                 .map_or(u64::MAX, |n| n as u64);
@@ -5968,25 +6335,28 @@ unsafe extern "C" fn h_compare_bool(at: *mut Object, arg: u32) -> u32 {
     }
 }
 
-/// `COMPARE_OP` with oparg `arg` over the plain instance and the operand
-/// at `at` and above it, whose class's comparison method (see
+/// A `COMPARE_OP` over the plain instance and the operand at `at` and
+/// above it, whose class's comparison method `f` (see
 /// `Interpreter::compare_instance_dunder`) is a warm pure leaf: evaluated
 /// in place, `0` or `1` its `bool` answer (the operands released), anything
 /// else declined untouched (another answer, `NotImplemented` among them,
 /// leaves the comparison to the core loop, which may run the method again:
 /// a pure leaf has no effects).
-unsafe extern "C" fn h_compare_dunder(st: *const State, at: *mut Object, arg: u32) -> u32 {
-    // SAFETY: the code passes its live state, two initialized stack slots,
-    // and the oparg the compiler emitted (as `compare_op_step` reads it).
+///
+/// # Safety
+///
+/// `st` is a live state, and `at` two initialized stack slots.
+unsafe fn compare_leaf(
+    st: *const State,
+    at: *mut Object,
+    f: &Rc<crate::object::PyFunction>,
+) -> u32 {
+    // SAFETY: the caller's contract.
     unsafe {
         let (a, b) = (&*at, &*at.add(1));
         if !droppable(a) || !droppable(b) {
             return 2;
         }
-        let kind: CompareKind = std::mem::transmute((arg & !COMPARE_OP_TO_BOOL_FLAG) as u8);
-        let Some(f) = Interpreter::compare_instance_dunder(a, b, kind) else {
-            return 2;
-        };
         // SAFETY: GIL-serialized raw read of the function's code cell.
         let code = &*f.code.as_ptr();
         if code.arg_count != 2
@@ -5997,7 +6367,7 @@ unsafe extern "C" fn h_compare_dunder(st: *const State, at: *mut Object, arg: u3
             return 2;
         }
         let ptrs = [at.cast_const(), at.add(1).cast_const()];
-        match (*(*st).interp).pure_leaf_eval::<false, false>(code, &f, &ptrs) {
+        match (*(*st).interp).pure_leaf_eval::<false, false>(code, f, &ptrs) {
             Some(Object::Bool(r)) => {
                 crate::drop_hot_at(at.add(1));
                 crate::drop_hot_at(at);
@@ -7699,6 +8069,15 @@ pub(crate) struct AttrSite {
     /// Whether the site has read a class's attribute through an instance
     /// (see `inst_class_attr_quick`): the slow paths try that first.
     class_attr: Cell<bool>,
+    /// Whether the site has read through a data descriptor written in
+    /// Python (see [`descr_get`]): a miss tries that first.
+    descr: Cell<bool>,
+    /// The class version under which the site's read last turned out not
+    /// to be such a descriptor's.
+    no_descr: Cell<u64>,
+    /// A receiver's class's native `__getattribute__` hook, for the
+    /// class's version (see [`native_hook`]).
+    hook: std::cell::RefCell<Option<(u64, Rc<crate::object::BuiltinFn>)>>,
     /// A class receiver's attribute the site read last (see
     /// [`type_attr_read`]).
     type_attr: std::cell::RefCell<Option<TypeMemo>>,
@@ -8000,6 +8379,29 @@ unsafe fn attr_miss(st: *mut State, site: &AttrSite, at: *mut Object, local: boo
             }
             _ => None,
         };
+        // An instance of a class with a `__getattribute__` of its own: no
+        // cached read applies, and the full handler runs the hook.
+        if let Object::Instance(inst) = &*at {
+            if !site.direct.is_null() && !Interpreter::default_getattribute(inst.cls_raw()) {
+                // (A `threading.local`'s native hook, called in place.)
+                if let Some(hook) = native_hook(site, inst.cls_raw()) {
+                    let r = native_hook_call(st, site, at, local, hook);
+                    if r != CALL_DECLINED {
+                        return r;
+                    }
+                }
+                let (pc, slot) = (u64::from(site.pc), u64::from(site.slot));
+                return h_property(st, site.code, pc, slot, at, u64::from(local), site.direct);
+            }
+            // A site that has read through a Python data descriptor: its
+            // `__get__` first.
+            if site.descr.get() {
+                let r = descr_get(st, site, at, local);
+                if r != CALL_DECLINED {
+                    return r;
+                }
+            }
+        }
         if let Some(v) = attr_miss_quick(site, &*at, local, running)
             .or_else(|| builtin_attr_read(st, site, &*at, local))
         {
@@ -8035,7 +8437,177 @@ unsafe fn attr_miss(st: *mut State, site: &AttrSite, at: *mut Object, local: boo
         if site.direct.is_null() {
             return CALL_DECLINED;
         }
+        // (Once a class version: a site that reads no descriptor asks
+        // again only when the class changes.)
+        if let Object::Instance(inst) = &*at {
+            let ver = inst.cls_raw().attr_version.get();
+            if !site.descr.get() && site.no_descr.get() != ver {
+                let r = descr_get(st, site, at, local);
+                if r != CALL_DECLINED {
+                    site.descr.set(true);
+                    return r;
+                }
+                site.no_descr.set(ver);
+            }
+        }
         h_property(st, site.code, pc, slot, at, u64::from(local), site.direct)
+    }
+}
+
+/// The native `__getattribute__` hook `cls` answers reads with (see
+/// `stdlib::local_native::is_hook`), where no `__getattr__` waits behind
+/// it: from the site's memo for the class's version, else looked up and
+/// remembered.
+fn native_hook(
+    site: &AttrSite,
+    cls: &crate::types::TypeObject,
+) -> Option<Rc<crate::object::BuiltinFn>> {
+    let ver = cls.attr_version.get();
+    if ver == 0 {
+        return None;
+    }
+    if let Ok(memo) = site.hook.try_borrow() {
+        if let Some((v, b)) = memo.as_ref() {
+            if *v == ver {
+                return Some(b.clone());
+            }
+        }
+    }
+    if crate::object::exotic_str_keys_possible()
+        || cls.dunder(crate::types::Dunder::GetAttr).present()
+    {
+        return None;
+    }
+    let Some(Object::Builtin(b)) = cls.lookup("__getattribute__") else {
+        return None;
+    };
+    if !crate::stdlib::local_native::is_hook(&b, false) {
+        return None;
+    }
+    if let Ok(mut memo) = site.hook.try_borrow_mut() {
+        *memo = Some((ver, b.clone()));
+    }
+    Some(b)
+}
+
+/// [`attr_miss`] for a receiver whose class's `__getattribute__` is the
+/// native hook `hook` ([`native_hook`]): the hook called as
+/// `hook(receiver, name)` on operands written from the site's slot, with
+/// the activation published as a builtin's call publishes it
+/// ([`native_body_here`]: the hook may run Python code, a subclass's
+/// `__init__` on a thread's first touch). `0` the result at the site's
+/// slot, `CALL_DECLINED` untouched, a status otherwise.
+///
+/// # Safety
+///
+/// As [`descr_get`]'s.
+#[inline(never)]
+unsafe fn native_hook_call(
+    st: *mut State,
+    site: &AttrSite,
+    at: *mut Object,
+    local: bool,
+    hook: Rc<crate::object::BuiltinFn>,
+) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let st = &mut *st;
+        // (An inlined body's site numbers its pc and slots its own way.)
+        if st.sw.is_null() || !std::ptr::eq(Rc::as_ptr(&(*st.frame).code), site.code) {
+            return CALL_DECLINED;
+        }
+        let code = &*site.code;
+        let (pc, slot) = (site.pc as usize, site.slot as usize);
+        let Some(name @ Object::Str(_)) = (&*site.ext)
+            .name_objs
+            .get(code.instructions[pc].arg as usize)
+        else {
+            return CALL_DECLINED;
+        };
+        let base = st.stack.add(slot);
+        // An entry of the namespace the thread has already: read in
+        // place, nothing run.
+        if local || droppable(&*at) {
+            if let Some(v) = crate::stdlib::local_native::getattribute_fast(&*at, name) {
+                if local {
+                    base.write(v);
+                } else {
+                    crate::drop_hot(std::mem::replace(&mut *at, v));
+                }
+                return 0;
+            }
+        }
+        // The call's operands from the site's slot: the hook, the
+        // receiver in its self slot (a local's copied, the stack's moved
+        // up) and the name.
+        if local {
+            base.add(1).write(crate::clone_hot(&*at));
+        } else {
+            base.add(1).write(base.read());
+        }
+        let f = Rc::as_ptr(&hook);
+        base.write(Object::Builtin(hook));
+        base.add(2).write(name.clone());
+        native_body_here(st, pc, slot, slot + 3, f, false)
+    }
+}
+
+/// [`attr_miss`] for a receiver whose class answers the site's name with
+/// a data descriptor written in Python (see
+/// `Interpreter::descr_getter`): its `__get__(descr, instance, owner)`
+/// called directly ([`dunder_call`]), the result at the site's slot. `0`
+/// done, `CALL_DECLINED` declined untouched, a status otherwise (as
+/// [`h_property`]'s).
+///
+/// # Safety
+///
+/// As [`attr_miss`]'s, at a site with a direct-call cache (nothing
+/// virtual lies below its slot, and three slots are free above the
+/// receiver's: see [`stack_need`]).
+#[inline(never)]
+unsafe fn descr_get(st: *mut State, site: &AttrSite, at: *mut Object, local: bool) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let st = &mut *st;
+        let Object::Instance(inst) = &*at else {
+            return CALL_DECLINED;
+        };
+        // (An inlined body's site numbers its pc and slots its own way.)
+        if st.sw.is_null() || !std::ptr::eq(Rc::as_ptr(&(*st.frame).code), site.code) {
+            return CALL_DECLINED;
+        }
+        let code = &*site.code;
+        let (pc, slot) = (site.pc as usize, site.slot as usize);
+        let Some((descr, get)) = Interpreter::descr_getter(code, inst, code.instructions[pc].arg)
+        else {
+            return CALL_DECLINED;
+        };
+        let owner = Object::Type(inst.cls());
+        // The call's operands from the site's slot: the descriptor, the
+        // receiver (a local's copied, the stack's moved up) and its class.
+        let base = st.stack.add(slot);
+        if local {
+            base.add(1).write(crate::clone_hot(&*at));
+        } else {
+            base.add(1).write(base.read());
+        }
+        base.write(Object::Instance(descr));
+        base.add(2).write(owner);
+        let r = dunder_call(st, pc, slot, 3, get, site.direct, None);
+        if r == CALL_DECLINED {
+            drop(base.add(2).read());
+            let recv = base.add(1).read();
+            drop(base.read());
+            if local {
+                drop(recv);
+            } else {
+                base.write(recv);
+            }
+        } else if r == 0 && (*st.maybe_dead).get() {
+            // (A receiver only the read held died with the call.)
+            return left_marked(st, site.pc, slot + 1);
+        }
+        r
     }
 }
 
@@ -8190,7 +8762,9 @@ unsafe extern "C" fn attr_local_slow(st: *mut State, site: *const AttrSite) -> u
             }
             // (A class attribute the site has read before.)
             Object::Instance(inst) => {
-                if let Some(v) = class_poly_hit(site, inst) {
+                if let Some(v) =
+                    class_poly_hit(site, inst).or_else(|| instance_class_read(site, inst))
+                {
                     (*st).stack.add(slot).write(v);
                     return 0;
                 }
@@ -8213,10 +8787,16 @@ unsafe extern "C" fn attr_local_slow(st: *mut State, site: *const AttrSite) -> u
         }
         let r = attr_miss(st, site, at, true);
         if r == 0 {
-            if let Object::Instance(inst) = &*at {
-                if !class_poly_known(site, inst) {
-                    class_poly_note(site, inst, &*(*st).stack.add(slot));
+            match &*at {
+                Object::Instance(inst) => {
+                    if !class_poly_known(site, inst) {
+                        class_poly_note(site, inst, &*(*st).stack.add(slot));
+                    }
                 }
+                Object::Type(cls) if type_name_site(site) => {
+                    type_name_note(site, cls, &*(*st).stack.add(slot));
+                }
+                _ => {}
             }
         }
         if r != CALL_DECLINED {
@@ -8483,10 +9063,88 @@ fn type_attr_memo(site: &AttrSite, cls: &Rc<crate::types::TypeObject>) -> Option
     let (p, ver) = (Rc::as_ptr(cls) as usize, cls.attr_version.get());
     let memo = site.type_attr.try_borrow().ok()?;
     match memo.as_ref()? {
-        m if m.cls == p && m.ver == ver && ver != 0 && !matches!(*m.val, Object::Unbound) => {
+        m if m.cls == p
+            && m.ver == ver
+            && ver != 0
+            && m.meta == meta_version(cls)
+            && !matches!(*m.val, Object::Unbound) =>
+        {
             Some(crate::clone_hot(&m.val))
         }
         _ => None,
+    }
+}
+
+/// `inst.__class__` at `site`, where `object`'s descriptor is what answers
+/// (no `__class__` or `__getattribute__` anywhere on the class, which isn't
+/// a builtin's, and no extension body): the instance's class. This is
+/// every `self.__class__`, and both sides of the `other.__class__ is
+/// self.__class__` a dataclass's comparisons open with.
+fn instance_class_read(site: &AttrSite, inst: &Rc<crate::types::PyInstance>) -> Option<Object> {
+    // SAFETY: the site's code is live (the caller's code runs it).
+    let code = unsafe { &*site.code };
+    let name = code
+        .names
+        .get(code.instructions[site.pc as usize].arg as usize)?;
+    if name != "__class__" {
+        return None;
+    }
+    let cls = inst.cls_raw();
+    (inst.c_body.get() == 0 && !cls.flags.is_builtin && cls.class_attr_is_plain())
+        .then(|| Object::Type(inst.cls()))
+}
+
+/// `x.__class__` of the value at `src` into the stack slot `dst` (the same
+/// slot for a receiver on the stack, whose reference goes by a plain
+/// decrement), where [`instance_class_read`]'s conditions hold: `0` done,
+/// anything else declined untouched.
+unsafe extern "C" fn h_class_read(dst: *mut Object, src: *const Object) -> u32 {
+    // SAFETY: the code passes an initialized value and a stack slot that is
+    // free, or the value's own.
+    unsafe {
+        let Object::Instance(inst) = &*src else {
+            return 1;
+        };
+        let cls = inst.cls_raw();
+        if inst.c_body.get() != 0 || cls.flags.is_builtin || !cls.class_attr_is_plain() {
+            return 1;
+        }
+        let ty = Object::Type(inst.cls());
+        if std::ptr::eq(dst.cast_const(), src) && !plain_release(&*src) {
+            // (The receiver's last reference: its release is the helper's.)
+            drop(ty);
+            return 1;
+        }
+        dst.write(ty);
+        0
+    }
+}
+
+/// Whether `site` reads one of the names every class answers with a string
+/// of its own (`cls.__name__`, as logging, reprs and error messages read
+/// it), which [`type_name_note`] memoizes. (Not `__qualname__`: assigning
+/// it leaves the class's version where it was.)
+fn type_name_site(site: &AttrSite) -> bool {
+    // SAFETY: the site's code is live (the caller's code runs it).
+    let code = unsafe { &*site.code };
+    code.names
+        .get(code.instructions[site.pc as usize].arg as usize)
+        .is_some_and(|name| matches!(name.as_str(), "__name__" | "__module__"))
+}
+
+/// Remember what the full lookup just read for `cls.__name__` (or
+/// `__module__`) at `site`: a string, of a class whose
+/// metaclass is `type` itself, held for the class's current version (any
+/// assignment to a class attribute, these among them, moves it).
+fn type_name_note(site: &AttrSite, cls: &Rc<crate::types::TypeObject>, value: &Object) {
+    let ver = cls.attr_version.get();
+    if ver == 0 || !matches!(value, Object::Str(_)) || !cls.metaclass_is_type() {
+        return;
+    }
+    if let Ok(mut memo) = site.type_attr.try_borrow_mut() {
+        *memo = Some(
+            TypeMemo::owned(Rc::as_ptr(cls) as usize, ver, value.clone()).under(meta_version(cls)),
+        );
     }
 }
 
@@ -8499,6 +9157,9 @@ fn type_attr_memo(site: &AttrSite, cls: &Rc<crate::types::TypeObject>) -> Option
 pub(crate) struct TypeMemo {
     cls: usize,
     ver: u64,
+    /// For a class's own read, its metaclass's version (see
+    /// [`meta_version`]), which the class's doesn't follow.
+    meta: u64,
     val: std::mem::ManuallyDrop<Object>,
     owned: bool,
 }
@@ -8508,10 +9169,26 @@ impl TypeMemo {
         Self {
             cls,
             ver,
+            meta: 0,
             val: std::mem::ManuallyDrop::new(val),
             owned: true,
         }
     }
+
+    /// The memo for a class's own read, under its metaclass's version.
+    fn under(mut self, meta: u64) -> Self {
+        self.meta = meta;
+        self
+    }
+}
+
+/// The attribute version of `cls`'s metaclass (`0` without one): a class's
+/// own read (`cls.name`) asks the metaclass first, so what a site
+/// remembers of one stands while this and the class's version do.
+#[inline]
+fn meta_version(cls: &crate::types::TypeObject) -> u64 {
+    // SAFETY: GIL-serialized raw read; the reference ends with the read.
+    unsafe { (*cls.metaclass.as_ptr()).as_ref() }.map_or(0, |m| m.attr_version.get())
 }
 
 impl Drop for TypeMemo {
@@ -8525,9 +9202,10 @@ impl Drop for TypeMemo {
 
 fn type_attr_read(site: &AttrSite, cls: &Rc<crate::types::TypeObject>) -> Option<Object> {
     let (p, ver) = (Rc::as_ptr(cls) as usize, cls.attr_version.get());
+    let meta = meta_version(cls);
     if let Ok(memo) = site.type_attr.try_borrow() {
         if let Some(m) = memo.as_ref() {
-            if m.cls == p && m.ver == ver && ver != 0 {
+            if m.cls == p && m.ver == ver && ver != 0 && m.meta == meta {
                 // (`Unbound`: a read this path declined under that version.)
                 return (!matches!(*m.val, Object::Unbound)).then(|| crate::clone_hot(&m.val));
             }
@@ -8536,12 +9214,12 @@ fn type_attr_read(site: &AttrSite, cls: &Rc<crate::types::TypeObject>) -> Option
     if ver == 0 || crate::object::exotic_str_keys_possible() {
         return None;
     }
-    let v = type_attr_resolve(site, cls, p, ver);
+    let v = type_attr_resolve(site, cls, p, ver, meta);
     // A declined read (a property, a bound class method) is remembered
     // too, so that the site's later misses skip the lookups.
     if v.is_none() {
         if let Ok(mut memo) = site.type_attr.try_borrow_mut() {
-            *memo = Some(TypeMemo::owned(p, ver, Object::Unbound));
+            *memo = Some(TypeMemo::owned(p, ver, Object::Unbound).under(meta));
         }
     }
     v
@@ -8555,6 +9233,7 @@ fn type_attr_resolve(
     cls: &Rc<crate::types::TypeObject>,
     p: usize,
     ver: u64,
+    meta_ver: u64,
 ) -> Option<Object> {
     // SAFETY: the site's code is live (the caller's code runs it).
     let code = unsafe { &*site.code };
@@ -8602,7 +9281,7 @@ fn type_attr_resolve(
             _ => return None,
         };
         if let Ok(mut memo) = site.type_attr.try_borrow_mut() {
-            *memo = Some(TypeMemo::owned(p, ver, b.clone()));
+            *memo = Some(TypeMemo::owned(p, ver, b.clone()).under(meta_ver));
         }
         return Some(b);
     } else if name.starts_with("__") && !dunder_memo_ok(name) {
@@ -8627,7 +9306,7 @@ fn type_attr_resolve(
     // the classes that hold them.
     if let b @ Object::Builtin(_) = v {
         if let Ok(mut memo) = site.type_attr.try_borrow_mut() {
-            *memo = Some(TypeMemo::owned(p, ver, b.clone()));
+            *memo = Some(TypeMemo::owned(p, ver, b.clone()).under(meta_ver));
         }
         return Some(b);
     }
@@ -8640,18 +9319,24 @@ fn type_attr_resolve(
             | Object::Str(_)
             | Object::Bytes(_)
     );
-    // A plain function (a class's read returns it as it is), or an
-    // instance of the class itself that isn't a descriptor (an `Enum`
-    // member; adding a `__get__` would move this class's version):
+    // A plain function (a class's read returns it as it is), an instance
+    // of the class itself that isn't a descriptor (an `Enum` member;
+    // adding a `__get__` would move this class's version), or a builtin
+    // container, which is never one (an enum class's `_member_map_`):
     // borrowed, so the memo never keeps a replaced one alive.
     let v = match v {
         v if plain => {
             if let Ok(mut memo) = site.type_attr.try_borrow_mut() {
-                *memo = Some(TypeMemo::owned(p, ver, v.clone()));
+                *memo = Some(TypeMemo::owned(p, ver, v.clone()).under(meta_ver));
             }
             return Some(v);
         }
         f @ Object::Function(_) => f,
+        c @ (Object::Dict(_)
+        | Object::List(_)
+        | Object::Tuple(_)
+        | Object::Set(_)
+        | Object::FrozenSet(_)) => c,
         Object::Instance(i)
             if std::ptr::eq(i.cls_raw(), Rc::as_ptr(cls))
                 && !name.starts_with("__")
@@ -8667,6 +9352,7 @@ fn type_attr_resolve(
         *memo = Some(TypeMemo {
             cls: p,
             ver,
+            meta: meta_ver,
             val: std::mem::ManuallyDrop::new(borrowed),
             owned: false,
         });
@@ -8781,13 +9467,25 @@ unsafe extern "C" fn attr_stack_slow(st: *mut State, site: *const AttrSite) -> u
             }
             // (A class attribute the site has read before.)
             Object::Instance(inst) => {
-                let v = class_poly_hit(site, inst).or_else(|| {
-                    site.class_attr.get().then(|| {
-                        let (code, ext) = (&*site.code, &*site.ext);
-                        crate::inst_class_attr_quick(code, ext, inst, &*at, site.pc as usize)
-                    })?
-                });
+                let v = class_poly_hit(site, inst)
+                    .or_else(|| instance_class_read(site, inst))
+                    .or_else(|| {
+                        site.class_attr.get().then(|| {
+                            let (code, ext) = (&*site.code, &*site.ext);
+                            crate::inst_class_attr_quick(code, ext, inst, &*at, site.pc as usize)
+                        })?
+                    });
                 if let Some(v) = v {
+                    if plain_release(&*at) {
+                        at.write(v);
+                        return 0;
+                    }
+                    drop(v);
+                }
+            }
+            // (A class's name, as the site read it before.)
+            Object::Type(cls) => {
+                if let Some(v) = type_attr_memo(site, cls) {
                     if plain_release(&*at) {
                         at.write(v);
                         return 0;
@@ -8814,12 +9512,23 @@ unsafe extern "C" fn attr_stack_slow(st: *mut State, site: *const AttrSite) -> u
                 Object::Instance(inst) if !class_poly_known(site, inst) => Some(inst.clone()),
                 _ => None,
             };
+            // (Likewise a class whose name the site is about to learn.)
+            let named = match &*at {
+                Object::Type(cls) if type_name_site(site) => Some(cls.clone()),
+                _ => None,
+            };
             let r = attr_miss(st, site, at, false);
             if let (0, Some(inst)) = (r, &recv) {
                 class_poly_note(site, inst, &*at);
             }
+            if let (0, Some(cls)) = (r, &named) {
+                type_name_note(site, cls, &*at);
+            }
             if let Some(inst) = recv {
                 (*(*st).interp).release_hot(Object::Instance(inst));
+            }
+            if let Some(cls) = named {
+                (*(*st).interp).release_hot(Object::Type(cls));
             }
             r
         };
@@ -10161,7 +10870,15 @@ unsafe extern "C" fn h_binop_dunder(
             Object::Instance(_) => cls.clone(),
             b => crate::builtins::class_of(b),
         };
-        dunder_call(st, pc, slot, 2, f, site, Some((op, inplace, &cls, &right)))
+        dunder_call(
+            st,
+            pc,
+            slot,
+            2,
+            f,
+            site,
+            Some(records::MethodOp::Binary(op, inplace, &cls, &right)),
+        )
     }
 }
 
@@ -10244,8 +10961,8 @@ unsafe extern "C" fn h_slice_dunder(
 
 /// The `n` (at most three) operands from stack slot `slot` up, as the
 /// instruction at `pc` leaves them, called as `f(*operands)` for a class's
-/// Python special method `f` (an instance operator's, `binop` its
-/// operator; see `InlineAct::binop`): a warm pure leaf evaluated in place,
+/// Python special method `f` (an instance operator's, `op` its
+/// operator; see `InlineAct::op`): a warm pure leaf evaluated in place,
 /// as the core loop's arms evaluate one, any other function through a
 /// direct call ([`direct_call`]); the result at `slot`. A callee without
 /// native code declines, and warms as a compiled caller's switched call
@@ -10266,19 +10983,16 @@ unsafe fn dunder_call(
     n: usize,
     f: Rc<crate::object::PyFunction>,
     site: *mut DirectSite,
-    binop: Option<(
-        BinOpKind,
-        bool,
-        &Rc<crate::types::TypeObject>,
-        &Rc<crate::types::TypeObject>,
-    )>,
+    op: records::Op<'_>,
 ) -> u32 {
     debug_assert!((1..=3).contains(&n));
     // SAFETY: the caller's contract.
     unsafe {
         let at = st.stack.add(slot);
-        let not_implemented = |st: &mut State, v: &Object| match binop {
-            Some((op, inplace, a, b)) if v.is_same(&crate::vm_singletons::not_implemented()) => {
+        let not_implemented = |st: &mut State, v: &Object| match op {
+            Some(records::MethodOp::Binary(op, inplace, a, b))
+                if v.is_same(&crate::vm_singletons::not_implemented()) =>
+            {
                 st.len = slot;
                 st.pc = pc + 1;
                 st.err = Some(crate::binop_type_error(op, inplace, a, b));
@@ -10318,7 +11032,7 @@ unsafe fn dunder_call(
             at.add(k + 1).write(at.add(k).read());
         }
         at.write(Object::Function(f));
-        match direct_call_out(st, pc, slot, slot + n + 1, &mut *site, binop) {
+        match direct_call_out(st, pc, slot, slot + n + 1, &mut *site, op) {
             None => {
                 let f = at.read();
                 for k in 0..n {
@@ -11044,15 +11758,10 @@ unsafe fn direct_call_out(
     start: usize,
     len: usize,
     site: &mut DirectSite,
-    binop: Option<(
-        BinOpKind,
-        bool,
-        &Rc<crate::types::TypeObject>,
-        &Rc<crate::types::TypeObject>,
-    )>,
+    op: records::Op<'_>,
 ) -> Option<u32> {
     // SAFETY: the caller's contract.
-    unsafe { direct_call::<false>(st, pc, start, len, site, binop, None) }
+    unsafe { direct_call::<false>(st, pc, start, len, site, op, None) }
 }
 
 /// The `CALL` at `pc` (its operands from `start` up a `len`-deep stack) of
@@ -11063,8 +11772,8 @@ unsafe fn direct_call_out(
 /// without the core loop's switch back. `Some(0)` leaves the result at
 /// `start`, `Some(RELOAD)` leaves the rest to the core loop (the switch's
 /// state synced), `None` touched nothing. An instance operator's method
-/// (`binop`) that leaves the direct return to the core loop carries the
-/// operator, whose `TypeError` its `NotImplemented` becomes there. A
+/// (`op`) that leaves the direct return to the core loop carries the
+/// operator, which settles its result there (see [`crate::MethodOp`]). A
 /// `functools.lru_cache` miss's function takes its store (`lru`, left in
 /// place by `None`) to its activation.
 #[inline(always)]
@@ -11074,12 +11783,7 @@ unsafe fn direct_call<const CALL: bool>(
     start: usize,
     len: usize,
     site: &mut DirectSite,
-    binop: Option<(
-        BinOpKind,
-        bool,
-        &Rc<crate::types::TypeObject>,
-        &Rc<crate::types::TypeObject>,
-    )>,
+    op: records::Op<'_>,
     lru: Option<&mut Option<crate::stdlib::functools_mod::LruPending>>,
 ) -> Option<u32> {
     // SAFETY: `h_call`'s contract, with a non-null switch.
@@ -11245,7 +11949,7 @@ unsafe fn direct_call<const CALL: bool>(
             cells,
             native,
             nested,
-            binop,
+            op,
             lru,
         )
     }
@@ -11256,7 +11960,7 @@ unsafe fn direct_call<const CALL: bool>(
 /// `fp` running `code_rc`, its checks passed: the callee bound on the
 /// level's record ([`records::enter`]: its arguments as `args` says, its
 /// cells when `cells`), then run through its native body `native` from its
-/// start ([`records::run`]). `nested` is the direct-call depth, and `binop`
+/// start ([`records::run`]). `nested` is the direct-call depth, and `op`
 /// an instance operator's (see [`direct_call`]). `None` touched nothing.
 ///
 /// # Safety
@@ -11276,7 +11980,7 @@ unsafe fn direct_enter(
     cells: bool,
     native: &Native,
     nested: *mut records::DirectRec,
-    binop: records::Binop<'_>,
+    op: records::Op<'_>,
     lru: Option<&mut Option<crate::stdlib::functools_mod::LruPending>>,
 ) -> Option<u32> {
     // SAFETY: the caller's contract.
@@ -11298,7 +12002,7 @@ unsafe fn direct_enter(
         if !bound {
             return None;
         }
-        Some(records::run(st, nested, native, binop))
+        Some(records::run(st, nested, native, op))
     }
 }
 
@@ -11331,7 +12035,7 @@ unsafe fn run_pushed_directly(
         let callee = sw.cur;
         let top = inl.last_mut()?;
         if top.gen.is_some()
-            || top.binop.is_some()
+            || top.op.is_some()
             || top.discard
             || top.direct
             || !std::ptr::eq(&raw const *top.frame, callee)
@@ -11452,12 +12156,7 @@ unsafe fn direct_done<const PUSHED: bool>(
     callee: *mut crate::Frame,
     depth: usize,
     saved_last: *mut usize,
-    binop: Option<(
-        BinOpKind,
-        bool,
-        &Rc<crate::types::TypeObject>,
-        &Rc<crate::types::TypeObject>,
-    )>,
+    op: records::Op<'_>,
     status: u32,
     cst: &mut State,
 ) -> u32 {
@@ -11488,11 +12187,11 @@ unsafe fn direct_done<const PUSHED: bool>(
                         .last()
                         .is_some_and(|a| a.direct && std::ptr::eq(&raw const *a.frame, callee)))
         );
-        // The activation goes on as any other (see `InlineAct::binop`).
+        // The activation goes on as any other (see `InlineAct::op`).
         let leave = |a: &mut crate::InlineAct| {
             a.direct = false;
-            if let Some((op, inplace, l, r)) = binop {
-                a.binop = Some((op, inplace, l.clone(), r.clone()));
+            if let Some(op) = op {
+                a.op = Some(op.owned());
             }
         };
         if status == DIRECT_RET {
@@ -11564,6 +12263,9 @@ unsafe fn direct_done<const PUSHED: bool>(
                 // error to drop.)
                 debug_assert!(cst.err.is_none());
                 if sw.pending.is_some() {
+                    if let Some(op) = op {
+                        op_after_reload(st, op);
+                    }
                     return RELOAD;
                 }
                 st.len = start + 1;
@@ -12089,7 +12791,7 @@ unsafe extern "C" fn h_call(
             if let (Object::Generator(g), true) =
                 (&*base.add(start + 2), Interpreter::core_drops_plain())
             {
-                match interp.gen_fast_next(g, st.snap_gen, 0, st.maybe_dead) {
+                match interp.gen_native_next(g, st.snap_gen, st.maybe_dead, st.depth_cell, 0) {
                     crate::gen_fast::GenNext::Yielded(v) => {
                         // The builtin and the generator (the stack's own
                         // slots hold them past the step) leave by plain
@@ -12145,7 +12847,7 @@ unsafe extern "C" fn h_call(
             if let (Object::Generator(g), true) =
                 (&*base.add(start + 2), Interpreter::core_drops_plain())
             {
-                match interp.gen_fast_next(g, st.snap_gen, 0, st.maybe_dead) {
+                match interp.gen_native_next(g, st.snap_gen, st.maybe_dead, st.depth_cell, 0) {
                     crate::gen_fast::GenNext::Yielded(v) => {
                         crate::release_run(base.add(start), 4);
                         base.add(start).write(v);
@@ -12586,6 +13288,10 @@ pub(crate) struct BuiltinSite {
     kernel: Option<Kernel>,
     recv_tag: u8,
     via_call: bool,
+    /// For a leaf whose fast half may decline: whether its whole body may
+    /// then run through the core loop's lane, as an unregistered builtin's
+    /// would (`Some(via_call)`), instead of the full handler.
+    lane: Option<bool>,
 }
 
 /// [`h_call`] at a site settled on a container's or string's leaf method
@@ -12678,6 +13384,21 @@ unsafe extern "C" fn h_call_leaf(
         if let Some(r) = call_leaf_in_place(&mut *st, &*site, pc, len as usize) {
             return r;
         }
+        // A fast half that declined (a write that must flush, a line that
+        // needs the next block): the body through the lane, where it would
+        // have run had it no fast half, not the full handler.
+        if let Some(via_call) = (*site).lane {
+            let whole = BuiltinSite {
+                f: (*site).f,
+                argc: (*site).argc,
+                kind: None,
+                kernel: None,
+                recv_tag: 0,
+                via_call,
+                lane: None,
+            };
+            return h_call_native(st, code, ext, pc, len, &raw const whole);
+        }
         h_call(st, code, ext, pc, len)
     }
 }
@@ -12704,13 +13425,38 @@ unsafe fn call_leaf_in_place(
         let base = s.stack;
         let hit =
             matches!(&*base.add(start), Object::Builtin(b) if std::ptr::eq(Rc::as_ptr(b), site.f));
-        if hit && !s.sw.is_null() {
-            let first = if matches!(&*base.add(start + 1), Object::Unbound) {
-                start + 2
-            } else {
-                start + 1
+        // A bound method of the builtin held in a local (`write = f.write`):
+        // its receiver ahead of the arguments, as bitwise views that are
+        // never dropped.
+        let mut bound = std::mem::ManuallyDrop::new([const { Object::Unbound }; 4]);
+        let bound_args = match (&*base.add(start), &*base.add(start + 1)) {
+            (Object::BoundMethod(bm), Object::Unbound)
+                if site.argc < bound.len()
+                    && !bm.redispatch_descriptor
+                    && matches!(&bm.function, Object::Builtin(b) if std::ptr::eq(Rc::as_ptr(b), site.f)) =>
+            {
+                let slots = bound.as_mut_ptr();
+                slots.write((&raw const bm.receiver).read());
+                std::ptr::copy_nonoverlapping(base.add(start + 2), slots.add(1), site.argc);
+                Some(std::slice::from_raw_parts(
+                    slots.cast_const(),
+                    site.argc + 1,
+                ))
+            }
+            _ => None,
+        };
+        if (hit || bound_args.is_some()) && !s.sw.is_null() {
+            let args = match bound_args {
+                Some(args) => args,
+                None => {
+                    let first = if matches!(&*base.add(start + 1), Object::Unbound) {
+                        start + 2
+                    } else {
+                        start + 1
+                    };
+                    std::slice::from_raw_parts(base.add(first), lenu - first)
+                }
             };
-            let args = std::slice::from_raw_parts(base.add(first), lenu - first);
             let b = &*site.f;
             // (A body that runs no Python code for any arguments, or for
             // scalar ones: as `h_call` and `leaf_builtin_call` run them.)
@@ -13250,12 +13996,11 @@ unsafe extern "C" fn h_call_kw(st: *mut State, code: *const CodeObject, pc: u64,
             _ => interp.core_pure_kw_call(code, pc, ops, argc, st.depth_cell),
         };
         let Some(r) = r else {
-            // A builtin whose keyword call may run Python code (`sorted`
-            // with a `key=` lambda): the core loop's lane for it, the
+            // A native callee whose keyword call may run Python code
+            // (`sorted` with a `key=` lambda, `xs.sort(key=f)`,
+            // `enumerate(xs, start=1)`): the core loop's lane for it, the
             // activation published, the result in place.
-            if matches!((&ops[0], &ops[1]), (Object::Builtin(_), Object::Unbound))
-                && !st.sw.is_null()
-            {
+            if Interpreter::kw_lane_callee(&ops[0], &ops[1]) && !st.sw.is_null() {
                 let frame = &mut *st.frame;
                 frame.stack.set_len(len);
                 frame.pc = pc as u32;
@@ -14123,13 +14868,14 @@ unsafe fn h_send_step(st: &mut State, pc: u64, len: usize) -> Option<u32> {
             return None;
         };
         let interp = &mut *st.interp.cast_mut();
-        let (v, exit) = match interp.gen_fast_next(g, st.snap_gen, 0, st.maybe_dead) {
-            crate::gen_fast::GenNext::Yielded(v) => (v, false),
-            crate::gen_fast::GenNext::Exhausted(v) => (v, true),
-            crate::gen_fast::GenNext::Declined | crate::gen_fast::GenNext::Partial => {
-                return None;
-            }
-        };
+        let (v, exit) =
+            match interp.gen_native_next(g, st.snap_gen, st.maybe_dead, st.depth_cell, 0) {
+                crate::gen_fast::GenNext::Yielded(v) => (v, false),
+                crate::gen_fast::GenNext::Exhausted(v) => (v, true),
+                crate::gen_fast::GenNext::Declined | crate::gen_fast::GenNext::Partial => {
+                    return None;
+                }
+            };
         // The sent `None`'s slot (no drop glue owed).
         st.stack.add(len - 1).write(v);
         let to = pc as usize + 1 + if exit { arg as usize } else { 0 };
@@ -14870,7 +15616,10 @@ pub(crate) mod background {
     /// Jobs handed over and not yet done, and how many there may be: each
     /// waiting job holds its lowered functions, which a burst of compiles
     /// would otherwise pile up (40 at once held 2.4 MB more than compiling
-    /// each in line).
+    /// each in line). Even two at once cost more memory than time: first
+    /// calls retire 0.3% to 0.9% fewer instructions (the code is ready
+    /// sooner), and `go`'s peak footprint is 1.2 MB higher, `tomllib_loads`'s
+    /// 0.4 MB.
     static IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     const MAX_IN_FLIGHT: usize = 1;
 
@@ -16122,6 +16871,8 @@ fn native_op(op: OpCode) -> bool {
             | OpCode::EndSend
             | OpCode::BuildSet
             | OpCode::SetUpdate
+            | OpCode::ImportName
+            | OpCode::ImportFrom
     )
 }
 
@@ -17631,7 +18382,9 @@ impl<'a> Lower<'a> {
             | OpCode::MapAdd
             | OpCode::DictUpdate
             | OpCode::BuildSlice
-            | OpCode::SetUpdate => return self.container(pc),
+            | OpCode::SetUpdate
+            | OpCode::ImportName
+            | OpCode::ImportFrom => return self.container(pc),
             OpCode::BuildSet => return self.build_set(pc, ins.arg as usize),
             OpCode::ContainsOp => return self.contains(pc, ins.arg),
             OpCode::LoadAttr => return self.load_attr(pc, ins.arg),
@@ -20194,24 +20947,27 @@ impl<'a> Lower<'a> {
         if crate::native_site(self.ext, pc) {
             return self.compare_helper(pc, arg, ai, bi);
         }
-        let (Some(a), Some(b)) = (self.operand(ai), self.operand(bi)) else {
-            // A string or other heap constant: through the helper.
-            let other = self.b.create_block();
-            let done = self.b.create_block();
-            self.b.append_block_param(done, types::I8);
-            self.b.ins().jump(other, &[]);
-            self.compare_fallback(pc, arg, ai, bi, other, done);
-            self.b.switch_to_block(done);
-            let r = self.b.block_params(done)[0];
-            self.push(Item::Bool(r));
-            self.set_last(pc);
-            return true;
+        let known = |o: &Option<Opnd>| {
+            o.as_ref()
+                .is_some_and(|o| !matches!(o.kind, Kind::Bool | Kind::None))
         };
-        if matches!(a.kind, Kind::Bool | Kind::None) || matches!(b.kind, Kind::Bool | Kind::None) {
-            let slow = self.exit_with(pc, &[ai, bi], INTERP);
-            self.b.ins().jump(slow, &[]);
-            return false;
-        }
+        let (a, b) = match (self.operand(ai), self.operand(bi)) {
+            (a, b) if known(&a) && known(&b) => (a.expect("known"), b.expect("known")),
+            _ => {
+                // A string or other heap constant, `None` or a `bool`:
+                // through the helper.
+                let other = self.b.create_block();
+                let done = self.b.create_block();
+                self.b.append_block_param(done, types::I8);
+                self.b.ins().jump(other, &[]);
+                self.compare_fallback(pc, arg, ai, bi, other, done);
+                self.b.switch_to_block(done);
+                let r = self.b.block_params(done)[0];
+                self.push(Item::Bool(r));
+                self.set_last(pc);
+                return true;
+            }
+        };
         let ia = self.is_kind(a, Kind::Int, self.tags.int);
         let ib = self.is_kind(b, Kind::Int, self.tags.int);
         let fa = self.is_kind(a, Kind::Float, self.tags.float);
@@ -20472,7 +21228,11 @@ impl<'a> Lower<'a> {
         // step allows; any other step below.
         if fused_pair_at(self.code, pc) {
             let r = self
-                .call(h_for_iter_pair as *const () as usize, &[it, out_slot], true)
+                .call(
+                    h_for_iter_pair as *const () as usize,
+                    &[self.st, it, out_slot],
+                    true,
+                )
                 .expect("returns");
             let pair_b = self.b.create_block();
             let single = self.b.create_block();
@@ -20715,6 +21475,9 @@ impl<'a> Lower<'a> {
             direct,
             cache: SlotCache::default(),
             class_attr: Cell::new(false),
+            descr: Cell::new(false),
+            no_descr: Cell::new(0),
+            hook: std::cell::RefCell::new(None),
             type_attr: std::cell::RefCell::new(None),
             class_poly: Default::default(),
             class_poly_next: Cell::new(0),
@@ -20729,7 +21492,33 @@ impl<'a> Lower<'a> {
         self.attr_sites.push(site);
         // A field of an instance local the site settled on: read in line,
         // its guards falling back on the helper.
+        let class_read = self
+            .code
+            .names
+            .get(self.code.instructions[pc].arg as usize)
+            .is_some_and(|name| name == "__class__");
         let in_line_field = match (item, field.map(FieldSlot::get), self.layout) {
+            // `x.__class__`: the instance's class where `object`'s
+            // descriptor answers ([`h_class_read`]), anything else through
+            // the site's helper.
+            (Item::Local(_) | Item::Mem(_), ..)
+                if class_read && !matches!(item, Item::Mem(s) if s != slot) =>
+            {
+                let helper_block = self.b.create_block();
+                let done = self.b.create_block();
+                let dst = self.slot_addr(slot);
+                let src = match item {
+                    Item::Local(i) => self.local_addr(i),
+                    _ => dst,
+                };
+                let r = self
+                    .call(h_class_read as *const () as usize, &[dst, src], true)
+                    .expect("returns");
+                self.b.ins().brif(r, helper_block, &[], done, &[]);
+                self.b.set_cold_block(helper_block);
+                self.b.switch_to_block(helper_block);
+                Some(done)
+            }
             (Item::Local(i), Some((ver, idx)), Some(l))
                 if !in_line
                     && ver != 0
@@ -21724,6 +22513,23 @@ impl<'a> Lower<'a> {
             Some(_) if in_core => h_site_leaf as *const () as usize,
             Some(_) => return None,
         };
+        // What `Interpreter::builtin_lane` would settle for the builtin
+        // were it not a leaf: a method body the dispatch calls directly or
+        // knows by name, or a function that never looks at its caller's
+        // frame.
+        let lane = match kind {
+            Some(LeafKind::Fast(_)) if f.binds_instance => {
+                if crate::native_call_ic_safe(f.name) {
+                    Some(false)
+                } else {
+                    crate::builtin_method_via_call(f.name).then_some(true)
+                }
+            }
+            Some(LeafKind::Fast(_)) => {
+                crate::builtin_fn_lane_ok(f.name).then(|| crate::builtin_needs_interp(f.name))
+            }
+            _ => None,
+        };
         let site = Box::new(BuiltinSite {
             f: Rc::as_ptr(&f),
             argc,
@@ -21731,6 +22537,7 @@ impl<'a> Lower<'a> {
             kernel,
             recv_tag,
             via_call,
+            lane,
         });
         self.held.push(f);
         let at = std::ptr::from_ref::<BuiltinSite>(&site).cast_mut().cast();

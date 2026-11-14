@@ -3224,14 +3224,57 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
             "object.__getattribute__ must be dispatched via Interpreter::call",
         ))
     }
+    /// `object.__getattribute__(obj, name)`'s leaf half (see
+    /// `leaf_builtins::register_fast`), for the reads the default lookup
+    /// answers without running any code: a plain instance's own attribute
+    /// or `__slots__` member, where the class holds nothing that would
+    /// answer first. This is what a `__getattribute__` override that
+    /// delegates up pays on every read. `None` leaves everything else,
+    /// misses included, to the full lookup.
+    fn object_getattribute_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+        let [Object::Instance(inst), Object::Str(name)] = args else {
+            return None;
+        };
+        let name: &str = name;
+        let cls = inst.cls_raw();
+        // (Dunders may be the object's or a builtin base's own.)
+        if name.starts_with("__") && name.ends_with("__")
+            || inst.native.get().is_some()
+            || inst.c_body.get() != 0
+            || cls.native_kind.get() != 0
+            || cls.is_super_proxy_type()
+            || crate::object::exotic_str_keys_possible()
+        {
+            return None;
+        }
+        match cls.lookup(name) {
+            Some(Object::SlotDescriptor(slot)) if slot.name == name => {
+                inst.slots.try_borrow().ok()?.get(name).cloned().map(Ok)
+            }
+            // Nothing on the class, or something the instance's own
+            // attribute shadows (a function, a plain value).
+            None
+            | Some(
+                Object::Function(_)
+                | Object::Int(_)
+                | Object::Float(_)
+                | Object::Bool(_)
+                | Object::None
+                | Object::Str(_),
+            ) => inst.attr_get_str(name).map(Ok),
+            Some(_) => None,
+        }
+    }
+    let getattribute = Rc::new(BuiltinFn {
+        name: ".object_getattribute",
+        binds_instance: true,
+        call: Box::new(object_getattribute_sentinel),
+        call_kw: None,
+    });
+    crate::leaf_builtins::register_fast(&getattribute, object_getattribute_fast);
     dict.insert(
         DictKey(Object::from_static("__getattribute__")),
-        Object::Builtin(Rc::new(BuiltinFn {
-            name: ".object_getattribute",
-            binds_instance: true,
-            call: Box::new(object_getattribute_sentinel),
-            call_kw: None,
-        })),
+        Object::Builtin(getattribute),
     );
 }
 

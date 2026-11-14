@@ -206,7 +206,7 @@ fn print_or_exit(interp: &mut Interpreter, err: RuntimeError) {
                 }
             };
             let _ = interp.flush_streams();
-            std::process::exit(status);
+            weavepy_vm::vm_singletons::exit_process(status);
         }
         if interp.print_uncaught_exception(exc) {
             return;

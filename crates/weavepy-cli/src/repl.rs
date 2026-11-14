@@ -432,7 +432,11 @@ if hook is not None:
                 .register_source_with_linecache(&code_rc, source, &filename);
         }
         let globals = self.main_module.dict.clone();
-        match self.interpreter.exec_module_in(&code, globals) {
+        let ran = self.interpreter.exec_module_in(&code, globals);
+        if interactive {
+            self.interpreter.flush_streams_quietly();
+        }
+        match ran {
             Ok(_) => Ok(()),
             Err(e) => {
                 self.exit_if_system_exit(&e);

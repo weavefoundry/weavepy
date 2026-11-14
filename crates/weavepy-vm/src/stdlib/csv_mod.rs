@@ -99,6 +99,25 @@ fn key(s: &'static str) -> DictKey {
     DictKey(Object::from_static(s))
 }
 
+/// The reader's own state keys, which every row reads and writes: built
+/// once, where [`key`] allocates a string per use.
+struct ReaderKeys {
+    input_iter: DictKey,
+    cfg: DictKey,
+    line_num: DictKey,
+    fields_live: DictKey,
+}
+
+fn reader_keys() -> &'static ReaderKeys {
+    static KEYS: OnceLock<ReaderKeys> = OnceLock::new();
+    KEYS.get_or_init(|| ReaderKeys {
+        input_iter: key("input_iter"),
+        cfg: key("_cfg"),
+        line_num: key("line_num"),
+        fields_live: key("_fields_live"),
+    })
+}
+
 /// A module-level function taking only positional args.
 fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
@@ -589,6 +608,41 @@ fn read_cfg(dialect: &Object) -> Result<DialectCfg, RuntimeError> {
     })
 }
 
+/// A reader's view of its dialect, packed for the reader's state: a dialect
+/// never changes once built, so a reader reads its attributes once and each
+/// row unpacks this instead. (The line terminator is the writer's business.)
+fn pack_reader_cfg(cfg: &DialectCfg) -> Object {
+    const NONE: u32 = u32::MAX;
+    let mut out = Vec::with_capacity(21);
+    out.extend_from_slice(&(cfg.delimiter as u32).to_le_bytes());
+    out.extend_from_slice(&cfg.quotechar.map_or(NONE, |c| c as u32).to_le_bytes());
+    out.extend_from_slice(&cfg.escapechar.map_or(NONE, |c| c as u32).to_le_bytes());
+    out.extend_from_slice(&cfg.quoting.to_le_bytes());
+    out.push(
+        u8::from(cfg.doublequote) | u8::from(cfg.skipinitialspace) << 1 | u8::from(cfg.strict) << 2,
+    );
+    Object::new_bytes(out)
+}
+
+/// [`pack_reader_cfg`]'s inverse; `None` for anything it didn't make.
+fn unpack_reader_cfg(packed: &Object) -> Option<DialectCfg> {
+    let Object::Bytes(b) = packed else {
+        return None;
+    };
+    let b: &[u8; 21] = (&b[..]).try_into().ok()?;
+    let word = |at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+    Some(DialectCfg {
+        delimiter: char::from_u32(word(0))?,
+        quotechar: char::from_u32(word(4)),
+        escapechar: char::from_u32(word(8)),
+        lineterminator: String::new(),
+        quoting: i64::from_le_bytes(b[12..20].try_into().ok()?),
+        doublequote: b[20] & 1 != 0,
+        skipinitialspace: b[20] & 2 != 0,
+        strict: b[20] & 4 != 0,
+    })
+}
+
 /// Resolve a (possibly string / object / `None`) dialect argument plus
 /// `**fmtparams` into a `_csv.Dialect` — the moral equivalent of
 /// `_call_dialect`, routed through `Dialect.__new__` for the heavy
@@ -660,8 +714,7 @@ impl Parser {
         if self.unquoted && self.field_len == 0 && (q == QUOTE_NOTNULL || q == QUOTE_STRINGS) {
             self.fields.push(Object::None);
         } else {
-            let s = std::mem::take(&mut self.field);
-            let mut val = crate::builtins::bridge_to_object(&s);
+            let mut val = crate::builtins::bridge_to_object(&self.field);
             if self.unquoted && self.field_len != 0 && (q == QUOTE_NONNUMERIC || q == QUOTE_STRINGS)
             {
                 val = interp.call_object(
@@ -675,6 +728,69 @@ impl Parser {
         self.field.clear();
         self.field_len = 0;
         Ok(())
+    }
+
+    /// How many bytes at the front of `rest` are ordinary characters of the
+    /// field being read, which go into it as they are: up to the next
+    /// character the current state gives a meaning to. Zero when the state
+    /// isn't inside a field, when the dialect's own characters aren't ASCII
+    /// (the scan is by byte), or when the run would pass the field limit
+    /// (the character-at-a-time path raises that at the right place).
+    fn plain_run(&self, rest: &[u8]) -> usize {
+        let ascii = |c: char| c.is_ascii().then_some(c as u8);
+        let escape = match self.cfg.escapechar {
+            None => None,
+            Some(c) => match ascii(c) {
+                Some(b) => Some(b),
+                None => return 0,
+            },
+        };
+        match self.state {
+            St::InField => {
+                let Some(delimiter) = ascii(self.cfg.delimiter) else {
+                    return 0;
+                };
+                match escape {
+                    None => memchr::memchr3(delimiter, b'\n', b'\r', rest),
+                    Some(e) => rest
+                        .iter()
+                        .position(|&b| b == delimiter || b == b'\n' || b == b'\r' || b == e),
+                }
+            }
+            St::InQuotedField => {
+                let quote = match self.cfg.quotechar {
+                    Some(q) if self.cfg.quoting != QUOTE_NONE => match ascii(q) {
+                        Some(b) => Some(b),
+                        None => return 0,
+                    },
+                    _ => None,
+                };
+                match (quote, escape) {
+                    (None, None) => None,
+                    (Some(a), None) | (None, Some(a)) => memchr::memchr(a, rest),
+                    (Some(a), Some(b)) => memchr::memchr2(a, b, rest),
+                }
+            }
+            _ => return 0,
+        }
+        .unwrap_or(rest.len())
+    }
+
+    /// Take the `run` of ordinary characters [`Parser::plain_run`] found
+    /// into the field. `false`, with nothing taken, when that would pass the
+    /// field limit.
+    fn add_run(&mut self, run: &str) -> bool {
+        let chars = if run.is_ascii() {
+            run.len()
+        } else {
+            run.chars().count()
+        } as i64;
+        if self.field_len + chars > FIELD_LIMIT.load(Ordering::Relaxed) {
+            return false;
+        }
+        self.field.push_str(run);
+        self.field_len += chars;
+        true
     }
 
     fn is_quote(&self, c: Option<char>) -> bool {
@@ -837,13 +953,14 @@ fn self_inst(args: &[Object]) -> Result<Rc<PyInstance>, RuntimeError> {
     }
 }
 
-fn str_chars(o: &Object) -> Option<String> {
+fn str_chars(o: &Object) -> Option<std::borrow::Cow<'_, str>> {
+    use std::borrow::Cow;
     match o {
-        Object::Str(s) => Some(s.to_string()),
+        Object::Str(s) => Some(Cow::Borrowed(s)),
         // Lone surrogates (e.g. a file read with `errors="surrogatepass"`)
         // ride through the DFA bridged into the PUA window; `save_field`
         // un-bridges them so fields keep the surrogate code points.
-        Object::WStr(cps) => Some(crate::builtins::bridge_encode_cps(cps)),
+        Object::WStr(cps) => Some(Cow::Owned(crate::builtins::bridge_encode_cps(cps))),
         _ => None,
     }
 }
@@ -860,12 +977,15 @@ fn csv_reader(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
         let dialect_pos = args.get(1).cloned();
         let input_iter = interp.iter_object(iterable)?;
         let dialect = call_dialect(interp, dialect_pos, kwargs)?;
+        let cfg = pack_reader_cfg(&read_cfg(&dialect)?);
         let inst = PyInstance::new(reader_type());
         {
+            let keys = reader_keys();
             let mut d = inst.dict_cell().borrow_mut();
-            d.insert(key("input_iter"), input_iter);
+            d.insert(keys.input_iter.clone(), input_iter);
             d.insert(key("dialect"), dialect);
-            d.insert(key("line_num"), Object::Int(0));
+            d.insert(keys.cfg.clone(), cfg);
+            d.insert(keys.line_num.clone(), Object::Int(0));
         }
         Ok(Object::Instance(Rc::new(inst)))
     })
@@ -884,17 +1004,22 @@ fn reader_disallow_new(_args: &[Object]) -> Result<Object, RuntimeError> {
 fn reader_iternext(args: &[Object]) -> Result<Object, RuntimeError> {
     let inst = self_inst(args)?;
     with_interp(|interp| {
-        let (input_iter, dialect_obj) = {
+        let keys = reader_keys();
+        let (input_iter, cfg) = {
             let d = inst.dict_cell().borrow();
-            (
-                d.get(&key("input_iter")).cloned(),
-                d.get(&key("dialect")).cloned(),
-            )
+            let cfg = match d.get(&keys.cfg).and_then(unpack_reader_cfg) {
+                Some(cfg) => cfg,
+                None => {
+                    let dialect = d
+                        .get(&key("dialect"))
+                        .ok_or_else(|| type_error("reader is missing its dialect"))?;
+                    read_cfg(dialect)?
+                }
+            };
+            (d.get(&keys.input_iter).cloned(), cfg)
         };
         let input_iter =
             input_iter.ok_or_else(|| type_error("reader is missing its input iterator"))?;
-        let dialect_obj = dialect_obj.ok_or_else(|| type_error("reader is missing its dialect"))?;
-        let cfg = read_cfg(&dialect_obj)?;
         let mut p = Parser::new(cfg);
         // CPython's `parse_reset` allocates `self->fields`; a successful
         // `__next__` hands it out and leaves NULL behind. A re-entrant
@@ -902,7 +1027,7 @@ fn reader_iternext(args: &[Object]) -> Result<Object, RuntimeError> {
         // therefore makes the outer call see NULL and raise (gh-145105).
         inst.dict_cell()
             .borrow_mut()
-            .insert(key("_fields_live"), Object::Bool(true));
+            .insert(keys.fields_live.clone(), Object::Bool(true));
         loop {
             match interp.iter_next_object(input_iter.clone())? {
                 None => {
@@ -928,17 +1053,27 @@ fn reader_iternext(args: &[Object]) -> Result<Object, RuntimeError> {
                     };
                     {
                         let mut d = inst.dict_cell().borrow_mut();
-                        if !matches!(d.get(&key("_fields_live")), Some(Object::Bool(true))) {
+                        if !matches!(d.get(&keys.fields_live), Some(Object::Bool(true))) {
                             return Err(csv_error("iterator has already advanced the reader"));
                         }
-                        let n = match d.get(&key("line_num")) {
+                        let n = match d.get(&keys.line_num) {
                             Some(Object::Int(n)) => *n,
                             _ => 0,
                         };
-                        d.insert(key("line_num"), Object::Int(n + 1));
+                        d.insert(keys.line_num.clone(), Object::Int(n + 1));
                     }
-                    for ch in line.chars() {
+                    // Runs of a field's ordinary characters go in whole; the
+                    // characters that mean something go through the machine.
+                    let mut at = 0;
+                    while at < line.len() {
+                        let run = p.plain_run(&line.as_bytes()[at..]);
+                        if run > 0 && p.add_run(&line[at..at + run]) {
+                            at += run;
+                            continue;
+                        }
+                        let ch = line[at..].chars().next().expect("at a character");
                         p.process(interp, Some(ch))?;
+                        at += ch.len_utf8();
                     }
                     p.process(interp, None)?;
                 }
@@ -949,7 +1084,7 @@ fn reader_iternext(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         inst.dict_cell()
             .borrow_mut()
-            .insert(key("_fields_live"), Object::Bool(false));
+            .insert(keys.fields_live.clone(), Object::Bool(false));
         Ok(Object::new_list(std::mem::take(&mut p.fields)))
     })
 }
