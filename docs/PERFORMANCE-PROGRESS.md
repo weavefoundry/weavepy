@@ -397,6 +397,61 @@ branch and pull request.
 
 ## Done
 
+- **Comparison methods, descriptors, thread-locals and queues** (this PR,
+  November 13). The everyday battery's class and thread cases, taken one
+  operation at a time:
+  - Comparison methods. A `COMPARE_OP` whose left operand's class has a
+    Python `__eq__`, `__lt__` or other comparison method ran it as a
+    nested general call unless the body was a pure leaf. Compiled code
+    now calls a method that has native code as a direct activation, the
+    way `BINARY_OP` calls an operator method. The operands wait on the
+    caller's stack under the call, so `NotImplemented` goes on to the
+    reflected method, identity or the `TypeError` without the method
+    running twice, and the instruction's fused `TO_BOOL` takes the truth
+    of an answer that isn't a `bool`. `NotImplemented` against `None`, a
+    number or a string is settled in the helper (`x == None` for a
+    dataclass). `a == b` with a dataclass-shaped `__eq__`: 6,860 to
+    2,200 instructions (CPython 1,920); a dataclass's `==` 5,190 to
+    2,070 (1,980) and `<` 6,470 to 2,320 (2,020); `a == None` 4,780 to
+    1,450 (1,060).
+  - The same bodies elsewhere. Two tuples built for a comparison left
+    compiled code every time (the helper answered only for operands
+    something else still held): `(a.x, a.y) == (b.x, b.y)` 2,040 to
+    1,040 instructions (1,010). `x.__class__` is one helper call, in
+    inlined bodies too, where it took the attribute-miss path at about
+    700 instructions a read: `a.__class__ is b.__class__` 640 to 360
+    (330), and a plain call of the `__eq__` body above 3,990 to 1,550
+    (1,410), `a + b` with that body 4,650 to 1,520 (1,770).
+  - Python descriptors. A data descriptor written in Python has its
+    `__get__` called directly from the compiled attribute site, where
+    the read went through the miss path, the property path and the core
+    loop's lane first: `Color.RED.name` 3,810 to 1,790 instructions
+    (1,500).
+  - Enum classes. A metaclass's `__getitem__` is called directly from
+    the compiled subscript site, and a class's own containers read
+    through a class under a metaclass (`cls._member_map_`) are
+    remembered per site under both versions: `Color["RED"]` 3,470 to
+    1,480 instructions (610), `Color(1)` 6,270 to 4,660 (2,670).
+  - `threading.local`. Its attribute hooks are builtins. Each thread
+    remembers, weakly, the namespace the shim gave it for a `local`
+    object, so only a thread's first touch runs Python; compiled code
+    calls the read hook in place. A read 4,330 to 1,020 instructions
+    (850), a store 5,650 to 2,260 (960).
+  - `queue.SimpleQueue`. `get`, `get_nowait` and `put_nowait` are
+    builtins beside `put`, and all of them read the queue's fields and
+    its deque in place instead of through six general attribute reads a
+    call. Put and get 13,850 to 3,040 instructions (900), the `nowait`
+    pair 19,100 to 3,140 (800). An empty queue or a timeout still goes
+    to the shim's Python.
+  - Fixed on the way, each found by a new test checked against CPython:
+    `COMPARE_OP` releases its right operand first, as CPython does (two
+    dying temporaries' finalizers show the order); a pure-leaf
+    comparison whose operand died with a finalizer ran it late; a class
+    that gains or loses `__get__`, `__set__` or `__delete__` after its
+    instances are other classes' attributes left stale instance-field
+    caches behind (every class's version moves now: CPython's
+    specializer refuses such descriptors instead); a `threading.local`
+    subclass ran `__init__` twice on the creating thread.
 - **File objects, standard streams and the first everyday cliffs** (this
   PR, November 12 and 13). Found by timing ordinary scripts instead of
   the suite:
@@ -2743,6 +2798,32 @@ slowdown in that run was the even-sized chunks, since fixed.
 
 ## What the measurements say
 
+- **A call from native code into Python costs four or five times a call
+  from compiled code** (November 13). The same `__eq__` body costs 2,200
+  instructions called directly from a compiled `COMPARE_OP`, 4,080 when
+  tier 2 runs the loop and compares through its generic helper, and
+  about 400 an element in `x in xs` against CPython's 160. The nested
+  entry is `call` to `call_python` to `call_python_bound` (190
+  instructions), tier 2's direct-entry probes (`try_call_native_direct`,
+  `direct_entry_for`, `callee_guards_hold`, `guards_hold`: 310),
+  `pooled_locals_from_args` and `lean_frame` (120), `run_frame_lean_impl`
+  (190), `quiet_native_step` (170) and `retire_lean_frame` (140): about
+  1,500 instructions around a body a direct call enters in 300.
+  Everything native that calls back pays it: `list.__contains__`,
+  `sorted(key=...)`, `min` and `max`, `map`, dict lookups through a
+  Python `__hash__` or `__eq__`, and tier 2's generic operations.
+- **Tier 2 takes loops it runs slower than the frame JIT would.** `if a
+  == b: k += 1` over two instances: 4,080 instructions an iteration
+  with tier 2, 2,400 with `WEAVEPY_TIER2=0`. The counter makes the loop
+  tier 2's, and the instance work in it then goes through helpers that
+  make nested calls. The same loop without the counter was the frame
+  JIT's all along.
+- **`dataclasses.asdict` and `replace` have no cliff.** 43,600 and
+  32,200 instructions a call against CPython's 15,600 and 12,000, and
+  the profile is flat: fourteen class-attribute lookups by name at 115
+  instructions each (`hasattr(type(obj), "__dataclass_fields__")` and
+  its kin), thirty-five global reads at 39, four general calls at 370, a
+  generator and three comprehensions. Nothing is past 4% of the total.
 - **The suite is not the workload** (November 13). The everyday battery's
   first run, WeavePy's time over CPython's, best of three runs a case, on
   a loaded machine:
@@ -3310,25 +3391,35 @@ slowdown in that run was the even-sized chunks, since fixed.
 ## Next
 
 What the everyday battery points at (`tools/pybench/everyday.py`; see
-"What the measurements say"). Rerun it first: several of its worst cases
-moved in this PR, and the list below is from its first run.
+"What the measurements say"):
 
-- `enum`: member lookup by name and by value, `.name` and `.value`, flag
-  arithmetic. All go through the metaclass and `DynamicClassAttribute`
-  on general paths.
-- Comparison dunders written in Python (`__eq__`, `__lt__`): a body that
-  isn't a pure leaf runs as a nested general call from `COMPARE_OP` (6,600
-  instructions against 1,760 for a two-field `__eq__`), where arithmetic
-  dunders are noted at the site and called directly. This is most of what
-  a dataclass's `==` and ordering still cost.
-- `dataclasses`: `asdict` and `replace`.
+- A lean entry for a call from native code into Python (see "What the
+  measurements say"): a callee with native code bound and run as a
+  compiled caller's direct call binds and runs it, for
+  `list.__contains__` and the other element comparisons, key functions,
+  `map` and `filter`, hashing, and tier 2's generic operations. It is
+  about 1,500 instructions a call today against 300.
+- Tier 2 leaving a loop to the frame JIT when the loop's work is on
+  instances (or calling comparison and operator methods directly, as
+  the frame JIT does).
+- `enum`: `Color(1)` (4,660 instructions against 2,670: the metaclass's
+  `__call__` and `__new__`'s value lookup) and flag arithmetic (13,300
+  against 7,700).
+- `dataclasses.asdict` and `replace`, which need the pieces rather than
+  a path: class-attribute lookups by name (`hasattr(cls, name)`,
+  `getattr(obj, name)` with a computed name), global reads in compiled
+  code, comprehensions.
 - `__setattr__` hooks and `object.__setattr__(self, name, value)`, which
   a frozen dataclass's `__init__` calls once a field: the store-side twin
-  of this PR's attribute-read hooks.
-- `threading.local` and `queue.SimpleQueue` as native types (both are the
-  pure-Python fallbacks), and thread start and join.
-- `getattr(obj, name)` of a property, `type(obj).__name__`, two-argument
-  `super()`, `issubclass` against an ABC.
+  of the attribute-read hooks. A `threading.local` store from compiled
+  code is the same gap (2,260 instructions against 960: it leaves for
+  the core loop).
+- Builtin methods a Python class holds (`SimpleQueue.put` and `get`: 3,040
+  instructions a pair against 900): the method load and the call take
+  the general dispatch. And a `threading.local`'s creation (28,900
+  against 3,900), thread start and join.
+- `getattr(obj, name)` of a property, two-argument `super()`,
+  `issubclass` against an ABC, a property through `super()`.
 - `f.read(n)` in a loop (1.6 times CPython after this PR dropped an
   `fcntl` per read: the bytes are still read into a vector and copied
   into the `bytes` object) and large single writes, which go through the
@@ -3350,12 +3441,8 @@ moved in this PR, and the list below is from its first run.
 What the single-operation battery points at (see "What the measurements
 say"), in the order the gaps would close the most:
 
-- A site cache for an attribute read that resolves to a Python descriptor
-  (`Enum` members' `.value` and `.name`, `DynamicClassAttribute`, a
-  class's own `__get__`): the descriptor and its `__get__` by class
-  version, called directly.
 - A class whose metaclass defines `__call__` in Python (`Color(1)`):
-  7,900 instructions against 2,700.
+  4,660 instructions against 2,670.
 - Small tuples: an allocation written in place and a release that
   doesn't go through the nested-release trashcan when every element is a
   scalar or shared; `zip` and `enumerate` reusing their result tuple
