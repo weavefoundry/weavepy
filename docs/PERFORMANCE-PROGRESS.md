@@ -443,6 +443,29 @@ branch and pull request.
     call. Put and get 13,850 to 3,040 instructions (900), the `nowait`
     pair 19,100 to 3,140 (800). An empty queue or a timeout still goes
     to the shim's Python.
+  - `datetime` methods written in Python. `astimezone()` took 333,000
+    instructions a call (CPython 24,500). `_pydatetime`'s methods read
+    `self._year`, `self._tzinfo` and the rest by their slot names, and a
+    natively packed value has no slot to read, so some fifty reads a
+    call missed every compiled path and took the general handler. The
+    native field read serves the slot names as it serves the public ones:
+    337,000 to 200,000 instructions, `replace(tzinfo=...).timestamp()`
+    15,500 to 11,900 (4,700), and the battery's datetime case retires
+    27% fewer. What's left of `astimezone` is the Python around seven
+    `localtime` calls, with no single cost past 10%.
+  - A regression sweep of the battery by instruction count, with the
+    compiler synchronous so that a background compile's timing doesn't
+    move a case (it moved `bytes_ops` by 5% between builds that are
+    identical with it synchronous), found two regressions from earlier
+    in this PR. A compiled attribute site asked on every miss whether its
+    read was a Python descriptor's (it asks once a class version now),
+    and `set(xs)` of a long list went through the pure-constructor path,
+    which built the set unsized: 142,800 instructions against 116,600
+    before for `set(xs) & set(ys)` of 300 and 200 ints (119,600 now; the
+    path sizes its set and leaves inputs past 64 items to the general
+    constructor). Left alone: `xs.sort(key=lambda x: -x)` retires 4%
+    more than at the start of the phase (179,000 against 172,700 for 300
+    items; CPython 199,800).
   - Fixed on the way, each found by a new test checked against CPython:
     `COMPARE_OP` releases its right operand first, as CPython does (two
     dying temporaries' finalizers show the order); a pure-leaf
