@@ -496,6 +496,30 @@ branch and pull request.
     constructor). Left alone: `xs.sort(key=lambda x: -x)` retires 4%
     more than at the start of the phase (179,000 against 172,700 for 300
     items; CPython 199,800).
+  - A review of the PR found that the first of those two fixes had
+    switched the descriptor call off. The site remembered "no descriptor
+    here" for the class's version whenever the direct call declined, and
+    the first call always declines, because the `__get__` it warms has no
+    native code yet: `Color.RED.name` was back at 3,880 instructions a
+    read at `4e230310`, which is the build the battery figures above were
+    measured on. The site now remembers only a lookup that finds no such
+    descriptor: 1,760 (CPython 1,510), and a sweep of the battery against
+    the build before shows no case more than 1.5% up. The same review led
+    to four more changes. A module loaded from a file before
+    `importlib.machinery` is (a `-c` program's own imports) gets its
+    `__spec__` and `__loader__` when its namespace is handed out as a
+    dict (`vars(m)`, `m.__dict__`, `globals()`, `dir(m)`), where
+    `'__spec__' in vars(m)` had become false; a program that never asks
+    still skips the 4.9 ms. A text stream's `read(n)` counts decoded
+    characters for every codec: it took a Latin-1 `\xe9` for the lead
+    byte of a three-byte character, split a Shift JIS character in two,
+    counted a byte-order mark, and read `a\r\nb` as `a\n\nb` when two
+    `read(2)` calls split the `\r\n`, all since before this PR (16,200
+    generated read sequences over 18 codecs now match CPython). The
+    attribute hooks called from compiled sites are handed the code
+    object's own name string, not a new one a call, and the `Arc`
+    allocation's layout is worked out in one place for the five paths
+    that free one by hand.
   - Fixed on the way, each found by a new test checked against CPython:
     `COMPARE_OP` releases its right operand first, as CPython does (two
     dying temporaries' finalizers show the order); a pure-leaf
