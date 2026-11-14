@@ -10656,7 +10656,9 @@ impl Interpreter {
             }
         };
         let name = match &hook {
-            Some(_) => Some(Object::from_str(
+            Some(_) => Some(code_name_str(
+                &frame.code,
+                ins.arg,
                 frame.code.names.get(ins.arg as usize)?.as_str(),
             )),
             None => None,
@@ -10991,7 +10993,7 @@ impl Interpreter {
             return None;
         }
         hook.lean_cells_ref(&code)?;
-        let name = Object::from_str(name.as_str());
+        let name = code_name_str(&frame.code, ins.arg, name.as_str());
         // Past the recursion limit the nested lean path raises.
         let crate::recursion::Enter::Ok(guard) = crate::recursion::enter() else {
             return None;
@@ -40231,7 +40233,10 @@ impl Interpreter {
                     // `del __main__.__file__` and expect `hasattr` to say
                     // so.) Every module builder seeds the dict entry from
                     // `PyModule::filename`, so there is no fallback here.
-                    "__dict__" => return Ok(Object::Dict(m.dict.clone())),
+                    "__dict__" => {
+                        self.fill_deferred_spec(&m.dict);
+                        return Ok(Object::Dict(m.dict.clone()));
+                    }
                     // CPython `module_get_annotations` (PEP 649 shape):
                     // a stored dict wins; else a callable `__annotate__`
                     // in the namespace is called with `VALUE` and the
@@ -58689,6 +58694,7 @@ impl Interpreter {
                         // active frame's globals are whatever the caller
                         // is currently executing inside — and that's
                         // exactly `outer_globals`.
+                        self.fill_deferred_spec(outer_globals);
                         return Ok(Object::Dict(outer_globals.clone()));
                     }
                     if (b.name == "locals" || b.name == "vars")
@@ -58701,10 +58707,15 @@ impl Interpreter {
                         // exec scope this *is* the module dict; in
                         // function scope it's a fresh dict snapshot of
                         // the locals (PEP 667).
-                        if let Some(top) = self.materialize_top_py_frame() {
-                            return Ok(top.locals_snapshot());
+                        // (At module scope that hands the namespace out.)
+                        let locals = match self.materialize_top_py_frame() {
+                            Some(top) => top.locals_snapshot(),
+                            None => Object::Dict(outer_globals.clone()),
+                        };
+                        if let Object::Dict(d) = &locals {
+                            self.fill_deferred_spec(d);
                         }
-                        return Ok(Object::Dict(outer_globals.clone()));
+                        return Ok(locals);
                     }
                     // Clinic arity: `dir([object])` / `vars([object])` take at
                     // most one positional argument (test_builtin test_dir /
@@ -58747,6 +58758,11 @@ impl Interpreter {
                             Err(e) => Err(e),
                         };
                     }
+                    if b.name == "dir" {
+                        if let [Object::Module(m)] = args {
+                            self.fill_deferred_spec(&m.dict);
+                        }
+                    }
                     if b.name == "dir" && args.is_empty() && kwargs.is_empty() {
                         // `dir()` with no argument returns the sorted names
                         // bound in the *current* local scope — CPython's
@@ -58762,6 +58778,7 @@ impl Interpreter {
                         };
                         let mut names: Vec<String> = Vec::new();
                         if let Object::Dict(d) = &locals {
+                            self.fill_deferred_spec(d);
                             for (k, _) in d.borrow().iter() {
                                 if let Object::Str(s) = &k.0 {
                                     names.push(s.to_string());
@@ -69395,6 +69412,50 @@ impl Interpreter {
             && !self.cache.is_initializing("importlib.machinery")
     }
 
+    /// Note that `module`, an on-disk module being loaded as `full`, was
+    /// left without its `(__spec__, __loader__)` pair: handing its
+    /// namespace to Python as a dict builds it (see
+    /// [`Interpreter::fill_deferred_spec`]).
+    fn defer_module_spec(module: &PyModule, full: &str) {
+        let mut deferred = spec_deferred();
+        deferred.insert(Rc::as_ptr(&module.dict) as usize, full.to_owned());
+        SPEC_DEFERRED_ANY.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `dict` is about to reach Python as a dict object (`globals()`,
+    /// `vars(module)`, `module.__dict__`, `dir(module)`): if it's the
+    /// namespace of a module whose `(__spec__, __loader__)` pair was left
+    /// unbuilt, build the pair now, so that the dict holds both keys as
+    /// CPython's does. Anything else costs one flag's read.
+    pub(crate) fn fill_deferred_spec(&mut self, dict: &Rc<RefCell<DictData>>) {
+        use std::sync::atomic::Ordering;
+        if !SPEC_DEFERRED_ANY.load(Ordering::Relaxed) {
+            return;
+        }
+        let key = Rc::as_ptr(dict) as usize;
+        let name = {
+            let mut deferred = spec_deferred();
+            let name = deferred.remove(&key);
+            if deferred.is_empty() {
+                SPEC_DEFERRED_ANY.store(false, Ordering::Relaxed);
+            }
+            name
+        };
+        let Some(name) = name else {
+            return;
+        };
+        // (A module that has since left `sys.modules`, or put something
+        // else there under its name, keeps what it has.)
+        let Some(Object::Module(m)) = self.cache.get(&name) else {
+            return;
+        };
+        if Rc::ptr_eq(&m.dict, dict) && self.ensure_module_spec(&m).is_none() {
+            // Not buildable just now (the import system is still starting
+            // up): the next asker tries again.
+            Self::defer_module_spec(&m, &name);
+        }
+    }
+
     /// RFC 0053 WS2 — synthesize and cache a module's PEP 451
     /// `(__spec__, __loader__)` pair on first read. The Rust importer
     /// cannot build specs eagerly (it runs before `importlib` is
@@ -70579,7 +70640,8 @@ impl Interpreter {
         // first import of a file of its own, where the import itself takes
         // 0.6. A program that never asks leaves them unbuilt, as CPython's
         // modules loaded before `_bootstrap._setup` have none; an
-        // attribute read still builds them.
+        // attribute read still builds them, and so does handing the
+        // namespace out as a dict (`fill_deferred_spec`).
         //
         // A module whose own code names either one gets them now, whatever
         // is loaded: its body or its functions may read the name as a
@@ -70592,12 +70654,15 @@ impl Interpreter {
                 d.contains_key(&DictKey(Object::from_static("__spec__")))
                     && d.contains_key(&DictKey(Object::from_static("__loader__")))
             };
-            if !has_both
-                && (self.import_machinery_loaded()
+            if !has_both {
+                if self.import_machinery_loaded()
                     || code_names_anywhere(&code, "__spec__")
-                    || code_names_anywhere(&code, "__loader__"))
-            {
-                let _ = self.ensure_module_spec(m);
+                    || code_names_anywhere(&code, "__loader__")
+                {
+                    let _ = self.ensure_module_spec(m);
+                } else {
+                    Self::defer_module_spec(m, full);
+                }
             }
         }
 
@@ -86146,6 +86211,21 @@ fn slot_name_matches_in(names: &[Object], code: &CodeObject, name_idx: u32, key:
         .is_some_and(|n| n.as_str() == &**s)
 }
 
+/// The namespaces of on-disk modules loaded without their
+/// `(__spec__, __loader__)` pair, by address, with the name each was
+/// loaded under (see `Interpreter::fill_deferred_spec`). Touched only
+/// with the GIL held.
+static SPEC_DEFERRED: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<usize, String>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Whether [`SPEC_DEFERRED`] lists anything.
+static SPEC_DEFERRED_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn spec_deferred() -> std::sync::MutexGuard<'static, std::collections::HashMap<usize, String>> {
+    SPEC_DEFERRED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Whether `code` or a code object nested in its constants mentions
 /// `name` as a name or a string constant.
 fn code_names_anywhere(code: &CodeObject, name: &str) -> bool {
@@ -86445,6 +86525,17 @@ fn exc_family_flags_slow(cls: &crate::types::TypeObject) -> u16 {
 #[inline]
 fn code_name_obj(code: &CodeObject, name_idx: u32) -> Option<&Object> {
     code_vm_ext(code).and_then(|t| t.name_objs.get(name_idx as usize))
+}
+
+/// `co_names[name_idx]`, which is `name`, as a `str` object: the code
+/// object's own where it has one ([`code_name_obj`]), so that a hook
+/// called with the name is handed the same object each time.
+#[inline]
+fn code_name_str(code: &CodeObject, name_idx: u32, name: &str) -> Object {
+    match code_name_obj(code, name_idx) {
+        Some(obj) => obj.clone(),
+        None => Object::from_str(name),
+    }
 }
 
 /// How a class's instances answer a boolean context without running
