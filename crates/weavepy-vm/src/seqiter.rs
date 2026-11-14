@@ -1617,13 +1617,31 @@ pub(crate) fn builtin_ctor_pure(cls: &Rc<TypeObject>, args: &[Object]) -> Option
                 }
                 _ => return None,
             };
-            if !items.iter().all(|x| plain_hashable(x, 0)) {
+            // (What this saves is the general call around the build, which
+            // a long input doesn't notice: that one keeps the general
+            // constructor's own bulk path.)
+            let simple = |x: &Object| {
+                matches!(
+                    x,
+                    Object::Int(_) | Object::Str(_) | Object::Bool(_) | Object::None
+                ) || plain_hashable(x, 0)
+            };
+            if items.len() > 64 || !items.iter().all(simple) {
                 return None;
             }
-            let obj = if frozen {
-                Object::new_frozenset_from(items.iter().cloned())
+            // (Sized once, as the general constructor's simple-key path
+            // sizes it: a set grown an item at a time rehashes as it goes.)
+            let mut data = crate::object::SetData::with_capacity(items.len());
+            for v in items {
+                data.insert(crate::object::DictKey(v.clone()));
+            }
+            let obj = if !frozen {
+                Object::Set(Rc::new(crate::sync::RefCell::new(data)))
+            } else if data.is_empty() {
+                // (The shared empty frozenset.)
+                Object::new_frozenset_from(std::iter::empty())
             } else {
-                Object::new_set_from(items.iter().cloned())
+                Object::FrozenSet(Rc::new(crate::object::FrozenSetObj::new(data)))
             };
             crate::gc_trace::track(&obj);
             return Some(obj);

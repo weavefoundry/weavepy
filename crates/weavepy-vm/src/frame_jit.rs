@@ -8072,6 +8072,9 @@ pub(crate) struct AttrSite {
     /// Whether the site has read through a data descriptor written in
     /// Python (see [`descr_get`]): a miss tries that first.
     descr: Cell<bool>,
+    /// The class version under which the site's read last turned out not
+    /// to be such a descriptor's.
+    no_descr: Cell<u64>,
     /// A receiver's class's native `__getattribute__` hook, for the
     /// class's version (see [`native_hook`]).
     hook: std::cell::RefCell<Option<(u64, Rc<crate::object::BuiltinFn>)>>,
@@ -8434,11 +8437,17 @@ unsafe fn attr_miss(st: *mut State, site: &AttrSite, at: *mut Object, local: boo
         if site.direct.is_null() {
             return CALL_DECLINED;
         }
-        if !site.descr.get() {
-            let r = descr_get(st, site, at, local);
-            if r != CALL_DECLINED {
-                site.descr.set(true);
-                return r;
+        // (Once a class version: a site that reads no descriptor asks
+        // again only when the class changes.)
+        if let Object::Instance(inst) = &*at {
+            let ver = inst.cls_raw().attr_version.get();
+            if !site.descr.get() && site.no_descr.get() != ver {
+                let r = descr_get(st, site, at, local);
+                if r != CALL_DECLINED {
+                    site.descr.set(true);
+                    return r;
+                }
+                site.no_descr.set(ver);
             }
         }
         h_property(st, site.code, pc, slot, at, u64::from(local), site.direct)
@@ -21467,6 +21476,7 @@ impl<'a> Lower<'a> {
             cache: SlotCache::default(),
             class_attr: Cell::new(false),
             descr: Cell::new(false),
+            no_descr: Cell::new(0),
             hook: std::cell::RefCell::new(None),
             type_attr: std::cell::RefCell::new(None),
             class_poly: Default::default(),
