@@ -8069,6 +8069,12 @@ pub(crate) struct AttrSite {
     /// Whether the site has read a class's attribute through an instance
     /// (see `inst_class_attr_quick`): the slow paths try that first.
     class_attr: Cell<bool>,
+    /// Whether the site has read through a data descriptor written in
+    /// Python (see [`descr_get`]): a miss tries that first.
+    descr: Cell<bool>,
+    /// A receiver's class's native `__getattribute__` hook, for the
+    /// class's version (see [`native_hook`]).
+    hook: std::cell::RefCell<Option<(u64, Rc<crate::object::BuiltinFn>)>>,
     /// A class receiver's attribute the site read last (see
     /// [`type_attr_read`]).
     type_attr: std::cell::RefCell<Option<TypeMemo>>,
@@ -8374,8 +8380,23 @@ unsafe fn attr_miss(st: *mut State, site: &AttrSite, at: *mut Object, local: boo
         // cached read applies, and the full handler runs the hook.
         if let Object::Instance(inst) = &*at {
             if !site.direct.is_null() && !Interpreter::default_getattribute(inst.cls_raw()) {
+                // (A `threading.local`'s native hook, called in place.)
+                if let Some(hook) = native_hook(site, inst.cls_raw()) {
+                    let r = native_hook_call(st, site, at, local, hook);
+                    if r != CALL_DECLINED {
+                        return r;
+                    }
+                }
                 let (pc, slot) = (u64::from(site.pc), u64::from(site.slot));
                 return h_property(st, site.code, pc, slot, at, u64::from(local), site.direct);
+            }
+            // A site that has read through a Python data descriptor: its
+            // `__get__` first.
+            if site.descr.get() {
+                let r = descr_get(st, site, at, local);
+                if r != CALL_DECLINED {
+                    return r;
+                }
             }
         }
         if let Some(v) = attr_miss_quick(site, &*at, local, running)
@@ -8413,7 +8434,171 @@ unsafe fn attr_miss(st: *mut State, site: &AttrSite, at: *mut Object, local: boo
         if site.direct.is_null() {
             return CALL_DECLINED;
         }
+        if !site.descr.get() {
+            let r = descr_get(st, site, at, local);
+            if r != CALL_DECLINED {
+                site.descr.set(true);
+                return r;
+            }
+        }
         h_property(st, site.code, pc, slot, at, u64::from(local), site.direct)
+    }
+}
+
+/// The native `__getattribute__` hook `cls` answers reads with (see
+/// `stdlib::local_native::is_hook`), where no `__getattr__` waits behind
+/// it: from the site's memo for the class's version, else looked up and
+/// remembered.
+fn native_hook(
+    site: &AttrSite,
+    cls: &crate::types::TypeObject,
+) -> Option<Rc<crate::object::BuiltinFn>> {
+    let ver = cls.attr_version.get();
+    if ver == 0 {
+        return None;
+    }
+    if let Ok(memo) = site.hook.try_borrow() {
+        if let Some((v, b)) = memo.as_ref() {
+            if *v == ver {
+                return Some(b.clone());
+            }
+        }
+    }
+    if crate::object::exotic_str_keys_possible()
+        || cls.dunder(crate::types::Dunder::GetAttr).present()
+    {
+        return None;
+    }
+    let Some(Object::Builtin(b)) = cls.lookup("__getattribute__") else {
+        return None;
+    };
+    if !crate::stdlib::local_native::is_hook(&b, false) {
+        return None;
+    }
+    if let Ok(mut memo) = site.hook.try_borrow_mut() {
+        *memo = Some((ver, b.clone()));
+    }
+    Some(b)
+}
+
+/// [`attr_miss`] for a receiver whose class's `__getattribute__` is the
+/// native hook `hook` ([`native_hook`]): the hook called as
+/// `hook(receiver, name)` on operands written from the site's slot, with
+/// the activation published as a builtin's call publishes it
+/// ([`native_body_here`]: the hook may run Python code, a subclass's
+/// `__init__` on a thread's first touch). `0` the result at the site's
+/// slot, `CALL_DECLINED` untouched, a status otherwise.
+///
+/// # Safety
+///
+/// As [`descr_get`]'s.
+#[inline(never)]
+unsafe fn native_hook_call(
+    st: *mut State,
+    site: &AttrSite,
+    at: *mut Object,
+    local: bool,
+    hook: Rc<crate::object::BuiltinFn>,
+) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let st = &mut *st;
+        // (An inlined body's site numbers its pc and slots its own way.)
+        if st.sw.is_null() || !std::ptr::eq(Rc::as_ptr(&(*st.frame).code), site.code) {
+            return CALL_DECLINED;
+        }
+        let code = &*site.code;
+        let (pc, slot) = (site.pc as usize, site.slot as usize);
+        let Some(name @ Object::Str(_)) = (&*site.ext)
+            .name_objs
+            .get(code.instructions[pc].arg as usize)
+        else {
+            return CALL_DECLINED;
+        };
+        let base = st.stack.add(slot);
+        // An entry of the namespace the thread has already: read in
+        // place, nothing run.
+        if local || droppable(&*at) {
+            if let Some(v) = crate::stdlib::local_native::getattribute_fast(&*at, name) {
+                if local {
+                    base.write(v);
+                } else {
+                    crate::drop_hot(std::mem::replace(&mut *at, v));
+                }
+                return 0;
+            }
+        }
+        // The call's operands from the site's slot: the hook, the
+        // receiver in its self slot (a local's copied, the stack's moved
+        // up) and the name.
+        if local {
+            base.add(1).write(crate::clone_hot(&*at));
+        } else {
+            base.add(1).write(base.read());
+        }
+        let f = Rc::as_ptr(&hook);
+        base.write(Object::Builtin(hook));
+        base.add(2).write(name.clone());
+        native_body_here(st, pc, slot, slot + 3, f, false)
+    }
+}
+
+/// [`attr_miss`] for a receiver whose class answers the site's name with
+/// a data descriptor written in Python (see
+/// `Interpreter::descr_getter`): its `__get__(descr, instance, owner)`
+/// called directly ([`dunder_call`]), the result at the site's slot. `0`
+/// done, `CALL_DECLINED` declined untouched, a status otherwise (as
+/// [`h_property`]'s).
+///
+/// # Safety
+///
+/// As [`attr_miss`]'s, at a site with a direct-call cache (nothing
+/// virtual lies below its slot, and three slots are free above the
+/// receiver's: see [`stack_need`]).
+#[inline(never)]
+unsafe fn descr_get(st: *mut State, site: &AttrSite, at: *mut Object, local: bool) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let st = &mut *st;
+        let Object::Instance(inst) = &*at else {
+            return CALL_DECLINED;
+        };
+        // (An inlined body's site numbers its pc and slots its own way.)
+        if st.sw.is_null() || !std::ptr::eq(Rc::as_ptr(&(*st.frame).code), site.code) {
+            return CALL_DECLINED;
+        }
+        let code = &*site.code;
+        let (pc, slot) = (site.pc as usize, site.slot as usize);
+        let Some((descr, get)) = Interpreter::descr_getter(code, inst, code.instructions[pc].arg)
+        else {
+            return CALL_DECLINED;
+        };
+        let owner = Object::Type(inst.cls());
+        // The call's operands from the site's slot: the descriptor, the
+        // receiver (a local's copied, the stack's moved up) and its class.
+        let base = st.stack.add(slot);
+        if local {
+            base.add(1).write(crate::clone_hot(&*at));
+        } else {
+            base.add(1).write(base.read());
+        }
+        base.write(Object::Instance(descr));
+        base.add(2).write(owner);
+        let r = dunder_call(st, pc, slot, 3, get, site.direct, None);
+        if r == CALL_DECLINED {
+            drop(base.add(2).read());
+            let recv = base.add(1).read();
+            drop(base.read());
+            if local {
+                drop(recv);
+            } else {
+                base.write(recv);
+            }
+        } else if r == 0 && (*st.maybe_dead).get() {
+            // (A receiver only the read held died with the call.)
+            return left_marked(st, site.pc, slot + 1);
+        }
+        r
     }
 }
 
@@ -8869,7 +9054,12 @@ fn type_attr_memo(site: &AttrSite, cls: &Rc<crate::types::TypeObject>) -> Option
     let (p, ver) = (Rc::as_ptr(cls) as usize, cls.attr_version.get());
     let memo = site.type_attr.try_borrow().ok()?;
     match memo.as_ref()? {
-        m if m.cls == p && m.ver == ver && ver != 0 && !matches!(*m.val, Object::Unbound) => {
+        m if m.cls == p
+            && m.ver == ver
+            && ver != 0
+            && m.meta == meta_version(cls)
+            && !matches!(*m.val, Object::Unbound) =>
+        {
             Some(crate::clone_hot(&m.val))
         }
         _ => None,
@@ -8943,11 +9133,9 @@ fn type_name_note(site: &AttrSite, cls: &Rc<crate::types::TypeObject>, value: &O
         return;
     }
     if let Ok(mut memo) = site.type_attr.try_borrow_mut() {
-        *memo = Some(TypeMemo::owned(
-            Rc::as_ptr(cls) as usize,
-            ver,
-            value.clone(),
-        ));
+        *memo = Some(
+            TypeMemo::owned(Rc::as_ptr(cls) as usize, ver, value.clone()).under(meta_version(cls)),
+        );
     }
 }
 
@@ -8960,6 +9148,9 @@ fn type_name_note(site: &AttrSite, cls: &Rc<crate::types::TypeObject>, value: &O
 pub(crate) struct TypeMemo {
     cls: usize,
     ver: u64,
+    /// For a class's own read, its metaclass's version (see
+    /// [`meta_version`]), which the class's doesn't follow.
+    meta: u64,
     val: std::mem::ManuallyDrop<Object>,
     owned: bool,
 }
@@ -8969,10 +9160,26 @@ impl TypeMemo {
         Self {
             cls,
             ver,
+            meta: 0,
             val: std::mem::ManuallyDrop::new(val),
             owned: true,
         }
     }
+
+    /// The memo for a class's own read, under its metaclass's version.
+    fn under(mut self, meta: u64) -> Self {
+        self.meta = meta;
+        self
+    }
+}
+
+/// The attribute version of `cls`'s metaclass (`0` without one): a class's
+/// own read (`cls.name`) asks the metaclass first, so what a site
+/// remembers of one stands while this and the class's version do.
+#[inline]
+fn meta_version(cls: &crate::types::TypeObject) -> u64 {
+    // SAFETY: GIL-serialized raw read; the reference ends with the read.
+    unsafe { (*cls.metaclass.as_ptr()).as_ref() }.map_or(0, |m| m.attr_version.get())
 }
 
 impl Drop for TypeMemo {
@@ -8986,9 +9193,10 @@ impl Drop for TypeMemo {
 
 fn type_attr_read(site: &AttrSite, cls: &Rc<crate::types::TypeObject>) -> Option<Object> {
     let (p, ver) = (Rc::as_ptr(cls) as usize, cls.attr_version.get());
+    let meta = meta_version(cls);
     if let Ok(memo) = site.type_attr.try_borrow() {
         if let Some(m) = memo.as_ref() {
-            if m.cls == p && m.ver == ver && ver != 0 {
+            if m.cls == p && m.ver == ver && ver != 0 && m.meta == meta {
                 // (`Unbound`: a read this path declined under that version.)
                 return (!matches!(*m.val, Object::Unbound)).then(|| crate::clone_hot(&m.val));
             }
@@ -8997,12 +9205,12 @@ fn type_attr_read(site: &AttrSite, cls: &Rc<crate::types::TypeObject>) -> Option
     if ver == 0 || crate::object::exotic_str_keys_possible() {
         return None;
     }
-    let v = type_attr_resolve(site, cls, p, ver);
+    let v = type_attr_resolve(site, cls, p, ver, meta);
     // A declined read (a property, a bound class method) is remembered
     // too, so that the site's later misses skip the lookups.
     if v.is_none() {
         if let Ok(mut memo) = site.type_attr.try_borrow_mut() {
-            *memo = Some(TypeMemo::owned(p, ver, Object::Unbound));
+            *memo = Some(TypeMemo::owned(p, ver, Object::Unbound).under(meta));
         }
     }
     v
@@ -9016,6 +9224,7 @@ fn type_attr_resolve(
     cls: &Rc<crate::types::TypeObject>,
     p: usize,
     ver: u64,
+    meta_ver: u64,
 ) -> Option<Object> {
     // SAFETY: the site's code is live (the caller's code runs it).
     let code = unsafe { &*site.code };
@@ -9063,7 +9272,7 @@ fn type_attr_resolve(
             _ => return None,
         };
         if let Ok(mut memo) = site.type_attr.try_borrow_mut() {
-            *memo = Some(TypeMemo::owned(p, ver, b.clone()));
+            *memo = Some(TypeMemo::owned(p, ver, b.clone()).under(meta_ver));
         }
         return Some(b);
     } else if name.starts_with("__") && !dunder_memo_ok(name) {
@@ -9088,7 +9297,7 @@ fn type_attr_resolve(
     // the classes that hold them.
     if let b @ Object::Builtin(_) = v {
         if let Ok(mut memo) = site.type_attr.try_borrow_mut() {
-            *memo = Some(TypeMemo::owned(p, ver, b.clone()));
+            *memo = Some(TypeMemo::owned(p, ver, b.clone()).under(meta_ver));
         }
         return Some(b);
     }
@@ -9101,18 +9310,24 @@ fn type_attr_resolve(
             | Object::Str(_)
             | Object::Bytes(_)
     );
-    // A plain function (a class's read returns it as it is), or an
-    // instance of the class itself that isn't a descriptor (an `Enum`
-    // member; adding a `__get__` would move this class's version):
+    // A plain function (a class's read returns it as it is), an instance
+    // of the class itself that isn't a descriptor (an `Enum` member;
+    // adding a `__get__` would move this class's version), or a builtin
+    // container, which is never one (an enum class's `_member_map_`):
     // borrowed, so the memo never keeps a replaced one alive.
     let v = match v {
         v if plain => {
             if let Ok(mut memo) = site.type_attr.try_borrow_mut() {
-                *memo = Some(TypeMemo::owned(p, ver, v.clone()));
+                *memo = Some(TypeMemo::owned(p, ver, v.clone()).under(meta_ver));
             }
             return Some(v);
         }
         f @ Object::Function(_) => f,
+        c @ (Object::Dict(_)
+        | Object::List(_)
+        | Object::Tuple(_)
+        | Object::Set(_)
+        | Object::FrozenSet(_)) => c,
         Object::Instance(i)
             if std::ptr::eq(i.cls_raw(), Rc::as_ptr(cls))
                 && !name.starts_with("__")
@@ -9128,6 +9343,7 @@ fn type_attr_resolve(
         *memo = Some(TypeMemo {
             cls: p,
             ver,
+            meta: meta_ver,
             val: std::mem::ManuallyDrop::new(borrowed),
             owned: false,
         });
@@ -21250,6 +21466,8 @@ impl<'a> Lower<'a> {
             direct,
             cache: SlotCache::default(),
             class_attr: Cell::new(false),
+            descr: Cell::new(false),
+            hook: std::cell::RefCell::new(None),
             type_attr: std::cell::RefCell::new(None),
             class_poly: Default::default(),
             class_poly_next: Cell::new(0),

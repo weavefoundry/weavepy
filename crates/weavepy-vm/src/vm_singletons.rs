@@ -549,6 +549,7 @@ pub fn clear_thread_python_tls() {
         }
     }
     crate::builtin_types::clear_thread_type_registry();
+    crate::stdlib::local_native::forget_thread();
 }
 
 /// Look up the worker thread id for the currently-running OS thread,

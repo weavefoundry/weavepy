@@ -10711,7 +10711,27 @@ impl Interpreter {
             return None;
         };
         if !Self::default_setattr(inst.cls_raw()) {
-            return None;
+            // A `threading.local`'s native `__setattr__`, where it runs no
+            // Python code: the entry stored in place.
+            let Some(Object::Builtin(b)) = inst.cls_raw().lookup("__setattr__") else {
+                return None;
+            };
+            let name = code_name_obj(&frame.code, ins.arg)?;
+            if !crate::stdlib::local_native::is_hook(&b, true)
+                || !crate::stdlib::local_native::setattr_fast(
+                    &frame.stack[n - 1],
+                    name,
+                    &frame.stack[n - 2],
+                )
+            {
+                return None;
+            }
+            let receiver = frame.stack.pop().expect("checked above");
+            let value = frame.stack.pop().expect("checked above");
+            frame.pc = pc as u32 + 1;
+            self.release(receiver);
+            self.release(value);
+            return Some(Ok(()));
         }
         let LeafAttr::Property(prop) =
             Self::leaf_resolve_instance_attr(&frame.code, inst, ins.arg)?
@@ -10837,6 +10857,46 @@ impl Interpreter {
         }
     }
 
+    /// The data descriptor written in Python that reading
+    /// `co_names[name_idx]` of `inst` calls, and its `__get__`: an instance
+    /// on the class's MRO whose own class has `__set__` or `__delete__`
+    /// (so it wins over the instance's own attributes) and a plain
+    /// `__get__(self, instance, owner)` function a lean activation can
+    /// run, where the class reads attributes the default way.
+    pub(crate) fn descr_getter(
+        code: &CodeObject,
+        inst: &PyInstance,
+        name_idx: u32,
+    ) -> Option<(Rc<PyInstance>, Rc<PyFunction>)> {
+        let cls = inst.cls_raw();
+        // (An `AttributeError` from `__get__` falls back to `__getattr__`
+        // on the full path.)
+        if !Self::default_getattribute(cls)
+            || crate::object::exotic_str_keys_possible()
+            || cls.dunder(crate::types::Dunder::GetAttr).present()
+        {
+            return None;
+        }
+        // (A non-data descriptor would yield to the instance's own
+        // attribute; those stay on the full path, as do dunders.)
+        let (descr, get) = Self::leaf_class_data_descr(code, cls, name_idx)?;
+        // SAFETY: GIL-serialized raw read of the function's code cell.
+        let gcode: &CodeObject = unsafe { &*get.code.as_ptr() };
+        if gcode.arg_count != 3
+            || gcode.kwonly_count != 0
+            || gcode.has_varargs
+            || gcode.has_varkeywords
+            || gcode.is_generator
+            || gcode.is_coroutine
+            || gcode.is_async_generator
+            || !Self::lean_code_ok(gcode)
+        {
+            return None;
+        }
+        get.lean_cells_ref(gcode)?;
+        Some((descr, get))
+    }
+
     /// `LOAD_ATTR` at `pc` of `frame` (no method flag) on an instance whose
     /// class attribute is a descriptor written in Python (an instance of a
     /// class with a plain `__get__(self, instance, owner)` function), as an
@@ -10857,31 +10917,8 @@ impl Interpreter {
         let Some(Object::Instance(inst)) = frame.stack.last() else {
             return None;
         };
-        let cls = inst.cls_raw();
-        // (An `AttributeError` from `__get__` falls back to `__getattr__`
-        // on the full path.)
-        if !Self::default_getattribute(cls)
-            || crate::object::exotic_str_keys_possible()
-            || cls.dunder(crate::types::Dunder::GetAttr).present()
-        {
-            return None;
-        }
-        // (A non-data descriptor would yield to the instance's own
-        // attribute; those stay on the full path, as do dunders.)
-        let (descr, get) = Self::leaf_class_data_descr(&frame.code, cls, ins.arg)?;
+        let (descr, get) = Self::descr_getter(&frame.code, inst, ins.arg)?;
         let code = get.code();
-        if code.arg_count != 3
-            || code.kwonly_count != 0
-            || code.has_varargs
-            || code.has_varkeywords
-            || code.is_generator
-            || code.is_coroutine
-            || code.is_async_generator
-            || !Self::lean_code_ok(&code)
-        {
-            return None;
-        }
-        get.lean_cells_ref(&code)?;
         let owner = Object::Type(inst.cls());
         let descr = Object::Instance(descr.clone());
         // Past the recursion limit the nested lean path raises.
@@ -11018,14 +11055,31 @@ impl Interpreter {
     /// a class neither natively served nor an extension's) and that is a
     /// plain Python function: the function the site remembers for the
     /// class's version (see [`Self::try_inline_getitem`]), else the
-    /// class's own.
+    /// class's own. For a class whose metaclass isn't `type`
+    /// (`Color["RED"]`, which `EnumType` serves), the metaclass's.
     pub(crate) fn getitem_dunder(
         code: &CodeObject,
         pc: usize,
         container: &Object,
     ) -> Option<Rc<crate::object::PyFunction>> {
-        let Object::Instance(inst) = container else {
-            return None;
+        let inst = match container {
+            Object::Instance(inst) => inst,
+            Object::Type(t) if !t.metaclass_is_type() => {
+                let meta = t.metaclass_or_type();
+                let ver = meta.attr_version.get();
+                let slot = code_method_slot(code, pc as u32);
+                if let Some(f) = slot.and_then(|s| s.get_held(ver)) {
+                    return Some(f);
+                }
+                let Some(Object::Function(f)) = meta.lookup("__getitem__") else {
+                    return None;
+                };
+                if let Some(s) = slot {
+                    s.set(ver, &f);
+                }
+                return Some(f);
+            }
+            _ => return None,
         };
         let cls = inst.cls_raw();
         if inst.native.get().is_some() || cls.native_kind.get() != 0 || cls.c_ext_ptr.get() != 0 {
@@ -55496,7 +55550,22 @@ impl Interpreter {
         if name == "__del__" {
             ty.invalidate_finalizer_cache();
         }
+        Self::descriptor_protocol_changed(name);
         Ok(())
+    }
+
+    /// A class attribute named `name` was assigned or deleted after the
+    /// class was made: for `__get__`, `__set__` and `__delete__`, the
+    /// class's instances start or stop being descriptors (or data
+    /// descriptors), which changes what they resolve to as *other*
+    /// classes' attributes. Those classes' versions don't follow this
+    /// one's, so every class's moves (CPython's specializer instead
+    /// refuses a descriptor whose class is mutable). This is rare: a
+    /// class's body sets these before anything can hold an instance.
+    fn descriptor_protocol_changed(name: &str) {
+        if matches!(name, "__get__" | "__set__" | "__delete__") {
+            builtin_types().object_.bump_attr_version();
+        }
     }
 
     /// The metaclass half of `_PyObject_GenericSetAttrWithDict` for a
@@ -55664,6 +55733,7 @@ impl Interpreter {
         if name == "__del__" {
             ty.invalidate_finalizer_cache();
         }
+        Self::descriptor_protocol_changed(name);
         // PyType_Watch: attribute deletion is a type modification too.
         if crate::capi_watchers::types_active() {
             crate::capi_watchers::type_modified(ty);
@@ -84395,6 +84465,9 @@ fn meta_entry_fill(code: &CodeObject, cls: &crate::types::TypeObject, pc: usize,
         | Object::Long(_)
         | Object::Tuple(_)
         | Object::FrozenSet(_)
+        | Object::Dict(_)
+        | Object::List(_)
+        | Object::Set(_)
         | Object::Module(_) => true,
         Object::Instance(i) => std::ptr::eq(i.cls_raw(), cls),
         _ => false,

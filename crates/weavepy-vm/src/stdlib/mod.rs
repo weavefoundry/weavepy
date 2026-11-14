@@ -173,6 +173,7 @@ pub mod collections_native;
 pub mod collections_odict;
 pub mod contextvars_native;
 pub mod gc_real;
+pub mod local_native;
 pub mod multiprocessing_mod;
 pub mod queue_native;
 pub mod thread_real;
@@ -313,6 +314,7 @@ pub fn register_all(cache: &ModuleCache) {
     // bound form must be a `builtin_function_or_method` —
     // test_types.test_method_descriptor_crash).
     cache.register_builtin("_weave_queue", queue_native::build);
+    cache.register_builtin("_weave_local", local_native::build);
     // Atomic `deque` end operations behind the `_collections` Python
     // stand-in (CPython documents append/pop from either side as
     // thread-safe; `SimpleQueue` and asyncio's ready queue rely on it).
