@@ -7,7 +7,37 @@ plan, what's done, and what's next, so a new session can pick up the work.
 
 ## Where WeavePy stands
 
-Measured on November 13, 2026 (this PR, quick builds, no fresh PGO run):
+Measured on November 13, 2026, at `4e230310` (this PR), a PGO build from a
+fresh training run against CPython 3.14.8 on the same idle host. The
+benchmark suite: warm time 0.850, cold time 0.959, peak RSS 1.137, and
+0.996 of the time of the last PGO build measured here (`d1f48c5c`) in the
+same run, so nothing in between cost the suite anything. WeavePy is ahead
+on 22 of the 33 workloads warm and 17 cold; the best warm times are
+`scimark` 0.51, `pickle_roundtrip` 0.57 and `raytrace` 0.60, the worst
+`async_tree` 1.25, `sudoku` 1.14, `context_managers` 1.12 and `deepcopy`
+1.11. Whole processes take 0.90 of CPython's time, `-c pass` 0.70 to 0.75
+(see "Measurement notes" for why that is a range), peak RSS is 1.14 and
+peak footprint 1.22 of CPython's (1.14 and 1.22 for the earlier build in
+the same run).
+
+The everyday battery (`tools/pybench/everyday.py`, 54 cases), which is
+where this part of the PR worked: 1.44 times CPython's time on average
+over two runs (1.45 and 1.43), against 1.79 for the earlier build in the
+same session. WeavePy is ahead on 12 cases (9 before), past twice
+CPython's time on 14 (18 before) and past three times on 5 (11 before):
+`threading_queue_ops` 4.2, `inspect_typing_ops` 3.9, `weakref_gc_ops`
+3.3, `class_features` 3.3 and `enum_dataclass_ops` 3.3. The cases this PR
+went after moved the most: reading a file's lines 117 to 0.88, writing
+them 13.6 to 0.84, `os_listdir_walk` 3.6 to 1.5, `print_to_buffer` 1.9 to
+1.0, `csv_ops` 3.3 to 1.9, `threading_queue_ops` 5.8 to 4.2,
+`enum_dataclass_ops` 4.1 to 3.3, `datetime_time_ops` 2.6 to 2.0,
+`argparse_ops` 3.2 to 2.5, `math_ops` 1.4 to 0.93. The library cases
+nobody has broken down yet (`inspect` and `typing`, `weakref`, `email`,
+`configparser`, `asyncio`) are where they were. So: ahead of CPython on
+the suite, still well behind it on a good part of ordinary library code,
+and "Next" below is ordered by that.
+
+Measured earlier on November 13, 2026 (this PR, quick builds, no fresh PGO run):
 the benchmark suite's figures below still hold, but they aren't the whole
 picture. A battery of 53 everyday operations
 (`tools/pybench/everyday.py`: file and directory work, text, data
@@ -3643,6 +3673,20 @@ Two items the November 12 measurements put ahead of the list below:
 
 ## Measurement notes
 
+- Start-up timings of two binaries differ by up to 8% for reasons that
+  aren't in them. The same PGO binary read 21.5 ms for `-c pass` in one
+  interleaved run and 19.7 ms two hours later, while the binary beside
+  it went from 19.6 to 21.6 across a later pair of runs; a build's
+  instruction count for the same start-up didn't move. Non-PGO builds
+  of the commits in between were flat (75.3 M to 75.6 M instructions,
+  cycles within 1.5%). Compare start-up by instructions and cycles
+  (`/usr/bin/time -l`, least of fifteen runs), and treat a wall-clock
+  gap under 10% between two binaries as unmeasured.
+- A regression sweep of the everyday battery runs each case with
+  `WEAVEPY_FRAME_JIT_SYNC=1` and compares raw instruction totals between
+  two builds. With the background compiler on, the moment a compile
+  lands moves a case by 5% between builds that are identical with it
+  synchronous.
 - Instruction counts (`/usr/bin/time -l`, or callgrind in the `wp-cg:latest`
   container) guide the work; wall time on a PGO build decides it. Pin
   `PYTHONHASHSEED=0` and unset `PYTHONDONTWRITEBYTECODE` for whole-process
