@@ -8437,8 +8437,10 @@ unsafe fn attr_miss(st: *mut State, site: &AttrSite, at: *mut Object, local: boo
         if site.direct.is_null() {
             return CALL_DECLINED;
         }
-        // (Once a class version: a site that reads no descriptor asks
-        // again only when the class changes.)
+        // (Once a class version: a site whose name the class answers with
+        // no such descriptor asks again only when the class changes, which
+        // `descr_get` notes. A getter that only declined its first calls,
+        // still warming up, is asked again.)
         if let Object::Instance(inst) = &*at {
             let ver = inst.cls_raw().attr_version.get();
             if !site.descr.get() && site.no_descr.get() != ver {
@@ -8447,7 +8449,6 @@ unsafe fn attr_miss(st: *mut State, site: &AttrSite, at: *mut Object, local: boo
                     site.descr.set(true);
                     return r;
                 }
-                site.no_descr.set(ver);
             }
         }
         h_property(st, site.code, pc, slot, at, u64::from(local), site.direct)
@@ -8580,6 +8581,7 @@ unsafe fn descr_get(st: *mut State, site: &AttrSite, at: *mut Object, local: boo
         let (pc, slot) = (site.pc as usize, site.slot as usize);
         let Some((descr, get)) = Interpreter::descr_getter(code, inst, code.instructions[pc].arg)
         else {
+            site.no_descr.set(inst.cls_raw().attr_version.get());
             return CALL_DECLINED;
         };
         let owner = Object::Type(inst.cls());
