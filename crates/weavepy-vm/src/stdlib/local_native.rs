@@ -63,24 +63,29 @@ pub(crate) fn forget_thread() {
 /// The namespace this thread remembers for `inst`, if it is still the
 /// shim's.
 fn remembered(inst: &Rc<PyInstance>) -> Option<Rc<RefCell<DictData>>> {
-    SPACES.with(|s| {
-        let mut s = s.try_borrow_mut().ok()?;
-        let at = s
-            .iter()
-            .position(|sp| std::ptr::eq(sp.owner.as_ptr(), Rc::as_ptr(inst)))?;
-        match s[at].dict.upgrade() {
-            Some(d) => {
-                if at != 0 {
-                    s.swap(0, at);
+    // (A thread that is tearing its storage down remembers nothing: the
+    // shim answers, as on a first touch.)
+    SPACES
+        .try_with(|s| {
+            let mut s = s.try_borrow_mut().ok()?;
+            let at = s
+                .iter()
+                .position(|sp| std::ptr::eq(sp.owner.as_ptr(), Rc::as_ptr(inst)))?;
+            match s[at].dict.upgrade() {
+                Some(d) => {
+                    if at != 0 {
+                        s.swap(0, at);
+                    }
+                    Some(d)
                 }
-                Some(d)
+                None => {
+                    s.swap_remove(at);
+                    None
+                }
             }
-            None => {
-                s.swap_remove(at);
-                None
-            }
-        }
-    })
+        })
+        .ok()
+        .flatten()
 }
 
 /// The calling thread's namespace for the `local` object `recv`: the one
@@ -104,7 +109,7 @@ fn namespace(
     let Object::Dict(d) = interp.call(&make, &[], &[], &g)? else {
         return Err(type_error("a thread-local namespace must be a dict"));
     };
-    SPACES.with(|s| {
+    let _ = SPACES.try_with(|s| {
         if let Ok(mut s) = s.try_borrow_mut() {
             // (Objects that are gone leave with the next one remembered.)
             s.retain(|sp| sp.owner.strong_count() != 0 && sp.dict.strong_count() != 0);
