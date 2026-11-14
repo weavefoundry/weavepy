@@ -6677,6 +6677,17 @@ fn utf8_prefix(buf: &[u8], want: usize) -> (usize, usize) {
     (at, count)
 }
 
+/// How a sized text read finds whole characters in the bytes waiting.
+#[derive(Debug, Clone, Copy)]
+enum CharWidths {
+    /// UTF-8's, by each lead byte ([`utf8_prefix`]).
+    Utf8,
+    /// A byte each.
+    One,
+    /// The codec's own business: it's asked what decodes.
+    Ask,
+}
+
 /// What a text stream's configuration means for the text passing through
 /// it, so that the per-line and per-write paths needn't read the encoding,
 /// error handler and newline strings again.
@@ -8369,27 +8380,125 @@ impl PyFile {
             return self.decode_text(bytes);
         }
         // Whole characters come out of the read-ahead, which the backend
-        // fills a block at a time.
-        let mut bytes: Vec<u8> = Vec::new();
+        // fills a block at a time. A piece can decode to fewer characters
+        // than it was taken for (a `\r\n` read as one `\n`, a byte-order
+        // mark, bytes an error handler drops), so pieces are taken until
+        // the count is met or the stream ends.
+        let plan = self.text_plan();
+        let widths = match plan.codec {
+            TextCodec::Utf8 => CharWidths::Utf8,
+            TextCodec::Latin1 | TextCodec::Ascii => CharWidths::One,
+            TextCodec::Other => match self.encoding.borrow().as_deref() {
+                Some(enc) if enc.to_ascii_lowercase().replace(['-', '_'], "") == "utf8sig" => {
+                    CharWidths::Utf8
+                }
+                _ => CharWidths::Ask,
+            },
+        };
+        let mut out = String::new();
         let mut chars = 0usize;
         while chars < n {
-            {
+            let mut bytes = self.take_chars(n - chars, widths)?;
+            if bytes.is_empty() {
+                break;
+            }
+            // A `\r` that ends the piece may be the first half of a `\r\n`,
+            // which a translating stream reads as one `\n`.
+            if plan.translate && bytes.last() == Some(&b'\r') {
+                if self.read_ahead.borrow().rest().is_empty() {
+                    self.fill_read_ahead()?;
+                }
                 let mut ra = self.read_ahead.borrow_mut();
-                let (len, count) = utf8_prefix(ra.rest(), n - chars);
-                if len > 0 {
+                if ra.rest().first() == Some(&b'\n') {
+                    bytes.push(b'\n');
+                    ra.consume(1);
+                }
+            }
+            let piece = self.decode_text(bytes)?;
+            chars += if piece.is_ascii() {
+                piece.len()
+            } else {
+                piece.chars().count()
+            };
+            if out.is_empty() {
+                out = piece;
+            } else {
+                out.push_str(&piece);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Take the bytes of at most `want` whole characters from the front of
+    /// this byte-backed text stream, filling the read-ahead as needed: fewer
+    /// only at the end of the stream, where a character cut short comes too
+    /// (for the codec to refuse).
+    fn take_chars(&self, want: usize, widths: CharWidths) -> Result<Vec<u8>, RuntimeError> {
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut chars = 0usize;
+        while chars < want {
+            let left = want - chars;
+            let found = match widths {
+                CharWidths::Utf8 => Some(utf8_prefix(self.read_ahead.borrow().rest(), left)),
+                CharWidths::One => {
+                    let len = left.min(self.read_ahead.borrow().rest().len());
+                    Some((len, len))
+                }
+                CharWidths::Ask => self.decodable_prefix(left),
+            };
+            match found {
+                Some((len, count)) if len > 0 => {
+                    let mut ra = self.read_ahead.borrow_mut();
+                    // (Asking the codec may have run code that read on.)
+                    let len = len.min(ra.rest().len());
                     bytes.extend_from_slice(&ra.rest()[..len]);
                     ra.consume(len);
                     chars += count;
-                    continue;
+                }
+                // Nothing waiting, or only the front of a character.
+                _ => {
+                    if !self.fill_read_ahead()? {
+                        bytes.extend(self.read_ahead.borrow_mut().take_all());
+                        break;
+                    }
                 }
             }
-            // Nothing waiting, or only the front of a character.
-            if !self.fill_read_ahead()? {
-                bytes.extend(self.read_ahead.borrow_mut().take_all());
-                break;
-            }
         }
-        self.decode_text(bytes)
+        Ok(bytes)
+    }
+
+    /// [`PyFile::take_chars`] for a codec whose characters' widths only it
+    /// knows: how much of the read-ahead's front holds at most `want` whole
+    /// characters, and a count no smaller than theirs. A character is a byte
+    /// at least, so `want` bytes hold no more than `want` of them; where
+    /// they end inside a character (the codec refuses them), its remaining
+    /// bytes, three at most, come along. `None` when the read-ahead must
+    /// grow before that can be told.
+    fn decodable_prefix(&self, want: usize) -> Option<(usize, usize)> {
+        /// The longest character of a codec CPython ships, in bytes.
+        const LONGEST: usize = 4;
+        let (window, whole) = {
+            let ra = self.read_ahead.borrow();
+            let rest = ra.rest();
+            let window = rest[..rest.len().min(want + LONGEST - 1)].to_vec();
+            (window, rest.len() >= want + LONGEST - 1)
+        };
+        if window.is_empty() {
+            return None;
+        }
+        let base = want.min(window.len());
+        let enc = self.encoding.borrow().clone()?;
+        let _exempt = crate::stdlib::codecs_mod::io_text_exempt_guard();
+        let decodes = |end: usize| {
+            crate::stdlib::codecs_mod::decode_bytes(&window[..end], &enc, "strict").is_ok()
+        };
+        match (base..=window.len()).find(|&end| decodes(end)) {
+            Some(end) => Some((end, base)),
+            // Malformed, with every byte that could complete a character
+            // in hand: the stream's error handler has it.
+            None if whole => Some((base, base)),
+            None => None,
+        }
     }
 
     // -- Faithful incremental text-decode path (CPython `TextIOWrapper`) -----
