@@ -170,6 +170,44 @@ pub(crate) unsafe fn sole_owner<T: ?Sized>(value: *const T) -> bool {
     }
 }
 
+/// The layout of the `Arc` allocation holding `value`: the two counters
+/// followed by the payload's layout, padded, which is how `Arc` sizes it
+/// (`arcinner_layout_for_value_layout`).
+///
+/// # Safety
+///
+/// `value` is the payload of an `Arc` allocation that hasn't been freed
+/// (the payload itself may have been dropped or moved out: its layout is
+/// its type's and its pointer's to tell).
+#[inline(always)]
+unsafe fn arc_layout<T: ?Sized>(value: *const T) -> std::alloc::Layout {
+    // SAFETY: per the caller.
+    let payload = std::alloc::Layout::for_value(unsafe { &*value });
+    let (inner, _) = std::alloc::Layout::new::<[usize; 2]>()
+        .extend(payload)
+        .expect("Arc layout");
+    inner.pad_to_align()
+}
+
+/// Free the `Arc` allocation holding `value`, with the layout `Arc`
+/// allocated it with ([`arc_layout`]).
+///
+/// # Safety
+///
+/// As [`arc_layout`]'s, and the caller holds the allocation's last
+/// reference, strong or weak: the payload is dropped, moved out or in no
+/// need of a drop, and nothing uses the allocation afterwards.
+#[inline(always)]
+pub(crate) unsafe fn free_arc<T: ?Sized>(value: *const T) {
+    // SAFETY: per the caller; the allocation starts at its strong count.
+    unsafe {
+        std::alloc::dealloc(
+            strong_word(value).cast::<u8>().cast_mut(),
+            arc_layout(value),
+        );
+    }
+}
+
 /// Add one strong owner of the `Arc` payload at `value`.
 ///
 /// # Safety
@@ -232,21 +270,9 @@ pub(crate) unsafe fn try_free_last<T: ?Sized>(value: *const T) -> bool {
     if strong.load(Ordering::Relaxed) != 1 || weak.load(Ordering::Relaxed) != 1 {
         return false;
     }
-    // `Arc` sizes its allocation as the two counters followed by the
-    // payload's layout, padded (`arcinner_layout_for_value_layout`).
-    // SAFETY: as above; the payload is live until the deallocation.
-    let payload = std::alloc::Layout::for_value(unsafe { &*value });
-    let (inner, _) = std::alloc::Layout::new::<[usize; 2]>()
-        .extend(payload)
-        .expect("Arc layout");
-    // SAFETY: the sole owner frees the allocation it owns, with the layout
-    // `Arc` allocated it with; the payload needs no drop.
-    unsafe {
-        std::alloc::dealloc(
-            ptr::from_ref(strong).cast::<u8>().cast_mut(),
-            inner.pad_to_align(),
-        );
-    }
+    // SAFETY: the sole owner frees the allocation it owns; the payload
+    // needs no drop.
+    unsafe { free_arc(value) };
     true
 }
 
@@ -298,13 +324,7 @@ unsafe fn drop_arc_in<T: ?Sized>(slot: &mut ManuallyDrop<Arc<T>>) {
 unsafe fn release_last<T: ?Sized>(value: *const T, strong: &AtomicUsize) {
     // SAFETY: the weak count is the word after the strong one (`ArcInner`
     // is `repr(C)`); the payload is live until it is dropped below.
-    let (weak, layout) = unsafe {
-        let payload = std::alloc::Layout::for_value(&*value);
-        let (inner, _) = std::alloc::Layout::new::<[usize; 2]>()
-            .extend(payload)
-            .expect("Arc layout");
-        (&*ptr::from_ref(strong).add(1), inner.pad_to_align())
-    };
+    let (weak, layout) = unsafe { (&*ptr::from_ref(strong).add(1), arc_layout(value)) };
     // As `Arc::drop_slow`: the payload drops with the strong count at zero
     // (a weak reference no longer upgrades), then the strong owners'
     // implicit weak reference goes.
@@ -325,7 +345,7 @@ unsafe fn release_last<T: ?Sized>(value: *const T, strong: &AtomicUsize) {
     };
     if free {
         // SAFETY: no strong or weak reference remains; the layout is the
-        // one `Arc` allocated with (see `try_free_last`).
+        // one `Arc` allocated with (see `arc_layout`).
         unsafe { std::alloc::dealloc(ptr::from_ref(strong).cast::<u8>().cast_mut(), layout) };
     }
 }
@@ -383,20 +403,15 @@ impl<T: 'static> Rc<T> {
         }
         let p = Arc::as_ptr(&this.0);
         // SAFETY: `this` keeps the allocation alive. Its sole owner moves
-        // the payload out exactly once and frees the allocation with the
-        // layout `Arc` allocated it with (the two counts, then the payload,
-        // padded: see `try_free_last`); `this` is never dropped.
+        // the payload out exactly once and frees the allocation; `this` is
+        // never dropped.
         unsafe {
             if !sole_owner(p) {
                 return Err(this);
             }
             let value = ptr::read(p);
-            let (inner, _) = std::alloc::Layout::new::<[usize; 2]>()
-                .extend(std::alloc::Layout::new::<T>())
-                .expect("Arc layout");
-            let strong = strong_word(p);
             let _ = ManuallyDrop::new(this);
-            std::alloc::dealloc(strong.cast::<u8>().cast_mut(), inner.pad_to_align());
+            free_arc(p);
             Ok(value)
         }
     }
@@ -917,8 +932,7 @@ impl<T: ?Sized> Drop for Weak<T> {
             // handle that isn't the allocation's last reference gives its
             // count up in place. The last one (the strong owners hold a
             // weak reference between them, so the payload is gone) frees
-            // the allocation, with the layout `Arc` allocated it with (see
-            // `try_free_last`; a dropped payload still has its layout).
+            // the allocation.
             // SAFETY: the bias holds, and this handle's reference is
             // released exactly once, here or below.
             unsafe {
@@ -929,11 +943,7 @@ impl<T: ?Sized> Drop for Weak<T> {
                     weak.store(n - 1, Ordering::Relaxed);
                     return;
                 }
-                let p = self.0.as_ptr();
-                let (inner, _) = std::alloc::Layout::new::<[usize; 2]>()
-                    .extend(std::alloc::Layout::for_value(&*p))
-                    .expect("Arc layout");
-                std::alloc::dealloc(strong_word(p).cast::<u8>().cast_mut(), inner.pad_to_align());
+                free_arc(self.0.as_ptr());
                 return;
             }
         }

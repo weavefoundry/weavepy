@@ -1045,8 +1045,7 @@ unsafe impl ThinPayload for crate::tuple_storage::TupleStorage {
             // weak handle either (`sole_owner`) nothing else reads its
             // items. Each item's count is given up once: in place here, or
             // by the nested release below (which sees the blanked items as
-            // scalars). The allocation is freed with the layout `Arc`
-            // allocated it with (see `rc::try_free_last`).
+            // scalars).
             unsafe {
                 if crate::rc::sole_owner(p) {
                     let items: &mut [crate::object::Object] = &mut *p.cast_mut();
@@ -1058,12 +1057,8 @@ unsafe impl ThinPayload for crate::tuple_storage::TupleStorage {
                         }
                     }
                     if done == items.len() {
-                        let (inner, _) = std::alloc::Layout::new::<[usize; 2]>()
-                            .extend(std::alloc::Layout::for_value(&*p))
-                            .expect("Arc layout");
-                        let start = crate::rc::strong_word(p).cast::<u8>().cast_mut();
                         std::mem::forget(last);
-                        std::alloc::dealloc(start, inner.pad_to_align());
+                        crate::rc::free_arc(p);
                         return;
                     }
                     for item in &mut items[..done] {
