@@ -481,9 +481,13 @@ branch and pull request.
     that entry again; `urllib.parse._checknetloc` ran interpreted on every
     call) and compiled code whose activations mostly side-exit or fail
     their entry guards, which waited for absolute budgets of 64. Call heat
-    now goes to the frame JIT once tier 2 has missed the call entry, and
-    compiled code retires once its misses reach 16 and outnumber its
-    finished native runs two to one. With tier 2 off the battery now runs
+    now goes to the frame JIT once tier 2 has missed the call entry and
+    the code has got hot that way 128 times with none of its loops run
+    (taking it at the first such heat cost raytrace 8%: `Scene.trace`'s
+    loop runs only for rays that hit something, which the first rows
+    don't, and tier 2 compiles that loop by OSR later), and compiled code
+    retires once its misses reach 16 and outnumber its finished native
+    runs two to one. With tier 2 off the battery now runs
     0.8% fewer instructions instead of 2%; the enum and dataclass case (8%)
     and the threading and queue case (6%) are what's left.
   - `os.environ.get(name)` and `name in os.environ` read the backing store.

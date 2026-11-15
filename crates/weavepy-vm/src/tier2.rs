@@ -16492,9 +16492,14 @@ pub(crate) fn stats_for_test() -> (u64, u64, u64) {
 /// Whether this thread's tier-2 state holds compiled code for `code` (an
 /// entry that may run its loops), or can't say right now.
 /// Whether tier 2's analysis already missed its probes for `code`'s
-/// call entry (pc 0): it never attempts that entry again (see
-/// `CacheEntry::probe_misses`), so a call can't reach tier 2 any more.
+/// call entry (pc 0), which it never attempts again (see
+/// `CacheEntry::probe_misses`), and none of the code's loops has run a
+/// back edge: a call can't reach tier 2 any more, and no loop asks it to
+/// enter by OSR.
 pub(crate) fn missed_call_entry(code: &CodeObject) -> bool {
+    if code.jit_hint.backedges_seen() {
+        return false;
+    }
     JIT.with(|cell| {
         cell.try_borrow().is_ok_and(|st| {
             st.cache

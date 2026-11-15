@@ -104,6 +104,11 @@ const CHAIN: u32 = 7;
 /// frame JIT takes it anyway (see `Slot::try_compile`).
 const LEFT_TO_TIER2: u32 = 16;
 
+/// How many times calls make code hot, after tier 2 missed its call entry
+/// and with none of its loops run, before the frame JIT takes it (see
+/// `Slot::try_compile`).
+const CALL_WAITS: u32 = 128;
+
 /// The heat per instruction of a code object at which it compiles (see
 /// `Slot::warm`; `WEAVEPY_FRAME_JIT_HOT` overrides it, a tuning aid). With
 /// the code generator a quarter of Cranelift's cost, 500 took 8% off the
@@ -621,6 +626,9 @@ pub(crate) struct Slot {
     /// How many times the code got hot while its loops waited for tier 2
     /// (see `try_compile`).
     left: AtomicU32,
+    /// How many times calls made the code hot after tier 2 had missed its
+    /// call entry, with none of its loops run (see `try_compile`).
+    call_waits: AtomicU32,
     /// A compile whose machine code a worker is generating (see
     /// [`background`]).
     pending: background::Pending,
@@ -803,13 +811,14 @@ impl Slot {
                 self.left.store(left, Ordering::Relaxed);
             }
             // (Call heat goes to the frame JIT once tier 2 has missed the
-            // call entry, which it never attempts again, while none of the
-            // code's loops has run: a loop that runs is tier 2's to enter
-            // by OSR.)
-            let left_to_tier2 = left < LEFT_TO_TIER2
-                && !(left == 0
-                    && self.left.load(Ordering::Relaxed) == 0
-                    && crate::tier2::missed_call_entry(code));
+            // call entry, which it never attempts again, and the code has
+            // got hot that way `CALL_WAITS` times with none of its loops
+            // run: a loop that runs is tier 2's to enter by OSR, and one
+            // that runs only now and then shouldn't be taken too soon.)
+            let taken_for_calls = left == 0
+                && crate::tier2::missed_call_entry(code)
+                && self.call_waits.fetch_add(1, Ordering::Relaxed) + 1 >= CALL_WAITS;
+            let left_to_tier2 = left < LEFT_TO_TIER2 && !taken_for_calls;
             if left_to_tier2 || crate::tier2::holds_compiled(code) {
                 if stats::enabled() {
                     let kind = if left > 0 { "loop" } else { "call" };

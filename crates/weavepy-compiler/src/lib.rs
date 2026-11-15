@@ -374,6 +374,16 @@ impl JitHint {
         true
     }
 
+    /// Whether a back edge of the code's loops has been counted (by
+    /// [`Self::backedge_tick`] or [`Self::backedge_pending`]): the
+    /// countdown starts at zero and never returns to it.
+    #[inline]
+    pub fn backedges_seen(&self) -> bool {
+        self.backedge_countdown
+            .load(std::sync::atomic::Ordering::Relaxed)
+            != 0
+    }
+
     /// Whether the tier-2 state has no further interest in this code's
     /// back edges (see [`Self::set_backedge_quiet`]).
     #[inline]
