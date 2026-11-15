@@ -1285,6 +1285,9 @@ impl JitState {
         let long_calls;
         let iters_per_call;
         let mut carved = weavepy_jit::Carved::default();
+        // A recompile's predecessor, put back if the recompile fails: the
+        // frame it compiled still serves the entries it has.
+        let mut predecessor: Option<Tier> = None;
         {
             let entry = cache_entry(&mut self.cache, &mut self.sweep_at, code);
             if entry_pc == 0 {
@@ -1297,7 +1300,10 @@ impl JitState {
             // here (see `CacheEntry::recompile_at_osr`).
             // A loop carved out for its code alone stays interpreted; one
             // carved out for want of live values recompiles from inside.
+            // (An entry pc that missed its probes already would miss them
+            // again: it observes the same frame state.)
             let recompile = entry_pc != 0
+                && !entry.probe_misses.contains(&entry_pc)
                 && matches!(&entry.tier, Tier::Compiled(a)
                     if !a.cf.osr_entries.iter().any(|e| e.pc == entry_pc)
                         && ((entry.recompile_at_osr && !a.cf.stayed_heads.contains(&entry_pc))
@@ -1308,7 +1314,7 @@ impl JitState {
                 entry.cold_recompiles = entry.cold_recompiles.saturating_add(1);
                 entry.osr_failures = 0;
                 entry.osr_absent.clear();
-                entry.tier = Tier::Cold;
+                predecessor = Some(std::mem::replace(&mut entry.tier, Tier::Cold));
                 entry.counter = entry.counter.max(self.threshold);
             }
             match &entry.tier {
@@ -1916,6 +1922,9 @@ impl JitState {
                         if loop_headers(code).all(|pc| entry.probe_misses.contains(&pc)) {
                             code.jit_hint.set_backedge_quiet();
                         }
+                        if let Some(prev) = predecessor {
+                            entry.tier = prev;
+                        }
                     }
                     return None;
                 }
@@ -1923,6 +1932,13 @@ impl JitState {
                 (Tier::NotJitable, None)
             }
         };
+        if let (Tier::NotJitable, Some(prev)) = (&tier, predecessor) {
+            // The new entry is out of reach; the old frame isn't.
+            if let Some(entry) = self.cache.get_mut(&key) {
+                entry.tier = prev;
+            }
+            return None;
+        }
         if matches!(tier, Tier::NotJitable) {
             // RFC 0067 — denormalize the rejection onto the code
             // object so every later activation skips tier-up on one
