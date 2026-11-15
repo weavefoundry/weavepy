@@ -1160,10 +1160,14 @@ fn make_ref_object_with_class(
         kind::CALLABLE_PROXY => callable_proxy_type(),
         _ => ref_type(),
     });
-    // Only exact refs share methods and native storage. Foreign classes,
-    // proxies, and subclasses preserve their dictionary representation.
-    let shared_methods = kind_tag == kind::REF && is_ref_type(&class);
-    let fixed_wrapper = shared_methods && cfg!(target_pointer_width = "64");
+    // Only exact refs keep native storage; foreign classes, proxies and
+    // subclasses keep their dictionary representation. A subclass of `ref`
+    // shares the class's `__call__` and `__repr__` too (they read the
+    // stored getter, and both are looked up on the type), so its instances
+    // skip two closures each (a `KeyedRef` per `WeakValueDictionary` item).
+    let exact = kind_tag == kind::REF && is_ref_type(&class);
+    let shared_methods = exact || (kind_tag == kind::REF && class.is_subclass_of(&ref_type()));
+    let fixed_wrapper = exact && cfg!(target_pointer_width = "64");
     let mut slot = WeakRefSlot::new(target_id, target.clone(), callback.is_some(), kind_tag);
     slot.fixed_wrapper = fixed_wrapper;
     let slot = Arc::new(slot);
