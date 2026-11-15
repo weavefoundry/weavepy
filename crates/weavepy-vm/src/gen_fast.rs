@@ -1375,7 +1375,10 @@ impl Interpreter {
                     .is_some_and(|c| c.has_materialized.load(Ordering::Relaxed))
                 || crate::trace::eval_frame_record_active()
                 || Rc::ptr_eq(d, g)
-                || !may_step(d)
+                // (A delegate whose body no fast step runs may still rest in
+                // a `yield from` of its own, which steps it the same way; one
+                // that doesn't declines at once, touching nothing.)
+                || d.chain.get() != 0
             {
                 break 'chain;
             }
