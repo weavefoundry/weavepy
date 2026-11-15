@@ -1029,6 +1029,28 @@ pub(crate) fn lazy_pure_next(l: &PyLazyIter) -> Option<Option<Object>> {
             return Some(Some(Object::Tuple(t)));
         }
     }
+    // Up to eight plain sequence cursors (`zip(xs, ys, zs)`): their items,
+    // into the previous result when this adapter holds it alone.
+    if (3..=CURSORS_MAX).contains(&iters.len()) {
+        if let Some(mut items) = cursors_next(iters) {
+            let n = iters.len();
+            if let Some(slots) = result
+                .as_mut()
+                .and_then(crate::shared_value::ThinArc::get_mut)
+                .filter(|slots| slots.len() == n)
+            {
+                // (The old items leave in `items`, released below.)
+                for (slot, x) in slots.iter_mut().zip(items.iter_mut()) {
+                    std::mem::swap(slot, x);
+                }
+                drop(items);
+                return Some(Some(Object::Tuple(result.clone()?)));
+            }
+            let t = crate::object::TupleStorage::from_vec(items[..n].to_vec());
+            *result = Some(t.clone());
+            return Some(Some(Object::Tuple(t)));
+        }
+    }
     if !srcs_ready(iters) {
         return None;
     }
@@ -1084,6 +1106,40 @@ pub(crate) fn lazy_pure_pair(l: &PyLazyIter) -> Option<(Object, Object)> {
         return None;
     }
     Some((src_step(a)?, src_step(b)?))
+}
+
+/// The most sources [`cursors_next`] steps at once.
+const CURSORS_MAX: usize = 8;
+
+/// [`cursor_pair`] for up to [`CURSORS_MAX`] distinct plain sequence
+/// cursors: every one's next item, all taken, in the first `iters.len()`
+/// slots of the result; `None` (none taken) unless each has one.
+fn cursors_next(iters: &[Object]) -> Option<[Object; CURSORS_MAX]> {
+    let n = iters.len();
+    if n > CURSORS_MAX {
+        return None;
+    }
+    let mut cells: [Option<&Rc<crate::sync::RefCell<crate::object::PyIterator>>>; CURSORS_MAX] =
+        [None; CURSORS_MAX];
+    for (k, it) in iters.iter().enumerate() {
+        let Object::Iter(c) = it else { return None };
+        if cells[..k].iter().flatten().any(|d| Rc::ptr_eq(c, d)) {
+            return None;
+        }
+        cells[k] = Some(c);
+    }
+    let mut items = [const { Object::None }; CURSORS_MAX];
+    for (slot, c) in items.iter_mut().zip(cells.iter().flatten()) {
+        // SAFETY: distinct cells, one viewed at a time; nothing here runs
+        // code, and each view ends with its step.
+        *slot = unsafe { c.peek_mut()? }.pure_peek()?;
+    }
+    for c in cells.iter().flatten() {
+        // SAFETY: as above; `pure_skip` steps past exactly what
+        // `pure_peek` found.
+        unsafe { c.peek_mut()? }.pure_skip();
+    }
+    Some(items)
 }
 
 /// The next items of two distinct plain sequence cursors, both taken; `None`
