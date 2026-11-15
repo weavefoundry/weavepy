@@ -965,6 +965,10 @@ fn lru_native_lookup(
             let value = data.get_index(index)?.1.clone();
             if bounded {
                 lru_state::Links::new(&mut bytes, data.len())?.touch(index)?;
+                // (Counted with the scalar path's: the bounded native hits
+                // keep the same recency links.)
+                #[cfg(test)]
+                note_scalar_lru_event(0);
             }
             lru_state::hit(&mut bytes)?;
             Some(NativeLookup::Hit(value))
@@ -1043,6 +1047,8 @@ fn native_store_in<P: ExactProbe>(
             return Ok(None);
         };
         links.touch(head).ok_or_else(invalid_lru_order)?;
+        #[cfg(test)]
+        note_scalar_lru_event(1);
         let evicted = data.replace_index_unique(head, hash, DictKey(key.clone()), result.clone());
         return Ok(Some(evicted));
     }
