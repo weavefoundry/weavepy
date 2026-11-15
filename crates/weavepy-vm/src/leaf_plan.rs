@@ -195,6 +195,15 @@ enum Op {
         c: u8,
         n: u8,
     },
+    /// `slice(regs[a], regs[b][, regs[c]])` (`n` bounds), its bounds
+    /// plain ints or `None`, held by the owned scratch.
+    Slice {
+        dst: u8,
+        a: u8,
+        b: u8,
+        c: u8,
+        n: u8,
+    },
     /// Exchange two registers.
     Swap {
         a: u8,
@@ -550,6 +559,22 @@ impl Builder<'_> {
                 let dst = self.push_new()?;
                 let item = |k: usize| items.get(k).copied().unwrap_or(items[0]);
                 self.ops.push(Op::Tuple {
+                    dst,
+                    a: item(0),
+                    b: item(1),
+                    c: item(2),
+                    n: n as u8,
+                });
+            }
+            // (`w[::-1]`, a key function's reversal.)
+            OpCode::BuildSlice if matches!(arg, 2 | 3) => {
+                let n = arg as usize;
+                let at = self.stack.len().checked_sub(n)?;
+                let items: Vec<Opnd> = self.stack[at..].to_vec();
+                self.stack.truncate(at);
+                let dst = self.push_new()?;
+                let item = |k: usize| items.get(k).copied().unwrap_or(items[0]);
+                self.ops.push(Op::Slice {
                     dst,
                     a: item(0),
                     b: item(1),
@@ -1176,6 +1201,9 @@ impl Interpreter {
                 Op::Tuple { dst, a, b, c, n } => {
                     set!(dst, new_tuple(&mut owned, [get!(a), get!(b), get!(c)], n)?)
                 }
+                Op::Slice { dst, a, b, c, n } => {
+                    set!(dst, new_slice(&mut owned, [get!(a), get!(b), get!(c)], n)?)
+                }
                 Op::Swap { a, b } => {
                     let (x, y) = (get!(a), get!(b));
                     set!(a, y);
@@ -1520,6 +1548,23 @@ fn subscr(owned: &mut Owned, a: V, b: V) -> Option<V> {
             }
             owned.own(Object::from_char(s.as_bytes()[index(i, s.len())?] as char))
         }
+        // A plain sequence sliced by a slice of plain bounds (as the core
+        // loop's container step slices it).
+        (Object::List(_) | Object::Tuple(_) | Object::Str(_) | Object::Bytes(_), V::R(k))
+            if matches!(unsafe { &*k }, Object::Slice(_)) =>
+        {
+            let Object::Slice(sl) = (unsafe { &*k }) else {
+                return None;
+            };
+            if ![&sl.start, &sl.stop, &sl.step]
+                .iter()
+                .all(|v| matches!(v, Object::None | Object::Int(_)))
+                || matches!(sl.step, Object::Int(0))
+            {
+                return None;
+            }
+            owned.own(crate::Interpreter::core_slice(unsafe { &*c }, sl)?)
+        }
         (Object::Dict(d), V::I(_) | V::R(_)) => {
             let int;
             let key = match b {
@@ -1560,6 +1605,21 @@ fn new_tuple(owned: &mut Owned, items: [V; 3], n: u8) -> Option<V> {
         _ => return None,
     };
     owned.own(t)
+}
+
+fn new_slice(owned: &mut Owned, items: [V; 3], n: u8) -> Option<V> {
+    let bound = |v: V| match v {
+        V::I(i) => Some(Object::Int(i)),
+        V::N => Some(Object::None),
+        _ => None,
+    };
+    let [a, b, c] = items;
+    let step = if n == 3 { bound(c)? } else { Object::None };
+    owned.own(Object::Slice(Rc::new(crate::object::PySlice {
+        start: bound(a)?,
+        stop: bound(b)?,
+        step,
+    })))
 }
 
 fn new_container(owned: &mut Owned, dict: bool) -> Option<V> {

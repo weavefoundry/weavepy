@@ -20995,7 +20995,7 @@ impl Interpreter {
     /// string over a slice of ints): the full handler's slicing, or
     /// `None` for it to run (and raise) itself.
     #[inline(never)]
-    fn core_slice(c: &Object, sl: &crate::object::PySlice) -> Option<Object> {
+    pub(crate) fn core_slice(c: &Object, sl: &crate::object::PySlice) -> Option<Object> {
         match c {
             Object::List(items) => {
                 let items = items.try_borrow().ok()?;
@@ -85902,6 +85902,9 @@ fn code_pure_leaf_decide(code: &CodeObject, ext: &CodeConstObjects) -> bool {
         }
         if ins.op == OpCode::BuildTuple {
             return (1..=3).contains(&ins.arg);
+        }
+        if ins.op == OpCode::BuildSlice {
+            return matches!(ins.arg, 2 | 3);
         }
         matches!(
             ins.op,

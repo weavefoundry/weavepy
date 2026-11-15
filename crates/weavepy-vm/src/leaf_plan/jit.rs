@@ -18,8 +18,8 @@
 //! natively too once the callee's own plan is compiled).
 
 use super::{
-    binary, compare, is_same, new_container, new_tuple, norm, plan_store, subscr, truth, unary,
-    LeafPlan, LeafRet, Op, Owned, Pending, NEST, V,
+    binary, compare, is_same, new_container, new_slice, new_tuple, norm, plan_store, subscr, truth,
+    unary, LeafPlan, LeafRet, Op, Owned, Pending, NEST, V,
 };
 use crate::object::{Object, PyFunction};
 use crate::sync::Rc;
@@ -743,6 +743,30 @@ unsafe extern "C" fn h_tuple(
     let c = unsafe { cx(ctx) };
     let items = [value(ta, pa), value(tb, pb), value(tc, pc)];
     match new_tuple(&mut c.owned, items, n as u8) {
+        Some(v) => {
+            c.put(v);
+            0
+        }
+        None => 1,
+    }
+}
+
+/// A slice of the first `n` of three bounds (see [`new_slice`]).
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn h_slice(
+    ctx: *mut Ctx<'static>,
+    ta: u64,
+    pa: u64,
+    tb: u64,
+    pb: u64,
+    tc: u64,
+    pc: u64,
+    n: u32,
+) -> u32 {
+    // SAFETY: called by native code with its context.
+    let c = unsafe { cx(ctx) };
+    let items = [value(ta, pa), value(tb, pb), value(tc, pc)];
+    match new_slice(&mut c.owned, items, n as u8) {
         Some(v) => {
             c.put(v);
             0
@@ -2297,6 +2321,18 @@ impl Lower<'_> {
                 let nv = self.u32c(u32::from(n));
                 let st = self.call(
                     h_tuple as *const () as usize,
+                    &[self.ctx, ta, pa, tb, pb, tc, pc, nv],
+                );
+                self.check(st);
+                self.set_out(fl, dst, 0);
+            }
+            Op::Slice { dst, a, b, c, n } => {
+                let (ta, pa) = self.get(fl, a);
+                let (tb, pb) = self.get(fl, b);
+                let (tc, pc) = self.get(fl, c);
+                let nv = self.u32c(u32::from(n));
+                let st = self.call(
+                    h_slice as *const () as usize,
                     &[self.ctx, ta, pa, tb, pb, tc, pc, nv],
                 );
                 self.check(st);
