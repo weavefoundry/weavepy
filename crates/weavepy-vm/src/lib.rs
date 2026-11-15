@@ -45957,6 +45957,35 @@ impl Interpreter {
         if let Some(items) = crate::object::collect_small_int_range(v) {
             return items;
         }
+        // `list(reversed(xs))`: the rest of the reversed list at once,
+        // the iterator left exhausted and detached as its last step leaves
+        // it (what that releases drops once the iterator is free again).
+        if let Object::Iter(it) = v {
+            if let Ok(mut cursor) = it.try_borrow_mut() {
+                if let crate::object::PyIterator::Reversed {
+                    items,
+                    index,
+                    owner,
+                } = &mut *cursor
+                {
+                    let out: Vec<Object> = {
+                        let v = items.borrow();
+                        match usize::try_from(*index) {
+                            Ok(i) if i < v.len() => v[..=i].iter().rev().cloned().collect(),
+                            _ => Vec::new(),
+                        }
+                    };
+                    let detached = (
+                        std::mem::replace(items, Rc::new(RefCell::new(Vec::new()))),
+                        owner.take(),
+                    );
+                    *index = -1;
+                    drop(cursor);
+                    drop(detached);
+                    return Ok(out);
+                }
+            }
+        }
         match v {
             Object::List(items) => Ok(items.borrow().clone()),
             Object::Tuple(items) => Ok(items.to_vec()),
@@ -74042,8 +74071,24 @@ pub(crate) fn slice_seq<T: Clone>(seq: &[T], s: &PySlice) -> Result<Vec<T>, Runt
             Vec::new()
         });
     }
+    // `[::-1]`: the whole sequence reversed, at once.
+    if step == -1 && start == len - 1 && stop == -1 {
+        return Ok(seq.iter().rev().cloned().collect());
+    }
     let mut i = start;
-    let mut out = Vec::new();
+    // (The slice's length, as `PySlice_AdjustIndices` computes it.)
+    let count = if step > 0 {
+        if start < stop {
+            (stop - start - 1) / step + 1
+        } else {
+            0
+        }
+    } else if stop < start {
+        (start - stop - 1) / (-step) + 1
+    } else {
+        0
+    };
+    let mut out = Vec::with_capacity(usize::try_from(count).unwrap_or(0).min(seq.len()));
     if step > 0 {
         while i < stop {
             if (0..len).contains(&i) {
