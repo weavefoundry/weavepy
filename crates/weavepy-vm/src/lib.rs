@@ -78708,6 +78708,18 @@ fn format_via_spec_impl(
     spec: &str,
     allow_int_precision: bool,
 ) -> Result<String, RuntimeError> {
+    // `.Nf` of a finite float (`f"{x:.2f}"`), the commonest float spec:
+    // the fixed digits and the sign, which is all the general path adds.
+    if let Object::Float(f) = value {
+        if let Some(prec) = plain_fixed_precision(spec).filter(|_| f.is_finite()) {
+            let core = fixed_core(f.abs(), prec);
+            return Ok(if f.is_sign_negative() {
+                format!("-{core}")
+            } else {
+                core
+            });
+        }
+    }
     // A surrogate-bearing `WStr` bridges its lone surrogates into the PUA
     // window so the (UTF-8-only) spec engine can pad/slice it; the Object
     // boundary (`FormatValue`/`str.format` via `str_result`) maps them back.
@@ -78722,6 +78734,18 @@ fn format_via_spec_impl(
         return Err(unsupported_format_string(value));
     }
     apply_format_spec_inner(value, spec, &plain, allow_int_precision)
+}
+
+/// The precision of a spec that is exactly `.Nf` (`N` up to two digits),
+/// or `None`.
+fn plain_fixed_precision(spec: &str) -> Option<usize> {
+    match spec.as_bytes() {
+        [b'.', d, b'f'] if d.is_ascii_digit() => Some(usize::from(d - b'0')),
+        [b'.', a, b, b'f'] if a.is_ascii_digit() && b.is_ascii_digit() => {
+            Some(usize::from(a - b'0') * 10 + usize::from(b - b'0'))
+        }
+        _ => None,
+    }
 }
 
 /// Public wrapper for `ascii()`.
@@ -86302,6 +86326,35 @@ pub(crate) unsafe fn format_simple_in_place(top: *mut Object) -> bool {
             }
             _ => return false,
         }
+    }
+    true
+}
+
+/// `FORMAT_VALUE` with a spec and no conversion of the value at `at` and
+/// the spec above it, as the core loop's arm runs it for an exact `int`,
+/// `float` or `str` and a `str` spec: the formatted string at `at`, the
+/// spec released. `false` touches nothing (another value, or a spec the
+/// value rejects, which the full handler raises for).
+///
+/// # Safety
+///
+/// The two slots from `at` are initialized, and nothing else reads them.
+pub(crate) unsafe fn format_spec_in_place(at: *mut Object) -> bool {
+    // SAFETY: the caller's contract; the replaced value owes a drop only
+    // for a `str`, which the write below releases.
+    unsafe {
+        let (value, spec) = (&*at, &*at.add(1));
+        let Object::Str(spec_str) = spec else {
+            return false;
+        };
+        if !matches!(value, Object::Int(_) | Object::Float(_) | Object::Str(_)) {
+            return false;
+        }
+        let Ok(formatted) = format_via_spec(value, spec_str) else {
+            return false;
+        };
+        drop(at.add(1).read());
+        drop(at.replace(Object::from_str(formatted)));
     }
     true
 }

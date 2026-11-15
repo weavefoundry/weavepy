@@ -10038,13 +10038,15 @@ const MAX_NATIVE_TUPLE: usize = 16;
 const FSTRING_CONVERT: u64 = 0;
 const FSTRING_FORMAT: u64 = 1;
 const FSTRING_JOIN: u64 = 2;
+const FSTRING_FORMAT_SPEC: u64 = 3;
 
 /// Whether the native code runs the f-string instruction `op` (`arg`):
-/// a conversion, a spec-less format, or a join of up to eight parts.
+/// a conversion, a format (with a spec, but no conversion), or a join of
+/// up to eight parts.
 fn fstring_native(op: OpCode, arg: u32) -> bool {
     match op {
         OpCode::ConvertValue => matches!(arg & 0x03, 1 | 2),
-        OpCode::FormatValue => arg == 0,
+        OpCode::FormatValue => arg == 0 || arg == 4,
         OpCode::BuildString => (1..=8).contains(&arg),
         _ => false,
     }
@@ -10061,6 +10063,7 @@ unsafe extern "C" fn h_fstring(at: *mut Object, kind: u64) -> u32 {
         match kind & 0xff {
             FSTRING_CONVERT => crate::convert_in_place(at, (kind >> 8) as u32),
             FSTRING_FORMAT => crate::format_simple_in_place(at),
+            FSTRING_FORMAT_SPEC => crate::format_spec_in_place(at),
             _ => crate::build_string_at(at, (kind >> 8) as usize),
         }
     };
@@ -22828,10 +22831,11 @@ impl<'a> Lower<'a> {
     /// f-string's pieces) through [`h_fstring`], which runs the core
     /// loop's arm; the core loop takes any other shape.
     fn fstring_op(&mut self, pc: usize, op: OpCode, arg: u32) -> bool {
-        let n = if op == OpCode::BuildString {
-            arg as usize
-        } else {
-            1
+        let n = match op {
+            OpCode::BuildString => arg as usize,
+            // (The value and its spec.)
+            OpCode::FormatValue if arg & 4 != 0 => 2,
+            _ => 1,
         };
         if n == 0 || n > self.depth || !fstring_native(op, arg) {
             self.exit(INTERP, pc);
@@ -22841,6 +22845,7 @@ impl<'a> Lower<'a> {
         let at = self.slot_addr(self.depth - n);
         let kind = match op {
             OpCode::ConvertValue => FSTRING_CONVERT | u64::from(arg) << 8,
+            OpCode::FormatValue if arg & 4 != 0 => FSTRING_FORMAT_SPEC,
             OpCode::FormatValue => FSTRING_FORMAT,
             _ => FSTRING_JOIN | (n as u64) << 8,
         };
