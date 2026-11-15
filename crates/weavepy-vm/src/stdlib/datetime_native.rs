@@ -2345,6 +2345,229 @@ fn parse_hms(t: &[u8]) -> Option<(i64, i64, i64, i64)> {
     Some((hh, mm, ss, us))
 }
 
+// ---------------------------------------------------------------------
+// Local time: `_pydatetime`'s `_mktime` and `_local_timezone`, through
+// the libc `localtime_r` that `time.localtime` uses.
+
+/// Seconds since the epoch of naive wall-clock fields.
+fn epoch_secs(y: i64, m: i64, d: i64, hh: i64, mm: i64, ss: i64) -> i64 {
+    (ymd2ord(y, m, d) - ymd2ord(1970, 1, 1)) * 86_400 + hh * 3600 + mm * 60 + ss
+}
+
+/// `time.localtime(u)`'s wall-clock fields, `tm_gmtoff` and `tm_zone`;
+/// `None` where it would raise (or a leap second, which `datetime`
+/// rejects).
+#[cfg(unix)]
+fn local_tm(u: i64) -> Option<([i64; 6], i64, Option<Vec<u8>>)> {
+    let t = libc::time_t::try_from(u).ok()?;
+    // SAFETY: plain C structs, filled by `localtime_r`.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&raw const t, &raw mut tm) }.is_null() || tm.tm_sec > 59 {
+        return None;
+    }
+    let zone = (!tm.tm_zone.is_null())
+        // SAFETY: a NUL-terminated name libc keeps for the process.
+        .then(|| unsafe { std::ffi::CStr::from_ptr(tm.tm_zone) }.to_bytes().to_vec());
+    let f = [
+        i64::from(tm.tm_year) + 1900,
+        i64::from(tm.tm_mon) + 1,
+        i64::from(tm.tm_mday),
+        i64::from(tm.tm_hour),
+        i64::from(tm.tm_min),
+        i64::from(tm.tm_sec),
+    ];
+    Some((f, tm.tm_gmtoff as i64, zone))
+}
+
+#[cfg(not(unix))]
+fn local_tm(_u: i64) -> Option<([i64; 6], i64, Option<Vec<u8>>)> {
+    None
+}
+
+/// `_mktime()` of naive fields with `fold`: the POSIX timestamp whose
+/// local time they are (`_pydatetime`'s search, step for step).
+fn mktime(f: &Dt, fold: i64) -> Option<i64> {
+    const MAX_FOLD_SECONDS: i64 = 24 * 3600;
+    let t = epoch_secs(f.y, f.m, f.d, f.hh, f.mm, f.ss);
+    let local = |u: i64| -> Option<i64> {
+        let ([y, m, d, hh, mm, ss], _, _) = local_tm(u)?;
+        Some(epoch_secs(y, m, d, hh, mm, ss))
+    };
+    let a = local(t)? - t;
+    let u1 = t - a;
+    let t1 = local(u1)?;
+    let b = if t1 == t {
+        let u2 = u1
+            + if fold == 0 {
+                -MAX_FOLD_SECONDS
+            } else {
+                MAX_FOLD_SECONDS
+            };
+        let b = local(u2)? - u2;
+        if a == b {
+            return Some(u1);
+        }
+        b
+    } else {
+        t1 - u1
+    };
+    let u2 = t - b;
+    if local(u2)? == t {
+        return Some(u2);
+    }
+    if t1 == t {
+        return Some(u1);
+    }
+    // In a gap: neither offset solves it.
+    Some(if fold == 0 { u1.max(u2) } else { u1.min(u2) })
+}
+
+/// The timestamp `_local_timezone` reads the local zone at, for naive
+/// fields (`None` for an aware value, whose own offset decides).
+fn local_ts(f: &Dt) -> Option<i64> {
+    let ts = mktime(f, f.fold)?;
+    let ts2 = mktime(f, 1 - f.fold)?;
+    // A gap or a fold.
+    Some(if ts2 != ts && (ts2 > ts) == (f.fold == 1) {
+        ts2
+    } else {
+        ts
+    })
+}
+
+/// Microseconds since the epoch of fields at a fixed UTC offset `off`.
+fn epoch_us(f: &Dt, off: i128) -> i128 {
+    dt_us(f) - off - i128::from(ymd2ord(1970, 1, 1)) * US_PER_DAY
+}
+
+/// `datetime.timestamp()` of a naive or fixed-offset value.
+fn dt_timestamp(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [x] = a else { return None };
+    let st = state_of(x)?;
+    let f = dt_fields(inst(x, KIND_DATETIME)?, st)?;
+    if !valid_date(f.y, f.m, f.d) {
+        return None;
+    }
+    let secs = match tz_of(&f.tz, st)? {
+        Tz::Naive => mktime(&f, f.fold)? as f64 + f.us as f64 / 1e6,
+        Tz::Fixed(off) => {
+            // (Exact as a float, so the division rounds as the Python
+            // code's integer true division does.)
+            let n = epoch_us(&f, off);
+            if n.unsigned_abs() >= 1 << 53 {
+                return None;
+            }
+            n as f64 / 1e6
+        }
+    };
+    Some(Ok(Object::Float(secs)))
+}
+
+/// `datetime.replace(...)` of the fields by position (`year` to `tzinfo`;
+/// an absent or `Unbound` one keeps the value's, as does `None` for any
+/// but `tzinfo`, whose own default is `True`), `tzinfo` `None` or an
+/// exact `timezone`. `fold` (keyword-only) is the Python method's.
+fn dt_replace(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let (x, rest) = a.split_first()?;
+    if rest.len() > 8 {
+        return None;
+    }
+    let st = state_of(x)?;
+    let mut f = dt_fields(inst(x, KIND_DATETIME)?, st)?;
+    for (i, v) in rest.iter().enumerate() {
+        if matches!(v, Object::Unbound) || (i < 7 && matches!(v, Object::None)) {
+            continue;
+        }
+        if i == 7 {
+            if !matches!(v, Object::Bool(true)) {
+                tz_of(v, st)?;
+                f.tz = v.clone();
+            }
+            continue;
+        }
+        let v = as_int(v)?;
+        match i {
+            0 => f.y = v,
+            1 => f.m = v,
+            2 => f.d = v,
+            3 => f.hh = v,
+            4 => f.mm = v,
+            5 => f.ss = v,
+            _ => f.us = v,
+        }
+    }
+    let ok = valid_date(f.y, f.m, f.d)
+        && (0..24).contains(&f.hh)
+        && (0..60).contains(&f.mm)
+        && (0..60).contains(&f.ss)
+        && (0..1_000_000).contains(&f.us);
+    if !ok {
+        return None;
+    }
+    Some(Ok(new_dt(st, f)?))
+}
+
+/// `datetime.astimezone(tz)` of a naive or fixed-offset value, to an
+/// exact `timezone` or (no `tz`) the local zone.
+fn dt_astimezone(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let (x, rest) = a.split_first()?;
+    let target = match rest {
+        [] | [Object::None] => None,
+        [t] => Some(t),
+        _ => return None,
+    };
+    let st = state_of(x)?;
+    let f = dt_fields(inst(x, KIND_DATETIME)?, st)?;
+    if !valid_date(f.y, f.m, f.d) {
+        return None;
+    }
+    let mine = tz_of(&f.tz, st)?;
+    let my_off = match mine {
+        Tz::Fixed(off) => off,
+        Tz::Naive => i128::from(local_tm(local_ts(&f)?)?.1) * 1_000_000,
+    };
+    let (tz, tz_off) = match target {
+        Some(t) => match tz_of(t, st)? {
+            Tz::Fixed(off) => (t.clone(), off),
+            Tz::Naive => return None,
+        },
+        None => {
+            let ts = match mine {
+                Tz::Naive => local_ts(&f)?,
+                Tz::Fixed(off) => i64::try_from(epoch_us(&f, off).div_euclid(1_000_000)).ok()?,
+            };
+            let (_, gmtoff, zone) = local_tm(ts)?;
+            let name = Object::from_str(String::from_utf8(zone?).ok()?);
+            let off = i128::from(gmtoff) * 1_000_000;
+            (new_named_timezone(st, off, name)?, off)
+        }
+    };
+    if matches!(mine, Tz::Fixed(_)) && f.tz.is_same(&tz) {
+        return Some(Ok(x.clone()));
+    }
+    // (Two steps, as the Python code takes them, so an intermediate
+    // overflow raises there.)
+    let utc = dt_shift(f, -my_off)?;
+    let mut g = dt_shift(utc, tz_off)?;
+    g.tz = tz;
+    Some(Ok(new_dt(st, g)?))
+}
+
+/// An exact `timezone` with the offset `us` and the name `name`, as
+/// `timezone(offset, name)` builds it (even for a zero offset).
+fn new_named_timezone(st: &State, us: i128, name: Object) -> Option<Object> {
+    if us.unsigned_abs() >= US_PER_DAY as u128 {
+        return None;
+    }
+    let off = new_td(st, 0, 0, us)?.ok()?;
+    let cls = st.timezone.upgrade()?;
+    let n = &st.names;
+    Some(instance(
+        cls,
+        vec![entry(&n.offset, off), entry(&n.name, name)],
+    ))
+}
+
 /// An exact `timezone` with the fixed offset `us` (non-zero, in range)
 /// and no name.
 fn new_timezone(st: &State, us: i128) -> Option<Object> {
@@ -2618,6 +2841,17 @@ fn kw_positional(
 ) -> Option<Vec<Object>> {
     let params: &[&str] = match key {
         (KIND_DATE, "replace") => &["year", "month", "day"],
+        (KIND_DATETIME, "replace") => &[
+            "year",
+            "month",
+            "day",
+            "hour",
+            "minute",
+            "second",
+            "microsecond",
+            "tzinfo",
+        ],
+        (KIND_DATETIME, "astimezone") => &["tz"],
         _ => return None,
     };
     let (recv, pos) = a.split_first()?;
@@ -2635,9 +2869,12 @@ fn kw_positional(
         }
         out[ix] = v.clone();
     }
-    for o in &mut out {
-        if matches!(o, Object::Unbound) {
-            *o = Object::None;
+    // (A datetime's `replace` tells an omitted `tzinfo` from `None`.)
+    if key != (KIND_DATETIME, "replace") {
+        for o in &mut out {
+            if matches!(o, Object::Unbound) {
+                *o = Object::None;
+            }
         }
     }
     Some(out)
@@ -2890,6 +3127,24 @@ const SPECS: &[Spec] = &[
         kind: KIND_DATETIME,
         name: "date",
         fast: dt_date,
+        classmethod: false,
+    },
+    Spec {
+        kind: KIND_DATETIME,
+        name: "replace",
+        fast: dt_replace,
+        classmethod: false,
+    },
+    Spec {
+        kind: KIND_DATETIME,
+        name: "timestamp",
+        fast: dt_timestamp,
+        classmethod: false,
+    },
+    Spec {
+        kind: KIND_DATETIME,
+        name: "astimezone",
+        fast: dt_astimezone,
         classmethod: false,
     },
     Spec {

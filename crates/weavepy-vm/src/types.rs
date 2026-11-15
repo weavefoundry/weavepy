@@ -346,13 +346,6 @@ pub(crate) mod type_cache {
         dict_idx: u32,
     }
 
-    const EMPTY: Entry = Entry {
-        name: None,
-        ver: 0,
-        mro_idx: ABSENT,
-        dict_idx: 0,
-    };
-
     thread_local! {
         /// This thread's table (`SIZE` entries), or null before the first
         /// fill. A plain pointer in a constant-initialized cell with no
@@ -404,11 +397,7 @@ pub(crate) mod type_cache {
     #[cold]
     #[inline(never)]
     fn alloc_memo() -> *mut NameHash {
-        let empty = NameHash {
-            name: None,
-            hash: 0,
-        };
-        let memo = Box::into_raw(vec![empty; HASHES].into_boxed_slice()).cast::<NameHash>();
+        let memo = zeroed_slice::<NameHash>(HASHES);
         HASH_MEMO.with(|t| t.set(memo));
         let _ = OWNER.try_with(|_| ());
         memo
@@ -437,11 +426,29 @@ pub(crate) mod type_cache {
         hash
     }
 
+    /// `n` empty entries (each a `None` name and zeros, which is all-zero
+    /// bytes) as a leaked boxed slice: zeroed memory comes from the
+    /// allocator's fresh pages without a store per entry, which a short
+    /// thread would otherwise pay for its whole table.
+    fn zeroed_slice<T>(n: usize) -> *mut T {
+        let layout = std::alloc::Layout::array::<T>(n).expect("small table");
+        // SAFETY: a nonzero layout; an all-zero `T` here is a `None` name
+        // (`Option<Rc<str>>`'s null niche) and zero integers, a valid value,
+        // and the boxed slice `Box::from_raw` rebuilds uses this layout.
+        unsafe {
+            let p = std::alloc::alloc_zeroed(layout).cast::<T>();
+            if p.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            p
+        }
+    }
+
     /// This thread's table, allocated on first use.
     #[cold]
     #[inline(never)]
     fn alloc_table() -> *mut Entry {
-        let table = Box::into_raw(vec![EMPTY; SIZE].into_boxed_slice()).cast::<Entry>();
+        let table = zeroed_slice::<Entry>(SIZE);
         TABLE.with(|t| t.set(table));
         // (Registers the owner's destructor; a thread already past its
         // destructors keeps the table until the process exits.)

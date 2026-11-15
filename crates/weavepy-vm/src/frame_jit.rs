@@ -6391,6 +6391,9 @@ pub(crate) struct TruthSite {
     /// The version of a class whose instances the site found always true
     /// (no `__bool__` or `__len__`).
     ver: std::cell::Cell<u64>,
+    /// The version of a class whose instances' truth is a native method
+    /// (see [`crate::NativeTruthPlan`]), and that plan.
+    native: std::cell::Cell<(u64, crate::NativeTruthPlan)>,
     pc: u32,
     /// The stack slot of the value, or a local's free one above the stack.
     slot: u32,
@@ -6435,6 +6438,12 @@ unsafe fn truth_at(st: *mut State, v: &Object, site: &TruthSite) -> Option<bool>
                 if ver != 0 && site.ver.get() == ver {
                     return Some(true);
                 }
+                let (nver, plan) = site.native.get();
+                if ver != 0 && nver == ver {
+                    if let Some(b) = plan.run(v) {
+                        return Some(b);
+                    }
+                }
                 truth_instance(st, v, site)?
             }
             // Native objects with neither `__bool__` nor `__len__` (a
@@ -6466,7 +6475,13 @@ unsafe fn truth_instance(st: *mut State, v: &Object, site: &TruthSite) -> Option
                 site.ver.set(ver);
             }
         }
-        (*(*st).interp).leaf_instance_truth(v)
+        let r = (*(*st).interp).leaf_instance_truth(v);
+        if let (Some(_), Object::Instance(inst)) = (r, v) {
+            if let Some(plan) = (*(*st).interp).native_truth_plan(inst) {
+                site.native.set(plan);
+            }
+        }
+        r
     }
 }
 
@@ -22106,6 +22121,7 @@ impl<'a> Lower<'a> {
         };
         let site = Box::new(TruthSite {
             ver: std::cell::Cell::new(0),
+            native: std::cell::Cell::new((0, crate::NativeTruthPlan::NONE)),
             pc: pc as u32,
             slot: slot as u32,
             local,

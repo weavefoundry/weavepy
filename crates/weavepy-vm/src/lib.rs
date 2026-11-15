@@ -1074,9 +1074,10 @@ pub struct Interpreter {
     /// The builtins the leaf burst may call directly (see [`LeafFns`]),
     /// resolved on first use.
     leaf_fns: std::cell::OnceCell<LeafFns>,
-    /// The registered leaf builtins (see [`leaf_builtins`]) as last
-    /// snapshotted, with the registry generation they reflect.
-    leaf_opaque: ThreadCell<(u64, leaf_builtins::LeafMap)>,
+    /// The registered leaf builtins (see [`leaf_builtins`]) this
+    /// interpreter has looked up, and the builtins it found unregistered
+    /// under the registry generation beside them.
+    leaf_opaque: ThreadCell<(u64, leaf_builtins::LeafMap, LeafMisses)>,
     /// The last builtin [`Interpreter::leaf_call_kind`] found no leaf, by
     /// address, and the registry generation it looked under: a call path
     /// asks for the same builtin several times over.
@@ -1338,7 +1339,11 @@ impl Default for Interpreter {
             recs: frame_jit::DirectRecs::new(),
             chain_pool: Vec::new(),
             leaf_fns: std::cell::OnceCell::new(),
-            leaf_opaque: ThreadCell::new((0, leaf_builtins::LeafMap::default())),
+            leaf_opaque: ThreadCell::new((
+                0,
+                leaf_builtins::LeafMap::default(),
+                LeafMisses::default(),
+            )),
             leaf_miss: std::cell::Cell::new((0, 0)),
             core_next: ThreadCell::new(None),
             core_truth: ThreadCell::new(None),
@@ -1493,7 +1498,11 @@ impl Interpreter {
             recs: frame_jit::DirectRecs::new(),
             chain_pool: Vec::new(),
             leaf_fns: std::cell::OnceCell::new(),
-            leaf_opaque: ThreadCell::new((0, leaf_builtins::LeafMap::default())),
+            leaf_opaque: ThreadCell::new((
+                0,
+                leaf_builtins::LeafMap::default(),
+                LeafMisses::default(),
+            )),
             leaf_miss: std::cell::Cell::new((0, 0)),
             core_next: ThreadCell::new(None),
             core_truth: ThreadCell::new(None),
@@ -31564,6 +31573,34 @@ impl Interpreter {
         }
     }
 
+    /// The cached truth verdict for `inst`'s class (see
+    /// [`Self::leaf_instance_truth`], which just filled it) as a plan a
+    /// compiled site keeps for the class's version, when it is a native
+    /// method's.
+    pub(crate) fn native_truth_plan(
+        &self,
+        inst: &crate::types::PyInstance,
+    ) -> Option<(u64, NativeTruthPlan)> {
+        let ver = inst.cls_raw().attr_version.get();
+        let plan = match &*self.core_truth.borrow() {
+            Some((v, t)) if *v == ver && ver != 0 => match t {
+                NativeTruth::Bool(b, op) => NativeTruthPlan {
+                    f: Rc::as_ptr(b),
+                    is_len: false,
+                    op: *op,
+                },
+                NativeTruth::Len(b) => NativeTruthPlan {
+                    f: Rc::as_ptr(b),
+                    is_len: true,
+                    op: 0,
+                },
+                _ => return None,
+            },
+            _ => return None,
+        };
+        Some((ver, plan))
+    }
+
     /// The attribute version of `inst`'s class, when its instances are
     /// always true in a boolean context (the cached verdict for that
     /// version, see [`Self::leaf_instance_truth`]): a compiled `TO_BOOL`
@@ -32333,23 +32370,39 @@ impl Interpreter {
         if let Some(k) = self.leaf_fns().calls.get(&p) {
             return Some(*k);
         }
+        let kind = |e: &leaf_builtins::Entry| match e {
+            leaf_builtins::Entry::Fast(f) => LeafKind::Fast(*f),
+            leaf_builtins::Entry::Opaque => LeafKind::Opaque,
+            leaf_builtins::Entry::Scalar => LeafKind::Scalar,
+        };
         let found = {
             let mut opaque = self.leaf_opaque.borrow_mut();
-            if opaque.0 != gen {
-                opaque.1 = leaf_builtins::snapshot();
-                opaque.0 = gen;
-            }
             // The registered builtin must still be *this* allocation: a
             // recycled address (a torn-down interpreter's module surface)
             // fails the upgrade or the identity check.
-            opaque.1.get(&p).and_then(|(w, fast)| {
+            let cached = opaque.1.get(&p).and_then(|(w, e)| {
                 let live = w.upgrade()?;
-                Rc::ptr_eq(&live, b).then(|| match fast {
-                    leaf_builtins::Entry::Fast(f) => LeafKind::Fast(*f),
-                    leaf_builtins::Entry::Opaque => LeafKind::Opaque,
-                    leaf_builtins::Entry::Scalar => LeafKind::Scalar,
-                })
-            })
+                Rc::ptr_eq(&live, b).then(|| kind(e))
+            });
+            if cached.is_some() {
+                cached
+            } else {
+                if opaque.0 != gen {
+                    opaque.2.clear();
+                    opaque.0 = gen;
+                }
+                if opaque.2.contains(&p) {
+                    None
+                } else if let Some(reg) = leaf_builtins::lookup(b) {
+                    let k = kind(&reg.1);
+                    opaque.1.insert(p, reg);
+                    Some(k)
+                } else {
+                    opaque.1.remove(&p);
+                    opaque.2.insert(p);
+                    None
+                }
+            }
         };
         if found.is_none() {
             self.leaf_miss.set((p, gen));
@@ -75517,8 +75570,9 @@ pub(crate) mod leaf_builtins {
         Scalar,
     }
 
-    static REGISTRY: parking_lot::Mutex<Vec<(Weak<crate::object::BuiltinFn>, Entry)>> =
-        parking_lot::Mutex::new(Vec::new());
+    /// The registrations by address (a dead builtin's entry is replaced by
+    /// whatever registers at its address next, and dropped at a push).
+    static REGISTRY: parking_lot::Mutex<Option<LeafMap>> = parking_lot::Mutex::new(None);
     static GENERATION: AtomicU64 = AtomicU64::new(1);
 
     /// Vouch for `b` (by identity): its whole body is a leaf.
@@ -75540,9 +75594,23 @@ pub(crate) mod leaf_builtins {
 
     fn push(b: &Rc<crate::object::BuiltinFn>, entry: Entry) {
         let mut reg = REGISTRY.lock();
-        reg.retain(|(w, _)| w.strong_count() > 0);
-        reg.push((Rc::downgrade(b), entry));
+        let reg = reg.get_or_insert_with(LeafMap::default);
+        reg.retain(|_, (w, _)| w.strong_count() > 0);
+        reg.insert(Rc::as_ptr(b) as usize, (Rc::downgrade(b), entry));
         GENERATION.fetch_add(1, Ordering::Release);
+    }
+
+    /// The registration at `b`'s address, if it is `b`'s.
+    pub(crate) fn lookup(
+        b: &Rc<crate::object::BuiltinFn>,
+    ) -> Option<(Weak<crate::object::BuiltinFn>, Entry)> {
+        let reg = REGISTRY.lock();
+        let (w, e) = reg.as_ref()?.get(&(Rc::as_ptr(b) as usize))?;
+        std::ptr::eq(w.as_ptr(), Rc::as_ptr(b))
+            .then(|| w.upgrade())
+            .flatten()
+            .filter(|live| Rc::ptr_eq(live, b))
+            .map(|_| (w.clone(), *e))
     }
 
     pub(crate) fn generation() -> u64 {
@@ -75605,22 +75673,16 @@ pub(crate) mod leaf_builtins {
             .map(|&(_, op)| op)
     }
 
-    /// The live registrations, keyed by address.
-    pub(crate) fn snapshot() -> LeafMap {
-        REGISTRY
-            .lock()
-            .iter()
-            .filter(|(w, _)| w.strong_count() > 0)
-            .map(|(w, f)| (w.as_ptr() as usize, (w.clone(), *f)))
-            .collect()
-    }
-
     pub(crate) type LeafMap = std::collections::HashMap<
         usize,
         (Weak<crate::object::BuiltinFn>, Entry),
         crate::fasthash::FxBuildHasher,
     >;
 }
+
+/// Builtins found unregistered as leaves, by address (see
+/// [`Interpreter::leaf_call_kind`]).
+type LeafMisses = std::collections::HashSet<usize, crate::fasthash::FxBuildHasher>;
 
 /// `WEAVEPY_BURST_STATS=1`: which opcodes the quiet loop still runs
 /// through the full handlers (that is, outside the leaf burst), printed
@@ -86623,6 +86685,51 @@ fn code_name_str(code: &CodeObject, name_idx: u32, name: &str) -> Object {
     match code_name_obj(code, name_idx) {
         Some(obj) => obj.clone(),
         None => Object::from_str(name),
+    }
+}
+
+/// A class's native truth method as a compiled `TO_BOOL` site keeps it
+/// for the class's version (which keeps the builtin alive: replacing the
+/// method moves the version).
+#[derive(Clone, Copy)]
+pub(crate) struct NativeTruthPlan {
+    f: *const crate::object::BuiltinFn,
+    is_len: bool,
+    op: u8,
+}
+
+impl NativeTruthPlan {
+    pub(crate) const NONE: Self = Self {
+        f: std::ptr::null(),
+        is_len: false,
+        op: 0,
+    };
+
+    /// `v`'s truth through the plan (`v` an instance of the class it was
+    /// made for), or `None` for the full path.
+    #[inline]
+    pub(crate) fn run(self, v: &Object) -> Option<bool> {
+        if self.f.is_null() {
+            return None;
+        }
+        if self.op == crate::stdlib::collections_native::OP_BOOL {
+            if let Some(Object::Bool(b)) =
+                crate::stdlib::collections_native::fast_op(self.op, v, None)
+            {
+                return Some(b);
+            }
+        }
+        // SAFETY: the class holds the builtin while its version holds.
+        let b = unsafe { &*self.f };
+        let r = match b.call_kw.as_ref() {
+            Some(ckw) => ckw(std::slice::from_ref(v), &[]),
+            None => (b.call)(std::slice::from_ref(v)),
+        };
+        match r.ok()? {
+            Object::Bool(b) => Some(b),
+            Object::Int(n) if self.is_len && n >= 0 => Some(n != 0),
+            _ => None,
+        }
     }
 }
 
