@@ -32573,6 +32573,35 @@ impl Interpreter {
         Self::leaf_getattr_parts(args.first()?, args.get(1)?, args.get(2), false).map(Ok)
     }
 
+    /// `getattr(obj, name[, default])` of a property whose getter is a
+    /// Python function that evaluates as a pure leaf, on a plain instance
+    /// (a property is a data descriptor, so no instance entry shadows
+    /// it): the getter's result. `None` for the full call.
+    fn leaf_getattr_property(&self, args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+        let (recv @ Object::Instance(inst), Object::Str(name)) = (args.first()?, args.get(1)?)
+        else {
+            return None;
+        };
+        if args.len() > 3 || crate::object::exotic_str_keys_possible() {
+            return None;
+        }
+        let cls = inst.cls_raw();
+        if cls.native_kind.get() != 0
+            || inst.native.get().is_some()
+            || inst.c_body.get() != 0
+            || !Self::default_getattribute(cls)
+        {
+            return None;
+        }
+        let Some(Object::Property(p)) = cls.lookup(name) else {
+            return None;
+        };
+        let Object::Function(fget) = p.fget() else {
+            return None;
+        };
+        self.call_pure_leaf_with(&fget, Some(recv), &[]).map(Ok)
+    }
+
     /// [`Self::leaf_getattr`] on its parts, `default` the third argument's
     /// value if any. With `probe` (`hasattr`), the value found matters
     /// only as present: a method found to bind is answered with `True`
@@ -32892,7 +32921,9 @@ impl Interpreter {
                     )
             }
             K::Isinstance => return Self::core_isinstance(args),
-            K::GetAttr => return Self::leaf_getattr(args),
+            K::GetAttr => {
+                return Self::leaf_getattr(args).or_else(|| self.leaf_getattr_property(args));
+            }
             // `list.append` and `list.pop` in line (as `list_append` and
             // `list_pop` do them).
             K::ListAppend => {

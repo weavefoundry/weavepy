@@ -9155,7 +9155,10 @@ fn type_name_site(site: &AttrSite) -> bool {
 /// assignment to a class attribute, these among them, moves it).
 fn type_name_note(site: &AttrSite, cls: &Rc<crate::types::TypeObject>, value: &Object) {
     let ver = cls.attr_version.get();
-    if ver == 0 || !matches!(value, Object::Str(_)) || !cls.metaclass_is_type() {
+    if ver == 0
+        || !matches!(value, Object::Str(_))
+        || !(cls.metaclass_is_type() || meta_leaves_names(cls))
+    {
         return;
     }
     if let Ok(mut memo) = site.type_attr.try_borrow_mut() {
@@ -9163,6 +9166,41 @@ fn type_name_note(site: &AttrSite, cls: &Rc<crate::types::TypeObject>, value: &O
             TypeMemo::owned(Rc::as_ptr(cls) as usize, ver, value.clone()).under(meta_version(cls)),
         );
     }
+}
+
+/// Whether `cls`'s metaclass is a Python subclass of `type` (`ABCMeta`)
+/// that leaves `__name__` and `__module__` to `type`: no class on its MRO
+/// before `type` defines them or `__getattribute__`. (The memo is held
+/// under the metaclass's version, which an assignment there moves.)
+fn meta_leaves_names(cls: &crate::types::TypeObject) -> bool {
+    // SAFETY: GIL-serialized raw read; the reference ends with the check.
+    let Some(meta) = (unsafe { (*cls.metaclass.as_ptr()).as_ref() }) else {
+        return false;
+    };
+    let Ok(mro) = meta.mro.try_borrow() else {
+        return false;
+    };
+    for t in mro.iter() {
+        if t.flags.is_builtin {
+            return t.name == "type";
+        }
+        let Ok(d) = t.dict.try_borrow() else {
+            return false;
+        };
+        // (A metaclass's own `__module__` is a string, which a class's read
+        // passes over: only a descriptor would intercept it.)
+        if d.get(&crate::object::StrKey("__getattribute__")).is_some()
+            || ["__name__", "__module__"].iter().any(|n| {
+                !matches!(
+                    d.get(&crate::object::StrKey(n)),
+                    None | Some(Object::Str(_) | Object::None)
+                )
+            })
+        {
+            return false;
+        }
+    }
+    false
 }
 
 /// A class attribute an [`AttrSite`] memoized: the class's address and
