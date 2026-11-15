@@ -1316,7 +1316,41 @@ fn writer_parts(inst: &Rc<PyInstance>) -> Result<(Object, DialectCfg), RuntimeEr
     };
     let write = write.ok_or_else(|| type_error("writer is missing its write method"))?;
     let dialect_obj = dialect_obj.ok_or_else(|| type_error("writer is missing its dialect"))?;
-    Ok((write, read_cfg(&dialect_obj)?))
+    Ok((write, writer_cfg(&dialect_obj)?))
+}
+
+thread_local! {
+    /// The last dialect a writer read (by address and its dict's stamp)
+    /// and its settings: a writer's `writerow` reads them every row.
+    static WRITER_CFG: std::cell::RefCell<Option<(usize, u64, DialectCfg)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// [`read_cfg`] for a writer, through [`WRITER_CFG`]: the dialect's dict
+/// unchanged since (its stamp moves with every store) means the same
+/// settings.
+fn writer_cfg(dialect: &Object) -> Result<DialectCfg, RuntimeError> {
+    let Object::Instance(inst) = dialect else {
+        return read_cfg(dialect);
+    };
+    let at = Rc::as_ptr(inst) as usize;
+    let stamp = inst.dict_cell().borrow().mutation_stamp();
+    let hit = WRITER_CFG.with(|c| {
+        c.try_borrow().ok().and_then(|c| match &*c {
+            Some((a, st, cfg)) if *a == at && *st == stamp => Some(cfg.clone()),
+            _ => None,
+        })
+    });
+    if let Some(cfg) = hit {
+        return Ok(cfg);
+    }
+    let cfg = read_cfg(dialect)?;
+    WRITER_CFG.with(|c| {
+        if let Ok(mut c) = c.try_borrow_mut() {
+            *c = Some((at, stamp, cfg.clone()));
+        }
+    });
+    Ok(cfg)
 }
 
 fn writer_writerow_inner(
