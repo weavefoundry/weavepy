@@ -32143,7 +32143,12 @@ impl Interpreter {
         // `__new__`, no class-defined `__init__` to run), as the full
         // call builds it.
         if ty.flags.is_builtin && ty.flags.is_exception {
-            if exc_family_flags(ty) & EXC_FAM_GROUP != 0 || lookup_exception_init(ty).is_some() {
+            // (`OSError`'s own `__init__` sets what the built instance
+            // already holds.)
+            if exc_family_flags(ty) & EXC_FAM_GROUP != 0
+                || lookup_exception_init(ty)
+                    .is_some_and(|init| !crate::builtin_types::is_os_error_init(&init))
+            {
                 return None;
             }
             return Some(self.build_exception_instance(ty.clone(), args));
@@ -64009,6 +64014,33 @@ impl Interpreter {
                 PyInstance::with_slots(cls, crate::types::SlotStorage::exception(args_tuple, []));
             let obj = Object::Instance(Rc::new(inst));
             // See the GC note at the end.
+            if args.iter().any(|x| !crate::gc_trace::is_atomic(x)) {
+                crate::gc_trace::track(&obj);
+            }
+            return obj;
+        }
+        // `OSError(errno, strerror[, filename])` of a plain `OSError`
+        // family class, every field given: `args` keeps the first two and
+        // the fields go in with it, in one step.
+        if families & !(EXC_CUSTOM_INIT | EXC_FAM_GROUP | exc_family_bit("OSError")) == 0
+            && (2..=3).contains(&args.len())
+            && !args.iter().any(|a| matches!(a, Object::None))
+            && cls.fresh_slots().is_empty_default()
+        {
+            let args_tuple = Object::new_tuple(args[..2].to_vec());
+            let (e, s) = (args[0].clone(), args[1].clone());
+            let slots = match args.get(2) {
+                Some(f) => crate::types::SlotStorage::exception(
+                    args_tuple,
+                    [("errno", e), ("strerror", s), ("filename", f.clone())],
+                ),
+                None => crate::types::SlotStorage::exception(
+                    args_tuple,
+                    [("errno", e), ("strerror", s)],
+                ),
+            };
+            let inst = PyInstance::with_slots(cls, slots);
+            let obj = Object::Instance(Rc::new(inst));
             if args.iter().any(|x| !crate::gc_trace::is_atomic(x)) {
                 crate::gc_trace::track(&obj);
             }

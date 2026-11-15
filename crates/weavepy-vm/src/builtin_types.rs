@@ -3931,6 +3931,17 @@ fn install_import_error_init(import_error: &Rc<TypeObject>) {
     );
 }
 
+/// The address of `OSError.__init__`'s builtin (see [`is_os_error_init`]).
+static OS_ERROR_INIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether `init` is `OSError`'s own `__init__`, whose work a built
+/// exception instance already holds (`Interpreter::build_exception_instance`
+/// sets the same fields).
+pub(crate) fn is_os_error_init(init: &Object) -> bool {
+    matches!(init, Object::Builtin(b)
+        if Rc::as_ptr(b) as usize == OS_ERROR_INIT.load(std::sync::atomic::Ordering::Relaxed))
+}
+
 fn install_os_error_init(os_error: &Rc<TypeObject>) {
     use crate::object::BuiltinFn;
     fn oserror_init(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -4060,14 +4071,19 @@ fn install_os_error_init(os_error: &Rc<TypeObject>) {
         }
     }
     let mut dict = os_error.dict.borrow_mut();
+    let init = Rc::new(BuiltinFn {
+        name: "__init__",
+        binds_instance: true,
+        call: Box::new(oserror_init),
+        call_kw: None,
+    });
+    OS_ERROR_INIT.store(
+        Rc::as_ptr(&init) as usize,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     dict.insert(
         DictKey(Object::from_static("__init__")),
-        Object::Builtin(Rc::new(BuiltinFn {
-            name: "__init__",
-            binds_instance: true,
-            call: Box::new(oserror_init),
-            call_kw: None,
-        })),
+        Object::Builtin(init),
     );
     dict.insert(
         DictKey(Object::from_static("__str__")),
