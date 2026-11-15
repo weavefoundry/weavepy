@@ -7322,6 +7322,10 @@ pub(crate) fn struct_seq_type_layout(
                 }),
                 call_kw: None,
             }));
+            // (The read is a dictionary lookup: no Python runs.)
+            if let Object::Builtin(b) = &fget {
+                crate::leaf_builtins::register(b);
+            }
             let prop = Object::Property(Rc::new(crate::object::PyProperty::new(
                 fget,
                 Object::None,

@@ -32379,7 +32379,7 @@ impl Interpreter {
     }
 
     /// Which leaf builtin `b` is, if any (pointer identity).
-    fn leaf_call_kind(&self, b: &Rc<crate::object::BuiltinFn>) -> Option<LeafKind> {
+    pub(crate) fn leaf_call_kind(&self, b: &Rc<crate::object::BuiltinFn>) -> Option<LeafKind> {
         let p = Rc::as_ptr(b) as usize;
         let gen = leaf_builtins::generation();
         // (A builtin freed and another made at its address meanwhile only

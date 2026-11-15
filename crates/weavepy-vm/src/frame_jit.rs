@@ -8419,6 +8419,7 @@ unsafe fn attr_miss(st: *mut State, site: &AttrSite, at: *mut Object, local: boo
         }
         if let Some(v) = attr_miss_quick(site, &*at, local, running)
             .or_else(|| builtin_attr_read(st, site, &*at, local))
+            .or_else(|| leaf_property_read(st, site, &*at, local))
         {
             if local {
                 (*st).stack.add(site.slot as usize).write(v);
@@ -8913,6 +8914,44 @@ unsafe fn builtin_attr_read(
         *memo = Some((tag, b.clone()));
     }
     Some(bind(&b))
+}
+
+/// A plain instance's read of a property whose getter is a builtin
+/// registered as a leaf for any arguments (a struct sequence's field, as
+/// `os.stat_result.st_mode`): the getter's result, or `None` for the full
+/// path (which raises what the getter would).
+unsafe fn leaf_property_read(
+    st: *mut State,
+    site: &AttrSite,
+    recv: &Object,
+    local: bool,
+) -> Option<Object> {
+    let Object::Instance(inst) = recv else {
+        return None;
+    };
+    if (!local && !droppable(recv)) || !Interpreter::default_getattribute(inst.cls_raw()) {
+        return None;
+    }
+    // SAFETY: the site's code is live.
+    let code = unsafe { &*site.code };
+    let name: &str = code
+        .names
+        .get(code.instructions[site.pc as usize].arg as usize)?;
+    if name.starts_with("__") {
+        return None;
+    }
+    let Some(Object::Property(p)) = inst.cls_raw().lookup(name) else {
+        return None;
+    };
+    let Object::Builtin(b) = p.fget() else {
+        return None;
+    };
+    // SAFETY: the interpreter outlives the code it runs.
+    let interp = unsafe { &*(*st).interp };
+    if !matches!(interp.leaf_call_kind(&b), Some(crate::LeafKind::Opaque)) {
+        return None;
+    }
+    (b.call)(std::slice::from_ref(recv)).ok()
 }
 
 /// The classes an attribute site's polymorphic class-attribute memo holds.
