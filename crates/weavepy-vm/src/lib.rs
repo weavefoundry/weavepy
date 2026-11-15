@@ -56963,6 +56963,19 @@ impl Interpreter {
         self.generic_setattr_instance_with_name(inst, obj, name, value, None)
     }
 
+    /// [`Self::generic_setattr_instance`] for a name held as a `str`
+    /// object (`object.__setattr__`'s argument): no copy of its text, and
+    /// the object itself goes to the intern pool.
+    pub(crate) fn generic_setattr_instance_shared(
+        &mut self,
+        inst: &Rc<PyInstance>,
+        obj: &Object,
+        name: &SharedStr,
+        value: Object,
+    ) -> Result<(), RuntimeError> {
+        self.generic_setattr_instance_with_name(inst, obj, name, value, Some(name))
+    }
+
     fn generic_setattr_instance_with_name(
         &mut self,
         inst: &Rc<PyInstance>,
@@ -57227,7 +57240,10 @@ impl Interpreter {
         } else {
             None
         };
-        let key = crate::stdlib::sys::intern_name(name);
+        let key = match shared_name {
+            Some(shared) => Object::Str(crate::stdlib::sys::intern_shared_memo(shared)),
+            None => crate::stdlib::sys::intern_name(name),
+        };
         let mut value = Some(value);
         let old = 'store: {
             // The split layout, while the instance keeps one (and no

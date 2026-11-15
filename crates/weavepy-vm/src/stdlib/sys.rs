@@ -1455,6 +1455,40 @@ pub(crate) fn intern_shared(text: &SharedStr) -> SharedStr {
     })
 }
 
+/// [`intern_shared`] through a per-thread memo of recent names by
+/// identity: a setter called with the same name object again (a frozen
+/// dataclass's `object.__setattr__(self, 'x', x)`, a `setattr` in a loop)
+/// skips the pool's hash and probe. Each entry holds the name it was
+/// asked for, so no other string can come to sit at its address.
+pub(crate) fn intern_shared_memo(text: &SharedStr) -> SharedStr {
+    const N: usize = 64;
+    thread_local! {
+        static MEMO: std::cell::RefCell<[Option<(SharedStr, SharedStr)>; N]> =
+            const { std::cell::RefCell::new([const { None }; N]) };
+    }
+    let slot = (text.as_ptr() as usize >> 4) % N;
+    let hit = MEMO
+        .try_with(|m| {
+            let m = m.try_borrow().ok()?;
+            match &m[slot] {
+                Some((asked, pooled)) if SharedStr::ptr_eq(asked, text) => Some(pooled.clone()),
+                _ => None,
+            }
+        })
+        .ok()
+        .flatten();
+    if let Some(pooled) = hit {
+        return pooled;
+    }
+    let pooled = intern_shared(text);
+    let _ = MEMO.try_with(|m| {
+        if let Ok(mut m) = m.try_borrow_mut() {
+            m[slot] = Some((text.clone(), pooled.clone()));
+        }
+    });
+    pooled
+}
+
 /// CPython's `intern_string_constants` rule (codeobject.c): a str
 /// constant is interned when it is ASCII and every character is a name
 /// character (`Py_ISALNUM` or `_`); the empty string and every

@@ -7585,6 +7585,10 @@ pub(crate) struct MethodSite {
     desc: Option<(u64, bool, Object)>,
     /// The class version whose attribute the site found isn't one.
     desc_miss: u64,
+    /// A builtin type receiver the site loaded an unbound attribute of
+    /// (`object.__setattr__(self, ...)`, `int.from_bytes(...)`): the type,
+    /// its version, and the attribute, which leaves the self slot empty.
+    type_attr: Option<(usize, u64, Object)>,
 }
 
 /// `LOAD_ATTR` with the method flag at `site`: the method in the
@@ -7677,6 +7681,23 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
                 }
             }
         }
+        // A builtin type's attribute the site loaded last, while the type's
+        // version holds: it and an empty self slot, the type released.
+        let type_recv = match &*top {
+            Object::Type(t) if t.flags.is_builtin => {
+                let (ptr, ver) = (Rc::as_ptr(t) as usize, t.attr_version.get());
+                if let Some((p, v, attr)) = &s.type_attr {
+                    if *p == ptr && *v == ver {
+                        let attr = crate::clone_hot(attr);
+                        crate::drop_hot(std::mem::replace(&mut *top, attr));
+                        (*st).stack.add(s.len as usize).write(Object::Unbound);
+                        return 0;
+                    }
+                }
+                Some((ptr, ver))
+            }
+            _ => None,
+        };
         // The instance's own value the site found last, at its position
         // among the instance's names while the class version holds (no
         // data descriptor of the name has come since): it and an empty
@@ -7739,6 +7760,15 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
         );
         if r != 0 {
             return left(st, s.pc, s.last, s.len as usize);
+        }
+        // A builtin type's unbound function or builtin: for the next time.
+        if let Some((ptr, ver)) = type_recv {
+            let callable = &*(*st).stack.add(s.len as usize - 1);
+            if matches!(&*(*st).stack.add(s.len as usize), Object::Unbound)
+                && matches!(callable, Object::Builtin(_) | Object::Function(_))
+            {
+                s.type_attr = Some((ptr, ver, callable.clone()));
+            }
         }
         // A `staticmethod`'s or `classmethod`'s function: the descriptor, for
         // the next time.
@@ -21894,6 +21924,7 @@ impl<'a> Lower<'a> {
             own: (0, 0, 0),
             desc: None,
             desc_miss: 0,
+            type_attr: None,
         });
         let c = self
             .b

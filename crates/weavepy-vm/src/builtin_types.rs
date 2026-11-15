@@ -2900,7 +2900,7 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
             ));
         }
         let name = match &args[1] {
-            Object::Str(s) => s.to_string(),
+            Object::Str(s) => s.clone(),
             _ => return Err(crate::error::type_error("attribute name must be str")),
         };
         match &args[0] {
@@ -2909,7 +2909,12 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
                     // SAFETY: published by an enclosing VM frame still
                     // live on this thread; the GIL keeps access exclusive.
                     let interp = unsafe { &mut *ptr };
-                    interp.generic_setattr_instance(inst, &args[0], &name, args[2].clone())?;
+                    interp.generic_setattr_instance_shared(
+                        inst,
+                        &args[0],
+                        &name,
+                        args[2].clone(),
+                    )?;
                 } else if matches!(inst.cls().lookup(&name), Some(Object::SlotDescriptor(_))) {
                     // No VM frame on this thread (e.g. a bare C-API embed):
                     // we can't run a Python property setter, but a
