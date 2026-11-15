@@ -8739,6 +8739,27 @@ pub(crate) fn b_reversed(args: &[Object]) -> Result<Object, RuntimeError> {
             owner: None,
         }))));
     }
+    // An iterator, a native adapter (an endless `itertools.count()`
+    // among them), a generator or a set isn't a sequence: CPython's
+    // `reversed` wants `__reversed__` or `__len__` and `__getitem__`.
+    let sequence = match iterable {
+        Object::Str(_) | Object::Bytes(_) | Object::ByteArray(_) => true,
+        Object::Instance(_) => crate::instance_method(iterable, "__getitem__").is_some(),
+        Object::Iter(_)
+        | Object::LazyIter(_)
+        | Object::Generator(_)
+        | Object::Coroutine(_)
+        | Object::AsyncGenerator(_)
+        | Object::Set(_)
+        | Object::FrozenSet(_) => false,
+        _ => lookup_method(iterable, "__getitem__").is_some(),
+    };
+    if !sequence {
+        return Err(type_error(format!(
+            "'{}' object is not reversible",
+            iterable.type_name()
+        )));
+    }
     // Otherwise materialize the source in *forward* order; the Reversed
     // iterator walks it back-to-front. (CPython's `reversed` uses
     // `__reversed__` or `__len__`+`__getitem__`; a forward snapshot

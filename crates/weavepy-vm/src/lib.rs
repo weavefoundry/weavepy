@@ -47504,8 +47504,20 @@ impl Interpreter {
                 return self.make_iter(&Object::new_list(out), globals);
             }
             // A built-in container subclass with no overrides reverses
-            // the native payload it wraps.
-            if let Some(native) = inst.native.get() {
+            // the native payload it wraps (a sequence or a dict's keys; a
+            // native iterator's payload, an endless `itertools.count()`'s
+            // say, isn't reversible).
+            if let Some(native) = inst.native.get().filter(|n| {
+                matches!(
+                    n,
+                    Object::List(_)
+                        | Object::Tuple(_)
+                        | Object::Str(_)
+                        | Object::Bytes(_)
+                        | Object::ByteArray(_)
+                        | Object::Dict(_)
+                )
+            }) {
                 let native = native.clone();
                 let items = self.collect_iterable(&native, globals)?;
                 let reversed: Vec<Object> = items.into_iter().rev().collect();
@@ -47516,11 +47528,9 @@ impl Interpreter {
                 obj.type_name()
             )));
         }
-        // Generators / coroutines aren't reversible; everything else
-        // (lists, tuples, ranges, …) has a native reverse.
-        let items = self.collect_iterable(obj, globals)?;
-        let reversed: Vec<Object> = items.into_iter().rev().collect();
-        self.make_iter(&Object::new_list(reversed), globals)
+        // Generators, iterators and sets aren't reversible; everything
+        // else (lists, tuples, ranges, …) has a native reverse.
+        crate::builtins::b_reversed(args)
     }
 
     fn do_list_sort_call(
