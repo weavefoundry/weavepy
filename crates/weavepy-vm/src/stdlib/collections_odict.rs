@@ -208,6 +208,11 @@ pub(crate) fn order_iter(
 
 /// `OrderedDict.__setitem__(self, key, value)`.
 fn od_setitem(args: &[Object]) -> Result<Object, RuntimeError> {
+    // (A store compiled code reaches through the class's `__setitem__`,
+    // tier 2's say, settles as the leaf half does when it can.)
+    if let Some(done) = od_setitem_leaf(args) {
+        return done;
+    }
     let (inst, main) = receiver(args, "__setitem__")?;
     let [_, key, value] = args else {
         return Err(type_error(format!(
