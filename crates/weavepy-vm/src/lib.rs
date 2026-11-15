@@ -14122,6 +14122,32 @@ impl Interpreter {
                                 Object::Generator(_) | Object::Coroutine(_)
                             )
                         {
+                            // `yield from` a range, tuple or list iterator,
+                            // sent `None`: its next item takes the sent
+                            // value's slot, or the `SEND` exits at its end
+                            // (see `gen_fast::send_iter_step`).
+                            // SAFETY: `len >= 2` (checked first).
+                            if let (true, Object::Iter(it), Object::None) = (
+                                len >= 2 && ins.arg & GEN_SEND == 0,
+                                unsafe { &*base.add(len - 2) },
+                                unsafe { &*base.add(len - 1) },
+                            ) {
+                                if let Some(item) = gen_fast::send_iter_step(it) {
+                                    let exit = item.is_none();
+                                    // SAFETY: the sent `None`'s slot (no drop
+                                    // glue owed).
+                                    unsafe {
+                                        base.add(len - 1).write(item.unwrap_or(Object::None))
+                                    };
+                                    last = pc;
+                                    pc += 1;
+                                    if exit {
+                                        pc += ins.arg as usize;
+                                    }
+                                    after_release!();
+                                    continue;
+                                }
+                            }
                             // `await fut` of a native asyncio future: its
                             // iterator's step, the sent value replaced by
                             // what it yields, or by the result as the
@@ -51583,6 +51609,18 @@ impl Interpreter {
                 })
             {
                 return None;
+            }
+            // Resting in a `yield from` over a range, tuple or list
+            // iterator with an item left, sent `None`: the item, the frame
+            // untouched (see `yield_from_iter_item`).
+            if let (false, None, Object::None, Some(Object::Iter(it))) =
+                (first_resume, &fold, sent, frame.stack.last())
+            {
+                if let Some(v) =
+                    Self::yield_from_iter_item(frame, &frame.code, frame.pc as usize, it)
+                {
+                    return Some(Ok(v));
+                }
             }
         }
         let guard = match crate::recursion::enter() {

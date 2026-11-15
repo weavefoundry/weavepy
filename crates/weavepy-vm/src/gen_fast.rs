@@ -404,6 +404,25 @@ fn scalar_truth(v: &Object) -> Option<bool> {
     })
 }
 
+/// A `SEND` of `None` to `it`, a `yield from`'s range, tuple or list
+/// iterator: `Some(Some(item))` its next item, `Some(None)` its end (a
+/// range's or tuple's, which frees nothing), `None` for the general path
+/// (another iterator, or a list's end, which detaches the list and may free
+/// a subclass's owner). Nothing here runs code.
+#[inline]
+pub(crate) fn send_iter_step(it: &Rc<crate::sync::RefCell<PyIterator>>) -> Option<Option<Object>> {
+    let mut it = it.try_borrow_mut().ok()?;
+    match &mut *it {
+        PyIterator::Range { .. } | PyIterator::Tuple { .. } => Some(it.next_value()),
+        PyIterator::List { items, index, .. } => {
+            let v = items.try_borrow().ok()?.get(*index).cloned()?;
+            *index += 1;
+            Some(Some(v))
+        }
+        _ => None,
+    }
+}
+
 /// How deep a chain of `yield from` delegations steps directly (see
 /// `Interpreter::gen_chain_step`).
 #[cfg(feature = "jit")]
@@ -1250,6 +1269,15 @@ impl Interpreter {
             {
                 return self.gen_chain_step(g, snap_gen, dead, depth_cell, level);
             }
+            // Resting in a `yield from` over a range, tuple or list iterator
+            // with an item left: the item, the frame untouched (a `SEND` of
+            // `None` to it and the `YIELD_VALUE` after are just that). Its
+            // end, and every other iterator, take the general resume.
+            if let Some(Object::Iter(it)) = frame.stack.last() {
+                if let Some(v) = Self::yield_from_iter_item(frame, code, pc, it) {
+                    return GenNext::Yielded(v);
+                }
+            }
             let Some(native) = ext.frame_jit.get(frame.locals.len()) else {
                 break 'lean;
             };
@@ -1336,6 +1364,44 @@ impl Interpreter {
     /// doesn't step this way leaves `g` as it was, for the ordinary steps.
     #[cfg(feature = "jit")]
     #[inline(never)]
+    /// The next item of `it`, the native iterator a generator's suspended
+    /// `frame` (at `pc` of `code`) rests on in a `yield from`, when stepping
+    /// it runs no code and doesn't end it (see `gen_native_next`).
+    #[inline]
+    pub(crate) fn yield_from_iter_item(
+        frame: &Frame,
+        code: &CodeObject,
+        pc: usize,
+        it: &Rc<crate::sync::RefCell<PyIterator>>,
+    ) -> Option<Object> {
+        use std::sync::atomic::Ordering;
+        let send = crate::yield_from_resend(&code.instructions, pc)?;
+        if code.instructions[send].arg & crate::GEN_SEND != 0
+            || frame.sent_consumed
+            || frame.py_frame.is_some()
+            || frame.has_saved_exc_info()
+            || frame.parked_native.is_some()
+            || frame
+                .shell_cache
+                .as_ref()
+                .is_some_and(|c| c.has_materialized.load(Ordering::Relaxed))
+            || crate::trace::eval_frame_record_active()
+        {
+            return None;
+        }
+        let mut it = it.try_borrow_mut().ok()?;
+        match &mut *it {
+            PyIterator::Range { .. } | PyIterator::Tuple { .. } => it.next_value(),
+            // (A list's end detaches it and may free a subclass owner.)
+            PyIterator::List { items, index, .. } => {
+                let v = items.try_borrow().ok()?.get(*index).cloned()?;
+                *index += 1;
+                Some(v)
+            }
+            _ => None,
+        }
+    }
+
     fn gen_chain_step(
         &mut self,
         g: &Rc<PyGenerator>,
