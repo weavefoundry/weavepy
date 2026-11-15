@@ -640,7 +640,7 @@ unsafe extern "C" fn enter_more(
         let missing = params - n;
         let defaults = &(*fp).defaults;
         if missing != 0
-            && (crate::sync::release_gates() != 0
+            && (crate::sync::release_gates() & crate::sync::RELEASE_OBSERVER_GATES != 0
                 || defaults.len() < missing
                 || (*fp).defaults_maybe_overridden())
         {
@@ -661,15 +661,21 @@ unsafe extern "C" fn enter_more(
         move_args(slot.add(2 - usize::from(has_self)), dst, n);
         if missing != 0 {
             let defaults = defaults.as_ptr().add(defaults.len() - missing);
+            let shared = crate::sync::release_gates() != 0;
             for k in 0..missing {
                 let d = defaults.add(k);
-                // While the gates are off this thread alone updates counts.
+                // While the gates are off this thread alone updates counts;
+                // with counts shared, a locked update.
                 if let Some(word) = (*d).strong_word() {
                     let w = &*word;
-                    w.store(
-                        w.load(std::sync::atomic::Ordering::Relaxed) + 1,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
+                    if shared {
+                        w.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        w.store(
+                            w.load(std::sync::atomic::Ordering::Relaxed) + 1,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
                 }
                 let (a, b) = (d.cast::<u64>(), dst.add(n + k).cast::<u64>());
                 let (x, y) = (a.read(), a.add(1).read());
@@ -1312,10 +1318,12 @@ pub(super) unsafe extern "C" fn h_direct_leave(
             || (*rec.locals_count).load(std::sync::atomic::Ordering::Relaxed) > 1
             || interp.gil_countdown <= 2
             || crate::hot_gates::loop_gen() != rec.st.snap_gen
-            || crate::sync::release_gates() != 0
+            || crate::sync::release_gates() & crate::sync::RELEASE_OBSERVER_GATES != 0
         {
             return left_slowly(s, rec, status);
         }
+        // (With counts shared, each release below is a locked update.)
+        let shared = crate::sync::release_gates() != 0;
         interp.lazy_top.set(rec.outer);
         (*rec.frame).stack.set_len(0);
         let n = (*rec.locals).len();
@@ -1328,6 +1336,12 @@ pub(super) unsafe extern "C" fn h_direct_leave(
             k -= 1;
             if let Some(word) = (*locals.add(k)).strong_word() {
                 // While the gates are off this thread alone updates counts.
+                if shared {
+                    if !crate::rc::release_unless_last(word) {
+                        return release_rest(s, rec, k + 1);
+                    }
+                    continue;
+                }
                 let w = &*word;
                 let c = w.load(std::sync::atomic::Ordering::Relaxed);
                 if c == 1 {
@@ -1342,11 +1356,17 @@ pub(super) unsafe extern "C" fn h_direct_leave(
         }
         // (A function's second word is its count's address.)
         let word = &**slot.cast::<*const std::sync::atomic::AtomicUsize>().add(1);
-        let c = word.load(std::sync::atomic::Ordering::Relaxed);
-        if c == 1 {
-            return finish_rest(s, rec);
+        if shared {
+            if !crate::rc::release_unless_last(word) {
+                return finish_rest(s, rec);
+            }
+        } else {
+            let c = word.load(std::sync::atomic::Ordering::Relaxed);
+            if c == 1 {
+                return finish_rest(s, rec);
+            }
+            word.store(c - 1, std::sync::atomic::Ordering::Relaxed);
         }
-        word.store(c - 1, std::sync::atomic::Ordering::Relaxed);
         let (a, b) = (rec.st.stack.cast::<u64>(), slot.cast::<u64>());
         let (x, y) = (a.read(), a.add(1).read());
         b.write(x);

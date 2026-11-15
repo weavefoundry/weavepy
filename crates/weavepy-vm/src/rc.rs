@@ -239,6 +239,28 @@ pub(crate) unsafe fn try_release_shared<T: ?Sized>(value: *const T) -> bool {
     unsafe { try_release_word(strong_word(value)) }
 }
 
+/// Release an owner through the strong count `word` with a locked update,
+/// unless it's the last one: `false`, with the count unchanged. The
+/// release ordering is `Arc`'s for an owner that isn't the last.
+///
+/// # Safety
+///
+/// `word` is the strong count of a live `Arc` allocation the caller owns
+/// a reference to; on `true` that reference is released.
+#[inline]
+pub(crate) unsafe fn release_unless_last(word: *const AtomicUsize) -> bool {
+    // SAFETY: per the caller.
+    let count = unsafe { &*word };
+    let mut n = count.load(Ordering::Relaxed);
+    while n > 1 {
+        match count.compare_exchange_weak(n, n - 1, Ordering::Release, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(now) => n = now,
+        }
+    }
+    false
+}
+
 /// Free the `Arc` allocation holding `value` when this is its last owner
 /// and no weak reference exists, with plain loads instead of `Arc`'s two
 /// locked decrements (strong, then the implicit weak). Only for payloads
@@ -604,6 +626,12 @@ impl<T: ?Sized + 'static> Rc<T> {
     unsafe fn drop_last(&mut self) {
         // SAFETY: the caller's contract.
         unsafe {
+            // Without the bias, an owner that isn't the last gives its
+            // reference up with one locked update, as `Arc`'s drop would,
+            // without the last owner's checks below.
+            if !refcounts_biased() && release_unless_last(strong_word(Arc::as_ptr(&self.0))) {
+                return;
+            }
             // The last reference to an object that owes a finalizer moves
             // to the finalizer queue instead: the object stays alive, at
             // its address, until its `__del__` (or generator close) has

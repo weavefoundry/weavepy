@@ -224,6 +224,7 @@ pub unsafe extern "C" fn PyEval_SaveThread() -> *mut PyThreadState {
     // represent the token as the count of guards we just
     // popped, encoded into the pointer. Anything non-null
     // restores; null means "we weren't holding the GIL".
+    weavepy_vm::gil::before_gil_release();
     let popped = pop_gil_guard();
     if popped.is_some() {
         // Encode "1 guard popped" as a dangling sentinel; the
@@ -256,5 +257,6 @@ pub unsafe extern "C" fn PyEval_AcquireThread(_state: *mut PyThreadState) {
 #[no_mangle]
 pub unsafe extern "C" fn PyEval_ReleaseThread(_state: *mut PyThreadState) {
     // Paired with `PyEval_AcquireThread`.
+    weavepy_vm::gil::before_gil_release();
     let _ = pop_gil_guard();
 }

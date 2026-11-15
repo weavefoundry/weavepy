@@ -13749,9 +13749,11 @@ unsafe fn native_body_here(
         frame.stack.set_len(lenu);
         // A lazily running activation stays so unless something looks while
         // the body runs, which a body that runs no Python code rarely makes
-        // happen. (Other threads can look without settling it: it registers
-        // first once there are any.)
-        let lazy = !s.lazy.is_null() && !crate::sync::rc_shared_flag().load(Ordering::Relaxed);
+        // happen. (Another thread looks only once this one releases the
+        // GIL, which settles it first, see `gil::before_gil_release`; a
+        // watchdog that reads frames without the GIL makes it register
+        // first.)
+        let lazy = !s.lazy.is_null() && !crate::sync::cells_unguarded();
         if !lazy {
             settle(s);
             *(*s.sw).last = s.last;

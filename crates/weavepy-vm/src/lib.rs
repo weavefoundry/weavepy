@@ -2630,8 +2630,15 @@ impl Interpreter {
             match dropped.strong_word() {
                 None => return std::mem::forget(dropped),
                 // SAFETY: `dropped` owns a reference, released here unless
-                // it is the last one.
-                Some(word) if unsafe { crate::rc::try_release_word(word) } => {
+                // it is the last one (with a locked update once the bias
+                // is gone).
+                Some(word)
+                    if unsafe {
+                        crate::rc::try_release_word(word)
+                            || (!crate::rc::refcounts_biased()
+                                && crate::rc::release_unless_last(word))
+                    } =>
+                {
                     return std::mem::forget(dropped);
                 }
                 Some(_) => {}
