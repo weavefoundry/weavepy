@@ -1483,6 +1483,25 @@ pub(crate) fn builtin_ctor_pure(cls: &Rc<TypeObject>, args: &[Object]) -> Option
             _ => None,
         };
     }
+    // `bytes(n)`, `bytes(b)`, `bytearray(n)` and `bytearray(b)` of a small
+    // count or an exact `bytes` or `bytearray` (a copy that runs no code).
+    let bytes = Rc::ptr_eq(cls, &bt.bytes_);
+    if bytes || Rc::ptr_eq(cls, &bt.bytearray_) {
+        let data = match args {
+            [] => Vec::new(),
+            [Object::Int(n)] if (0..=1 << 16).contains(n) => vec![0; *n as usize],
+            // (An exact `bytes` is its own copy.)
+            [Object::Bytes(_)] if bytes => return Some(args[0].clone()),
+            [Object::Bytes(b)] => b.to_vec(),
+            [Object::ByteArray(b)] => b.try_borrow().ok()?.clone(),
+            _ => return None,
+        };
+        return Some(if bytes {
+            Object::new_bytes(data)
+        } else {
+            Object::new_bytearray(data)
+        });
+    }
     // `types.MethodType(func, obj)`: `func` bound to `obj`, as the full
     // constructor binds it.
     if Rc::ptr_eq(cls, &bt.method_) {

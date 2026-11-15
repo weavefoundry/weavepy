@@ -20994,8 +20994,33 @@ impl Interpreter {
             }
             Object::Tuple(items) => Some(Object::new_tuple(slice_seq(&items[..], sl).ok()?)),
             Object::Str(st) => str_subscript_slice(st, sl).ok(),
+            Object::Bytes(b) => {
+                // (A contiguous slice copies its range once.)
+                if matches!(sl.step, Object::None | Object::Int(1)) {
+                    let (lo, hi) = Self::slice_bounds(sl, b.len())?;
+                    return Some(Object::Bytes(SharedSlice::from(&b[lo..hi.max(lo)])));
+                }
+                Some(Object::new_bytes(slice_seq(&b[..], sl).ok()?))
+            }
             _ => None,
         }
+    }
+
+    /// A unit-step slice's clamped `[lo, hi)` over `n` items, its bounds
+    /// plain ints or omitted (`None` otherwise).
+    #[inline]
+    fn slice_bounds(sl: &crate::object::PySlice, n: usize) -> Option<(usize, usize)> {
+        let n = n as i64;
+        let at = |v: &Object, dflt: i64| -> Option<usize> {
+            let i = match v {
+                Object::None => dflt,
+                Object::Int(i) if *i < 0 => (*i + n).max(0),
+                Object::Int(i) => (*i).min(n),
+                _ => return None,
+            };
+            Some(i as usize)
+        };
+        Some((at(&sl.start, 0)?, at(&sl.stop, n)?))
     }
 
     /// The core loop's `BINARY_OP` over strings: `str + str`, a small
@@ -21899,6 +21924,7 @@ impl Interpreter {
                         | Object::Tuple(_)
                         | Object::Dict(_)
                         | Object::Str(_)
+                        | Object::Bytes(_)
                         | Object::MappingProxy(_)
                 ) || !Self::core_droppable(c)
                 {
@@ -21931,6 +21957,14 @@ impl Interpreter {
                             return None;
                         }
                         clone_hot(&t[i as usize])
+                    }
+                    (Object::Bytes(b), Object::Int(i)) => {
+                        let n = b.len() as i64;
+                        let i = if *i < 0 { *i + n } else { *i };
+                        if i < 0 || i >= n {
+                            return None;
+                        }
+                        Object::Int(i64::from(b[i as usize]))
                     }
                     // (A tuple key's probe takes only ints and strings,
                     // which compare and drop without running code.)
@@ -21967,10 +22001,12 @@ impl Interpreter {
                     // `seq[a:b:c]` with plain int (or omitted) bounds: the
                     // full handler's own slicing, out of line (a bad step
                     // declines, and the full handler raises).
-                    (Object::List(_) | Object::Tuple(_) | Object::Str(_), Object::Slice(sl))
-                        if [&sl.start, &sl.stop, &sl.step]
-                            .iter()
-                            .all(|v| matches!(v, Object::None | Object::Int(_))) =>
+                    (
+                        Object::List(_) | Object::Tuple(_) | Object::Str(_) | Object::Bytes(_),
+                        Object::Slice(sl),
+                    ) if [&sl.start, &sl.stop, &sl.step]
+                        .iter()
+                        .all(|v| matches!(v, Object::None | Object::Int(_))) =>
                     {
                         Self::core_slice(c, sl)?
                     }
@@ -22002,8 +22038,10 @@ impl Interpreter {
                         &*base.add(len - 1),
                     )
                 };
-                if !matches!(c, Object::List(_) | Object::Tuple(_) | Object::Str(_))
-                    || !Self::core_droppable(c)
+                if !matches!(
+                    c,
+                    Object::List(_) | Object::Tuple(_) | Object::Str(_) | Object::Bytes(_)
+                ) || !Self::core_droppable(c)
                     || !matches!(a, Object::None | Object::Int(_))
                     || !matches!(b, Object::None | Object::Int(_))
                 {
@@ -52459,6 +52497,11 @@ impl Interpreter {
         b: &Object,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
+        if let Object::Bytes(t) = a {
+            if let Some(out) = bytes_percent_simple(t, b) {
+                return Ok(Object::new_bytes(out));
+            }
+        }
         let template: String = match a {
             Object::Bytes(t) => t.iter().map(|x| *x as char).collect(),
             Object::ByteArray(t) => t.borrow().iter().map(|x| *x as char).collect(),
@@ -79146,6 +79189,51 @@ fn star_arg_int(v: &Object) -> Result<i64, RuntimeError> {
 /// `resolve(item, kind)` lets the caller render `%s` / `%r` of user
 /// instances through `__str__` / `__repr__` (returning `Some(rendered)`),
 /// falling back to the built-in conversion when it returns `None`.
+/// `bytes % args` for the plain conversions (`%d`, `%i`, `%u`, `%x`, `%s`
+/// and `%b` without flags, width or precision, and `%%`) over ints and
+/// `bytes`, straight into the output; `None` for anything else, which the
+/// general engine formats (and raises for).
+pub(crate) fn bytes_percent_simple(template: &[u8], value: &Object) -> Option<Vec<u8>> {
+    let one;
+    let args: &[Object] = match value {
+        Object::Tuple(items) => &items[..],
+        Object::Int(_) | Object::Bytes(_) => {
+            one = [value.clone()];
+            &one
+        }
+        _ => return None,
+    };
+    let mut out = Vec::with_capacity(template.len() + 8 * args.len());
+    let mut next = args.iter();
+    let mut i = 0;
+    while i < template.len() {
+        let Some(k) = memchr::memchr(b'%', &template[i..]) else {
+            out.extend_from_slice(&template[i..]);
+            break;
+        };
+        out.extend_from_slice(&template[i..i + k]);
+        let conv = *template.get(i + k + 1)?;
+        i += k + 2;
+        if conv == b'%' {
+            out.push(b'%');
+            continue;
+        }
+        match (conv, next.next()?) {
+            (b'd' | b'i' | b'u', Object::Int(n)) => {
+                out.extend_from_slice(itoa::Buffer::new().format(*n).as_bytes());
+            }
+            (b'x', Object::Int(n)) if *n >= 0 => {
+                use std::io::Write;
+                write!(out, "{n:x}").ok()?;
+            }
+            (b's' | b'b', Object::Bytes(b)) => out.extend_from_slice(b),
+            _ => return None,
+        }
+    }
+    // (Arguments left over raise in the general engine.)
+    next.next().is_none().then_some(out)
+}
+
 pub(crate) fn percent_format_with(
     template: &str,
     value: &Object,
@@ -87095,6 +87183,9 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             // bytes mode over a latin-1 (raw byte → 1:1 codepoint) view,
             // then re-encodes. (The VM path in `dispatch_binop` handles
             // `__bytes__`; this pure fallback covers bytes-like args.)
+            if let Some(out) = bytes_percent_simple(template, v) {
+                return Ok(Object::new_bytes(out));
+            }
             let s: String = template.iter().map(|b| *b as char).collect();
             let mut noop = |_: &Object, _: char| Ok(None);
             let rendered = percent_format_with(&s, v, PercentMode::Bytes, &mut noop)?;

@@ -11948,6 +11948,34 @@ pub(crate) fn substr_find(hay: &str, needle: &str) -> Option<usize> {
 /// `a == b` for the short needle tails the substring scans compare, inline
 /// (a `memcmp` call costs more than comparing a few bytes).
 #[inline(always)]
+/// The first `n` in `h`, as [`substr_find`] scans bytes: a short needle
+/// by its first byte's `memchr` and an in-line compare of the rest (a
+/// `memmem` searcher's set-up costs more than a short haystack's whole
+/// scan), anything else through `memmem`.
+pub(crate) fn bytes_search(h: &[u8], n: &[u8]) -> Option<usize> {
+    if n.is_empty() {
+        return Some(0);
+    }
+    if n.len() > 16 || h.len() < n.len() || h.len() > 256 {
+        return memchr::memmem::find(h, n);
+    }
+    let last_start = h.len() - n.len();
+    let mut i = 0;
+    let mut budget = h.len() / n.len() + 32;
+    while i <= last_start {
+        let at = i + memchr::memchr(n[0], &h[i..=last_start])?;
+        if short_bytes_eq(&h[at + 1..at + n.len()], &n[1..]) {
+            return Some(at);
+        }
+        budget -= 1;
+        if budget == 0 {
+            return memchr::memmem::find(&h[at + 1..], n).map(|k| k + at + 1);
+        }
+        i = at + 1;
+    }
+    None
+}
+
 fn short_bytes_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x == y)
 }
@@ -15240,10 +15268,12 @@ fn set_symmetric_difference_update(args: &[Object]) -> Result<Object, RuntimeErr
 
 // ---------- bytes methods ----------
 
-fn bytes_data(args: &[Object]) -> Result<Vec<u8>, RuntimeError> {
+fn bytes_data(args: &[Object]) -> Result<std::borrow::Cow<'_, [u8]>, RuntimeError> {
     match args.first() {
-        Some(Object::Bytes(b)) => Ok(b.to_vec()),
-        Some(Object::ByteArray(b)) => Ok(b.borrow().clone()),
+        // (An immutable receiver is read in place; a `bytearray` is copied,
+        // as the method may run code that resizes it.)
+        Some(Object::Bytes(b)) => Ok(std::borrow::Cow::Borrowed(&b[..])),
+        Some(Object::ByteArray(b)) => Ok(std::borrow::Cow::Owned(b.borrow().clone())),
         _ => Err(type_error("expected bytes-like receiver")),
     }
 }
@@ -15268,6 +15298,18 @@ fn with_bytes_data<R>(
 }
 
 pub(crate) fn bytes_argview(arg: &Object) -> Result<Vec<u8>, RuntimeError> {
+    bytes_argview_cow(arg).map(std::borrow::Cow::into_owned)
+}
+
+/// [`bytes_argview`], reading a `bytes` argument in place.
+pub(crate) fn bytes_argview_cow(arg: &Object) -> Result<std::borrow::Cow<'_, [u8]>, RuntimeError> {
+    if let Object::Bytes(b) = arg {
+        return Ok(std::borrow::Cow::Borrowed(&b[..]));
+    }
+    bytes_argview_owned(arg).map(std::borrow::Cow::Owned)
+}
+
+fn bytes_argview_owned(arg: &Object) -> Result<Vec<u8>, RuntimeError> {
     match arg {
         Object::Bytes(b) => Ok(b.to_vec()),
         Object::ByteArray(b) => Ok(b.borrow().clone()),
@@ -15436,7 +15478,7 @@ pub fn buffer_exported_view(obj: &Object, flags: i64) -> Option<Rc<crate::object
 fn bytes_hex_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let data = match args.first() {
         Some(Object::MemoryView(mv)) => mv.to_bytes(),
-        _ => bytes_data(args)?,
+        _ => bytes_data(args)?.into_owned(),
     };
     let mut sep_obj = args.get(1).cloned();
     let mut bps_obj = args.get(2).cloned();
@@ -15708,7 +15750,7 @@ fn bytes_find_in(data: &[u8], sub: &[u8], start: usize, end: usize) -> i64 {
     if sub.is_empty() {
         return start as i64;
     }
-    memchr::memmem::find(hay, sub).map_or(-1, |i| (start + i) as i64)
+    bytes_search(hay, sub).map_or(-1, |i| (start + i) as i64)
 }
 
 /// gh-142560: converting a search argument can run Python code (a user
@@ -15968,7 +16010,7 @@ fn bytes_split_args(
             .as_i64()
             .ok_or_else(|| type_error("integer argument expected"))?,
     };
-    Ok((data, sep, maxsplit))
+    Ok((data.into_owned(), sep, maxsplit))
 }
 
 fn bytes_split_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
@@ -16001,7 +16043,7 @@ fn bytes_split_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object
             let mut start = 0;
             let mut nsplit = 0i64;
             while maxsplit < 0 || nsplit < maxsplit {
-                match memchr::memmem::find(&data[start..], &sep) {
+                match bytes_search(&data[start..], &sep) {
                     Some(rel) => {
                         parts.push(data[start..start + rel].to_vec());
                         start += rel + sep.len();
@@ -16267,11 +16309,11 @@ fn bytes_join(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn bytes_replace_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let data = bytes_data(args)?;
-    let from = bytes_argview(
+    let from = bytes_argview_cow(
         args.get(1)
             .ok_or_else(|| type_error("replace() expected 2 args"))?,
     )?;
-    let to = bytes_argview(
+    let to = bytes_argview_cow(
         args.get(2)
             .ok_or_else(|| type_error("replace() expected 2 args"))?,
     )?;
@@ -16292,28 +16334,41 @@ fn bytes_replace_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Obje
             .as_i64()
             .ok_or_else(|| type_error("integer argument expected"))?,
     };
-    let mut out = Vec::new();
-    let mut done = 0i64;
-    let mut i = 0;
-    while i < data.len() {
-        let within_budget = max < 0 || done < max;
-        if within_budget && i + from.len() <= data.len() && data[i..i + from.len()] == from[..] {
-            out.extend_from_slice(&to);
-            done += 1;
-            i += from.len().max(1);
-            if from.is_empty() {
-                out.push(data[i - 1]);
+    let out = if from.is_empty() {
+        let mut out = Vec::with_capacity(data.len() + to.len() * (data.len() + 1));
+        let mut done = 0i64;
+        for &c in data.iter() {
+            if max < 0 || done < max {
+                out.extend_from_slice(&to);
+                done += 1;
             }
-        } else {
-            out.push(data[i]);
-            i += 1;
+            out.push(c);
         }
-    }
-    // An empty needle also matches at end-of-string (CPython appends a
-    // final replacement: `b"ab".replace(b"", b"-") == b"-a-b-"`).
-    if from.is_empty() && (max < 0 || done < max) {
-        out.extend_from_slice(&to);
-    }
+        // An empty needle also matches at end-of-string (CPython appends a
+        // final replacement: `b"ab".replace(b"", b"-") == b"-a-b-"`).
+        if max < 0 || done < max {
+            out.extend_from_slice(&to);
+        }
+        out
+    } else {
+        // (One searcher over the haystack, and the output sized for the
+        // common no-growth case.)
+        let mut out = Vec::with_capacity(data.len());
+        let mut last = 0;
+        let mut done = 0i64;
+        while max < 0 || done < max {
+            let Some(k) = bytes_search(&data[last..], &from) else {
+                break;
+            };
+            let at = last + k;
+            out.extend_from_slice(&data[last..at]);
+            out.extend_from_slice(&to);
+            last = at + from.len();
+            done += 1;
+        }
+        out.extend_from_slice(&data[last..]);
+        out
+    };
     Ok(bytes_like_result(args, out))
 }
 
@@ -16357,7 +16412,7 @@ fn bytes_translate_kw(
         Some(o) => bytes_argview(&o)?,
     };
     let mut out = Vec::with_capacity(data.len());
-    for &b in &data {
+    for &b in data.iter() {
         if delete.contains(&b) {
             continue;
         }
@@ -16403,13 +16458,13 @@ fn bytes_partition(args: &[Object]) -> Result<Object, RuntimeError> {
     if sep.is_empty() {
         return Err(value_error("empty separator"));
     }
-    let (head, mid, tail) = match memchr::memmem::find(&data, &sep) {
+    let (head, mid, tail) = match bytes_search(&data, &sep) {
         Some(i) => (
             data[..i].to_vec(),
             sep.clone(),
             data[i + sep.len()..].to_vec(),
         ),
-        None => (data, Vec::new(), Vec::new()),
+        None => (data.into_owned(), Vec::new(), Vec::new()),
     };
     Ok(Object::new_tuple_array([
         bytes_like_result(args, head),
@@ -16433,7 +16488,7 @@ fn bytes_rpartition(args: &[Object]) -> Result<Object, RuntimeError> {
             sep.clone(),
             data[i + sep.len()..].to_vec(),
         ),
-        None => (Vec::new(), Vec::new(), data),
+        None => (Vec::new(), Vec::new(), data.into_owned()),
     };
     Ok(Object::new_tuple_array([
         bytes_like_result(args, head),
@@ -16457,7 +16512,7 @@ fn bytes_removeprefix(args: &[Object]) -> Result<Object, RuntimeError> {
     let out = if data.starts_with(&prefix) {
         data[prefix.len()..].to_vec()
     } else {
-        data
+        data.into_owned()
     };
     Ok(bytes_like_result(args, out))
 }
@@ -16477,7 +16532,7 @@ fn bytes_removesuffix(args: &[Object]) -> Result<Object, RuntimeError> {
     let out = if !suffix.is_empty() && data.ends_with(&suffix) {
         data[..data.len() - suffix.len()].to_vec()
     } else {
-        data
+        data.into_owned()
     };
     Ok(bytes_like_result(args, out))
 }
@@ -16508,7 +16563,7 @@ fn bytes_expandtabs(args: &[Object], kwargs: &[(String, Object)]) -> Result<Obje
     };
     let mut out = Vec::with_capacity(data.len());
     let mut col: i64 = 0;
-    for &b in &data {
+    for &b in data.iter() {
         match b {
             b'\t' => {
                 if tabsize > 0 {
@@ -16554,7 +16609,7 @@ fn bytes_pad_args(args: &[Object], name: &str) -> Result<(Vec<u8>, i64, u8), Run
             }
         }
     };
-    Ok((data, width, fill))
+    Ok((data.into_owned(), width, fill))
 }
 
 fn bytes_center(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -16600,7 +16655,7 @@ fn bytes_zfill(args: &[Object]) -> Result<Object, RuntimeError> {
         .ok_or_else(|| type_error("zfill() expected integer width"))?;
     let len = data.len() as i64;
     if width <= len {
-        return Ok(bytes_like_result(args, data));
+        return Ok(bytes_like_result(args, data.into_owned()));
     }
     let pad = (width - len) as usize;
     let mut out = Vec::with_capacity(width as usize);
@@ -16634,7 +16689,7 @@ fn bytes_title(args: &[Object]) -> Result<Object, RuntimeError> {
     let data = bytes_data(args)?;
     let mut out = Vec::with_capacity(data.len());
     let mut prev_alpha = false;
-    for &b in &data {
+    for &b in data.iter() {
         if b.is_ascii_alphabetic() {
             out.push(if prev_alpha {
                 b.to_ascii_lowercase()
@@ -16689,7 +16744,7 @@ fn bytes_istitle(args: &[Object]) -> Result<Object, RuntimeError> {
     let data = bytes_data(args)?;
     let mut cased = false;
     let mut prev_cased = false;
-    for &b in &data {
+    for &b in data.iter() {
         if b.is_ascii_uppercase() {
             if prev_cased {
                 return Ok(Object::Bool(false));
