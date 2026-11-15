@@ -1349,21 +1349,6 @@ impl Interpreter {
         self.gen_fast_next(g, snap_gen, 0, dead)
     }
 
-    /// [`Self::gen_native_next`] for a generator resting in a `yield from`
-    /// over another generator: the delegate steps directly (itself through
-    /// `gen_native_next`, one level deeper), and what it yields is what `g`
-    /// yields, `g`'s frame untouched but for being marked running
-    /// meanwhile. Resuming `g` itself for that runs its native code up to
-    /// the `SEND`, which a generator's own activation can't take, and then
-    /// the lazy resume: 360 instructions an item more than this.
-    ///
-    /// A delegate that returns leaves `g` as its `SEND` leaves it at the
-    /// delegate's end (the value above the delegate, at the `SEND`'s jump
-    /// target, to continue with nothing sent): a step stopped partway,
-    /// which the caller's general resume continues. A delegate that
-    /// doesn't step this way leaves `g` as it was, for the ordinary steps.
-    #[cfg(feature = "jit")]
-    #[inline(never)]
     /// The next item of `it`, the native iterator a generator's suspended
     /// `frame` (at `pc` of `code`) rests on in a `yield from`, when stepping
     /// it runs no code and doesn't end it (see `gen_native_next`).
@@ -1402,6 +1387,21 @@ impl Interpreter {
         }
     }
 
+    /// [`Self::gen_native_next`] for a generator resting in a `yield from`
+    /// over another generator: the delegate steps directly (itself through
+    /// `gen_native_next`, one level deeper), and what it yields is what `g`
+    /// yields, `g`'s frame untouched but for being marked running
+    /// meanwhile. Resuming `g` itself for that runs its native code up to
+    /// the `SEND`, which a generator's own activation can't take, and then
+    /// the lazy resume: 360 instructions an item more than this.
+    ///
+    /// A delegate that returns leaves `g` as its `SEND` leaves it at the
+    /// delegate's end (the value above the delegate, at the `SEND`'s jump
+    /// target, to continue with nothing sent): a step stopped partway,
+    /// which the caller's general resume continues. A delegate that
+    /// doesn't step this way leaves `g` as it was, for the ordinary steps.
+    #[cfg(feature = "jit")]
+    #[inline(never)]
     fn gen_chain_step(
         &mut self,
         g: &Rc<PyGenerator>,
