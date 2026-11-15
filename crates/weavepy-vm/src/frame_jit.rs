@@ -802,7 +802,11 @@ impl Slot {
             if left > 0 {
                 self.left.store(left, Ordering::Relaxed);
             }
-            if left < LEFT_TO_TIER2 || crate::tier2::holds_compiled(code) {
+            // (Call heat goes to the frame JIT once tier 2 has missed the
+            // call entry, which it never attempts again.)
+            let left_to_tier2 =
+                left < LEFT_TO_TIER2 && !(left == 0 && crate::tier2::missed_call_entry(code));
+            if left_to_tier2 || crate::tier2::holds_compiled(code) {
                 if stats::enabled() {
                     let kind = if left > 0 { "loop" } else { "call" };
                     eprintln!("frame jit: {} left to tier 2 ({kind})", code.qualname);

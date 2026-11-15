@@ -14591,6 +14591,15 @@ fn note_entry_guard_failure(code: &Rc<CodeObject>) {
             return;
         };
         ce.guard_failures = ce.guard_failures.saturating_add(1);
+        if matches!(ce.tier, Tier::Compiled(_)) && chronically_missed(ce) {
+            ce.tier = Tier::NotJitable;
+            code.jit_hint.mark_not_jitable();
+            code.jit_hint.unmark_compiled();
+            if crate::hot_gates::env_flags::jit_trace() {
+                eprintln!("jit miss retire {:?}", code.qualname);
+            }
+            return;
+        }
         if !ce.no_interp_entry
             && ce.guard_failures >= GUARD_FAILURE_BUDGET
             && ce.guard_failures / ce.native_entries.max(1) >= GUARD_FAILURES_PER_ENTRY
@@ -15595,7 +15604,7 @@ fn note_native_exit(
             let key = Rc::as_ptr(&frame.code).cast::<CodeObject>();
             if let Some(ce) = st.cache.get_mut(&key) {
                 ce.deopts += 1;
-                if ce.deopts >= DEOPT_BUDGET {
+                if ce.deopts >= DEOPT_BUDGET || chronically_missed(ce) {
                     ce.tier = Tier::NotJitable;
                     frame.code.jit_hint.mark_not_jitable();
                 }
@@ -15603,6 +15612,20 @@ fn note_native_exit(
         }
     });
 }
+
+/// Compiled code that mostly misses: its side exits and failed entry
+/// guards reach [`MISS_RETIRE_EVENTS`] and outnumber the native runs that
+/// finished two to one. Its activations run in the interpreter, which the
+/// frame JIT would otherwise take over (it leaves code tier 2 holds
+/// compiled alone), so it retires well before the absolute budgets.
+fn chronically_missed(ce: &CacheEntry) -> bool {
+    let misses = ce.deopts.saturating_add(ce.guard_failures);
+    let finished = ce.native_entries.saturating_sub(ce.deopts);
+    misses >= MISS_RETIRE_EVENTS && misses >= finished.saturating_mul(2)
+}
+
+/// See [`chronically_missed`].
+const MISS_RETIRE_EVENTS: u32 = 16;
 
 /// Charge one side exit of `frame`'s compiled code against its
 /// [`DEOPT_BUDGET`], retiring the code once spent.
@@ -15612,7 +15635,7 @@ fn charge_deopt(frame: &super::Frame) {
         let key = Rc::as_ptr(&frame.code).cast::<CodeObject>();
         if let Some(ce) = st.cache.get_mut(&key) {
             ce.deopts += 1;
-            if ce.deopts >= DEOPT_BUDGET {
+            if ce.deopts >= DEOPT_BUDGET || chronically_missed(ce) {
                 ce.tier = Tier::NotJitable;
                 frame.code.jit_hint.mark_not_jitable();
             }
@@ -16468,6 +16491,21 @@ pub(crate) fn stats_for_test() -> (u64, u64, u64) {
 
 /// Whether this thread's tier-2 state holds compiled code for `code` (an
 /// entry that may run its loops), or can't say right now.
+/// Whether tier 2's analysis already missed its probes for `code`'s
+/// call entry (pc 0): it never attempts that entry again (see
+/// `CacheEntry::probe_misses`), so a call can't reach tier 2 any more.
+pub(crate) fn missed_call_entry(code: &CodeObject) -> bool {
+    JIT.with(|cell| {
+        cell.try_borrow().is_ok_and(|st| {
+            st.cache
+                .get(&std::ptr::from_ref(code))
+                .is_some_and(|entry| {
+                    matches!(entry.tier, Tier::Cold) && entry.probe_misses.contains(&0)
+                })
+        })
+    })
+}
+
 pub(crate) fn holds_compiled(code: &CodeObject) -> bool {
     JIT.with(|cell| {
         cell.try_borrow().map_or(true, |st| {
