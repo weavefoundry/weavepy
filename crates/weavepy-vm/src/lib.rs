@@ -42146,12 +42146,195 @@ impl Interpreter {
         let Some(name) = code.names.get((arg >> 2) as usize) else {
             return Ok(None);
         };
-        let Some(attr) = self.super_mro_attr(&obj_type, &receiver, &cls, name)? else {
+        let Some(attr) = self.super_attr_resolve(&obj_type, &receiver, &cls, name)? else {
             return Ok(None);
         };
         let len = frame.stack.len();
         frame.stack.truncate(len - 3);
         Ok(Some(attr))
+    }
+
+    /// What a bound `super(thisclass, receiver)` reads for `name` from the
+    /// classes after `thisclass` in `obj_type`'s MRO: the MRO walk, then the
+    /// slots WeavePy keeps outside the type dicts (`object.__repr__`, ...).
+    /// `None` leaves the name to the proxy's own attributes.
+    fn super_attr_resolve(
+        &mut self,
+        obj_type: &Rc<TypeObject>,
+        receiver: &Object,
+        thisclass: &Rc<TypeObject>,
+        name: &str,
+    ) -> Result<Option<Object>, RuntimeError> {
+        let (obj_type, receiver, thisclass) =
+            (obj_type.clone(), receiver.clone(), thisclass.clone());
+        if let Some(v) = self.super_mro_attr(&obj_type, &receiver, &thisclass, name)? {
+            return Ok(Some(v));
+        }
+        // `object.__repr__` / `object.__str__` are identity slots that
+        // WeavePy keeps as native behaviour rather than type-dict
+        // entries, so the MRO walk above can't find them. CPython's
+        // `super_getattro` resolves them to `object`'s slot wrappers
+        // (`object_repr` / `object_str`); mirror that so
+        // `super().__repr__()` / `super().__str__()` delegate to the
+        // base implementation instead of falling through to the super
+        // proxy's *own* repr. `__repr__` is the non-virtual
+        // `<Cls object at 0x…>` (computed here directly); `__str__` is
+        // `PyObject_Repr(self)` (a *virtual* repr dispatch), routed via
+        // the `.object_str` sentinel that `Interpreter::call`
+        // intercepts. Only pure-Python receivers reach here — built-in
+        // bases (`dict`, `list`, …) were already served by the native
+        // payload probe just above.
+        //
+        // `object.__dir__` is likewise a native slot absent from
+        // `object`'s type dict, so the MRO walk above can't find it.
+        // pandas' `DirNamesMixin.__dir__` seeds its attribute set with
+        // `set(super().__dir__())`; without this the call fell through
+        // to the *proxy's* own `__dir__` (listing the super proxy's
+        // ~20 members, not the receiver's), so `dir(df)` /
+        // `inspect.getmembers(df)` lost every class-level property and
+        // method (GH38740). Bind the default `dir` namespace walk
+        // (`b_dir`, the same impl `object.__dir__` uses) to the
+        // receiver.
+        if name == "__dir__" {
+            return Ok(Some(Object::BoundMethod(Rc::new(
+                crate::object::BoundMethod::new(
+                    receiver.clone(),
+                    Object::Builtin(Rc::new(crate::object::BuiltinFn {
+                        name: "__dir__",
+                        binds_instance: true,
+                        call: Box::new(crate::builtins::b_dir),
+                        call_kw: None,
+                    })),
+                ),
+            ))));
+        }
+        // `type.mro` is a native slot absent from `type`'s dict, so
+        // the MRO walk above can't find it. A metaclass method doing
+        // `super().mro()` (test_super.test___class___mro) must reach
+        // the default C3 recomputation bound to the receiver class.
+        if name == "mro"
+            && matches!(&receiver, Object::Type(_))
+            && obj_type
+                .mro
+                .borrow()
+                .iter()
+                .any(|t| Rc::ptr_eq(t, &builtin_types().type_))
+        {
+            return Ok(Some(Object::BoundMethod(Rc::new(
+                crate::object::BoundMethod::new(
+                    receiver.clone(),
+                    Object::Builtin(Rc::new(crate::object::BuiltinFn {
+                        name: "mro",
+                        binds_instance: true,
+                        call: Box::new(|args| {
+                            let recv = match args.first() {
+                                Some(Object::Type(t)) => t.clone(),
+                                _ => {
+                                    return Err(type_error(
+                                        "descriptor 'mro' requires a 'type' object",
+                                    ))
+                                }
+                            };
+                            let mro = crate::types::TypeObject::recompute_c3(&recv)?;
+                            Ok(Object::new_list(
+                                mro.into_iter().map(Object::Type).collect(),
+                            ))
+                        }),
+                        call_kw: None,
+                    })),
+                ),
+            ))));
+        }
+        // `type.__prepare__` lives in `type`'s dict but is marked
+        // surface-only (RFC 0056 WS4), so the walk above skipped it.
+        // A metaclass classmethod chaining `super().__prepare__(*args,
+        // **kwds)` (test_metaclass) must reach the default: return a
+        // fresh empty dict, ignoring all arguments like CPython.
+        if name == "__prepare__"
+            && obj_type
+                .mro
+                .borrow()
+                .iter()
+                .any(|t| Rc::ptr_eq(t, &builtin_types().type_))
+        {
+            fn default_prepare(_args: &[Object]) -> Result<Object, RuntimeError> {
+                Ok(Object::new_dict())
+            }
+            return Ok(Some(Object::BoundMethod(Rc::new(
+                crate::object::BoundMethod::new(
+                    receiver.clone(),
+                    Object::Builtin(Rc::new(crate::object::BuiltinFn {
+                        name: "__prepare__",
+                        binds_instance: true,
+                        call: Box::new(default_prepare),
+                        call_kw: Some(Box::new(|args, _kwargs| default_prepare(args))),
+                    })),
+                ),
+            ))));
+        }
+        if matches!(name, "__repr__" | "__str__") {
+            let func = if name == "__repr__" {
+                Object::Builtin(Rc::new(crate::object::BuiltinFn {
+                    name: "__repr__",
+                    binds_instance: true,
+                    call: Box::new(|args: &[Object]| {
+                        let o = args.first().ok_or_else(|| {
+                            type_error("__repr__() takes exactly one argument (0 given)")
+                        })?;
+                        Ok(Object::from_str(object_base_repr_string(o)))
+                    }),
+                    call_kw: None,
+                }))
+            } else {
+                Object::Builtin(Rc::new(crate::object::BuiltinFn {
+                    name: ".object_str",
+                    binds_instance: true,
+                    call: Box::new(|_| {
+                        Err(crate::error::runtime_error(
+                            "object.__str__ must be dispatched via Interpreter::call",
+                        ))
+                    }),
+                    call_kw: None,
+                }))
+            };
+            return Ok(Some(Object::BoundMethod(Rc::new(
+                crate::object::BoundMethod::new(receiver.clone(), func),
+            ))));
+        }
+        // The remaining native slot wrappers (`object.__getstate__`,
+        // `__format__`, `__sizeof__`, the rich comparisons, …) live in
+        // CPython's `tp_dict` and are found by `super_getattro`'s MRO
+        // walk, then bound to `su->obj` (or left unbound in the
+        // class-bound form). WeavePy synthesizes them on demand, so
+        // probe the built-in bases past `thisclass` here; otherwise the
+        // proxy's own generic lookup would bind them to the *proxy*
+        // (test_super test_special_methods: `super(C, e).__getstate__
+        // == e.__getstate__`).
+        {
+            let tail: Vec<Rc<TypeObject>> = {
+                let mro = obj_type.mro.borrow();
+                let start = mro
+                    .iter()
+                    .position(|t| Rc::ptr_eq(t, &thisclass))
+                    .map_or(mro.len(), |i| i + 1);
+                mro[start..].to_vec()
+            };
+            for base in tail.iter().filter(|b| b.flags.is_builtin) {
+                if let Some(f) = crate::builtins::builtin_type_dunder(&base.name, name) {
+                    let class_bound = matches!(
+                        &receiver,
+                        Object::Type(r) if Rc::ptr_eq(r, &obj_type)
+                    );
+                    if class_bound {
+                        return Ok(Some(f));
+                    }
+                    return Ok(Some(Object::BoundMethod(Rc::new(
+                        crate::object::BoundMethod::new(receiver.clone(), f),
+                    ))));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// The default `object.__getattribute__` body: data descriptor → instance
@@ -42220,172 +42403,8 @@ impl Interpreter {
             None
         };
         if let Some((obj_type, receiver, thisclass)) = super_fields {
-            if let Some(v) = self.super_mro_attr(&obj_type, &receiver, &thisclass, name)? {
+            if let Some(v) = self.super_attr_resolve(&obj_type, &receiver, &thisclass, name)? {
                 return Ok(v);
-            }
-            // `object.__repr__` / `object.__str__` are identity slots that
-            // WeavePy keeps as native behaviour rather than type-dict
-            // entries, so the MRO walk above can't find them. CPython's
-            // `super_getattro` resolves them to `object`'s slot wrappers
-            // (`object_repr` / `object_str`); mirror that so
-            // `super().__repr__()` / `super().__str__()` delegate to the
-            // base implementation instead of falling through to the super
-            // proxy's *own* repr. `__repr__` is the non-virtual
-            // `<Cls object at 0x…>` (computed here directly); `__str__` is
-            // `PyObject_Repr(self)` (a *virtual* repr dispatch), routed via
-            // the `.object_str` sentinel that `Interpreter::call`
-            // intercepts. Only pure-Python receivers reach here — built-in
-            // bases (`dict`, `list`, …) were already served by the native
-            // payload probe just above.
-            //
-            // `object.__dir__` is likewise a native slot absent from
-            // `object`'s type dict, so the MRO walk above can't find it.
-            // pandas' `DirNamesMixin.__dir__` seeds its attribute set with
-            // `set(super().__dir__())`; without this the call fell through
-            // to the *proxy's* own `__dir__` (listing the super proxy's
-            // ~20 members, not the receiver's), so `dir(df)` /
-            // `inspect.getmembers(df)` lost every class-level property and
-            // method (GH38740). Bind the default `dir` namespace walk
-            // (`b_dir`, the same impl `object.__dir__` uses) to the
-            // receiver.
-            if name == "__dir__" {
-                return Ok(Object::BoundMethod(Rc::new(
-                    crate::object::BoundMethod::new(
-                        receiver.clone(),
-                        Object::Builtin(Rc::new(crate::object::BuiltinFn {
-                            name: "__dir__",
-                            binds_instance: true,
-                            call: Box::new(crate::builtins::b_dir),
-                            call_kw: None,
-                        })),
-                    ),
-                )));
-            }
-            // `type.mro` is a native slot absent from `type`'s dict, so
-            // the MRO walk above can't find it. A metaclass method doing
-            // `super().mro()` (test_super.test___class___mro) must reach
-            // the default C3 recomputation bound to the receiver class.
-            if name == "mro"
-                && matches!(&receiver, Object::Type(_))
-                && obj_type
-                    .mro
-                    .borrow()
-                    .iter()
-                    .any(|t| Rc::ptr_eq(t, &builtin_types().type_))
-            {
-                return Ok(Object::BoundMethod(Rc::new(
-                    crate::object::BoundMethod::new(
-                        receiver.clone(),
-                        Object::Builtin(Rc::new(crate::object::BuiltinFn {
-                            name: "mro",
-                            binds_instance: true,
-                            call: Box::new(|args| {
-                                let recv = match args.first() {
-                                    Some(Object::Type(t)) => t.clone(),
-                                    _ => {
-                                        return Err(type_error(
-                                            "descriptor 'mro' requires a 'type' object",
-                                        ))
-                                    }
-                                };
-                                let mro = crate::types::TypeObject::recompute_c3(&recv)?;
-                                Ok(Object::new_list(
-                                    mro.into_iter().map(Object::Type).collect(),
-                                ))
-                            }),
-                            call_kw: None,
-                        })),
-                    ),
-                )));
-            }
-            // `type.__prepare__` lives in `type`'s dict but is marked
-            // surface-only (RFC 0056 WS4), so the walk above skipped it.
-            // A metaclass classmethod chaining `super().__prepare__(*args,
-            // **kwds)` (test_metaclass) must reach the default: return a
-            // fresh empty dict, ignoring all arguments like CPython.
-            if name == "__prepare__"
-                && obj_type
-                    .mro
-                    .borrow()
-                    .iter()
-                    .any(|t| Rc::ptr_eq(t, &builtin_types().type_))
-            {
-                fn default_prepare(_args: &[Object]) -> Result<Object, RuntimeError> {
-                    Ok(Object::new_dict())
-                }
-                return Ok(Object::BoundMethod(Rc::new(
-                    crate::object::BoundMethod::new(
-                        receiver.clone(),
-                        Object::Builtin(Rc::new(crate::object::BuiltinFn {
-                            name: "__prepare__",
-                            binds_instance: true,
-                            call: Box::new(default_prepare),
-                            call_kw: Some(Box::new(|args, _kwargs| default_prepare(args))),
-                        })),
-                    ),
-                )));
-            }
-            if matches!(name, "__repr__" | "__str__") {
-                let func = if name == "__repr__" {
-                    Object::Builtin(Rc::new(crate::object::BuiltinFn {
-                        name: "__repr__",
-                        binds_instance: true,
-                        call: Box::new(|args: &[Object]| {
-                            let o = args.first().ok_or_else(|| {
-                                type_error("__repr__() takes exactly one argument (0 given)")
-                            })?;
-                            Ok(Object::from_str(object_base_repr_string(o)))
-                        }),
-                        call_kw: None,
-                    }))
-                } else {
-                    Object::Builtin(Rc::new(crate::object::BuiltinFn {
-                        name: ".object_str",
-                        binds_instance: true,
-                        call: Box::new(|_| {
-                            Err(crate::error::runtime_error(
-                                "object.__str__ must be dispatched via Interpreter::call",
-                            ))
-                        }),
-                        call_kw: None,
-                    }))
-                };
-                return Ok(Object::BoundMethod(Rc::new(
-                    crate::object::BoundMethod::new(receiver.clone(), func),
-                )));
-            }
-            // The remaining native slot wrappers (`object.__getstate__`,
-            // `__format__`, `__sizeof__`, the rich comparisons, …) live in
-            // CPython's `tp_dict` and are found by `super_getattro`'s MRO
-            // walk, then bound to `su->obj` (or left unbound in the
-            // class-bound form). WeavePy synthesizes them on demand, so
-            // probe the built-in bases past `thisclass` here; otherwise the
-            // proxy's own generic lookup would bind them to the *proxy*
-            // (test_super test_special_methods: `super(C, e).__getstate__
-            // == e.__getstate__`).
-            {
-                let tail: Vec<Rc<TypeObject>> = {
-                    let mro = obj_type.mro.borrow();
-                    let start = mro
-                        .iter()
-                        .position(|t| Rc::ptr_eq(t, &thisclass))
-                        .map_or(mro.len(), |i| i + 1);
-                    mro[start..].to_vec()
-                };
-                for base in tail.iter().filter(|b| b.flags.is_builtin) {
-                    if let Some(f) = crate::builtins::builtin_type_dunder(&base.name, name) {
-                        let class_bound = matches!(
-                            &receiver,
-                            Object::Type(r) if Rc::ptr_eq(r, &obj_type)
-                        );
-                        if class_bound {
-                            return Ok(f);
-                        }
-                        return Ok(Object::BoundMethod(Rc::new(
-                            crate::object::BoundMethod::new(receiver.clone(), f),
-                        )));
-                    }
-                }
             }
             // Not found along the delegated MRO: fall through to normal
             // resolution so the proxy's *own* attributes (`__init__`,
