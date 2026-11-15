@@ -1483,6 +1483,12 @@ pub(crate) fn builtin_ctor_pure(cls: &Rc<TypeObject>, args: &[Object]) -> Option
             _ => None,
         };
     }
+    // `weakref.ref(x)` with no callback.
+    if let [target] = args {
+        if crate::stdlib::weakref_real::is_ref_type(cls) {
+            return crate::stdlib::weakref_real::ref_pure(target);
+        }
+    }
     // `bytes(n)`, `bytes(b)`, `bytearray(n)` and `bytearray(b)` of a small
     // count or an exact `bytes` or `bytearray` (a copy that runs no code).
     let bytes = Rc::ptr_eq(cls, &bt.bytes_);

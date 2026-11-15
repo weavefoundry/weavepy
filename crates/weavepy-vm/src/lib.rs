@@ -32377,6 +32377,13 @@ impl Interpreter {
         };
         let found = {
             let mut opaque = self.leaf_opaque.borrow_mut();
+            // (A registration may replace a builtin's entry: what this
+            // interpreter looked up before it is looked up again.)
+            if opaque.0 != gen {
+                opaque.1.clear();
+                opaque.2.clear();
+                opaque.0 = gen;
+            }
             // The registered builtin must still be *this* allocation: a
             // recycled address (a torn-down interpreter's module surface)
             // fails the upgrade or the identity check.
@@ -32387,10 +32394,6 @@ impl Interpreter {
             if cached.is_some() {
                 cached
             } else {
-                if opaque.0 != gen {
-                    opaque.2.clear();
-                    opaque.0 = gen;
-                }
                 if opaque.2.contains(&p) {
                     None
                 } else if let Some(reg) = leaf_builtins::lookup(b) {

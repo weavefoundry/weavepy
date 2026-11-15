@@ -43,6 +43,9 @@ use crate::weakref_registry::{
 
 thread_local! {
     static REF_TYPE: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
+    /// [`REF_TYPE`]'s address once built (`0` before): a type call's one
+    /// compare (see [`is_ref_type`]).
+    static REF_TYPE_ADDR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static PROXY_TYPE: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
     static CALLABLE_PROXY_TYPE: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
 }
@@ -519,8 +522,28 @@ fn ref_type() -> Rc<TypeObject> {
         )
         .expect("ref type");
         *cell.borrow_mut() = Some(t.clone());
+        REF_TYPE_ADDR.with(|a| a.set(Rc::as_ptr(&t) as usize));
         t
     })
+}
+
+/// Whether `cls` is this thread's `weakref.ref` type itself.
+#[inline]
+pub(crate) fn is_ref_type(cls: &Rc<TypeObject>) -> bool {
+    REF_TYPE_ADDR.with(|a| a.get() == Rc::as_ptr(cls) as usize)
+}
+
+/// `weakref.ref(target)` with no callback, for a type call that runs no
+/// code (see `seqiter::builtin_ctor_pure`): `None` for a target that
+/// can't be weakly referenced (the full call raises).
+pub(crate) fn ref_pure(target: &Object) -> Option<Object> {
+    if !supports_weakref(target) {
+        return None;
+    }
+    if let Some(cached) = find_cached_wrapper(id_of(target), kind::REF) {
+        return Some(cached);
+    }
+    Some(make_ref_object(target.clone(), None, kind::REF))
 }
 
 /// If `obj` is a weakproxy (either flavour), dereference it: CPython's
@@ -1032,7 +1055,7 @@ pub(crate) fn construct_ref(
 /// (test_ref_reuse / test_proxy_reuse). Only exact native-type wrappers
 /// are shared; subclass instances never are.
 fn find_cached_wrapper(target_id: ObjectId, kind_tag: u8) -> Option<Object> {
-    let base = match kind_tag {
+    let base = || match kind_tag {
         kind::PROXY => proxy_type(),
         kind::CALLABLE_PROXY => callable_proxy_type(),
         _ => ref_type(),
@@ -1040,7 +1063,7 @@ fn find_cached_wrapper(target_id: ObjectId, kind_tag: u8) -> Option<Object> {
     for slot in reg::collect_for(target_id) {
         if slot.kind == kind_tag && !slot.is_dead() && !slot.has_callback {
             if let Some(inst) = slot.py_ref.borrow().as_ref().and_then(|w| w.upgrade()) {
-                if Rc::ptr_eq(&inst.cls(), &base) {
+                if Rc::ptr_eq(&inst.cls(), &base()) {
                     return Some(Object::Instance(inst));
                 }
             }
@@ -1133,7 +1156,7 @@ fn make_ref_object_with_class(
     });
     // Only exact refs share methods and native storage. Foreign classes,
     // proxies, and subclasses preserve their dictionary representation.
-    let shared_methods = kind_tag == kind::REF && Rc::ptr_eq(&class, &ref_type());
+    let shared_methods = kind_tag == kind::REF && is_ref_type(&class);
     let fixed_wrapper = shared_methods && cfg!(target_pointer_width = "64");
     let mut slot = WeakRefSlot::new(target_id, target.clone(), callback.is_some(), kind_tag);
     slot.fixed_wrapper = fixed_wrapper;
@@ -1280,6 +1303,10 @@ pub(crate) fn supports_weakref(target: &Object) -> bool {
     // slots-free (or weakref-slotted) class on the MRO is enough —
     // `__slots__ = ["__dict__"]` grants a dict but *not* weakrefs.
     let cls = inst.cls();
+    // (The common case first: a class of its own with no `__slots__`.)
+    if !cls.flags.is_builtin && !cls.declares_slots.get() {
+        return true;
+    }
     // CPython's `module` type carries `tp_weaklistoffset`, so every module
     // object is weakly referenceable — including `types.ModuleType(...)`
     // doubles and the fresh extension-module re-imports
