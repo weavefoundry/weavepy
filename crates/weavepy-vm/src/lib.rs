@@ -32067,6 +32067,21 @@ impl Interpreter {
                     &[("decode", LeafKind::Fast(crate::builtins::bytes_decode_leaf))],
                 ),
             ];
+            // `bytes.translate(table, delete=...)` (`shlex.quote`'s), whose
+            // keyword binds by name: registered once per process.
+            static KW_LEAVES: std::sync::Once = std::sync::Once::new();
+            KW_LEAVES.call_once(|| {
+                if let Some(Object::Builtin(b)) = crate::builtins::lookup_method(
+                    &Object::new_bytes(Vec::<u8>::new()),
+                    "translate",
+                ) {
+                    leaf_builtins::register_fast_kw(
+                        &b,
+                        &["table", "delete"],
+                        crate::builtins::bytes_translate_fast,
+                    );
+                }
+            });
             for (recv, probe, names) in table {
                 // The type's own entry for each name, a receiver-checking
                 // shim over the method (what `str.upper` reads as), takes

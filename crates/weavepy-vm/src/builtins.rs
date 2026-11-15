@@ -16414,6 +16414,19 @@ fn bytes_replace_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Obje
 /// equivalent. `table` is `None` (identity) or a bytes-like of length
 /// 256; bytes present in `delete` are dropped first. The receiver's
 /// type (bytes vs bytearray) is preserved.
+/// `bytes.translate(table[, delete])`'s leaf half: a `bytes` or
+/// `bytearray` receiver, a `None` or `bytes` table and a `bytes` deletion
+/// set, for which the body runs no code.
+pub(crate) fn bytes_translate_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    match args {
+        [Object::Bytes(_) | Object::ByteArray(_), Object::None | Object::Bytes(_)]
+        | [Object::Bytes(_) | Object::ByteArray(_), Object::None | Object::Bytes(_), Object::Bytes(_)] => {
+            Some(bytes_translate_kw(args, &[]))
+        }
+        _ => None,
+    }
+}
+
 fn bytes_translate_kw(
     args: &[Object],
     kwargs: &[(String, Object)],
