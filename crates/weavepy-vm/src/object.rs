@@ -3945,7 +3945,8 @@ pub(crate) fn int_order_value(o: &Object) -> Option<i64> {
 fn leaf_tuple_item(o: &Object, depth: u32) -> bool {
     match o {
         Object::Int(_) | Object::Str(_) | Object::Bytes(_) | Object::None => true,
-        Object::Instance(i) => int_like_value(i).is_some(),
+        Object::Instance(i) => int_like_value(i).is_some() || identity_instance(i),
+        Object::Type(t) => type_hash_is_identity(t),
         Object::Tuple(t) => depth < 3 && t.iter().all(|x| leaf_tuple_item(x, depth + 1)),
         _ => false,
     }
@@ -3964,6 +3965,17 @@ fn leaf_tuples_eq(a: &[Object], b: &[Object], depth: u32) -> Option<bool> {
             (Object::Bytes(p), Object::Bytes(q)) => p[..] == q[..],
             (Object::None, Object::None) => true,
             (Object::Instance(p), Object::Instance(q)) if Rc::ptr_eq(p, q) => true,
+            // Objects that compare by identity alone: only themselves.
+            (Object::Instance(p), Object::Instance(q))
+                if identity_instance(p) && identity_instance(q) =>
+            {
+                false
+            }
+            (Object::Type(p), Object::Type(q))
+                if type_hash_is_identity(p) && type_hash_is_identity(q) =>
+            {
+                Rc::ptr_eq(p, q)
+            }
             (Object::Tuple(p), Object::Tuple(q)) if depth < 3 => {
                 p.len() == q.len() && leaf_tuples_eq(p, q, depth + 1)?
             }
@@ -3974,6 +3986,18 @@ fn leaf_tuples_eq(a: &[Object], b: &[Object], depth: u32) -> Option<bool> {
         };
     }
     Some(equal)
+}
+
+/// Whether `i` hashes and compares by identity alone: a plain instance
+/// (no native payload) whose class keeps `object`'s `__hash__`, `__eq__`
+/// and `__ne__`.
+#[inline]
+pub(crate) fn identity_instance(i: &crate::types::PyInstance) -> bool {
+    use crate::types::Dunder;
+    i.native.get().is_none()
+        && i.class_dunder(Dunder::Hash).object_owner()
+        && i.class_dunder(Dunder::Eq).object_owner()
+        && i.class_dunder(Dunder::Ne).object_owner()
 }
 
 /// A machine `int`'s value, or an [`int_like_value`] instance's.

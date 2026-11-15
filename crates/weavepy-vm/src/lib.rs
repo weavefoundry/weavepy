@@ -18547,6 +18547,16 @@ impl Interpreter {
                 matches!(frame.stack[callee_at + 1], Object::Unbound)
                     && self.builtin_lane(b, None).is_some()
             }
+            // A `functools.lru_cache` wrapper spread from a tuple without
+            // keywords (`typing`'s `_tp_cache`: `cached(*args, **kwds)`):
+            // through `call`, which settles a hit natively.
+            callee @ Object::Instance(_)
+                if ins.op == OpCode::CallEx
+                    && crate::stdlib::functools_mod::is_lru_wrapper(callee) =>
+            {
+                builtin = true;
+                matches!(frame.stack[callee_at + 1], Object::Unbound)
+            }
             _ => false,
         };
         if !ok {

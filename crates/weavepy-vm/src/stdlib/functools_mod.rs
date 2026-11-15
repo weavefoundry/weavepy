@@ -774,10 +774,17 @@ fn native_lru_tuple_key(key: &Object, depth: usize, remaining: &mut usize) -> bo
                 || Rc::ptr_eq(cls, &builtins.str_)
                 || Rc::ptr_eq(cls, &builtins.bytes_)
                 || Rc::ptr_eq(cls, &builtins.tuple_)
+                // (Or any class that hashes and compares by identity; see
+                // the instance arm below.)
+                || crate::object::type_hash_is_identity(cls)
         }
         Object::Tuple(items) if depth > 0 && items.len() <= *remaining => items
             .iter()
             .all(|item| native_lru_tuple_key(item, depth - 1, remaining)),
+        // An argument that hashes and compares by identity (`typing`'s
+        // `_tp_cache` keys an alias and a class): nothing runs for either,
+        // and an evicted key is released with the cache consistent.
+        Object::Instance(i) => crate::object::identity_instance(i),
         _ => false,
     }
 }
