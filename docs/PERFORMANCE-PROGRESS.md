@@ -7,6 +7,23 @@ plan, what's done, and what's next, so a new session can pick up the work.
 
 ## Where WeavePy stands
 
+Measured on November 15, 2026, at `98339f92` (PR #112), two PGO builds of
+that commit on the same idle host against CPython 3.14.8: one from the
+usual training, one from a training that also runs the everyday battery
+(the training now does, see "Done"). The everyday battery: 1.228 times
+CPython's time over two runs (1.228 and 1.227) for the battery-trained
+build, 1.265 (1.252 and 1.278) for the other, against 1.357 at
+`2ce79fa5`. WeavePy is ahead on 20 cases (17 before), past twice CPython's
+time on 9 (12 before) and past three times on 2: `enum_dataclass_ops` 3.1
+and `class_features` 3.1, then `email_html_ops` 2.8,
+`file_read_binary_chunks` 2.8 (its time is in the reads),
+`inspect_typing_ops` 2.6, `threading_queue_ops` 2.6 (3.4 before),
+`configparser_ops` 2.5 and `argparse_ops` 2.5. The suite in the same
+session, battery-trained build: warm time 0.847, cold time 0.955, peak RSS
+1.135, and 1.000 of the other build's time, so the battery in the
+training costs the suite nothing. The commits after `98339f92` (see
+"Done") weren't in either build.
+
 Measured on November 14, 2026, at `2ce79fa5` (PR #112), a PGO build from a
 fresh training run against CPython 3.14.8 on the same idle host, beside
 the November 13 PGO build PR #110's figures came from. The everyday
