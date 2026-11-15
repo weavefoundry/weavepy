@@ -31935,6 +31935,8 @@ impl Interpreter {
                     ("divmod", LeafKind::Fast(crate::seqiter::divmod_fast)),
                     ("vars", LeafKind::Fast(crate::seqiter::vars_fast)),
                     ("pow", LeafKind::Fast(crate::seqiter::pow_fast)),
+                    ("round", LeafKind::Fast(crate::seqiter::round_fast)),
+                    ("repr", LeafKind::Fast(crate::seqiter::repr_fast)),
                 ] {
                     if let Some(Object::Builtin(f)) = b.get(&crate::object::StrKey(name)) {
                         calls.insert(Rc::as_ptr(f) as usize, kind);
@@ -31961,6 +31963,7 @@ impl Interpreter {
                         ("reverse", LeafKind::ListReverse),
                         ("copy", LeafKind::ListCopy),
                         ("remove", LeafKind::ListRemove),
+                        ("sort", LeafKind::Fast(crate::seqiter::list_sort_fast)),
                     ],
                 ),
                 (

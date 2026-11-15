@@ -71,6 +71,13 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         // quoted-printable pair, etc.
         register_kw(&mut d, "b2a_hex", b2a_hex_kw);
         register_kw(&mut d, "hexlify", b2a_hex_kw);
+        // `hexlify(data)`/`b2a_hex(data)` of a `bytes` or `bytearray`: the
+        // full body, which then runs no code.
+        for name in ["hexlify", "b2a_hex"] {
+            if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static(name))) {
+                crate::leaf_builtins::register_fast(b, hex_fast);
+            }
+        }
         register_kw(&mut d, "b2a_base64", b2a_base64_kw);
         register_kw(&mut d, "a2b_base64", a2b_base64_kw);
         register_kw(&mut d, "b2a_uu", b2a_uu_kw);
@@ -191,6 +198,13 @@ fn truthy_kw(kwargs: &[(String, Object)], key: &str) -> Option<bool> {
 }
 
 // ---- hex ----
+
+fn hex_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    match args {
+        [Object::Bytes(_) | Object::ByteArray(_)] => Some(b2a_hex_kw(args, &[])),
+        _ => None,
+    }
+}
 
 fn b2a_hex_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let data = buffer_bytes(args.first())?;

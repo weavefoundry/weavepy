@@ -2201,6 +2201,44 @@ fn arg_or_kw<'a>(
 /// `float.fromhex`, `bytes.maketrans`). Returns an unbound builtin
 /// so the call site supplies the arguments unchanged.
 pub fn builtin_classmethod(type_name: &str, attr: &str) -> Option<Object> {
+    // `int.from_bytes` is read on every `int.from_bytes(data)` call: one
+    // builtin per thread, registered with a leaf half (see
+    // `int_from_bytes_fast`), rather than a fresh one each read.
+    if (type_name, attr) == ("int", "from_bytes") {
+        thread_local! {
+            static FROM_BYTES: Object = {
+                let mut f = method_kw("from_bytes", int_from_bytes_method);
+                f.binds_instance = false;
+                let b = Rc::new(f);
+                crate::leaf_builtins::register_fast(&b, int_from_bytes_fast);
+                Object::Builtin(b)
+            };
+        }
+        if let Ok(f) = FROM_BYTES.try_with(Object::clone) {
+            return Some(f);
+        }
+    }
+    builtin_classmethod_fresh(type_name, attr)
+}
+
+/// `int.from_bytes(data[, byteorder])` of a `bytes` or `bytearray` with a
+/// `str` byte order: the full body, which then runs no code. `None`
+/// for any other shape (an iterable's or buffer's items, keywords).
+fn int_from_bytes_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let rest = match args {
+        [Object::Type(_), rest @ ..] => rest,
+        _ => args,
+    };
+    match rest {
+        [Object::Bytes(_) | Object::ByteArray(_)]
+        | [Object::Bytes(_) | Object::ByteArray(_), Object::Str(_)] => {
+            Some(int_from_bytes_method(args, &[]))
+        }
+        _ => None,
+    }
+}
+
+fn builtin_classmethod_fresh(type_name: &str, attr: &str) -> Option<Object> {
     let f = match (type_name, attr) {
         ("str", "maketrans") => Some(method("maketrans", str_maketrans)),
         ("bytes", "fromhex") | ("bytearray", "fromhex") => Some(method("fromhex", bytes_fromhex)),

@@ -2063,6 +2063,52 @@ fn exact_f64(x: &Object) -> Option<f64> {
     }
 }
 
+/// `round(x[, n])` of a plain number with a plain `int` (or no) digit
+/// count: the builtin's own arithmetic, which runs no code for these.
+pub(crate) fn round_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let num = |o: &Object| matches!(o, Object::Int(_) | Object::Float(_) | Object::Bool(_));
+    match args {
+        [x] | [x, Object::None] if num(x) => Some(crate::builtins::b_round(args)),
+        [x, Object::Int(_)] if num(x) => Some(crate::builtins::b_round(args)),
+        _ => None,
+    }
+}
+
+/// `repr(x)` of a value whose repr runs no code: a native scalar or a
+/// `str`.
+pub(crate) fn repr_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    match args {
+        [x @ (Object::Int(_)
+        | Object::Float(_)
+        | Object::Bool(_)
+        | Object::None
+        | Object::Str(_))] => Some(Ok(Object::from_str(x.repr()))),
+        _ => None,
+    }
+}
+
+/// `list.sort()` with no arguments of a list of strings only or of plain
+/// numbers only, whose comparisons run no code: sorted in place.
+pub(crate) fn list_sort_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::List(l)] = args else {
+        return None;
+    };
+    let mut v = l.try_borrow_mut().ok()?;
+    let all_str = v.iter().all(|x| matches!(x, Object::Str(_)));
+    let all_num = all_str
+        || v.iter()
+            .all(|x| matches!(x, Object::Int(_) | Object::Float(_) | Object::Bool(_)));
+    if !all_num {
+        return None;
+    }
+    Some(
+        crate::timsort::sort(&mut v, |a, b| {
+            crate::compare_op(a, b, weavepy_compiler::CompareKind::Lt)
+        })
+        .map(|()| Object::None),
+    )
+}
+
 /// `abs(x)` of a plain number (an int's magnitude must fit).
 pub(crate) fn abs_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     Some(Ok(match args {

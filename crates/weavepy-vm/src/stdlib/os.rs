@@ -284,10 +284,15 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("listdir")),
             builtin("listdir", os_listdir),
         );
-        d.insert(
-            DictKey(Object::from_static("urandom")),
-            builtin("urandom", os_urandom),
-        );
+        d.insert(DictKey(Object::from_static("urandom")), {
+            // Takes only a plain int (no `__index__` call): no Python
+            // runs, whatever the arguments.
+            let f = builtin("urandom", os_urandom);
+            if let Object::Builtin(b) = &f {
+                crate::leaf_builtins::register(b);
+            }
+            f
+        });
         d.insert(
             DictKey(Object::from_static("close")),
             builtin("close", os_close_stub),

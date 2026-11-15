@@ -499,14 +499,20 @@ fn ref_type() -> Rc<TypeObject> {
                 },
             )))),
         );
+        let init = Rc::new(BuiltinFn {
+            name: "__init__",
+            binds_instance: true,
+            call: Box::new(|args| ref_init(args, &[])),
+            call_kw: Some(Box::new(ref_init)),
+        });
+        // (A subclass's `super().__init__(ob, callback)`, as `KeyedRef`
+        // makes for every `WeakValueDictionary` entry, checks its count.)
+        crate::leaf_builtins::register_fast(&init, |args| {
+            (2..=3).contains(&args.len()).then_some(Ok(Object::None))
+        });
         type_dict.insert(
             DictKey(Object::from_static("__init__")),
-            Object::Builtin(Rc::new(BuiltinFn {
-                name: "__init__",
-                binds_instance: true,
-                call: Box::new(|args| ref_init(args, &[])),
-                call_kw: Some(Box::new(ref_init)),
-            })),
+            Object::Builtin(init),
         );
         // CPython 3.13's `tp_name` is `"weakref.ReferenceType"`, so
         // `weakref.ref.__name__ == 'ReferenceType'` and
