@@ -2709,6 +2709,25 @@ impl Interpreter {
         }
     }
 
+    /// The fast half of an instance's class's native `__call__`
+    /// (`attrgetter("x")`, `itemgetter(0)`), for a caller that calls it per
+    /// item (a sort's key) to resolve once; it takes the instance first.
+    pub(crate) fn instance_call_fast(&self, func: &Object) -> Option<crate::leaf_builtins::Fast> {
+        let Object::Instance(i) = func else {
+            return None;
+        };
+        if crate::gil::free_threading_enabled() {
+            return None;
+        }
+        let Object::Builtin(b) = i.cls_raw().lookup("__call__")? else {
+            return None;
+        };
+        match self.leaf_call_kind(&b)? {
+            LeafKind::Fast(f) => Some(f),
+            _ => None,
+        }
+    }
+
     /// `groupby_step` when taking the next value and computing its key
     /// run no code: the value and its key, the value taken. `None` (nothing
     /// consumed) otherwise.

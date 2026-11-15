@@ -47619,8 +47619,20 @@ impl Interpreter {
         // evaluates in place, as `map`'s callback does; after one decline
         // the rest take the full call.
         let mut pure = !len_key && crate::seqiter::pure_callback_maybe(f);
+        // An instance whose native `__call__` has a fast half, resolved once.
+        let call_fast = if pure {
+            self.instance_call_fast(f)
+        } else {
+            None
+        };
         for item in items.iter() {
-            let k = if len_key {
+            let fast_key = call_fast.and_then(|fast| match fast(&[f.clone(), item.clone()]) {
+                Some(Ok(k)) => Some(k),
+                _ => None,
+            });
+            let k = if let Some(k) = fast_key {
+                k
+            } else if len_key {
                 self.do_len_call(item, globals)?
             } else if let Some(k) = pure
                 .then(|| self.pure_callback(f, std::slice::from_ref(item), true))
