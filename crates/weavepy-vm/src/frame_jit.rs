@@ -803,9 +803,13 @@ impl Slot {
                 self.left.store(left, Ordering::Relaxed);
             }
             // (Call heat goes to the frame JIT once tier 2 has missed the
-            // call entry, which it never attempts again.)
-            let left_to_tier2 =
-                left < LEFT_TO_TIER2 && !(left == 0 && crate::tier2::missed_call_entry(code));
+            // call entry, which it never attempts again, while none of the
+            // code's loops has run: a loop that runs is tier 2's to enter
+            // by OSR.)
+            let left_to_tier2 = left < LEFT_TO_TIER2
+                && !(left == 0
+                    && self.left.load(Ordering::Relaxed) == 0
+                    && crate::tier2::missed_call_entry(code));
             if left_to_tier2 || crate::tier2::holds_compiled(code) {
                 if stats::enabled() {
                     let kind = if left > 0 { "loop" } else { "call" };
