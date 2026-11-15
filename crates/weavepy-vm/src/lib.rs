@@ -32192,6 +32192,19 @@ impl Interpreter {
                 [Object::Int(n)] => Some(Object::from_str(itoa::Buffer::new().format(*n))),
                 [Object::Bool(b)] => Some(Object::from_static(if *b { "True" } else { "False" })),
                 [Object::None] => Some(Object::from_static("None")),
+                // A plain instance whose class's `__str__` is a Python
+                // function that evaluates as a pure leaf, answering a `str`.
+                [recv @ Object::Instance(inst)] if inst.native.get().is_none() => {
+                    let f = Self::instance_dunder_function(
+                        inst,
+                        crate::types::AttrKey::vm(crate::types::vm_key::STR_FN),
+                        "__str__",
+                    )?;
+                    match self.call_pure_leaf_with(&f, Some(recv), &[])? {
+                        s @ Object::Str(_) => Some(s),
+                        _ => None,
+                    }
+                }
                 _ => crate::seqiter::builtin_ctor_pure(ty, args),
             };
         }
@@ -32926,6 +32939,16 @@ impl Interpreter {
     ) -> Option<Result<Object, RuntimeError>> {
         use LeafKind as K;
         use Object as O;
+        // A method kind called unbound with no receiver (`list.pop()`) takes
+        // the full path, which raises the TypeError.
+        if args.is_empty()
+            && !matches!(
+                kind,
+                K::Fast(_) | K::ObjectNew | K::Opaque | K::Scalar | K::Isinstance | K::GetAttr
+            )
+        {
+            return None;
+        }
         // Pure leaves as method arguments: hashing, comparison, and
         // conversion never reach user code.
         let leaf_key = |o: &Object| matches!(o, O::Str(_) | O::Int(_) | O::Bool(_) | O::None);
@@ -38334,15 +38357,30 @@ impl Interpreter {
                 let has_spec = (arg & 0x04) != 0;
                 let spec = if has_spec { Some(frame.pop()?) } else { None };
                 let value = frame.pop()?;
-                let globals = frame.globals.clone();
-                let formatted = self.format_value(&value, conversion, spec.as_ref(), &globals)?;
-                // A surrogate-bearing value formats into bridged PUA code
-                // points; map them back so the f-string fragment is a faithful
-                // `WStr`. Non-`WStr` values never produce bridge-window output.
-                if matches!(value, Object::WStr(_)) {
-                    frame.push(crate::builtins::bridge_to_object(&formatted));
+                // `f"{x}"` of a plain instance with a Python `__str__` and no
+                // `__format__`: `object.__format__(x, '')` is `str(x)`, and a
+                // `str` result is the fragment as it stands.
+                if let Some(r) = (arg == 0)
+                    .then(|| self.format_plain_instance(&value))
+                    .flatten()
+                {
+                    frame.push(match r? {
+                        s @ Object::Str(_) => s,
+                        r => Object::from_str(Self::require_str_result(r, "__str__")?),
+                    });
                 } else {
-                    frame.push(Object::from_str(formatted));
+                    let globals = frame.globals.clone();
+                    let formatted =
+                        self.format_value(&value, conversion, spec.as_ref(), &globals)?;
+                    // A surrogate-bearing value formats into bridged PUA code
+                    // points; map them back so the f-string fragment is a
+                    // faithful `WStr`. Non-`WStr` values never produce
+                    // bridge-window output.
+                    if matches!(value, Object::WStr(_)) {
+                        frame.push(crate::builtins::bridge_to_object(&formatted));
+                    } else {
+                        frame.push(Object::from_str(formatted));
+                    }
                 }
             }
             // PEP 750 t-strings (`-X lang=next`, RFC 0076 WS15). Builds
@@ -44014,7 +44052,15 @@ impl Interpreter {
                     return Ok(r);
                 }
             }
-            if let Some(method) = instance_method(value, "__format__") {
+            let lacks_format = Self::class_lacks(
+                inst.cls_raw(),
+                crate::types::AttrKey::vm(crate::types::vm_key::FORMAT_LACKS),
+                "__format__",
+            );
+            if let Some(method) = (!lacks_format)
+                .then(|| instance_method(value, "__format__"))
+                .flatten()
+            {
                 let r = self.call(&method, &[Object::from_str(spec)], &[], globals)?;
                 // CPython's `PyObject_Format` rejects a non-str result
                 // (test_builtin test_format BadFormatResult).
@@ -44200,7 +44246,11 @@ impl Interpreter {
                 crate::types::AttrKey::vm(crate::types::vm_key::LEN_FN),
                 "__len__",
             ) {
-                let r = self.call(&Object::Function(f), std::slice::from_ref(v), &[], globals)?;
+                // (Evaluated in place when a pure leaf.)
+                let r = match self.call_pure_leaf_with(&f, Some(v), &[]) {
+                    Some(r) => r,
+                    None => self.call_python(&f, std::slice::from_ref(v), &[])?,
+                };
                 return coerce_len_result(r).map(Object::Int);
             }
         }
@@ -48183,12 +48233,56 @@ impl Interpreter {
         self.stringify(v, globals)
     }
 
+    /// `format(v, '')` of a plain instance (no native payload) whose class
+    /// has a Python `__str__` and no `__format__`: that `__str__`'s
+    /// unchecked result, evaluated in place when a pure leaf. `None` for
+    /// any other value.
+    fn format_plain_instance(&mut self, v: &Object) -> Option<Result<Object, RuntimeError>> {
+        let Object::Instance(inst) = v else {
+            return None;
+        };
+        if inst.native.get().is_some()
+            || !Self::class_lacks(
+                inst.cls_raw(),
+                crate::types::AttrKey::vm(crate::types::vm_key::FORMAT_LACKS),
+                "__format__",
+            )
+        {
+            return None;
+        }
+        let f = Self::instance_dunder_function(
+            inst,
+            crate::types::AttrKey::vm(crate::types::vm_key::STR_FN),
+            "__str__",
+        )?;
+        Some(match self.call_pure_leaf_with(&f, Some(v), &[]) {
+            Some(r) => Ok(r),
+            None => self.call_python(&f, std::slice::from_ref(v), &[]),
+        })
+    }
+
     fn stringify(
         &mut self,
         v: &Object,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<String, RuntimeError> {
         if let Object::Instance(inst) = v {
+            // A Python `__str__` (cached on the class): evaluated in place
+            // when a pure leaf, else called with the instance, without a
+            // bound method.
+            if inst.native.get().is_none() {
+                if let Some(f) = Self::instance_dunder_function(
+                    inst,
+                    crate::types::AttrKey::vm(crate::types::vm_key::STR_FN),
+                    "__str__",
+                ) {
+                    let r = match self.call_pure_leaf_with(&f, Some(v), &[]) {
+                        Some(r) => r,
+                        None => self.call_python(&f, std::slice::from_ref(v), &[])?,
+                    };
+                    return Self::require_str_result(r, "__str__");
+                }
+            }
             if let Some(method) = instance_method(v, "__str__") {
                 let r = self.call(&method, &[], &[], globals)?;
                 return Self::require_str_result(r, "__str__");
