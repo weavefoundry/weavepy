@@ -2094,19 +2094,33 @@ pub(crate) fn list_sort_fast(args: &[Object]) -> Option<Result<Object, RuntimeEr
         return None;
     };
     let mut v = l.try_borrow_mut().ok()?;
-    let all_str = v.iter().all(|x| matches!(x, Object::Str(_)));
-    let all_num = all_str
-        || v.iter()
-            .all(|x| matches!(x, Object::Int(_) | Object::Float(_) | Object::Bool(_)));
-    if !all_num {
-        return None;
-    }
-    Some(
+    // (The comparisons the interpreter's own sort makes for these kinds:
+    // code-point order for strings, which their UTF-8 bytes sort in.)
+    let sorted = if v.iter().all(|x| matches!(x, Object::Str(_))) {
+        crate::timsort::sort(&mut v, |a, b| {
+            Ok(match (a, b) {
+                (Object::Str(a), Object::Str(b)) => a.as_bytes() < b.as_bytes(),
+                _ => false,
+            })
+        })
+    } else if v.iter().all(|x| matches!(x, Object::Int(_))) {
+        crate::timsort::sort(&mut v, |a, b| {
+            Ok(match (a, b) {
+                (Object::Int(a), Object::Int(b)) => a < b,
+                _ => false,
+            })
+        })
+    } else if v
+        .iter()
+        .all(|x| matches!(x, Object::Int(_) | Object::Float(_) | Object::Bool(_)))
+    {
         crate::timsort::sort(&mut v, |a, b| {
             crate::compare_op(a, b, weavepy_compiler::CompareKind::Lt)
         })
-        .map(|()| Object::None),
-    )
+    } else {
+        return None;
+    };
+    Some(sorted.map(|()| Object::None))
 }
 
 /// `abs(x)` of a plain number (an int's magnitude must fit).
