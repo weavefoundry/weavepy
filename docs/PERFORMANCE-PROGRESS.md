@@ -462,6 +462,63 @@ branch and pull request.
 
 ## Done
 
+- **Tier 2's wasted work, a start-up deadlock, and more cliffs** (PR #112,
+  November 15). Ratios are instructions, WeavePy's over CPython's unless
+  stated, with synchronous compiles.
+  - Tier 2 cost the everyday battery more than it gave it: with tier 2
+    off, the battery ran 2% fewer instructions, and no case ran more than
+    3% more. Three causes, each fixed. The analysis found each pc's
+    innermost loop by searching the whole loop forest per pc, once per
+    analysis and carving step, which made a failed attempt on a big
+    function expensive (the argparse case ran 13% more instructions with
+    tier 2 than without; now the two are even). A recompile at a loop the
+    compiled frame couldn't enter dropped the frame first, and when the new
+    analysis missed its probes the code went cold and compiled the same
+    frame again on the next call (difflib's `find_longest_match`, four
+    compiles a run, 7% of the case). And the frame JIT leaves code with
+    loops to tier 2, which left two kinds of code interpreted for good:
+    code whose call entry tier 2 had already missed (it never attempts
+    that entry again; `urllib.parse._checknetloc` ran interpreted on every
+    call) and compiled code whose activations mostly side-exit or fail
+    their entry guards, which waited for absolute budgets of 64. Call heat
+    now goes to the frame JIT once tier 2 has missed the call entry, and
+    compiled code retires once its misses reach 16 and outnumber its
+    finished native runs two to one. With tier 2 off the battery now runs
+    0.8% fewer instructions instead of 2%; the enum and dataclass case (8%)
+    and the threading and queue case (6%) are what's left.
+  - `os.environ.get(name)` and `name in os.environ` read the backing store.
+    `Mapping`'s versions find a missing variable through `__getitem__`,
+    which raises and catches two `KeyError`s, and programs probe unset
+    variables constantly (argparse's color and gettext checks probe 22 for
+    each parser): a miss is 0.31 of CPython's instructions instead of 2.2
+    times. An `ArgumentParser()` went from 2.66 to 1.96.
+  - Natively built instances (a `re.Match`, a `Decimal`, a `datetime`, an
+    ElementTree iterator) get their slots at birth instead of an all-unset
+    block that was dropped at once: an allocation, a fill and a free less
+    per object. A trivial `re.match` went from 1.25 to 0.92.
+  - `super().__repr__()` and the other names WeavePy keeps outside the type
+    dicts (`__str__`, `__dir__`, `type.mro`, `__prepare__`, the builtin
+    bases' dunders) resolve through `LOAD_SUPER_ATTR`'s direct path instead
+    of building the `super` proxy and reading it back: 5.2 to 2.2.
+  - Fixed: a process's first thread could deadlock at start-up. The thread
+    that revokes the cell bias spun, holding the GIL, until the first
+    thread's lock-free guards drained; a count that never drained hung
+    torch's DataLoader on macOS (its first queue feeder thread never
+    reached Python code), and the ecosystem shard ran out its 30 minutes.
+    While the GIL guards every cell the revoker can't race a guard holder,
+    so past 50 ms it goes on. A temporary torch-only CI job found it: the
+    ecosystem harness now sends a timed-out probe `SIGABRT` first, so a
+    probe with `faulthandler` on dumps every thread, and keeps the output's
+    tail in the row's reason.
+  - Fixed: `reversed()` of an iterator, a set or a native adapter raises
+    `TypeError`, as CPython's does; it read the source to the end first,
+    so `reversed(itertools.count())` hung.
+  - Looked at and left: an explicit `super` object (`super().__class__`,
+    which CPython doesn't compile to `LOAD_SUPER_ATTR` either) is about 8
+    times CPython's, through a dozen general layers, and rare; setting an
+    `EmailMessage` header is 3.4 times CPython's, a flat profile of
+    polymorphic attribute sites and frames with nothing dominant.
+
 - **Threads that have exited, lock hand-offs, and more cliffs** (PR #112,
   November 15). Ratios are WeavePy's instructions over CPython's, before
   and after, with synchronous compiles.
