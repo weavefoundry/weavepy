@@ -1497,7 +1497,8 @@ impl Interpreter {
             lazy_top: std::cell::Cell::new(0),
             recs: frame_jit::DirectRecs::new(),
             chain_pool: Vec::new(),
-            leaf_fns: std::cell::OnceCell::new(),
+            // (The same builtins, so the same function objects.)
+            leaf_fns: self.leaf_fns.clone(),
             leaf_opaque: ThreadCell::new((
                 0,
                 leaf_builtins::LeafMap::default(),
@@ -74828,6 +74829,9 @@ fn leaf_recv_tag(recv: &Object) -> Option<u64> {
 /// of the builtin types (the same bodies a bound method calls, without
 /// the type-dict descriptor's receiver check, which the burst's variant
 /// match makes redundant).
+// (A thread's fork shares the builtins, and so this table: see
+// `Interpreter::fork_for_thread`.)
+#[derive(Clone)]
 struct LeafFns {
     /// Function address → kind, for pointer-identity dispatch at `CALL`.
     calls: std::collections::HashMap<usize, LeafKind, crate::fasthash::FxBuildHasher>,
