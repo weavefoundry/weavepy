@@ -32626,6 +32626,9 @@ impl Interpreter {
             if let Some(d) = default.filter(|_| attr_certainly_missing(recv, name)) {
                 return Some(d.clone());
             }
+            if let Some(v) = Self::leaf_plain_class_dunder(inst, name) {
+                return Some(v);
+            }
             return Self::leaf_builtin_dunder_attr(inst, recv, name);
         }
         let cls = inst.cls_raw();
@@ -32700,7 +32703,8 @@ impl Interpreter {
             || crate::capi_watchers::types_active()
             || (name.starts_with("__")
                 && !Self::type_dunder_transparent(name)
-                && !matches!(name, "__format__" | "__new_member__"))
+                && !matches!(name, "__format__" | "__new_member__")
+                && !Self::type_dunder_unclaimed(cls, name))
         {
             return None;
         }
@@ -32764,6 +32768,37 @@ impl Interpreter {
             },
             Some(_) => None,
         }
+    }
+
+    /// A dunder a plain instance reads from a plain value on its class
+    /// (`getattr(obj, "__dataclass_fields__")`, `obj.__match_args__`): the
+    /// instance dictionary's entry, else the class's value, which no
+    /// descriptor protocol touches. `None` for anything else.
+    fn leaf_plain_class_dunder(inst: &PyInstance, name: &str) -> Option<Object> {
+        let cls = inst.cls_raw();
+        if cls.native_kind.get() != 0
+            || inst.native.get().is_some()
+            || inst.c_body.get() != 0
+            || !Self::default_getattribute(cls)
+            || cls.is_super_proxy_type()
+        {
+            return None;
+        }
+        let v = cls.lookup(name)?;
+        if !matches!(
+            v,
+            Object::Dict(_)
+                | Object::Tuple(_)
+                | Object::Str(_)
+                | Object::Int(_)
+                | Object::Bool(_)
+                | Object::None
+                | Object::Float(_)
+                | Object::FrozenSet(_)
+        ) {
+            return None;
+        }
+        Some(inst.attr_get_str(name).unwrap_or(v))
     }
 
     /// A dunder a plain instance gets from a builtin method on its class
@@ -34262,6 +34297,39 @@ impl Interpreter {
                 | "__reduce_ex__"
                 | "__init_subclass__"
         )
+    }
+
+    /// Whether a class attribute read of dunder `name` (one that isn't on
+    /// [`Self::type_dunder_transparent`]'s list) still resolves in the
+    /// class's own MRO: the class's metaclass is `type`, which defines no
+    /// attribute of that name, and `load_attr_type` doesn't serve it from
+    /// outside the dicts (`__dataclass_fields__`, `__slots__`,
+    /// `__match_args__`).
+    fn type_dunder_unclaimed(cls: &TypeObject, name: &str) -> bool {
+        !matches!(
+            name,
+            "__abstractmethods__"
+                | "__annotations__"
+                | "__base__"
+                | "__bases__"
+                | "__basicsize__"
+                | "__class__"
+                | "__dict__"
+                | "__dir__"
+                | "__doc__"
+                | "__flags__"
+                | "__itemsize__"
+                | "__module__"
+                | "__mro__"
+                | "__name__"
+                | "__qualname__"
+                | "__subclasses__"
+                | "__text_signature__"
+                | "__type_params__"
+                | "__weakref__"
+        ) && !name.starts_with("__weavepy")
+            && Self::plain_metaclass(cls)
+            && builtin_types().type_.lookup(name).is_none()
     }
 
     /// Whether `cls`'s metaclass is `type` itself.
