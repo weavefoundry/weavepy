@@ -537,6 +537,11 @@ branch and pull request.
     `bytes.translate`; `list.sort()`'s leaf half comparing strings and
     ints directly; a property with a native getter read in the compiled
     attribute site.
+  - The PGO training runs the everyday battery too (`tools/pgo/train.sh`),
+    its profile merged with the rest rather than into the order file's
+    hot group: the library paths it runs get branch weights and inlining.
+    Two builds of one commit: the battery at 0.96 and 0.98 of the other's
+    time over two runs, the suite at 1.000.
   - Fixed on the way: a method leaf called unbound with no receiver
     (`list.pop()`) indexed an empty argument list and panicked
     (`test_types.test_call_unbound_crash`).
