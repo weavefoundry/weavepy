@@ -521,6 +521,22 @@ branch and pull request.
     instructions, 68 with a per-thread cache of each call site's last
     answer); `zip` of three to eight sequences stepped each source through
     the general checks (2.41 to 2.17).
+  - Two more idiom sweeps (about 90 operations: binary formats, hashing,
+    iteration helpers, application-level library calls). The cliffs, with
+    their ratios before and after: `struct.pack` 4.30 to about 1.0 (a
+    Python function forwarding `*v` to the packer, which copied and
+    SipHashed the format text each call; now a native that packs plain
+    values in place and calls the Python function for anything else);
+    unpacking a `namedtuple` 4.27 to 0.96 (compiled code left for the core
+    loop, which iterated the tuple subclass); `str.format_map` 3.72 to
+    1.17 (always the interpreter's format engine, by a generic call);
+    `list(reversed(xs))` 2.11 to 1.08 and `xs[::-1]` 1.94 to 1.10;
+    `next(itertools.count())` 1.90 to 0.90 (`next` wasn't a leaf);
+    `md5(b).hexdigest()` 2.06 to 1.53 (each byte formatted through
+    `core::fmt`); a `csv` writer's `writerow` reading the dialect's
+    attributes by name every row; a sort key's native `__call__` looked
+    up per item; `heapq` fetching the interpreter before comparisons that
+    don't need it.
   - Python dunders from native code. `str(x)`, `len(x)`, f-string
     formatting and `x in obj` of a plain instance call the class's
     `__str__`, `__len__` or `__contains__` without a bound method, in
@@ -3715,6 +3731,13 @@ builds, synchronous compiles):
   (`operator.itemgetter` 1.6), a builtin with keywords and
   `functools.partial` (1.8) all take. A call site that remembered its
   callee's shape could skip to it.
+- `pickle.dumps` of a small dict (1.8): every call re-verifies about 13
+  module functions the engine depends on (their code and defaults); a
+  global epoch bumped by `__code__`, `__defaults__` and `__kwdefaults__`
+  assignments would let it check a stamp instead.
+- `string.Template.substitute` (1.9), `itertools.groupby` (1.8),
+  `urllib.parse.quote` (1.6), `bisect.insort` (1.6), `random.randint`
+  (1.7): Python-level library code over callbacks.
 - Tier 2's method calls on built-in values it can't type: the counting
   idiom `d[k] = d.get(k, 0) + 1` runs 1.9 times CPython's instructions in
   tier 2 against 0.94 in the frame JIT alone, because tier 2 reads
