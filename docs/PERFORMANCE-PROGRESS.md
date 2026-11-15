@@ -7,6 +7,20 @@ plan, what's done, and what's next, so a new session can pick up the work.
 
 ## Where WeavePy stands
 
+Measured on November 15, 2026, at `83efee9b` (PR #112), a PGO build
+against CPython 3.14.8 on a host that wasn't idle (load averages between
+2 and 9). The everyday battery: 1.258 times CPython's time over three runs
+(1.236, 1.258 and 1.265), within the earlier build's spread; by
+instructions (synchronous compiles, quick builds) 1.282 times CPython's
+against 1.297 at the start of the day. WeavePy is ahead on 21 cases (20
+before), past twice CPython's time on 9 and past three times on none (2
+before): `file_read_binary_chunks` 2.9, `class_features` 2.9,
+`enum_dataclass_ops` 2.8, `email_html_ops` 2.7, `configparser_ops` 2.7,
+`threading_queue_ops` 2.7, `inspect_typing_ops` 2.7, `bigint_ops` 2.2 and
+`argparse_ops` 2.1. The suite in the same session: warm time 0.842, cold
+time 0.952, peak RSS 1.129. The commits after `83efee9b` (see "Done")
+weren't in the build.
+
 Measured on November 15, 2026, at `98339f92` (PR #112), two PGO builds of
 that commit on the same idle host against CPython 3.14.8: one from the
 usual training, one from a training that also runs the everyday battery
@@ -504,6 +518,28 @@ branch and pull request.
     dicts (`__str__`, `__dir__`, `type.mro`, `__prepare__`, the builtin
     bases' dunders) resolve through `LOAD_SUPER_ATTR`'s direct path instead
     of building the `super` proxy and reading it back: 5.2 to 2.2.
+  - Builtin subclasses. A `str`, `int`, `float`, `complex`, `bytes` or
+    `tuple` subclass's `__slots__` are laid out as `object`'s are: any
+    builtin base but `object` kept members in the keyed form, which
+    compiled code never reads in line, so each member read of a
+    `configparser` `_Line` (a `str` subclass) took the attribute miss path
+    (3.40 to 0.41). Constructing a builtin subclass's instance asks the
+    type cache whether `__init__` is overridden instead of probing each
+    class dict with a fresh key, and the collector's "not due yet" answer
+    comes from one load (a `str` subclass's construction, 4.1 to 3.4).
+  - Smaller ones: `object.__setattr__(self, name, value)` (a frozen
+    dataclass's `__init__`) passes the name object through a per-thread
+    memo to the intern pool instead of copying and re-interning its text,
+    and a method site keeps a builtin type's unbound or class method
+    (`object.__setattr__`, `dict.fromkeys`) for its version; `lru_cache`
+    keys holding a plain instance or a user class take the native lookup
+    (`typing`'s `_tp_cache`); `OrderedDict.__setitem__` called as a method
+    settles through its leaf half; a `weakref.ref` subclass's instances
+    share the class's `__call__` and `__repr__` instead of two closures
+    each (a `KeyedRef` per `WeakValueDictionary` item); and a thread's
+    interpreter fork takes its parent's leaf builtin table instead of
+    rebuilding it (a thread's start and join, about 10% fewer
+    instructions).
   - Fixed: a process's first thread could deadlock at start-up. The thread
     that revokes the cell bias spun, holding the GIL, until the first
     thread's lock-free guards drained; a count that never drained hung

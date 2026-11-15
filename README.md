@@ -20,8 +20,8 @@ are how it measures progress.
 | --- | --- | --- |
 | CPython test suite | 464 of 468 `Lib/test` entries pass | November 2, 2026, on macOS |
 | Real packages | 48 of 48 install and pass a behavior check | September 2026, on macOS and Linux; kept in CI |
-| Warm speed | 0.85 times CPython's time | November 15, 2026, over 33 workloads |
-| Peak memory | 1.14 times CPython's resident set, 1.22 times its footprint | November 13, 2026, over 33 workloads |
+| Warm speed | 0.84 times CPython's time | November 15, 2026, over 33 workloads |
+| Peak memory | 1.13 times CPython's resident set | November 15, 2026, over 33 workloads |
 | Everyday library code | 1.23 times CPython's time | November 15, 2026, over 54 short loops |
 
 The sections below explain what these numbers cover and where they fall short.
