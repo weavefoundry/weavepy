@@ -279,6 +279,7 @@ impl GilState {
         self.note_acquired();
         let me = current_thread_id();
         crate::sync::note_vm_thread(me);
+        crate::sync::note_gil_thread(me);
         self.holder.store(me, Ordering::Release);
         self.depth.fetch_add(1, Ordering::AcqRel);
         // We must hold the parking_lot guard for the lifetime
@@ -310,6 +311,7 @@ impl GilState {
         self.note_acquired();
         let me = current_thread_id();
         crate::sync::note_vm_thread(me);
+        crate::sync::note_gil_thread(me);
         self.holder.store(me, Ordering::Release);
         self.depth.fetch_add(1, Ordering::AcqRel);
         // SAFETY: as in `acquire`.
@@ -335,6 +337,7 @@ impl GilState {
         self.note_acquired();
         let me = current_thread_id();
         crate::sync::note_vm_thread(me);
+        crate::sync::note_gil_thread(me);
         self.holder.store(me, Ordering::Release);
         self.depth.fetch_add(1, Ordering::AcqRel);
         let static_guard: parking_lot::ReentrantMutexGuard<'static, ()> =

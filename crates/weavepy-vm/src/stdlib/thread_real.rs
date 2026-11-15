@@ -32,7 +32,7 @@
 use crate::sync::Rc;
 use crate::sync::RefCell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -881,7 +881,48 @@ fn lock_acquire_blocking(lock: &RealLock, me: u64) {
     if lock.try_acquire(me) {
         return;
     }
-    crate::gil::allow_threads_then(|| lock.acquire(me));
+    let _ = acquire_contended(|| lock.try_acquire(me), |w| lock.wait_free(w), None, false);
+}
+
+/// A contended acquire, as CPython's lock takes it: the GIL is released
+/// only to wait for the lock to come free, and the lock is taken once the
+/// GIL is back. A waiter that took the lock while the GIL holder ran on
+/// would make that holder block at its next acquire of the same lock (a
+/// `queue.Queue`'s mutex between a producer and a consumer), handing the
+/// GIL over at every operation. With the GIL back first, the running
+/// thread retakes a lock it released, and a woken waiter that finds it
+/// taken waits again. `deadline` bounds the whole acquire (`false` when it
+/// passes); `signals` waits in slices on the main thread, running pending
+/// signal handlers between them (CPython's `EINTR` retry loop), and a
+/// handler that raises abandons the acquire.
+fn acquire_contended(
+    try_take: impl Fn() -> bool,
+    wait_free: impl Fn(Option<Duration>),
+    deadline: Option<Instant>,
+    signals: bool,
+) -> Result<bool, RuntimeError> {
+    loop {
+        let mut wait = match deadline {
+            Some(dl) => {
+                let now = Instant::now();
+                if now >= dl {
+                    return Ok(false);
+                }
+                Some(dl - now)
+            }
+            None => None,
+        };
+        if signals {
+            wait = Some(wait.map_or(SIGNAL_POLL_SLICE, |w| w.min(SIGNAL_POLL_SLICE)));
+        }
+        crate::gil::allow_threads_then(|| wait_free(wait));
+        if try_take() {
+            return Ok(true);
+        }
+        if signals {
+            service_pending_signals()?;
+        }
+    }
 }
 
 /// Slice length for the main thread's signal-interruptible wait. Short
@@ -919,32 +960,12 @@ fn lock_acquire_interruptible(
     if lock.try_acquire(me) {
         return Ok(true);
     }
-    if !crate::gil::is_main_thread() {
-        return Ok(match timeout {
-            Some(d) => crate::gil::allow_threads_then(|| lock.acquire_timeout(me, d)),
-            None => {
-                crate::gil::allow_threads_then(|| lock.acquire(me));
-                true
-            }
-        });
-    }
-    let deadline = timeout.map(|d| Instant::now() + d);
-    loop {
-        let wait = match deadline {
-            Some(dl) => {
-                let now = Instant::now();
-                if now >= dl {
-                    return Ok(false);
-                }
-                (dl - now).min(SIGNAL_POLL_SLICE)
-            }
-            None => SIGNAL_POLL_SLICE,
-        };
-        if crate::gil::allow_threads_then(|| lock.acquire_timeout(me, wait)) {
-            return Ok(true);
-        }
-        service_pending_signals()?;
-    }
+    acquire_contended(
+        || lock.try_acquire(me),
+        |w| lock.wait_free(w),
+        timeout.map(|d| Instant::now() + d),
+        crate::gil::is_main_thread(),
+    )
 }
 
 /// Reentrant counterpart to [`lock_acquire_interruptible`].
@@ -956,32 +977,12 @@ fn rlock_acquire_interruptible(
     if lock.try_acquire(me) {
         return Ok(true);
     }
-    if !crate::gil::is_main_thread() {
-        return Ok(match timeout {
-            Some(d) => crate::gil::allow_threads_then(|| lock.acquire_timeout(me, d)),
-            None => {
-                crate::gil::allow_threads_then(|| lock.acquire(me));
-                true
-            }
-        });
-    }
-    let deadline = timeout.map(|d| Instant::now() + d);
-    loop {
-        let wait = match deadline {
-            Some(dl) => {
-                let now = Instant::now();
-                if now >= dl {
-                    return Ok(false);
-                }
-                (dl - now).min(SIGNAL_POLL_SLICE)
-            }
-            None => SIGNAL_POLL_SLICE,
-        };
-        if crate::gil::allow_threads_then(|| lock.acquire_timeout(me, wait)) {
-            return Ok(true);
-        }
-        service_pending_signals()?;
-    }
+    acquire_contended(
+        || lock.try_acquire(me),
+        |w| lock.wait_free(me, w),
+        timeout.map(|d| Instant::now() + d),
+        crate::gil::is_main_thread(),
+    )
 }
 
 /// Grace period a `join()` blocks normally before it begins running
@@ -1084,7 +1085,12 @@ fn rlock_acquire_blocking(lock: &RealRLock, me: u64) {
     if lock.try_acquire(me) {
         return;
     }
-    crate::gil::allow_threads_then(|| lock.acquire(me));
+    let _ = acquire_contended(
+        || lock.try_acquire(me),
+        |w| lock.wait_free(me, w),
+        None,
+        false,
+    );
 }
 
 fn get_ident(_args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1205,6 +1211,41 @@ fn start_new_thread(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Int(synth_id as i64))
 }
 
+/// Workers spawned whose OS threads haven't been joined yet (see
+/// [`reap_workers`]).
+static UNREAPED_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// After a `join()` saw worker `ident` finish: join the OS threads of it
+/// and of every other worker that has finished (each is past its last
+/// touch of an object, and its thread-local destructors run before the OS
+/// join returns), with the GIL released. Once no worker is left, the
+/// joining thread is the only one, and the single-thread bias comes back
+/// (see [`crate::sync::restore_bias`]): a program that ran threads for a
+/// while runs as fast afterwards as one that never did.
+fn reap_workers(ident: u64) {
+    let registry = thread_registry();
+    let mut handles = Vec::new();
+    for entry in registry.all() {
+        if entry.native_id == ident || !entry.is_alive() {
+            if let Some(h) = entry.take_handle() {
+                handles.push(h);
+            }
+        }
+    }
+    if handles.is_empty() {
+        return;
+    }
+    let n = handles.len();
+    crate::gil::allow_threads_then(|| {
+        for h in handles {
+            let _ = h.join();
+        }
+    });
+    if UNREAPED_WORKERS.fetch_sub(n, Ordering::SeqCst) == n {
+        crate::sync::restore_bias(crate::gil::current_thread_id());
+    }
+}
+
 /// Spawn one Python worker on a real OS thread. Shared by
 /// `_thread.start_new_thread` (fire-and-forget) and
 /// `_thread.start_joinable_thread` (RFC 0039 — returns a handle the
@@ -1285,10 +1326,12 @@ fn spawn_python_worker(
     const WORKER_STACK_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
                                                         // The worker clones and drops objects before it first takes the GIL.
     crate::rc::revoke_refcount_bias();
-    let handle = std::thread::Builder::new()
+    UNREAPED_WORKERS.fetch_add(1, Ordering::SeqCst);
+    let spawned = std::thread::Builder::new()
         .name(format!("weavepy-worker-{}", synth_id))
         .stack_size(WORKER_STACK_BYTES)
         .spawn(move || {
+            crate::sync::note_vm_worker();
             crate::vm_singletons::install_worker_thread_id(synth_id);
             // RFC 0040 WS4: record this worker's pthread_t so
             // `signal.pthread_kill(ident, sig)` can target it.
@@ -1432,8 +1475,11 @@ fn spawn_python_worker(
             #[cfg(unix)]
             super::signal_mod::unregister_thread_pthread(synth_id);
             crate::vm_singletons::clear_worker_thread_id();
-        })
-        .map_err(|e| runtime_error(format!("failed to spawn thread: {}", e)))?;
+        });
+    let handle = spawned.map_err(|e| {
+        UNREAPED_WORKERS.fetch_sub(1, Ordering::SeqCst);
+        runtime_error(format!("failed to spawn thread: {}", e))
+    })?;
 
     let entry = Arc::new(ThreadEntry::new(synth_id, thread_name, daemon, handle));
     entry.attach_join_lock(join_lock);
@@ -1669,6 +1715,7 @@ fn make_thread_handle_object(state: Arc<ThreadHandleState>, ident: Object) -> Ob
             return Err(runtime_error("thread not started"));
         }
         if join_state.done.load(Ordering::Acquire) {
+            reap_workers(ident);
             return Ok(Object::None);
         }
         // Joining a thread from itself would deadlock; CPython's handle
@@ -1717,6 +1764,9 @@ fn make_thread_handle_object(state: Arc<ThreadHandleState>, ident: Object) -> Ob
                     }
                 }
             },
+        }
+        if join_state.done.load(Ordering::Acquire) {
+            reap_workers(ident);
         }
         Ok(Object::None)
     };

@@ -472,7 +472,8 @@ pub(crate) const RELEASE_OBSERVER_GATES: u32 = u32::from_ne_bytes([0, 0xff, 0xff
 
 /// Whether reference counts must be updated atomically: set whenever the
 /// cell bias is revoked, and also before spawning a thread that may touch
-/// objects before it registers (see [`crate::rc`]). Never cleared.
+/// objects before it registers (see [`crate::rc`]). Cleared again only by
+/// [`restore_bias`].
 static RC_SHARED: &std::sync::atomic::AtomicBool = &RELEASE_GATES.rc_shared;
 
 /// The flag [`bias_held`] reads (native code that takes references in
@@ -716,6 +717,65 @@ pub fn note_vm_thread(thread_id: u64) {
             revoke_bias();
         }
     }
+}
+
+/// Set once a thread the VM didn't start (a C thread entering through
+/// `PyGILState_Ensure`, say) takes the GIL: nothing says when it's gone, so
+/// the bias is never restored (see [`restore_bias`]).
+static FOREIGN_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+std::thread_local! {
+    /// Whether this thread is known to the VM: the first to register, or a
+    /// worker it started (see [`note_vm_worker`]). Checked at its first
+    /// GIL acquire ([`note_gil_thread`]).
+    static KNOWN_THREAD: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// Mark the calling thread as a worker the VM started, before it first
+/// takes the GIL.
+pub(crate) fn note_vm_worker() {
+    KNOWN_THREAD.with(|k| k.set(1));
+}
+
+/// Called with the GIL just taken (after [`note_vm_thread`]): a thread
+/// that is neither the first to register nor a worker the VM started is
+/// foreign (see [`FOREIGN_SEEN`]).
+#[inline]
+pub(crate) fn note_gil_thread(thread_id: u64) {
+    let _ = KNOWN_THREAD.try_with(|k| {
+        if k.get() == 0 {
+            k.set(1);
+            if FIRST.load(Ordering::Acquire) != thread_id {
+                FOREIGN_SEEN.store(true, Ordering::SeqCst);
+            }
+        }
+    });
+}
+
+/// Restore the single-thread bias (plain reference counts, lock-free cell
+/// borrows) on the calling thread, `thread_id`, once every other thread
+/// that ran VM code is gone: the caller has joined every worker's OS
+/// thread, so nothing else can touch an object until a new thread
+/// registers or is spawned, which revokes the bias again exactly as the
+/// first one did. Declined (`false`) after a foreign thread or a thread
+/// that touches objects without the GIL appeared, or while this thread
+/// holds a cell borrow taken on the locked path.
+pub(crate) fn restore_bias(thread_id: u64) -> bool {
+    if !RC_SHARED.load(Ordering::SeqCst)
+        || CELLS_UNGUARDED.load(Ordering::SeqCst)
+        || FOREIGN_SEEN.load(Ordering::SeqCst)
+        || FIRST.load(Ordering::SeqCst) != thread_id
+        || cell_guards_live()
+        || SOLE_GUARDS.load(Ordering::SeqCst) != 0
+    {
+        return false;
+    }
+    if std::env::var_os("WEAVEPY_CELLS_TRACE").is_some() {
+        eprintln!("[cells] biased again: thread {thread_id:#x} is the only one");
+    }
+    CELLS_SHARED.store(false, Ordering::SeqCst);
+    RC_SHARED.store(false, Ordering::SeqCst);
+    true
 }
 
 /// Every cell is shared from now on (free-threading, a foreign thread
@@ -1534,6 +1594,24 @@ impl RealLock {
         true
     }
 
+    /// Block until the lock is free (without taking it) or `timeout`
+    /// runs out: the GIL-released half of a contended acquire (see
+    /// `thread_real::acquire_contended`).
+    pub fn wait_free(&self, timeout: Option<Duration>) {
+        let deadline = timeout.map(|d| Instant::now() + d);
+        let mut state = self.state.lock();
+        while state.held {
+            match deadline {
+                None => self.cv.wait(&mut state),
+                Some(dl) => {
+                    if self.cv.wait_until(&mut state, dl).timed_out() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     /// Release the lock. Returns `Ok(())` on success, `Err` if
     /// the lock isn't held.
     pub fn release(&self) -> Result<(), &'static str> {
@@ -1676,6 +1754,24 @@ impl RealRLock {
                     let result = self.cv.wait_for(&mut state, deadline - now);
                     if result.timed_out() && state.owner.is_some() && state.owner != Some(owner) {
                         return false;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Block until `owner` could take the lock (it is free, or already
+    /// `owner`'s) without taking it, or until `timeout` runs out (see
+    /// [`RealLock::wait_free`]).
+    pub fn wait_free(&self, owner: u64, timeout: Option<Duration>) {
+        let deadline = timeout.map(|d| Instant::now() + d);
+        let mut state = self.state.lock();
+        while state.owner.is_some_and(|o| o != owner) {
+            match deadline {
+                None => self.cv.wait(&mut state),
+                Some(dl) => {
+                    if self.cv.wait_until(&mut state, dl).timed_out() {
+                        return;
                     }
                 }
             }
