@@ -695,10 +695,36 @@ fn revoke_bias() {
     // first time a barrier is due.)
     enable_asymmetric_barrier();
     heavy_barrier();
+    // While the GIL guards every cell, the revoker (a thread registering
+    // at its first GIL acquire) holds it: the biased thread is parked
+    // outside the VM, and a guard it still holds is released under the
+    // GIL later, after this thread has given it up. A count that stays
+    // up can then only be a lost update or a guard held across a GIL
+    // release, and waiting on either would deadlock: past a bound the
+    // revoker goes on. With cells touched outside the GIL the drain is
+    // what makes the revocation safe, and it waits for good.
+    let bounded = !CELLS_UNGUARDED.load(Ordering::SeqCst) && !crate::gil::free_threading_enabled();
+    let start = std::time::Instant::now();
+    let mut spins = 0u32;
     while SOLE_GUARDS.load(Ordering::SeqCst) > 0 {
         std::hint::spin_loop();
+        spins = spins.wrapping_add(1);
+        if bounded && spins % 1024 == 0 && start.elapsed() >= DRAIN_BOUND {
+            if std::env::var_os("WEAVEPY_CELLS_TRACE").is_some() {
+                eprintln!(
+                    "[cells] drain gave up after {:?}: {} guard(s) outstanding",
+                    start.elapsed(),
+                    SOLE_GUARDS.load(Ordering::SeqCst)
+                );
+            }
+            break;
+        }
     }
 }
+
+/// How long [`revoke_bias`] waits for the biased thread's guards while
+/// the GIL guards every cell.
+const DRAIN_BOUND: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Record that `thread_id` is about to run VM code. Called from the GIL
 /// acquire path (and free-threading start-up); the first thread to
