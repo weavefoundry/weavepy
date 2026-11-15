@@ -32068,9 +32068,21 @@ impl Interpreter {
                 ),
             ];
             for (recv, probe, names) in table {
+                // The type's own entry for each name, a receiver-checking
+                // shim over the method (what `str.upper` reads as), takes
+                // the method's kind too: every kind declines a receiver of
+                // another kind, which the shim then checks or unwraps.
+                let cls = crate::builtins::class_of(&probe);
                 for (name, kind) in names.iter().copied() {
                     if let Some(Object::Builtin(f)) = crate::builtins::lookup_method(&probe, name) {
                         calls.insert(Rc::as_ptr(&f) as usize, kind);
+                        if let Some(Object::Builtin(shim)) =
+                            cls.dict.borrow().get(&crate::object::StrKey(name))
+                        {
+                            if !Rc::ptr_eq(shim, &f) && !matches!(kind, LeafKind::Len) {
+                                calls.insert(Rc::as_ptr(shim) as usize, kind);
+                            }
+                        }
                         methods.push((recv, name, f));
                     }
                 }

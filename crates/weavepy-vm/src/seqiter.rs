@@ -2560,7 +2560,9 @@ impl Interpreter {
             Object::Function(f) => self.call_pure_leaf(f, args),
             // (As the core loop's leaf builtin lane admits them: a function,
             // or a method bound to its exact builtin receiver.)
-            Object::Builtin(b) if !b.binds_instance => {
+            // (A method read off its type, `map(str.upper, xs)`, takes its
+            // receiver first, as its kind expects.)
+            Object::Builtin(b) if !b.binds_instance || !args.is_empty() => {
                 let kind = admit(self.leaf_call_kind(b)?)?;
                 self.leaf_builtin_call(kind, b, args)?.ok()
             }
