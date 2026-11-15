@@ -30719,6 +30719,25 @@ impl Interpreter {
             // A class's `__dict__` view (`'__dict__' in type.__dict__`, as
             // `inspect` asks) tests the class dict it wraps.
             Object::MappingProxy(d) => Self::leaf_contains(&Object::Dict(d.clone()), item),
+            // An instance whose class's Python `__contains__` evaluates as a
+            // pure leaf with a scalar answer (anything else is the full
+            // path's, which runs it again: nothing observed the first).
+            Object::Instance(inst) => {
+                let f = Self::instance_dunder_function(
+                    inst,
+                    crate::types::AttrKey::vm(crate::types::vm_key::CONTAINS),
+                    "__contains__",
+                )?;
+                // SAFETY: the running thread's interpreter, under the GIL;
+                // a pure leaf runs no other Python and takes no frame.
+                let interp = unsafe { &*crate::vm_singletons::current_interpreter_ptr()? };
+                match interp.call_pure_leaf_with(&f, Some(container), std::slice::from_ref(item))? {
+                    Object::Bool(b) => Some(b),
+                    Object::Int(i) => Some(i != 0),
+                    Object::None => Some(false),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
