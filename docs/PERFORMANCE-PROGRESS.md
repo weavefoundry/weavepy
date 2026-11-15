@@ -460,6 +460,18 @@ branch and pull request.
     paid for it: by wall time on quick builds, `asyncio_ops` 0.69 of the
     earlier build's, `print_to_buffer` 0.74, `weakref_gc_ops` 0.79,
     `sqlite_ops` 0.80, `inspect_typing_ops` 0.81.
+  - Code that runs while a second thread is alive. Every release that
+    wasn't the last took the last owner's checks out of line, compiled
+    calls that bind defaults weren't entered directly, a direct call's
+    return released through the slow path, and lazily running frames
+    registered before every native body in case another thread looked.
+    Releases that aren't the last are now one locked update, the direct
+    call protocol makes locked updates instead of declining, and frames
+    register first only for a watchdog that reads them without the GIL:
+    every release of the GIL (C code's `PyEval_SaveThread` included)
+    settles them first. A queue put and get with an idle second thread
+    alive: 26,430 instructions to 18,695 (16,380 with none, CPython's
+    11,800). `threading_queue_ops` 1.82 to 1.64.
   - Lock hand-offs. A contended acquire took the lock as soon as it was
     free, while the GIL holder ran on; the holder then blocked at its next
     acquire of the same lock, so a producer and a consumer sharing a
@@ -3632,9 +3644,10 @@ builds, synchronous compiles):
 - Thread start and join (4.6 times CPython's instructions): each thread
   zeroes and later drops a 4,096-entry type cache (128 KB) and tier 2
   analyzes again what another thread compiled. And code that runs while a
-  second thread is alive: every reference count is atomic and frames
-  register before native bodies, so a queue put and get costs 27,500
-  instructions against CPython's 12,400 (16,000 with one thread).
+  second thread is alive still costs about 15% more than with one: the
+  frame JIT's in-line reference-count updates go to helpers when counts
+  are shared (the code generator has no atomic instructions), and cell
+  borrows take the locked path.
 - Keyword calls of a function with keyword-only parameters in a tier-2
   loop: tier 2's static binding requires `kwonly_count == 0`, so `f(i,
   c=4)` goes through its dynamic keyword helper (1,240 instructions
