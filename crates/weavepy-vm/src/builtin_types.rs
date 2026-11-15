@@ -1737,7 +1737,31 @@ fn native_seed_for_new(cls: &Rc<TypeObject>, value: Option<&Object>) -> Option<O
         return None;
     }
     let bt = builtin_types();
-    let is_strict = |base: &Rc<TypeObject>| cls.is_subclass_of(base) && !Rc::ptr_eq(cls, base);
+    // The one value or container type among these the class derives from
+    // (no class derives from two: their layouts conflict), found in one
+    // walk of its MRO instead of a subclass test per kind.
+    let kinds: [&Rc<TypeObject>; 11] = [
+        &bt.int_,
+        &bt.float_,
+        &bt.complex_,
+        &bt.str_,
+        &bt.bytearray_,
+        &bt.bytes_,
+        &bt.tuple_,
+        &bt.frozenset_,
+        &bt.list_,
+        &bt.set_,
+        &bt.dict_,
+    ];
+    let found = cls
+        .mro
+        .borrow()
+        .iter()
+        .skip(1)
+        .find_map(|t| kinds.iter().position(|k| Rc::ptr_eq(t, k)));
+    let is_strict = |base: &Rc<TypeObject>| {
+        found.is_some_and(|i| Rc::ptr_eq(kinds[i], base)) && !Rc::ptr_eq(cls, base)
+    };
     if is_strict(&bt.int_) {
         return Some(match value {
             None => Object::Int(0),
