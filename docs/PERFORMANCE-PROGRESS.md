@@ -503,7 +503,17 @@ branch and pull request.
     retires once its misses reach 16 and outnumber its finished native
     runs two to one. With tier 2 off the battery now runs
     0.8% fewer instructions instead of 2%; the enum and dataclass case (8%)
-    and the threading and queue case (6%) are what's left.
+    and the threading and queue case (6%) are what's left. And tier 2 made
+    a loop's dynamic calls through general helpers where the frame JIT
+    runs a Python callee in line (a keyword call in a range loop: 1,080
+    instructions an iteration under tier 2, 265 under the frame JIT, 0.39
+    of CPython's); each dynamic call now counts as three generic
+    operations in the share past which tier 2 leaves a loop to the frame
+    JIT. Still open: a share of 10% instead of 20% would send more loops
+    to the frame JIT (the battery 0.4% fewer instructions, the suite even),
+    but there a Python `__eq__` that a native instance-dict lookup runs
+    sees the wrong caller frame in an activation's first lookup: the core
+    loop publishes its activation only before the calls it makes itself.
   - `os.environ.get(name)` and `name in os.environ` read the backing store.
     `Mapping`'s versions find a missing variable through `__getitem__`,
     which raises and catches two `KeyError`s, and programs probe unset
