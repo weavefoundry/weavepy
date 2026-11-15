@@ -2052,27 +2052,19 @@ pub(crate) fn overrides_dunder_new(cls: &Rc<TypeObject>) -> bool {
 
 /// Does `cls` (or a non-`object` base) define a *user* `__init__`?
 pub(crate) fn overrides_dunder_init(cls: &Rc<TypeObject>) -> bool {
-    for ty in cls.mro.borrow().iter() {
-        if let Some(init) = ty
-            .dict
-            .borrow()
-            .get(&DictKey(Object::from_static("__init__")))
-        {
-            // Surface-only default-`__init__` mirrors (RFC 0056 WS4)
-            // are not overrides.
-            if crate::descr_registry::is_surface_only(init) {
-                continue;
-            }
-            // `object.__init__` itself stored on a subclass (`typing`'s
-            // protocol init does `cls.__init__ = object.__init__`) leaves
-            // CPython's `tp_init` at `object_init`: not an override.
-            if matches!(init, Object::Builtin(b) if crate::is_object_init(b)) {
-                return false;
-            }
-            return ty.name != "object";
-        }
+    // (Through the class's type cache: the first `__init__` along the MRO,
+    // past the surface-only default mirrors of RFC 0056 WS4, which aren't
+    // overrides.)
+    let Some((init, owner)) = cls.lookup_with_owner("__init__") else {
+        return false;
+    };
+    // `object.__init__` itself stored on a subclass (`typing`'s protocol
+    // init does `cls.__init__ = object.__init__`) leaves CPython's
+    // `tp_init` at `object_init`: not an override.
+    if matches!(&init, Object::Builtin(b) if crate::is_object_init(b)) {
+        return false;
     }
-    false
+    owner.name != "object"
 }
 
 /// A fresh `Object::Builtin("__new__")` wrapping [`object_new`]. Each

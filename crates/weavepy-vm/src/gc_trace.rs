@@ -1861,7 +1861,9 @@ impl GcState {
     /// structure and drops the previous one thus seldom collects, as in
     /// CPython; the pruning costs a few steps per allocation.)
     pub fn maybe_auto_collect(&self) -> bool {
-        if !self.is_enabled() || self.collecting.load(Ordering::Acquire) {
+        // (The gauge settles the common answer, not due yet, from one
+        // load: no borrow of the counts or thresholds.)
+        if !self.auto_collect_due() {
             return false;
         }
         // How many collections in a row have found nothing (see `wanted`
