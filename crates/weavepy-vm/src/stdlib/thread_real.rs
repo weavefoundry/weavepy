@@ -881,7 +881,13 @@ fn lock_acquire_blocking(lock: &RealLock, me: u64) {
     if lock.try_acquire(me) {
         return;
     }
-    let _ = acquire_contended(|| lock.try_acquire(me), |w| lock.wait_free(w), None, false);
+    let _ = acquire_contended(
+        || lock.try_acquire(me),
+        |w| lock.wait_free(w),
+        |w| take_lock(lock, me, w),
+        None,
+        false,
+    );
 }
 
 /// A contended acquire, as CPython's lock takes it: the GIL is released
@@ -891,16 +897,22 @@ fn lock_acquire_blocking(lock: &RealLock, me: u64) {
 /// `queue.Queue`'s mutex between a producer and a consumer), handing the
 /// GIL over at every operation. With the GIL back first, the running
 /// thread retakes a lock it released, and a woken waiter that finds it
-/// taken waits again. `deadline` bounds the whole acquire (`false` when it
+/// taken waits again. A waiter that has waited [`HANDOFF_AFTER`] takes the
+/// lock as soon as it comes free instead (`take_waiting`, with the GIL
+/// released), as CPython's lock hands itself to a waiter of over a
+/// millisecond: a holder that always has the lock when it yields the GIL
+/// can't starve it. `deadline` bounds the whole acquire (`false` when it
 /// passes); `signals` waits in slices on the main thread, running pending
 /// signal handlers between them (CPython's `EINTR` retry loop), and a
 /// handler that raises abandons the acquire.
 fn acquire_contended(
     try_take: impl Fn() -> bool,
     wait_free: impl Fn(Option<Duration>),
+    take_waiting: impl Fn(Option<Duration>) -> bool,
     deadline: Option<Instant>,
     signals: bool,
 ) -> Result<bool, RuntimeError> {
+    let start = Instant::now();
     loop {
         let mut wait = match deadline {
             Some(dl) => {
@@ -915,12 +927,46 @@ fn acquire_contended(
         if signals {
             wait = Some(wait.map_or(SIGNAL_POLL_SLICE, |w| w.min(SIGNAL_POLL_SLICE)));
         }
-        crate::gil::allow_threads_then(|| wait_free(wait));
-        if try_take() {
-            return Ok(true);
+        if start.elapsed() >= HANDOFF_AFTER {
+            if crate::gil::allow_threads_then(|| take_waiting(wait)) {
+                return Ok(true);
+            }
+        } else {
+            let turn = Some(wait.map_or(HANDOFF_AFTER, |w| w.min(HANDOFF_AFTER)));
+            crate::gil::allow_threads_then(|| wait_free(turn));
+            if try_take() {
+                return Ok(true);
+            }
         }
         if signals {
             service_pending_signals()?;
+        }
+    }
+}
+
+/// How long a contended acquire waits for its turn before it takes the
+/// lock as soon as it comes free (see [`acquire_contended`]).
+const HANDOFF_AFTER: Duration = Duration::from_millis(5);
+
+/// `lock`'s blocking acquire for `me`, bounded by `wait` (the waiting half
+/// of a contended acquire past its hand-off point).
+fn take_lock(lock: &RealLock, me: u64, wait: Option<Duration>) -> bool {
+    match wait {
+        Some(d) => lock.acquire_timeout(me, d),
+        None => {
+            lock.acquire(me);
+            true
+        }
+    }
+}
+
+/// [`take_lock`] for a reentrant lock.
+fn take_rlock(lock: &RealRLock, me: u64, wait: Option<Duration>) -> bool {
+    match wait {
+        Some(d) => lock.acquire_timeout(me, d),
+        None => {
+            lock.acquire(me);
+            true
         }
     }
 }
@@ -963,6 +1009,7 @@ fn lock_acquire_interruptible(
     acquire_contended(
         || lock.try_acquire(me),
         |w| lock.wait_free(w),
+        |w| take_lock(lock, me, w),
         timeout.map(|d| Instant::now() + d),
         crate::gil::is_main_thread(),
     )
@@ -980,6 +1027,7 @@ fn rlock_acquire_interruptible(
     acquire_contended(
         || lock.try_acquire(me),
         |w| lock.wait_free(me, w),
+        |w| take_rlock(lock, me, w),
         timeout.map(|d| Instant::now() + d),
         crate::gil::is_main_thread(),
     )
@@ -1088,6 +1136,7 @@ fn rlock_acquire_blocking(lock: &RealRLock, me: u64) {
     let _ = acquire_contended(
         || lock.try_acquire(me),
         |w| lock.wait_free(me, w),
+        |w| take_rlock(lock, me, w),
         None,
         false,
     );
