@@ -63765,22 +63765,40 @@ impl Interpreter {
                     let global_dummy = Rc::new(RefCell::new(DictData::default()));
                     let items = self.collect_iterable(&args[0], &global_dummy)?;
                     let mut d = DictData::default();
+                    // While every key compares natively (as all so far
+                    // have), an insert runs no Python comparison to catch.
+                    let mut native = true;
                     for (i, pair) in items.into_iter().enumerate() {
                         // A 2-tuple (`dict(zip(ks, vs))`) is its own pair.
-                        let kv = match &pair {
-                            Object::Tuple(t) if t.len() == 2 => t.to_vec(),
-                            _ => self.collect_iterable(&pair, &global_dummy)?,
+                        let (key, value) = match &pair {
+                            Object::Tuple(t) if t.len() == 2 => (t[0].clone(), t[1].clone()),
+                            _ => {
+                                let kv = self.collect_iterable(&pair, &global_dummy)?;
+                                if kv.len() != 2 {
+                                    return Err(value_error(format!(
+                                        "dictionary update sequence element #{i} has length {}; 2 is required",
+                                        kv.len()
+                                    )));
+                                }
+                                let mut kv = kv.into_iter();
+                                (kv.next().expect("two"), kv.next().expect("two"))
+                            }
                         };
-                        if kv.len() != 2 {
-                            return Err(type_error(format!(
-                                "dictionary update sequence element #{i} has length {}; 2 is required",
-                                kv.len()
-                            )));
+                        crate::builtins::ensure_dict_key(&key)?;
+                        native &= matches!(
+                            key,
+                            Object::Str(_)
+                                | Object::Int(_)
+                                | Object::Bool(_)
+                                | Object::None
+                                | Object::Float(_)
+                                | Object::Bytes(_)
+                        );
+                        if native {
+                            d.insert(DictKey(key), value);
+                        } else {
+                            crate::object::key_cmp_scope(|| d.insert(DictKey(key), value))?;
                         }
-                        crate::builtins::ensure_dict_key(&kv[0])?;
-                        crate::object::key_cmp_scope(|| {
-                            d.insert(DictKey(kv[0].clone()), kv[1].clone())
-                        })?;
                     }
                     let out = Object::Dict(Rc::new(RefCell::new(d)));
                     crate::gc_trace::track(&out);
@@ -63812,7 +63830,7 @@ impl Interpreter {
                         for (i, pair) in items.into_iter().enumerate() {
                             let kv = self.collect_iterable(&pair, &global_dummy)?;
                             if kv.len() != 2 {
-                                return Err(type_error(format!(
+                                return Err(value_error(format!(
                                     "dictionary update sequence element #{i} has length {}; 2 is required",
                                     kv.len()
                                 )));
