@@ -537,6 +537,12 @@ branch and pull request.
     type cache whether `__init__` is overridden instead of probing each
     class dict with a fresh key, and the collector's "not due yet" answer
     comes from one load (a `str` subclass's construction, 4.1 to 3.4).
+  - `yield from` a range, tuple or list iterator steps it in place: the
+    core loop's `SEND` took the full step for any delegate but a
+    generator or an asyncio future, so every item went through the
+    general handler (`yield from range(100)`, 3.40 to 1.27). A list's end
+    keeps the general path, since it detaches the list and may free a
+    subclass's owner.
   - Smaller ones: `object.__setattr__(self, name, value)` (a frozen
     dataclass's `__init__`) passes the name object through a per-thread
     memo to the intern pool instead of copying and re-interning its text,
