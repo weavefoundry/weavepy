@@ -1489,6 +1489,26 @@ pub(crate) fn builtin_ctor_pure(cls: &Rc<TypeObject>, args: &[Object]) -> Option
             return crate::stdlib::weakref_real::ref_pure(target);
         }
     }
+    // `dict(d)` of an exact dict, and `dict(zip(xs, ys))` of plain
+    // sequences with simple keys.
+    if let [src] = args {
+        if Rc::ptr_eq(cls, &bt.dict_) {
+            if crate::stdlib::tracemalloc_real::is_tracking() || crate::gc_trace::auto_collect_due()
+            {
+                return None;
+            }
+            let data = match src {
+                // SAFETY: a read between two instructions (cloning runs no
+                // code).
+                Object::Dict(d) => unsafe { d.peek() }?.clone(),
+                Object::LazyIter(l) => dict_from_zip_pure(l)?,
+                _ => return None,
+            };
+            let obj = Object::Dict(Rc::new(crate::sync::RefCell::new(data)));
+            crate::gc_trace::track(&obj);
+            return Some(obj);
+        }
+    }
     // `bytes(n)`, `bytes(b)`, `bytearray(n)` and `bytearray(b)` of a small
     // count or an exact `bytes` or `bytearray` (a copy that runs no code).
     let bytes = Rc::ptr_eq(cls, &bt.bytes_);
@@ -1965,6 +1985,87 @@ pub(crate) fn plain_hashable(x: &Object, depth: u32) -> bool {
         Object::Tuple(t) => depth < 4 && t.iter().all(|e| plain_hashable(e, depth + 1)),
         _ => false,
     }
+}
+
+/// `dict(zip(xs, ys))` over two plain list or tuple cursors whose keys
+/// hash and compare without running code ([`plain_hashable`]): the dict,
+/// with both cursors left as the general `zip` step leaves them (the first
+/// source one past the pairs when the second ran out first, and the source
+/// that ran out finished). `None`, nothing consumed, for anything else, or
+/// when finishing a source would free its list (which could run code).
+pub(crate) fn dict_from_zip_pure(l: &PyLazyIter) -> Option<crate::object::DictData> {
+    use crate::object::PyIterator;
+    const MAX_PAIRS: usize = 4096;
+    // SAFETY: nothing below runs code; the views end with this call.
+    let st = unsafe { l.state.peek_mut() }?;
+    let LazyIterKind::Zip {
+        iters,
+        strict: false,
+        held,
+        ..
+    } = st
+    else {
+        return None;
+    };
+    if !held.is_empty() {
+        return None;
+    }
+    let [Object::Iter(ca), Object::Iter(cb)] = iters.as_slice() else {
+        return None;
+    };
+    if Rc::ptr_eq(ca, cb) {
+        return None;
+    }
+    // SAFETY: two distinct cells, as above.
+    let (ia, ib) = unsafe { (ca.peek_mut()?, cb.peek_mut()?) };
+    // A cursor's items from its position, and whether finishing it frees
+    // nothing.
+    fn rest(it: &PyIterator) -> Option<(&[Object], bool)> {
+        match it {
+            PyIterator::List {
+                items,
+                index,
+                owner: None,
+            } => {
+                // SAFETY: a read that runs no code.
+                let v = unsafe { items.peek() }?;
+                Some((v.get(*index..).unwrap_or(&[]), Rc::strong_count(items) > 1))
+            }
+            PyIterator::Tuple { items, index } => Some((items.get(*index..).unwrap_or(&[]), true)),
+            _ => None,
+        }
+    }
+    let ((xs, a_free), (ys, b_free)) = (rest(ia)?, rest(ib)?);
+    let n = xs.len().min(ys.len());
+    let first_ends = xs.len() <= ys.len();
+    if n > MAX_PAIRS || !(if first_ends { a_free } else { b_free }) {
+        return None;
+    }
+    let keys = &xs[..n];
+    if !keys.iter().all(|k| plain_hashable(k, 0)) {
+        return None;
+    }
+    let mut data = crate::object::DictData::default();
+    data.reserve(n);
+    for (k, v) in keys.iter().zip(&ys[..n]) {
+        data.insert(crate::object::DictKey(k.clone()), v.clone());
+    }
+    // (The general step takes the first source's next item before it
+    // finds the second finished.)
+    let advance = |it: &mut PyIterator, by: usize| match it {
+        PyIterator::List { index, .. } | PyIterator::Tuple { index, .. } => *index += by,
+        _ => {}
+    };
+    if first_ends {
+        advance(ia, n);
+        advance(ib, n);
+        let _ = ia.next_value();
+    } else {
+        advance(ia, n + 1);
+        advance(ib, n);
+        let _ = ib.next_value();
+    }
+    Some(data)
 }
 
 /// `hash(x)` of a value whose hash runs no Python code and can't fail
