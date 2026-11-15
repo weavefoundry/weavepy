@@ -401,12 +401,7 @@ fn hasher_hexdigest(args: &[Object]) -> Result<Object, RuntimeError> {
     let st = state.borrow();
     let length = digest_length(&st, args)?;
     let bytes = st.digest(length);
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        use std::fmt::Write;
-        write!(out, "{b:02x}").unwrap();
-    }
-    Ok(Object::from_str(out))
+    Ok(Object::from_str(crate::object::hex_lower(&bytes)))
 }
 
 fn hasher_copy(args: &[Object]) -> Result<Object, RuntimeError> {

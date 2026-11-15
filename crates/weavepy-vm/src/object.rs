@@ -47,6 +47,23 @@ const _: () = {
 /// UTF-8, so the first count is a scan; scanners and tokenisers that ask
 /// for the length of the same large string repeatedly stay linear.
 #[inline]
+/// Push `b` as two lowercase hex digits.
+#[inline]
+pub(crate) fn push_hex_byte(out: &mut String, b: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.push(char::from(HEX[usize::from(b >> 4)]));
+    out.push(char::from(HEX[usize::from(b & 15)]));
+}
+
+/// The lowercase hex text of `bytes` (a digest's `hexdigest()`).
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        push_hex_byte(&mut out, b);
+    }
+    out
+}
+
 pub(crate) fn str_char_len(s: &SharedStr) -> usize {
     SharedStr::char_count(s)
 }
@@ -13197,7 +13214,8 @@ impl Object {
                         c => {
                             let n = c as u32;
                             if n <= 0xff {
-                                out.push_str(&format!("\\x{n:02x}"));
+                                out.push_str("\\x");
+                                push_hex_byte(&mut out, n as u8);
                             } else if n <= 0xffff {
                                 out.push_str(&format!("\\u{n:04x}"));
                             } else {
@@ -13235,7 +13253,8 @@ impl Object {
                         // non-printable scalars escape by code-point width.
                         _ => {
                             if n <= 0xff {
-                                out.push_str(&format!("\\x{n:02x}"));
+                                out.push_str("\\x");
+                                push_hex_byte(&mut out, n as u8);
                             } else if n <= 0xffff {
                                 out.push_str(&format!("\\u{n:04x}"));
                             } else {
@@ -15637,7 +15656,10 @@ fn bytes_repr_inner(b: &[u8], smartquotes: bool) -> String {
             b'\r' => out.push_str("\\r"),
             b'\t' => out.push_str("\\t"),
             0x20..=0x7E => out.push(c as char),
-            _ => out.push_str(&format!("\\x{c:02x}")),
+            _ => {
+                out.push_str("\\x");
+                push_hex_byte(&mut out, c);
+            }
         }
     }
     out.push(quote as char);

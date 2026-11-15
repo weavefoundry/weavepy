@@ -233,12 +233,7 @@ fn mac_hexdigest(args: &[Object]) -> Result<Object, RuntimeError> {
     let id = instance_handle(args)?;
     let entry = lookup_mac(id)?;
     let bytes = entry.state.borrow().digest();
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        use std::fmt::Write;
-        write!(out, "{b:02x}").unwrap();
-    }
-    Ok(Object::from_str(out))
+    Ok(Object::from_str(crate::object::hex_lower(&bytes)))
 }
 
 fn mac_copy(args: &[Object]) -> Result<Object, RuntimeError> {
