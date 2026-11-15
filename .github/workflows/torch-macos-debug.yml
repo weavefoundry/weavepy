@@ -1,0 +1,49 @@
+# TEMPORARY (perf/native-to-python-calls): the torch ecosystem probe on
+# macOS arm64 alone, with every process's stacks dumped if it hangs. To be
+# removed before the branch merges.
+name: torch-macos-debug
+
+on:
+  push:
+    branches: [perf/native-to-python-calls]
+
+jobs:
+  torch:
+    runs-on: macos-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Build weavepy
+        run: cargo build --release -p weavepy-cli
+      - name: Fetch and install torch
+        run: |
+          python -m pip download --only-binary :all: -d wheels torch==2.13.0 numpy pip setuptools
+          target/release/weavepy -m venv v
+          v/bin/python -m pip install --quiet --no-index --find-links wheels torch==2.13.0 numpy
+      - name: Run the torch probe
+        shell: bash
+        run: |
+          export PYTHONFAULTHANDLER=1 WEAVEPY_CELLS_TRACE=1
+          v/bin/python tests/ecosystem/probes/torch_probe.py &
+          pid=$!
+          for i in $(seq 1 120); do
+            sleep 5
+            kill -0 $pid 2>/dev/null || break
+          done
+          if kill -0 $pid 2>/dev/null; then
+            echo "=== hung after 600 s; processes:"
+            ps -ax -o pid,ppid,stat,etime,command | grep -E "weavepy|v/bin/python" | grep -v grep
+            for p in $(pgrep -f "v/bin/python"); do
+              echo "=== stacks of $p"
+              kill -ABRT $p
+            done
+            sleep 10
+            pkill -9 -f "v/bin/python"
+            exit 1
+          fi
+          wait $pid
