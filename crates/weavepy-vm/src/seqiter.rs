@@ -149,6 +149,26 @@ impl Interpreter {
                     return self.call_python_owned(f, vec![bm.receiver.clone(), v], Vec::new());
                 }
             }
+            // A placeholder-free `functools.partial` with no stored
+            // keywords (`map(partial(add, 3), xs)`): its function over the
+            // stored positionals and `v`, as its native `__call__` makes
+            // the call, without the bound `__call__` and its general call.
+            Object::Instance(inst) if Self::is_plain_partial(inst) => {
+                let parts = crate::stdlib::functools_mod::with_partial_call(inst, |f, args, kw| {
+                    kw.is_empty().then(|| {
+                        let mut all = Vec::with_capacity(args.len() + 1);
+                        all.extend_from_slice(args);
+                        (f.clone(), all)
+                    })
+                });
+                if let Some((f, mut all)) = parts {
+                    all.push(v);
+                    if let Some(r) = self.pure_callback(&f, &all, true) {
+                        return Ok(r);
+                    }
+                    return self.call(&f, &all, &[], globals);
+                }
+            }
             _ => {}
         }
         let r = self.call(func, std::slice::from_ref(&v), &[], globals);
@@ -156,6 +176,13 @@ impl Interpreter {
         // freelist does: `map(id, ((i, i) for ...))` sees one address).
         self.release(v);
         r
+    }
+
+    /// Whether calling `inst` is `functools.partial`'s own native
+    /// `__call__` (its class is `partial` or a subclass that keeps it).
+    fn is_plain_partial(inst: &crate::types::PyInstance) -> bool {
+        matches!(inst.cls_raw().lookup("__call__"),
+            Some(Object::Builtin(b)) if crate::stdlib::functools_mod::is_partial_call(&b))
     }
 
     /// Drain a builtin adapter into `out` (`list(map(f, xs))`, `sorted`,
@@ -201,6 +228,38 @@ impl Interpreter {
                 match self.filter_next(&func, &source, globals) {
                     Ok(Some(v)) => out.push(v),
                     Ok(None) => return Ok(true),
+                    Err(e) => return stop(e),
+                }
+            }
+        }
+        // A placeholder-free `partial` with no stored keywords, resolved
+        // once (its function and stored arguments are read-only): each
+        // item is its function's last argument (see `seq_call1`).
+        let partial = match &func {
+            Object::Instance(inst) if Self::is_plain_partial(inst) => {
+                crate::stdlib::functools_mod::with_partial_call(inst, |f, args, kw| {
+                    kw.is_empty().then(|| (f.clone(), args.to_vec()))
+                })
+            }
+            _ => None,
+        };
+        if let Some((f, stored)) = partial {
+            let mut all = stored;
+            let at = all.len();
+            loop {
+                let v = match self.seq_step_source(&source, globals) {
+                    Ok(Some(v)) => v,
+                    Ok(None) => return Ok(true),
+                    Err(e) => return stop(e),
+                };
+                all.truncate(at);
+                all.push(v);
+                let r = match self.pure_callback(&f, &all, true) {
+                    Some(r) => Ok(r),
+                    None => self.call(&f, &all, &[], globals),
+                };
+                match r {
+                    Ok(r) => out.push(r),
                     Err(e) => return stop(e),
                 }
             }
@@ -1253,7 +1312,36 @@ fn chain_drain(l: &PyLazyIter, out: &mut Vec<Object>) -> bool {
                 out.extend_from_slice(items.get(from..).unwrap_or(&[]));
             }
             Object::Tuple(items) => out.extend_from_slice(items.get(from..).unwrap_or(&[])),
+            // A `range` of machine ints (`chain(range(a), range(b))`).
+            Object::Range(r) if from == 0 && r.big.is_none() => {
+                let (start, stop, step) = (
+                    i64::try_from(r.start).ok()?,
+                    i64::try_from(r.stop).ok()?,
+                    i64::try_from(r.step).ok()?,
+                );
+                range_ints(start, stop, step, out)?;
+            }
             _ => return None,
+        }
+        Some(())
+    }
+    // `start` to `stop` by `step` (non-zero), at most a million of them.
+    fn range_ints(start: i64, stop: i64, step: i64, out: &mut Vec<Object>) -> Option<()> {
+        let n = if step > 0 && start < stop {
+            (i128::from(stop) - i128::from(start) + i128::from(step) - 1) / i128::from(step)
+        } else if step < 0 && start > stop {
+            (i128::from(start) - i128::from(stop) - i128::from(step) - 1) / -i128::from(step)
+        } else {
+            0
+        };
+        if n > 1 << 20 {
+            return None;
+        }
+        out.reserve(n as usize);
+        let mut v = start;
+        for _ in 0..n {
+            out.push(Object::Int(v));
+            v = v.wrapping_add(step);
         }
         Some(())
     }
@@ -1287,6 +1375,16 @@ fn chain_drain(l: &PyLazyIter, out: &mut Vec<Object>) -> bool {
             PyIterator::Tuple { items, index } => {
                 out.extend_from_slice(items.get(*index..).unwrap_or(&[]));
                 *index = items.len();
+            }
+            PyIterator::Range {
+                current,
+                stop,
+                step,
+            } => {
+                if range_ints(*current, *stop, *step, out).is_none() {
+                    return false;
+                }
+                *current = *stop;
             }
             _ => return false,
         }
