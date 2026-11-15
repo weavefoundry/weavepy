@@ -47512,10 +47512,52 @@ impl Interpreter {
                     },
                 }
             }),
-            SortKind::General => crate::timsort::sort(v, |a, b| {
-                self.dispatch_compare_op(key(a), key(b), CompareKind::Lt, globals)
-            }),
+            SortKind::General => {
+                // Instances of one exact class whose `__lt__` is a Python
+                // function that evaluates as a pure leaf: the function,
+                // resolved once, called on each pair as `<` would (any
+                // answer but a `bool` takes the full protocol).
+                let lt_fn = Self::common_instance_dunder(
+                    v.iter().map(key),
+                    crate::types::vm_key::LT_FN,
+                    "__lt__",
+                );
+                crate::timsort::sort(v, |a, b| {
+                    let (x, y) = (key(a), key(b));
+                    if let Some(f) = &lt_fn {
+                        if let Some(Object::Bool(lt)) =
+                            self.call_pure_leaf_with(f, Some(x), std::slice::from_ref(y))
+                        {
+                            return Ok(lt);
+                        }
+                    }
+                    self.dispatch_compare_op(x, y, CompareKind::Lt, globals)
+                })
+            }
         }
+    }
+
+    /// The Python function `name` resolves to on the one exact class every
+    /// one of `objs` is a plain instance of, if they share one and it is
+    /// a function (cached on the class under `key`).
+    fn common_instance_dunder<'a>(
+        mut objs: impl Iterator<Item = &'a Object>,
+        key: u32,
+        name: &str,
+    ) -> Option<Rc<crate::object::PyFunction>> {
+        let Some(Object::Instance(first)) = objs.next() else {
+            return None;
+        };
+        let cls = std::ptr::from_ref(first.cls_raw());
+        if first.native.get().is_some()
+            || !objs.all(|o| {
+                matches!(o, Object::Instance(i)
+                    if std::ptr::eq(i.cls_raw(), cls) && i.native.get().is_none())
+            })
+        {
+            return None;
+        }
+        Self::instance_dunder_function(first, crate::types::AttrKey::vm(key), name)
     }
 
     /// Run `__str__` on instances, falling back to `__repr__` then
@@ -48457,9 +48499,38 @@ impl Interpreter {
         item: &Object,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<bool, RuntimeError> {
+        // An instance of a class whose `__eq__` is a Python function that
+        // evaluates as a pure leaf, compared with elements of its exact
+        // class: the function, resolved once for the scan, called on each
+        // (element, item) pair as `list.__contains__` calls it. Any answer
+        // but a `bool` goes through the full protocol (a pure leaf has no
+        // effects to repeat).
+        let eq_fn = match item {
+            Object::Instance(inst) if inst.native.get().is_none() => {
+                Self::instance_dunder_function(
+                    inst,
+                    crate::types::AttrKey::vm(crate::types::vm_key::EQ_FN),
+                    "__eq__",
+                )
+                .map(|f| (std::ptr::from_ref(inst.cls_raw()), f))
+            }
+            _ => None,
+        };
         for x in items {
             if x.is_same(item) {
                 return Ok(true);
+            }
+            if let (Some((cls, f)), Object::Instance(xi)) = (&eq_fn, x) {
+                if std::ptr::eq(xi.cls_raw(), *cls) && xi.native.get().is_none() {
+                    if let Some(Object::Bool(b)) =
+                        self.call_pure_leaf_with(f, Some(x), std::slice::from_ref(item))
+                    {
+                        if b {
+                            return Ok(true);
+                        }
+                        continue;
+                    }
+                }
             }
             // Escalate to the full rich-comparison protocol whenever either
             // operand can carry custom `__eq__` semantics the native

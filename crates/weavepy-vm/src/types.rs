@@ -743,6 +743,8 @@ pub(crate) mod vm_key {
     pub(crate) const ABC_CLASS: u32 = 20;
     pub(crate) const CHAINMAP_MAPS: u32 = 21;
     pub(crate) const NATIVE_GETITEM_ANY: u32 = 22;
+    pub(crate) const EQ_FN: u32 = 23;
+    pub(crate) const LT_FN: u32 = 24;
     /// Per comparison (eight).
     pub(crate) const CMP: u32 = 32;
     /// Per binary operator (sixteen each): its method, and whether the
