@@ -773,6 +773,26 @@ fn innermost_loop(loops: &[LoopInfo], pc: usize) -> Option<usize> {
         .max_by_key(|&k| loops[k].head)
 }
 
+/// [`innermost_loop`] of every pc below `n`, filled loop by loop over
+/// each extent instead of searching the forest per pc.
+fn innermost_loops(loops: &[LoopInfo], n: usize) -> Vec<Option<usize>> {
+    let mut out: Vec<Option<usize>> = vec![None; n];
+    for (k, lp) in loops.iter().enumerate() {
+        if lp.head >= n {
+            continue;
+        }
+        for slot in &mut out[lp.head..=lp.end.min(n - 1)] {
+            // The innermost is the containing loop with the latest head
+            // (the later one on a tie, as `max_by_key` picks).
+            if slot.is_none_or(|j| loops[j].head <= lp.head) {
+                *slot = Some(k);
+            }
+        }
+    }
+    debug_assert!((0..n).all(|pc| out[pc] == innermost_loop(loops, pc)));
+    out
+}
+
 /// The start of the statement holding the top-level (loop-free) `p`:
 /// the first instruction of its source line (a statement's internal
 /// jumps, a comprehension's loop say, stay inside the cut). For a loop
@@ -876,9 +896,7 @@ impl Region {
         let roots = (0..loops.len())
             .filter(|&k| !stays[k] && loops[k].parent.is_some_and(|p| stays[p]))
             .collect();
-        let innermost = (0..code.instructions.len())
-            .map(|pc| innermost_loop(loops, pc))
-            .collect();
+        let innermost = innermost_loops(loops, code.instructions.len());
         Region {
             stays,
             innermost,
