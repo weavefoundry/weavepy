@@ -709,7 +709,7 @@ fn revoke_bias() {
     while SOLE_GUARDS.load(Ordering::SeqCst) > 0 {
         std::hint::spin_loop();
         spins = spins.wrapping_add(1);
-        if bounded && spins % 1024 == 0 && start.elapsed() >= DRAIN_BOUND {
+        if bounded && spins.is_multiple_of(1024) && start.elapsed() >= DRAIN_BOUND {
             if std::env::var_os("WEAVEPY_CELLS_TRACE").is_some() {
                 eprintln!(
                     "[cells] drain gave up after {:?}: {} guard(s) outstanding",
