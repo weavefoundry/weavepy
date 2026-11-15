@@ -22,7 +22,7 @@ are how it measures progress.
 | Real packages | 48 of 48 install and pass a behavior check | September 2026, on macOS and Linux; kept in CI |
 | Warm speed | 0.85 times CPython's time | November 13, 2026, over 33 workloads |
 | Peak memory | 1.14 times CPython's resident set, 1.22 times its footprint | November 13, 2026, over 33 workloads |
-| Everyday library code | 1.44 times CPython's time | November 13, 2026, over 54 short loops |
+| Everyday library code | 1.36 times CPython's time | November 14, 2026, over 54 short loops |
 
 The sections below explain what these numbers cover and where they fall short.
 
@@ -130,13 +130,14 @@ times as many. The [progress note](docs/PERFORMANCE-PROGRESS.md) lists them.
 
 Ordinary library-heavy code is where WeavePy is behind. A battery of 54
 everyday operations (`tools/pybench/everyday.py`: file and directory work,
-text, data formats, classes, threads, common modules) runs at 1.44 times
-CPython's time on average (1.79 before the work that followed its first run).
-WeavePy is ahead on 12 of the 54 and past twice CPython's time on 14, with
-thread queues, `inspect` and `typing`, `weakref`, class-protocol code, and
-`enum` with `dataclasses` between 3 and 4 times. File and stream I/O, which was
-far slower still (a line read took a system call per byte), is now level with
-CPython or ahead of it. The rest is the current work.
+text, data formats, classes, threads, common modules) runs at 1.36 times
+CPython's time on average (1.79 before the work that followed its first run,
+1.43 before the latest). WeavePy is ahead on 17 of the 54 and past twice
+CPython's time on 12, with `inspect` and `typing`, thread queues,
+class-protocol code and `weakref` between 3 and 4 times. File and stream
+I/O, which was far slower still (a line read took a system call per byte), is
+now level with CPython or ahead of it, as are `datetime`, `re` and `json`. The
+rest is the current work.
 
 Code that the JIT compiles fully can run far faster. The numeric loops in the
 [bench gate fixtures](docs/PERFORMANCE-CPYTHON-PARITY.md) took 5% to 8% of

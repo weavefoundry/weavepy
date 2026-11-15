@@ -7,6 +7,24 @@ plan, what's done, and what's next, so a new session can pick up the work.
 
 ## Where WeavePy stands
 
+Measured on November 14, 2026, at `2ce79fa5` (PR #112), a PGO build from a
+fresh training run against CPython 3.14.8 on the same idle host, beside
+the November 13 PGO build PR #110's figures came from. The everyday
+battery: 1.357 times CPython's time over two runs (1.345 and 1.369),
+against 1.431 for the earlier build in the same session. WeavePy is
+ahead on 17 cases (16 before), past twice CPython's time on 12 (14
+before) and past three times on 5: `inspect_typing_ops` 4.0,
+`threading_queue_ops` 3.4, `class_features` 3.3, `weakref_gc_ops` 3.2
+and `file_read_binary_chunks` 3.0 (1.5 by instructions: its time is in
+the reads). The cases this PR went after moved the most:
+`datetime_time_ops` 2.02 to 0.75, `bytes_ops` 2.36 to 1.36, `csv_ops`
+2.15 to 1.40, `threading_queue_ops` 4.11 to 3.38, `glob_fnmatch` 1.61 to
+1.36. The suite in the same session: warm time 0.849, cold time 0.949,
+peak RSS 1.123, and 1.004 of the earlier build's time, so the battery's
+fixes cost the suite nothing. The commits after `2ce79fa5` (see "Done")
+weren't in that build; by instructions on quick builds the battery
+stands at 1.34 times CPython's against 1.45 at the start of this PR.
+
 Measured on November 13, 2026, at `4e230310` (this PR), a PGO build from a
 fresh training run against CPython 3.14.8 on the same idle host. The
 benchmark suite: warm time 0.850, cold time 0.959, peak RSS 1.137, and
@@ -426,6 +444,69 @@ branch and pull request.
    `logging_mix`, `class_creation`).
 
 ## Done
+
+- **Operation-level cliffs in the everyday battery** (PR #112, November
+  14). Each case broken into single operations, each operation's
+  instructions counted against CPython's with synchronous compiles
+  (`WEAVEPY_FRAME_JIT_SYNC=1`), and the outliers profiled in the
+  container. Ratios are WeavePy's instructions over CPython's, before and
+  after.
+  - `bytes`. Methods read their receiver in place instead of copying it;
+    a short search skips `memmem`'s set-up (`replace` scanned with a
+    `memcmp` at every position); slices, indexing, plain `%` formatting,
+    `bytes(n)` and `bytearray(b)` have fast paths. `replace` 3.08 to
+    1.13, `b[5:20]` 3.08 to 0.93, `b"%d:%s" % args` 2.69 to 1.44,
+    `bytes(10)` 2.60 to 0.78.
+  - `datetime`. `astimezone` ran `_pydatetime`'s local-time search in
+    Python (six or seven `time.localtime` calls and datetime arithmetic);
+    `replace`, `timestamp` and `astimezone` are now native for exact
+    classes with no `tzinfo` or a fixed-offset `timezone`, following
+    `_mktime` and `_local_timezone` step for step, with results identical
+    to the Python methods' across DST gaps and folds in five zones.
+    `astimezone(utc)` 9.32 to 0.86.
+  - `OSError`. Its family's builtin `__init__` kept every construction
+    off the leaf path; the leaf path's instance already holds what that
+    `__init__` sets. `OSError(errno, msg)` 6.22 to 1.98. `gettext`
+    raises and catches one per catalog lookup, about 50 per
+    `argparse.ArgumentParser()`.
+  - Dunder reads by name. `getattr(cls, name)` and `hasattr(cls, name)`
+    declined every dunder off a short list, so `dataclasses`'
+    `hasattr(type(obj), "__dataclass_fields__")` took the full
+    type-attribute path; a dunder `type` doesn't define and the full path
+    doesn't synthesize now resolves in the class's MRO. 6.06 to 1.51.
+  - Comparison methods resolved once. `x in xs` and sorting instances of
+    one class with a Python `__eq__` or `__lt__` went through the whole
+    rich-comparison dispatch per element; the method is now resolved once
+    per scan or sort. `x in xs` 2.14 to 1.55, sorting 1.51 to 0.90.
+  - Builtins called through the generic path. A native function compiled
+    code calls without a leaf registration leaves for the interpreter's
+    general call, about 2,500 instructions. `WEAVEPY_BURST_STATS`'
+    "generic call" lines, summed over the battery minus an empty run,
+    rank them; those whose plain shapes run no code now have leaf halves:
+    `os.urandom`, `int.from_bytes` (one builtin per thread instead of a
+    fresh one per read), `binascii.hexlify`, `round`, `repr` of scalars,
+    `list.sort()` of strings or numbers, `weakref.ref.__init__`, and
+    `str`, `tuple` and `int` `__new__` of a value of the type. A builtin
+    method read off its type (`str.upper`) is a receiver-checking shim,
+    which now takes the method's leaf kind. `secrets.token_hex(8)` 2.29
+    to 0.97, `f = str.upper; f(s)` 2.49 to 0.96.
+  - Smaller ones: `weakref.ref(x)` as a pure constructor (3.19 to 1.53);
+    `dict(zip(xs, ys))` and `dict(d)` built directly (2.42 to 0.95);
+    `functools.partial` callbacks unwrapped in `map` (5.18 to 1.09);
+    `itertools.chain` of ranges drained at once (2.20 to 0.36); a
+    property read through `getattr` in the leaf lane (3.36 to 1.03);
+    `type(o).__name__` remembered under `ABCMeta` (3.45 to 0.56); the
+    csv writer's dialect read once per `writerows` and plain fields
+    copied whole (2.26 to 1.52); `os.stat`'s field names shared through
+    a per-thread cache of literal strings (1.53 to 1.40); `json.dumps`'s
+    `sort_keys` sorting `str` keys in place; a thread's type cache taken
+    from zeroed memory, and leaf-builtin registrations no longer making
+    every interpreter rebuild its map.
+  - Tried and dropped: leaving loops whose work is Python calls on
+    objects to the frame JIT. It cut one shape 4x (2,470 instructions an
+    iteration to 573) and was neutral on the suite and the battery, but
+    it handed loops whose calls tier 2 makes natively to the frame JIT,
+    and the bench gate read `nbody` at 1.6 times its base.
 
 - **Comparison methods, descriptors, thread-locals and queues** (this PR,
   November 13). The everyday battery's class and thread cases, taken one
@@ -2875,6 +2956,18 @@ slowdown in that run was the even-sized chunks, since fixed.
 
 ## What the measurements say
 
+- **The battery's whole-case profile is flat** (November 14, callgrind
+  over all 54 cases with synchronous compiles). The core loop's own body
+  is 4.9% of the instructions, allocation and release about 7%, and no
+  other function passes 2%; the layers around a native caller's call into
+  Python are 2.5%, and compiling about 2% (9% to 14% in the shortest
+  cases). What gave way was operation-level: a case broken into single
+  operations and each counted against CPython shows one or two at 3 to
+  9 times, a general path taken where a cached or native one was
+  missing. Two measuring traps: a breakdown script's loops must each sit
+  in a function of their own (one function with an `if` per case runs
+  them interpreted, 3 times slower), and short runs under load measure
+  loops still waiting for their background compile.
 - **A call from native code into Python costs four or five times a call
   from compiled code** (November 13). The same `__eq__` body costs 2,200
   instructions called directly from a compiled `COMPARE_OP`, 4,080 when
@@ -3466,6 +3559,28 @@ slowdown in that run was the even-sized chunks, since fixed.
   generators (below noise).
 
 ## Next
+
+What PR #112's breakdowns left (instructions against CPython, quick
+builds, synchronous compiles):
+
+- `typing` subscripts (`typing.List[int]` 6.1, `Optional[str]` 5.8): the
+  native subscript calls `_tp_cache`'s Python wrapper, which forwards
+  `*args, **kwds` to the `lru_cache`, through the nested native-to-Python
+  entry.
+- `email`'s header parsing (setting one header 3.0) and `configparser`
+  (`write` 2.8, `read_string` 2.0): flat profiles of interpreted library
+  code, the core loop's call and return about 1,000 instructions a call.
+- The remaining builtins called through the generic path, ranked by the
+  battery's "generic call" counts: `getattr` misses (an `AttributeError`
+  raised and caught), `str.join` and `list.extend` over generators,
+  `next` of a generator, `print` with keywords, `StringIO.write`,
+  `setattr` on plain instances, `len` and `hash` through Python methods.
+- A raise caught in its caller (2.2) and three frames up (2.4).
+- Thread start and join (4.5 times CPython's instructions): each thread
+  zeroes and later drops a 4,096-entry type cache (128 KB) and tier 2
+  analyzes again what another thread compiled.
+- Two-argument `super(C, obj)` used other than for an immediate attribute
+  read (5.95), and `super(...).__class__` (7.8).
 
 What the everyday battery points at (`tools/pybench/everyday.py`; see
 "What the measurements say"):
