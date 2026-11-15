@@ -1182,7 +1182,27 @@ fn mostly_generic(tfunc: &TFunc) -> bool {
     } else {
         op_mix(tfunc)
     };
-    (mix.dyn_calls + mix.dyn_attrs + mix.dyn_other) * 100 > mix.total * percent
+    // A dynamic call weighs more than the other generic operations: tier 2
+    // makes it through general helpers, where the frame JIT runs a Python
+    // callee in line (a keyword call in a loop: 1,080 instructions an
+    // iteration under tier 2, 265 under the frame JIT).
+    let weight = dyn_call_weight();
+    (mix.dyn_calls * weight + mix.dyn_attrs + mix.dyn_other) * 100 > mix.total * percent
+}
+
+/// How many generic operations a dynamic call counts as in
+/// [`mostly_generic`] (`WEAVEPY_T2_CALL_WEIGHT` overrides it). At 3 the
+/// fixtures and the suite read even and the everyday battery 0.2% less; at
+/// 5 the `call_overhead` fixture lost 18% (its loops' calls are tier 2's
+/// direct ones).
+fn dyn_call_weight() -> u32 {
+    static W: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("WEAVEPY_T2_CALL_WEIGHT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3)
+    })
 }
 
 /// The blocks of `tfunc` that some back edge spans (blocks are in

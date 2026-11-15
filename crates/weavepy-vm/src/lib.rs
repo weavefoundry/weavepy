@@ -91468,6 +91468,9 @@ assert loop(2000) == 1999000
     #[cfg(feature = "jit")]
     #[test]
     fn jit_scalar_leaf_calls_borrow_cached_artifacts() {
+        // Its loops' dynamic calls are tier 2's to make here, however much
+        // of them they are (the frame JIT takes such loops by default).
+        weavepy_jit::admit_generic_loops();
         const CHILD: &str = "WEAVEPY_BORROWED_SCALAR_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let status = std::process::Command::new(std::env::current_exe().unwrap())
