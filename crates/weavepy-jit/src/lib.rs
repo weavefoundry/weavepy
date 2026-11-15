@@ -31,7 +31,7 @@ mod value;
 
 pub use analyze::{
     analyze, analyze_for_ret, analyze_frame, analyze_with_probe, analyze_with_probes,
-    returns_none_syntactically, returns_self_syntactically, JitVerdict, MethodResolution,
+    returns_none_syntactically, returns_self_syntactically, Carved, JitVerdict, MethodResolution,
     PathArena, Probes, ELEM_SENTINEL, MIN_REGION_TRIPS,
 };
 pub use engine::{

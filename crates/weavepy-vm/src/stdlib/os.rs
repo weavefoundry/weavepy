@@ -3390,7 +3390,12 @@ fn os_scandir(args: &[Object]) -> Result<Object, RuntimeError> {
             // `DirEntry.inode()` keeps working after the entry is unlinked
             // (`test_os.TestScandir.test_removed_{file,dir}`).
             let cached_inode = dir_entry_cached_inode(&entry);
-            build_dir_entry(name_obj, path_obj, fs_path, cached_inode)
+            // (`file_type` is the read's `d_type` where the file system
+            // supplies one.)
+            let kind = entry
+                .file_type()
+                .map_or(ENTRY_UNKNOWN, entry_kind_of);
+            build_dir_entry(name_obj, path_obj, fs_path, kind, cached_inode)
         })
         .collect();
     Ok(build_scandir_iterator(entries))
@@ -3622,32 +3627,6 @@ fn dir_entry_follow(kwargs: &[(String, Object)]) -> bool {
         .unwrap_or(true)
 }
 
-/// Build one of the lazy, `follow_symlinks`-aware `DirEntry` type predicates
-/// (`is_dir`/`is_file`). CPython's `DirEntry.is_dir()` follows symlinks by
-/// default (so a symlink-to-dir is a dir — the invariant the verbatim `glob`
-/// uses to recurse through symlinked directories), and re-`stat`s on demand.
-fn dir_entry_typecheck(name: &'static str, fs_path: String, want_dir: bool) -> Object {
-    let p_pos = fs_path.clone();
-    let classify = move |path: &str, follow: bool| -> bool {
-        let md = if follow {
-            std::fs::metadata(path)
-        } else {
-            std::fs::symlink_metadata(path)
-        };
-        md.map(|m| if want_dir { m.is_dir() } else { m.is_file() })
-            .unwrap_or(false)
-    };
-    let classify_pos = classify;
-    Object::Builtin(Rc::new(crate::object::BuiltinFn {
-        name,
-        binds_instance: false,
-        call: Box::new(move |_args| Ok(Object::Bool(classify_pos(&p_pos, true)))),
-        call_kw: Some(Box::new(move |_args, kwargs| {
-            Ok(Object::Bool(classify(&fs_path, dir_entry_follow(kwargs))))
-        })),
-    }))
-}
-
 /// Build a CPython-compatible ``os.DirEntry`` instance: ``name``/``path``
 /// attributes plus the lazy ``is_dir``/``is_file``/``is_symlink``/``stat``/
 /// ``inode`` methods (all `follow_symlinks`-aware where CPython is).
@@ -3732,6 +3711,7 @@ pub(crate) fn dir_entry_type() -> Rc<crate::types::TypeObject> {
                 },
             )))),
         );
+        dir_entry_methods(&mut dict);
         let cls = TypeObject::new_user("DirEntry", vec![bt.object_.clone()], dict)
             .expect("DirEntry type");
         *slot.borrow_mut() = Some(cls.clone());
@@ -3739,104 +3719,288 @@ pub(crate) fn dir_entry_type() -> Rc<crate::types::TypeObject> {
     })
 }
 
+/// What the directory read said an entry is (`d_type`), which answers
+/// `is_dir()`, `is_file()` and `is_symlink()` without a `stat`, as CPython's
+/// `DirEntry` answers them.
+const ENTRY_UNKNOWN: i64 = 0;
+const ENTRY_DIR: i64 = 1;
+const ENTRY_FILE: i64 = 2;
+const ENTRY_LINK: i64 = 3;
+const ENTRY_OTHER: i64 = 4;
+
+/// The keys of a `DirEntry`'s own state: `name` and `path` are its public
+/// attributes; the rest is what its methods (on the type) work from.
+struct EntryKeys {
+    name: DictKey,
+    path: DictKey,
+    /// The path as a `str`, when `path` is `bytes`.
+    fs: DictKey,
+    /// The directory's descriptor, for an `os.scandir(fd)` entry (whose
+    /// `path` is the bare name, resolved against it).
+    #[cfg(unix)]
+    dir_fd: DictKey,
+    /// One of the `ENTRY_*` kinds.
+    kind: DictKey,
+    /// The inode the directory read reported.
+    ino: DictKey,
+    /// `stat()` results the entry has fetched: of a link's target, and of
+    /// the entry itself.
+    stat: DictKey,
+    lstat: DictKey,
+}
+
+fn entry_keys() -> &'static EntryKeys {
+    static KEYS: std::sync::OnceLock<EntryKeys> = std::sync::OnceLock::new();
+    KEYS.get_or_init(|| {
+        let key = |s: &'static str| DictKey(Object::from_static(s));
+        EntryKeys {
+            name: key("name"),
+            path: key("path"),
+            fs: key("_fs"),
+            #[cfg(unix)]
+            dir_fd: key("_dir_fd"),
+            kind: key("_kind"),
+            ino: key("_ino"),
+            stat: key("_stat"),
+            lstat: key("_lstat"),
+        }
+    })
+}
+
+/// A `DirEntry` method's receiver.
+fn entry_self(args: &[Object]) -> Result<&Rc<crate::types::PyInstance>, RuntimeError> {
+    match args.first() {
+        Some(Object::Instance(inst)) => Ok(inst),
+        _ => Err(type_error("descriptor requires a 'posix.DirEntry' object")),
+    }
+}
+
+/// Where a `DirEntry` is on the file system: a path, or a name under an
+/// open directory.
+enum EntryPlace {
+    Path(String),
+    #[cfg(unix)]
+    Under(libc::c_int, String),
+}
+
+impl EntryPlace {
+    fn of(inst: &crate::types::PyInstance) -> Result<Self, RuntimeError> {
+        let keys = entry_keys();
+        let d = inst.dict_cell().borrow();
+        let Some(Object::Str(fs)) = d.get(&keys.fs).or_else(|| d.get(&keys.path)) else {
+            return Err(type_error("DirEntry is missing its path"));
+        };
+        #[cfg(unix)]
+        if let Some(Object::Int(fd)) = d.get(&keys.dir_fd) {
+            return Ok(Self::Under(*fd as libc::c_int, fs.to_string()));
+        }
+        Ok(Self::Path(fs.to_string()))
+    }
+
+    /// The entry's kind by `stat` (`follow`) or `lstat`; `None` when that
+    /// fails (a dangling link, an entry removed since the read).
+    fn kind(&self, follow: bool) -> Option<i64> {
+        match self {
+            Self::Path(path) => {
+                let md = if follow {
+                    std::fs::metadata(path)
+                } else {
+                    std::fs::symlink_metadata(path)
+                };
+                md.ok().map(|m| entry_kind_of(m.file_type()))
+            }
+            #[cfg(unix)]
+            Self::Under(fd, name) => {
+                fstatat_mode(*fd, name, follow)
+                    .ok()
+                    .map(|m| match m & libc::S_IFMT {
+                        libc::S_IFDIR => ENTRY_DIR,
+                        libc::S_IFREG => ENTRY_FILE,
+                        libc::S_IFLNK => ENTRY_LINK,
+                        _ => ENTRY_OTHER,
+                    })
+            }
+        }
+    }
+}
+
+fn entry_kind_of(ft: std::fs::FileType) -> i64 {
+    if ft.is_dir() {
+        ENTRY_DIR
+    } else if ft.is_file() {
+        ENTRY_FILE
+    } else if ft.is_symlink() {
+        ENTRY_LINK
+    } else {
+        ENTRY_OTHER
+    }
+}
+
+/// `DirEntry.is_dir(*, follow_symlinks=True)` and `is_file`: whether the
+/// entry is of kind `want`. The directory read's answer stands unless the
+/// entry is a link to follow, or the file system didn't say.
+fn entry_is(args: &[Object], follow: bool, want: i64) -> Result<Object, RuntimeError> {
+    let inst = entry_self(args)?;
+    let read = match inst.dict_cell().borrow().get(&entry_keys().kind) {
+        Some(Object::Int(kind)) => *kind,
+        _ => ENTRY_UNKNOWN,
+    };
+    let kind = match read {
+        ENTRY_UNKNOWN => EntryPlace::of(inst)?.kind(follow),
+        ENTRY_LINK if follow => EntryPlace::of(inst)?.kind(true),
+        known => Some(known),
+    };
+    Ok(Object::Bool(kind == Some(want)))
+}
+
+/// `DirEntry.is_symlink()`: always the link itself, never its target.
+fn entry_is_symlink(args: &[Object]) -> Result<Object, RuntimeError> {
+    let inst = entry_self(args)?;
+    let read = match inst.dict_cell().borrow().get(&entry_keys().kind) {
+        Some(Object::Int(kind)) => *kind,
+        _ => ENTRY_UNKNOWN,
+    };
+    let kind = match read {
+        ENTRY_UNKNOWN => EntryPlace::of(inst)?.kind(false),
+        known => Some(known),
+    };
+    Ok(Object::Bool(kind == Some(ENTRY_LINK)))
+}
+
+/// `DirEntry.inode()`: the number the directory read reported, so that it
+/// survives the entry being unlinked; an `lstat` only when there is none.
+fn entry_inode(args: &[Object]) -> Result<Object, RuntimeError> {
+    let inst = entry_self(args)?;
+    if let Some(ino @ Object::Int(_)) = inst.dict_cell().borrow().get(&entry_keys().ino) {
+        return Ok(ino.clone());
+    }
+    Ok(Object::Int(match EntryPlace::of(inst)? {
+        EntryPlace::Path(path) => dir_entry_inode(&path),
+        #[cfg(unix)]
+        EntryPlace::Under(fd, name) => fstatat_raw(fd, &name, false)
+            .map(|st| st.st_ino as i64)
+            .unwrap_or(0),
+    }))
+}
+
+/// `DirEntry.stat(*, follow_symlinks=True)`. An entry keeps the results it
+/// has fetched, as CPython's does: one for the entry itself and one for a
+/// link's target, which are the same thing for anything but a link.
+fn entry_stat(args: &[Object], follow: bool) -> Result<Object, RuntimeError> {
+    let inst = entry_self(args)?;
+    let keys = entry_keys();
+    let (cached, is_link) = {
+        let d = inst.dict_cell().borrow();
+        let is_link = !matches!(
+            d.get(&keys.kind),
+            Some(Object::Int(ENTRY_DIR | ENTRY_FILE | ENTRY_OTHER))
+        );
+        let follow = follow && is_link;
+        let key = if follow { &keys.stat } else { &keys.lstat };
+        (d.get(key).cloned(), is_link)
+    };
+    if let Some(result) = cached {
+        return Ok(result);
+    }
+    let follow = follow && is_link;
+    let result = match EntryPlace::of(inst)? {
+        EntryPlace::Path(path) => dir_entry_stat(&path, follow)?,
+        #[cfg(unix)]
+        EntryPlace::Under(fd, name) => fstatat_stat_result(fd, &name, follow, None)?,
+    };
+    let key = if follow { &keys.stat } else { &keys.lstat };
+    inst.dict_cell()
+        .borrow_mut()
+        .insert(key.clone(), result.clone());
+    Ok(result)
+}
+
+/// `DirEntry.__fspath__()`: its `path` (`str` for a `str` scandir, `bytes`
+/// for a `bytes` one), which is what lets `shutil.copytree` recurse with an
+/// entry as its source.
+fn entry_fspath(args: &[Object]) -> Result<Object, RuntimeError> {
+    entry_self(args)?
+        .dict_cell()
+        .borrow()
+        .get(&entry_keys().path)
+        .cloned()
+        .ok_or_else(|| type_error("DirEntry is missing its path"))
+}
+
+/// The methods every `DirEntry` shares, for its type's dict.
+fn dir_entry_methods(dict: &mut DictData) {
+    use crate::object::BuiltinFn;
+    let mut method = |name: &'static str,
+                      call: fn(&[Object]) -> Result<Object, RuntimeError>,
+                      call_kw: Option<
+        fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError>,
+    >| {
+        dict.insert(
+            DictKey(Object::from_static(name)),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name,
+                binds_instance: true,
+                call: Box::new(call),
+                call_kw: call_kw.map(|f| {
+                    Box::new(f)
+                        as Box<
+                            dyn Fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError>
+                                + Send
+                                + Sync,
+                        >
+                }),
+            })),
+        );
+    };
+    method("__fspath__", entry_fspath, None);
+    method(
+        "is_dir",
+        |args| entry_is(args, true, ENTRY_DIR),
+        Some(|args, kwargs| entry_is(args, dir_entry_follow(kwargs), ENTRY_DIR)),
+    );
+    method(
+        "is_file",
+        |args| entry_is(args, true, ENTRY_FILE),
+        Some(|args, kwargs| entry_is(args, dir_entry_follow(kwargs), ENTRY_FILE)),
+    );
+    method("is_symlink", entry_is_symlink, None);
+    // Windows reparse-point junctions: always `False` on POSIX (matching
+    // `os.path.isjunction`). `os.walk`'s `_walk_symlinks_as_files` mode
+    // calls this.
+    method("is_junction", |_args| Ok(Object::Bool(false)), None);
+    method("inode", entry_inode, None);
+    method(
+        "stat",
+        |args| entry_stat(args, true),
+        Some(|args, kwargs| entry_stat(args, dir_entry_follow(kwargs))),
+    );
+}
+
+/// An `os.DirEntry` for the entry at `fs_path`. `name` and `path` carry the
+/// *type* of the `scandir` argument: `str` entries for a `str` directory,
+/// `bytes` entries for a `bytes` one, the CPython invariant the verbatim
+/// `glob` relies on for bytes globs.
 fn build_dir_entry(
     name: Object,
     path: Object,
     fs_path: String,
+    kind: i64,
     cached_inode: Option<i64>,
 ) -> Object {
-    use crate::object::BuiltinFn;
     use crate::types::PyInstance;
-    let class = dir_entry_type();
-    let inst = PyInstance::new(class);
+    let keys = entry_keys();
+    let inst = PyInstance::new(dir_entry_type());
     {
         let mut d = inst.dict_cell().borrow_mut();
-        // `name`/`path` carry the *type* of the `scandir` argument: `str`
-        // entries for a `str` directory, `bytes` entries for a `bytes` one —
-        // the CPython invariant the verbatim `glob` relies on for bytes globs.
-        d.insert(DictKey(Object::from_static("name")), name);
-        d.insert(DictKey(Object::from_static("path")), path.clone());
-        // `os.PathLike`: `DirEntry.__fspath__()` returns the `.path` (str for a
-        // str scandir, bytes for a bytes one). This is what lets `shutil`'s
-        // `copytree` recurse with a `DirEntry` as `src` (the default
-        // `copy_function is copy2` path passes the entry, not a string, to
-        // `os.scandir`/`copy2`/`os.stat`).
-        d.insert(
-            DictKey(Object::from_static("__fspath__")),
-            Object::Builtin(Rc::new(BuiltinFn {
-                name: "__fspath__",
-                binds_instance: false,
-                call: Box::new(move |_args| Ok(path.clone())),
-                call_kw: None,
-            })),
-        );
-        d.insert(
-            DictKey(Object::from_static("is_dir")),
-            dir_entry_typecheck("is_dir", fs_path.clone(), true),
-        );
-        d.insert(
-            DictKey(Object::from_static("is_file")),
-            dir_entry_typecheck("is_file", fs_path.clone(), false),
-        );
-        // `is_symlink()` is always an lstat (no `follow_symlinks` in CPython).
-        let p_sym = fs_path.clone();
-        d.insert(
-            DictKey(Object::from_static("is_symlink")),
-            Object::Builtin(Rc::new(BuiltinFn {
-                name: "is_symlink",
-                binds_instance: false,
-                call: Box::new(move |_args| {
-                    Ok(Object::Bool(
-                        std::fs::symlink_metadata(&p_sym)
-                            .map(|m| m.file_type().is_symlink())
-                            .unwrap_or(false),
-                    ))
-                }),
-                call_kw: None,
-            })),
-        );
-        // `is_junction()` — Windows reparse-point junctions; always `False`
-        // on POSIX (matching `os.path.isjunction`). `os.walk`'s
-        // `_walk_symlinks_as_files` mode calls this.
-        d.insert(
-            DictKey(Object::from_static("is_junction")),
-            Object::Builtin(Rc::new(BuiltinFn {
-                name: "is_junction",
-                binds_instance: false,
-                call: Box::new(move |_args| Ok(Object::Bool(false))),
-                call_kw: None,
-            })),
-        );
-        // `inode()` — the entry's inode number (CPython `DirEntry.inode`),
-        // taken from the cached readdir value so it survives the entry being
-        // unlinked; falls back to a live `lstat` only when no cache exists.
-        let p_ino = fs_path.clone();
-        d.insert(
-            DictKey(Object::from_static("inode")),
-            Object::Builtin(Rc::new(BuiltinFn {
-                name: "inode",
-                binds_instance: false,
-                call: Box::new(move |_args| {
-                    Ok(Object::Int(
-                        cached_inode.unwrap_or_else(|| dir_entry_inode(&p_ino)),
-                    ))
-                }),
-                call_kw: None,
-            })),
-        );
-        let p_stat_pos = fs_path.clone();
-        let p_stat_kw = fs_path;
-        d.insert(
-            DictKey(Object::from_static("stat")),
-            Object::Builtin(Rc::new(BuiltinFn {
-                name: "stat",
-                binds_instance: false,
-                call: Box::new(move |_args| dir_entry_stat(&p_stat_pos, true)),
-                call_kw: Some(Box::new(move |_args, kwargs| {
-                    dir_entry_stat(&p_stat_kw, dir_entry_follow(kwargs))
-                })),
-            })),
-        );
+        d.insert(keys.name.clone(), name);
+        if !matches!(path, Object::Str(_)) {
+            d.insert(keys.fs.clone(), Object::from_str(fs_path));
+        }
+        d.insert(keys.path.clone(), path);
+        d.insert(keys.kind.clone(), Object::Int(kind));
+        if let Some(ino) = cached_inode {
+            d.insert(keys.ino.clone(), Object::Int(ino));
+        }
     }
     Object::Instance(Rc::new(inst))
 }
@@ -3846,7 +4010,7 @@ fn build_dir_entry(
 /// and `os.listdir(fd)`. The DIR* stream gets its own `dup` (which `closedir`
 /// reclaims) so the caller's fd survives — exactly like CPython.
 #[cfg(unix)]
-fn readdir_entries_fd(fd: libc::c_int) -> Result<Vec<(String, i64)>, RuntimeError> {
+fn readdir_entries_fd(fd: libc::c_int) -> Result<Vec<(String, i64, i64)>, RuntimeError> {
     // `fdopendir` takes ownership of the fd it is handed and `closedir` closes
     // it; dup first so the caller's fd survives (CPython dups for this reason).
     let dup_fd = unsafe { libc::dup(fd) };
@@ -3867,7 +4031,7 @@ fn readdir_entries_fd(fd: libc::c_int) -> Result<Vec<(String, i64)>, RuntimeErro
     // the full listing (the shared position is reset to 0, which is harmless
     // for the `openat`-relative descent `rmtree` performs next).
     unsafe { libc::rewinddir(dirp) };
-    let mut out: Vec<(String, i64)> = Vec::new();
+    let mut out: Vec<(String, i64, i64)> = Vec::new();
     loop {
         let ent = unsafe { libc::readdir(dirp) };
         if ent.is_null() {
@@ -3883,7 +4047,14 @@ fn readdir_entries_fd(fd: libc::c_int) -> Result<Vec<(String, i64)>, RuntimeErro
         // Cache the inode from the directory read so `DirEntry.inode()` keeps
         // working after the entry is unlinked (the `rmtree` case).
         let ino = unsafe { (*ent).d_ino } as i64;
-        out.push((name_str, ino));
+        let kind = match unsafe { (*ent).d_type } {
+            libc::DT_DIR => ENTRY_DIR,
+            libc::DT_REG => ENTRY_FILE,
+            libc::DT_LNK => ENTRY_LINK,
+            libc::DT_UNKNOWN => ENTRY_UNKNOWN,
+            _ => ENTRY_OTHER,
+        };
+        out.push((name_str, ino, kind));
     }
     unsafe { libc::closedir(dirp) };
     Ok(out)
@@ -3897,7 +4068,7 @@ fn readdir_entries_fd(fd: libc::c_int) -> Result<Vec<(String, i64)>, RuntimeErro
 fn scandir_fd(fd: libc::c_int) -> Result<Object, RuntimeError> {
     let entries: Vec<Object> = readdir_entries_fd(fd)?
         .into_iter()
-        .map(|(name, ino)| build_dir_entry_fd(name, fd, Some(ino)))
+        .map(|(name, ino, kind)| build_dir_entry_fd(name, fd, kind, ino))
         .collect();
     Ok(build_scandir_iterator(entries))
 }
@@ -3909,7 +4080,7 @@ fn scandir_fd(fd: libc::c_int) -> Result<Object, RuntimeError> {
 fn listdir_fd(fd: libc::c_int) -> Result<Object, RuntimeError> {
     let names: Vec<Object> = readdir_entries_fd(fd)?
         .into_iter()
-        .map(|(name, _)| Object::from_str(name))
+        .map(|(name, _, _)| Object::from_str(name))
         .collect();
     Ok(Object::new_list(names))
 }
@@ -3937,130 +4108,23 @@ fn fstatat_mode(dir_fd: libc::c_int, name: &str, follow: bool) -> std::io::Resul
     fstatat_raw(dir_fd, name, follow).map(|st| st.st_mode)
 }
 
-/// The `fstatat`-relative twin of [`dir_entry_typecheck`] for `os.scandir(fd)`
-/// entries: `is_dir`/`is_file` resolved against the parent's descriptor,
-/// `follow_symlinks`-aware (default `True`, matching CPython).
+/// An `os.DirEntry` for an `os.scandir(fd)` listing: `name` and `path` are
+/// the bare entry name (there is no directory path to join onto), and its
+/// methods resolve it against `dir_fd` (RFC 0040 WS1), which the caller keeps
+/// open across them, as CPython's caller does.
 #[cfg(unix)]
-fn dir_entry_fd_typecheck(
-    name: &'static str,
-    dir_fd: libc::c_int,
-    ent: String,
-    want_dir: bool,
-) -> Object {
-    let ent_pos = ent.clone();
-    let classify = move |ent: &str, follow: bool| -> bool {
-        fstatat_mode(dir_fd, ent, follow)
-            .map(|m| {
-                let fmt = m & libc::S_IFMT;
-                if want_dir {
-                    fmt == libc::S_IFDIR
-                } else {
-                    fmt == libc::S_IFREG
-                }
-            })
-            .unwrap_or(false)
-    };
-    let classify_pos = classify;
-    Object::Builtin(Rc::new(crate::object::BuiltinFn {
-        name,
-        binds_instance: false,
-        call: Box::new(move |_args| Ok(Object::Bool(classify_pos(&ent_pos, true)))),
-        call_kw: Some(Box::new(move |_args, kwargs| {
-            Ok(Object::Bool(classify(&ent, dir_entry_follow(kwargs))))
-        })),
-    }))
-}
-
-/// Build an `os.DirEntry` for an `os.scandir(fd)` listing: `name`/`path` are
-/// the bare entry name (no directory to join) and every lazy accessor resolves
-/// `fstatat`-relative to `dir_fd` (RFC 0040 WS1).
-#[cfg(unix)]
-fn build_dir_entry_fd(name: String, dir_fd: libc::c_int, cached_inode: Option<i64>) -> Object {
-    use crate::object::BuiltinFn;
+fn build_dir_entry_fd(name: String, dir_fd: libc::c_int, kind: i64, inode: i64) -> Object {
     use crate::types::PyInstance;
-    let class = dir_entry_type();
-    let inst = PyInstance::new(class);
-    let name_obj = Object::from_str(name.clone());
+    let keys = entry_keys();
+    let inst = PyInstance::new(dir_entry_type());
+    let name = Object::from_str(name);
     {
         let mut d = inst.dict_cell().borrow_mut();
-        d.insert(DictKey(Object::from_static("name")), name_obj.clone());
-        // For an fd-relative scandir CPython sets `.path` to the bare entry name
-        // (there is no directory path to join onto).
-        d.insert(DictKey(Object::from_static("path")), name_obj.clone());
-        let fspath = name_obj;
-        d.insert(
-            DictKey(Object::from_static("__fspath__")),
-            Object::Builtin(Rc::new(BuiltinFn {
-                name: "__fspath__",
-                binds_instance: false,
-                call: Box::new(move |_args| Ok(fspath.clone())),
-                call_kw: None,
-            })),
-        );
-        d.insert(
-            DictKey(Object::from_static("is_dir")),
-            dir_entry_fd_typecheck("is_dir", dir_fd, name.clone(), true),
-        );
-        d.insert(
-            DictKey(Object::from_static("is_file")),
-            dir_entry_fd_typecheck("is_file", dir_fd, name.clone(), false),
-        );
-        let sym_name = name.clone();
-        d.insert(
-            DictKey(Object::from_static("is_symlink")),
-            Object::Builtin(Rc::new(BuiltinFn {
-                name: "is_symlink",
-                binds_instance: false,
-                call: Box::new(move |_args| {
-                    Ok(Object::Bool(
-                        fstatat_mode(dir_fd, &sym_name, false)
-                            .map(|m| (m & libc::S_IFMT) == libc::S_IFLNK)
-                            .unwrap_or(false),
-                    ))
-                }),
-                call_kw: None,
-            })),
-        );
-        d.insert(
-            DictKey(Object::from_static("is_junction")),
-            Object::Builtin(Rc::new(BuiltinFn {
-                name: "is_junction",
-                binds_instance: false,
-                call: Box::new(move |_args| Ok(Object::Bool(false))),
-                call_kw: None,
-            })),
-        );
-        let ino_name = name.clone();
-        d.insert(
-            DictKey(Object::from_static("inode")),
-            Object::Builtin(Rc::new(BuiltinFn {
-                name: "inode",
-                binds_instance: false,
-                call: Box::new(move |_args| {
-                    Ok(Object::Int(cached_inode.unwrap_or_else(|| {
-                        fstatat_raw(dir_fd, &ino_name, false)
-                            .map(|st| st.st_ino as i64)
-                            .unwrap_or(0)
-                    })))
-                }),
-                call_kw: None,
-            })),
-        );
-        let stat_name_pos = name.clone();
-        let stat_name_kw = name;
-        d.insert(
-            DictKey(Object::from_static("stat")),
-            Object::Builtin(Rc::new(BuiltinFn {
-                name: "stat",
-                binds_instance: false,
-                call: Box::new(move |_args| {
-                    fstatat_stat_result(dir_fd, &stat_name_pos, true, None)
-                }),
-                call_kw: Some(Box::new(move |_args, kwargs| {
-                    fstatat_stat_result(dir_fd, &stat_name_kw, dir_entry_follow(kwargs), None)
-                })),
-            })),
-        );
+        d.insert(keys.name.clone(), name.clone());
+        d.insert(keys.path.clone(), name);
+        d.insert(keys.dir_fd.clone(), Object::Int(i64::from(dir_fd)));
+        d.insert(keys.kind.clone(), Object::Int(kind));
+        d.insert(keys.ino.clone(), Object::Int(inode));
     }
     Object::Instance(Rc::new(inst))
 }
@@ -7415,8 +7479,8 @@ fn struct_seq_init(
         // `None`. Only these names are consumable — CPython counts the found
         // keys and errors if the dict held anything else.
         let mut n_found = 0usize;
-        for i in values.len()..max {
-            let f = layout.slots[i].expect("hidden struct-seq slots are named");
+        for slot in layout.slots.iter().take(max).skip(values.len()) {
+            let f = slot.expect("hidden struct-seq slots are named");
             let v = dict_arg
                 .as_ref()
                 .and_then(|d2| d2.borrow().get(&DictKey(Object::from_static(f))).cloned());

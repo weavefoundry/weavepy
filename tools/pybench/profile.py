@@ -48,7 +48,8 @@ def parse(text):
             threads[-1][1].append((depth, int(m.group("count")), sym))
 
     waits = ("__ulock_wait", "__psynch_cvwait", "__semwait_signal", "mach_msg2_trap",
-             "mach_msg_trap", "kevent", "__select", "__psynch_mutexwait")
+             "mach_msg_trap", "kevent", "__select", "__psynch_mutexwait",
+             "semaphore_wait_trap", "semaphore_timedwait_trap")
 
     def busy(t):
         # Samples whose leaf isn't a wait: the next node is no deeper.

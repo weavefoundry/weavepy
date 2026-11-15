@@ -184,6 +184,21 @@ impl NativeEq for IntEq {
     }
 }
 
+/// A finite `float` probe: equal to a stored `float` of its value (`0.0`
+/// and `-0.0` are equal and hash alike). A stored `int` of equal value has
+/// the same hash too, and leaves the lookup undecided.
+struct FloatEq(f64);
+
+impl NativeEq for FloatEq {
+    #[inline(always)]
+    fn native_eq(&self, stored: &DictKey) -> Option<bool> {
+        match stored.0 {
+            Object::Float(g) => Some(g == self.0),
+            _ => None,
+        }
+    }
+}
+
 /// A class probe hashed by identity: equal to itself (a stored class of
 /// equal hash but another identity might compare through its metaclass's
 /// `__eq__`, so that leaves the lookup undecided).
@@ -652,9 +667,9 @@ impl<V> Table<V> {
     }
 
     /// [`Self::find_native`] for `key`, with its hash: a `str` whose hash
-    /// is known or a machine `int` hashed by itself, met only by stored
-    /// keys of its own kind (any other key, or a stored key of another
-    /// kind with an equal hash, leaves it undecided).
+    /// is known, a machine `int` hashed by itself, or a finite `float`,
+    /// met only by stored keys of its own kind (any other key, or a stored
+    /// key of another kind with an equal hash, leaves it undecided).
     #[inline(always)]
     pub fn find_object_native(&self, key: &Object) -> Option<(i64, Result<usize, usize>)> {
         use crate::shared_value::SharedStr;
@@ -666,6 +681,11 @@ impl<V> Table<V> {
             // (A machine int below the hash modulus is its own hash.)
             Object::Int(i) if (*i as u64) < (1 << 61) - 1 => {
                 Some((*i, self.find_native(*i, &IntEq(*i))?))
+            }
+            // (A NaN is found by identity, which the general lookup has.)
+            Object::Float(f) if f.is_finite() => {
+                let hash = crate::object::py_hash_double(*f);
+                Some((hash, self.find_native(hash, &FloatEq(*f))?))
             }
             _ => None,
         }

@@ -53,7 +53,12 @@ class SimpleQueue:
     # accelerator (test_types.test_method_descriptor_crash).
     from _weave_queue import simplequeue_put as put
 
-    def get(self, block=True, timeout=None):
+    # Native builtin (`_weave_queue.simplequeue_get`), as `put` is: an item
+    # that is already waiting is popped there, and an empty queue or a
+    # timeout comes to `_get_slow` below.
+    from _weave_queue import simplequeue_get as get
+
+    def _get_slow(self, block=True, timeout=None):
         '''Remove and return an item from the queue.
 
         If optional args 'block' is true and 'timeout' is None (the
@@ -96,21 +101,9 @@ class SimpleQueue:
             except IndexError:
                 pass
 
-    def put_nowait(self, item):
-        '''Put an item into the queue without blocking.
-
-        This is exactly equivalent to `put(item, block=False)` and is only
-        provided for compatibility with the Queue class.
-        '''
-        return self.put(item, block=False)
-
-    def get_nowait(self):
-        '''Remove and return an item from the queue without blocking.
-
-        Only get an item if one is immediately available. Otherwise
-        raise the Empty exception.
-        '''
-        return self.get(block=False)
+    # `put(item, block=False)` and `get(block=False)`, native as they are.
+    from _weave_queue import simplequeue_put_nowait as put_nowait
+    from _weave_queue import simplequeue_get_nowait as get_nowait
 
     def empty(self):
         '''Return True if the queue is empty, False otherwise (not reliable!).'''

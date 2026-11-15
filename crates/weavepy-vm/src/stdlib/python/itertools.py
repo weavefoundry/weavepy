@@ -116,588 +116,6 @@ except ImportError:
     _HAVE_NATIVE = False
 
 
-class _PyCoreBase:
-    def __iter__(self):
-        return self
-
-
-class _PyIsliceCore(_PyCoreBase):
-    __slots__ = ("source", "next_idx", "pos", "stop", "step", "done")
-
-    def __init__(self, source, start, stop, step):
-        self.source = source
-        self.next_idx = start
-        self.pos = 0
-        self.stop = stop
-        self.step = step
-        self.done = False
-
-    def __next__(self):
-        # CPython's islice_next order: consume the skipped elements
-        # first, *then* check the stop bound — `islice(it, 3, 3)`
-        # advances `it` by three even though it yields nothing.
-        if self.done:
-            raise StopIteration
-        src = self.source
-        try:
-            while self.pos < self.next_idx:
-                next(src)
-                self.pos += 1
-            stop = self.stop
-            if stop is not None and self.pos >= stop:
-                self.done = True
-                self.source = None
-                raise StopIteration
-            item = next(src)
-        except StopIteration:
-            self.done = True
-            self.source = None
-            raise
-        self.pos += 1
-        new_next = self.next_idx + self.step
-        if self.stop is not None and new_next > self.stop:
-            new_next = self.stop
-        self.next_idx = new_next
-        return item
-
-    def state(self):
-        return (self.source, self.next_idx, self.pos, self.stop, self.step,
-                self.done)
-
-
-class _PyRepeatCore(_PyCoreBase):
-    __slots__ = ("obj", "times")
-
-    def __init__(self, obj, times):
-        self.obj = obj
-        self.times = times
-
-    def __next__(self):
-        t = self.times
-        if t is None:
-            return self.obj
-        if t <= 0:
-            raise StopIteration
-        self.times = t - 1
-        return self.obj
-
-    def state(self):
-        return (self.obj, self.times)
-
-
-class _PyTeeCore(_PyCoreBase):
-    __slots__ = ("data", "index")
-
-    def __init__(self, data, index):
-        self.data = data
-        self.index = index
-
-    def __next__(self):
-        sh = self.data
-        buf = sh.buffer
-        i = self.index
-        if i < len(buf):
-            value = buf[i]
-        else:
-            if sh.source is None:
-                raise StopIteration
-            if sh.busy:
-                raise RuntimeError("cannot re-enter the tee iterator")
-            sh.busy = True
-            try:
-                try:
-                    value = next(sh.source)
-                except StopIteration:
-                    sh.source = None
-                    raise
-            finally:
-                sh.busy = False
-            buf.append(value)
-        self.index = i + 1
-        return value
-
-    def state(self):
-        return (self.data, self.index)
-
-
-class _PyCountCore(_PyCoreBase):
-    __slots__ = ("current", "step")
-
-    def __init__(self, current, step):
-        self.current = current
-        self.step = step
-
-    def __next__(self):
-        v = self.current
-        self.current = v + self.step
-        return v
-
-    def state(self):
-        return (self.current, self.step)
-
-
-class _PyCycleCore(_PyCoreBase):
-    __slots__ = ("source", "saved", "index", "firstpass")
-
-    def __init__(self, source, saved, index, firstpass):
-        self.source = source
-        self.saved = saved
-        self.index = index
-        self.firstpass = firstpass
-
-    def __next__(self):
-        src = self.source
-        if src is not None:
-            try:
-                item = next(src)
-            except StopIteration:
-                self.source = None
-            else:
-                if not self.firstpass:
-                    self.saved.append(item)
-                return item
-        saved = self.saved
-        if not saved:
-            raise StopIteration
-        i = self.index
-        item = saved[i]
-        i += 1
-        if i >= len(saved):
-            i = 0
-        self.index = i
-        return item
-
-    def state(self):
-        return (self.source, self.saved, self.index, self.firstpass)
-
-
-class _PyChainCore(_PyCoreBase):
-    __slots__ = ("source", "active")
-
-    def __init__(self, source, active):
-        self.source = source
-        self.active = active
-
-    def __next__(self):
-        while True:
-            source = self.source
-            if source is None:
-                raise StopIteration
-            active = self.active
-            if active is None:
-                try:
-                    iterable = next(source)
-                except StopIteration:
-                    self.source = None
-                    raise
-                except BaseException:
-                    self.source = None
-                    raise
-                try:
-                    active = iter(iterable)
-                except BaseException:
-                    self.source = None
-                    raise
-                self.active = active
-            try:
-                return next(active)
-            except StopIteration:
-                self.active = None
-            except BaseException:
-                self.source = None
-                self.active = None
-                raise
-
-    def state(self):
-        return (self.source, self.active)
-
-
-class _PyCompressCore(_PyCoreBase):
-    __slots__ = ("data", "selectors")
-
-    def __init__(self, data, selectors):
-        self.data = data
-        self.selectors = selectors
-
-    def __next__(self):
-        data = self.data
-        selectors = self.selectors
-        while True:
-            item = next(data)
-            keep = next(selectors)
-            if keep:
-                return item
-
-    def state(self):
-        return (self.data, self.selectors)
-
-
-class _PyDropWhileCore(_PyCoreBase):
-    __slots__ = ("func", "source", "started")
-
-    def __init__(self, func, source, started):
-        self.func = func
-        self.source = source
-        self.started = started
-
-    def __next__(self):
-        it = self.source
-        func = self.func
-        while True:
-            item = next(it)
-            if self.started:
-                return item
-            if not func(item):
-                self.started = True
-                return item
-
-    def state(self):
-        return (self.func, self.source, self.started)
-
-
-class _PyTakeWhileCore(_PyCoreBase):
-    __slots__ = ("func", "source", "stopped")
-
-    def __init__(self, func, source, stopped):
-        self.func = func
-        self.source = source
-        self.stopped = stopped
-
-    def __next__(self):
-        if self.stopped:
-            raise StopIteration
-        item = next(self.source)
-        if self.func(item):
-            return item
-        self.stopped = True
-        raise StopIteration
-
-    def state(self):
-        return (self.func, self.source, self.stopped)
-
-
-class _PyFilterFalseCore(_PyCoreBase):
-    __slots__ = ("func", "source")
-
-    def __init__(self, func, source):
-        self.func = func
-        self.source = source
-
-    def __next__(self):
-        func = self.func
-        it = self.source
-        while True:
-            item = next(it)
-            if func is None or func is bool:
-                if not item:
-                    return item
-            elif not func(item):
-                return item
-
-    def state(self):
-        return (self.func, self.source)
-
-
-class _PyStarMapCore(_PyCoreBase):
-    __slots__ = ("func", "source")
-
-    def __init__(self, func, source):
-        self.func = func
-        self.source = source
-
-    def __next__(self):
-        args = next(self.source)
-        if not isinstance(args, tuple):
-            args = tuple(args)
-        return self.func(*args)
-
-    def state(self):
-        return (self.func, self.source)
-
-
-class _PyPairwiseCore(_PyCoreBase):
-    __slots__ = ("source", "old")
-
-    def __init__(self, source):
-        self.source = source
-        self.old = None
-
-    def __next__(self):
-        it = self.source
-        if it is None:
-            raise StopIteration
-        old = self.old
-        if old is None:
-            try:
-                old = next(it)
-            except StopIteration:
-                self.source = None
-                self.old = None
-                raise
-        try:
-            new = next(it)
-        except StopIteration:
-            self.source = None
-            self.old = None
-            raise
-        self.old = new
-        return (old, new)
-
-    def state(self):
-        return (self.source, self.old)
-
-
-class _PyZipLongestCore(_PyCoreBase):
-    __slots__ = ("iters", "fillvalue", "numactive")
-
-    def __init__(self, fillvalue, iters):
-        self.iters = list(iters)
-        self.fillvalue = fillvalue
-        self.numactive = sum(1 for it in self.iters if it is not None)
-
-    def __next__(self):
-        iters = self.iters
-        if not iters or self.numactive <= 0:
-            raise StopIteration
-        fillvalue = self.fillvalue
-        result = []
-        for i, it in enumerate(iters):
-            if it is None:
-                result.append(fillvalue)
-                continue
-            try:
-                value = next(it)
-            except StopIteration:
-                self.numactive -= 1
-                if self.numactive <= 0:
-                    raise
-                iters[i] = None
-                result.append(fillvalue)
-            else:
-                result.append(value)
-        return tuple(result)
-
-    def state(self):
-        return (self.fillvalue, self.numactive, tuple(self.iters))
-
-
-class _PyAccumulateCore(_PyCoreBase):
-    __slots__ = ("source", "func", "has_total", "total", "initial")
-
-    def __init__(self, source, func, has_total, total, initial):
-        self.source = source
-        self.func = func
-        self.has_total = bool(has_total)
-        self.total = total
-        self.initial = initial
-
-    def __next__(self):
-        initial = self.initial
-        if initial is not None:
-            self.initial = None
-            self.has_total = True
-            self.total = initial
-            return initial
-        if not self.has_total:
-            total = next(self.source)
-            self.has_total = True
-            self.total = total
-            return total
-        item = next(self.source)
-        func = self.func
-        if func is None:
-            total = self.total + item
-        else:
-            total = func(self.total, item)
-        self.total = total
-        return total
-
-    def state(self):
-        return (self.source, self.func, self.has_total, self.total,
-                self.initial)
-
-
-class _PyProductCore(_PyCoreBase):
-    __slots__ = ("pools", "indices", "started", "stopped")
-
-    def __init__(self, pools, indices, started, stopped):
-        self.pools = pools
-        self.indices = list(indices) if indices is not None else [0] * len(pools)
-        self.started = started
-        self.stopped = stopped
-
-    def __next__(self):
-        if self.stopped:
-            raise StopIteration
-        pools = self.pools
-        n = len(pools)
-        indices = self.indices
-        if not self.started:
-            for pool in pools:
-                if not pool:
-                    self.stopped = True
-                    raise StopIteration
-            self.started = True
-            return tuple(pool[0] for pool in pools)
-        i = n - 1
-        while i >= 0:
-            indices[i] += 1
-            if indices[i] < len(pools[i]):
-                break
-            indices[i] = 0
-            i -= 1
-        else:
-            self.stopped = True
-            raise StopIteration
-        return tuple(pool[idx] for pool, idx in zip(pools, indices))
-
-    def state(self):
-        return (self.pools, tuple(self.indices), self.started, self.stopped)
-
-
-class _PyPermutationsCore(_PyCoreBase):
-    __slots__ = ("pool", "r", "indices", "cycles", "started", "stopped")
-
-    def __init__(self, pool, r, indices, cycles, started, stopped):
-        n = len(pool)
-        self.pool = pool
-        self.r = r
-        self.indices = list(indices) if indices is not None else list(range(n))
-        self.cycles = list(cycles) if cycles is not None else list(range(n, n - r, -1))
-        self.started = started
-        self.stopped = stopped
-
-    def __next__(self):
-        if self.stopped:
-            raise StopIteration
-        pool = self.pool
-        indices = self.indices
-        cycles = self.cycles
-        r = self.r
-        n = len(pool)
-        if not self.started:
-            self.started = True
-            return tuple(pool[indices[i]] for i in range(r))
-        if not n:
-            self.stopped = True
-            raise StopIteration
-        i = r - 1
-        while i >= 0:
-            cycles[i] -= 1
-            if cycles[i] == 0:
-                indices[i:] = indices[i + 1:] + indices[i:i + 1]
-                cycles[i] = n - i
-            else:
-                j = cycles[i]
-                indices[i], indices[-j] = indices[-j], indices[i]
-                return tuple(pool[indices[k]] for k in range(r))
-            i -= 1
-        self.stopped = True
-        raise StopIteration
-
-    def state(self):
-        return (self.pool, self.r, tuple(self.indices), tuple(self.cycles),
-                self.started, self.stopped)
-
-
-class _PyCombinationsCore(_PyCoreBase):
-    __slots__ = ("pool", "r", "indices", "started", "stopped")
-
-    def __init__(self, pool, r, indices, started, stopped):
-        self.pool = pool
-        self.r = r
-        self.indices = list(indices) if indices is not None else list(range(r))
-        self.started = started
-        self.stopped = stopped
-
-    def __next__(self):
-        if self.stopped:
-            raise StopIteration
-        pool = self.pool
-        indices = self.indices
-        r = self.r
-        n = len(pool)
-        if not self.started:
-            self.started = True
-            return tuple(pool[i] for i in indices)
-        i = r - 1
-        while i >= 0 and indices[i] == i + n - r:
-            i -= 1
-        if i < 0:
-            self.stopped = True
-            raise StopIteration
-        indices[i] += 1
-        for j in range(i + 1, r):
-            indices[j] = indices[j - 1] + 1
-        return tuple(pool[i] for i in indices)
-
-    def state(self):
-        return (self.pool, self.r, tuple(self.indices), self.started,
-                self.stopped)
-
-
-class _PyCwrCore(_PyCoreBase):
-    __slots__ = ("pool", "r", "indices", "started", "stopped")
-
-    def __init__(self, pool, r, indices, started, stopped):
-        self.pool = pool
-        self.r = r
-        self.indices = list(indices) if indices is not None else [0] * r
-        self.started = started
-        self.stopped = stopped
-
-    def __next__(self):
-        if self.stopped:
-            raise StopIteration
-        pool = self.pool
-        indices = self.indices
-        r = self.r
-        n = len(pool)
-        if not self.started:
-            self.started = True
-            return tuple(pool[i] for i in indices)
-        i = r - 1
-        while i >= 0 and indices[i] == n - 1:
-            i -= 1
-        if i < 0:
-            self.stopped = True
-            raise StopIteration
-        indices[i:] = [indices[i] + 1] * (r - i)
-        return tuple(pool[i] for i in indices)
-
-    def state(self):
-        return (self.pool, self.r, tuple(self.indices), self.started,
-                self.stopped)
-
-
-class _PyBatchedCore(_PyCoreBase):
-    __slots__ = ("source", "n", "strict")
-
-    def __init__(self, source, n, strict):
-        self.source = source
-        self.n = n
-        self.strict = strict
-
-    def __next__(self):
-        it = self.source
-        if it is None:
-            raise StopIteration
-        batch = []
-        try:
-            for _ in range(self.n):
-                batch.append(next(it))
-        except StopIteration:
-            self.source = None
-            if not batch:
-                raise
-            if self.strict:
-                raise ValueError("batched(): incomplete batch") from None
-        return tuple(batch)
-
-    def state(self):
-        return (self.source, self.n, self.strict)
-
-
 if _HAVE_NATIVE:
     _islice_core = _n.islice_core
     _repeat_core = _n.repeat_core
@@ -723,6 +141,588 @@ if _HAVE_NATIVE:
     def _islice_set_cnt(core, cnt):
         _n.islice_set_cnt(core, cnt)
 else:
+    # The pure-Python cores, with the native ones' state layout.
+    class _PyCoreBase:
+        def __iter__(self):
+            return self
+
+
+    class _PyIsliceCore(_PyCoreBase):
+        __slots__ = ("source", "next_idx", "pos", "stop", "step", "done")
+
+        def __init__(self, source, start, stop, step):
+            self.source = source
+            self.next_idx = start
+            self.pos = 0
+            self.stop = stop
+            self.step = step
+            self.done = False
+
+        def __next__(self):
+            # CPython's islice_next order: consume the skipped elements
+            # first, *then* check the stop bound — `islice(it, 3, 3)`
+            # advances `it` by three even though it yields nothing.
+            if self.done:
+                raise StopIteration
+            src = self.source
+            try:
+                while self.pos < self.next_idx:
+                    next(src)
+                    self.pos += 1
+                stop = self.stop
+                if stop is not None and self.pos >= stop:
+                    self.done = True
+                    self.source = None
+                    raise StopIteration
+                item = next(src)
+            except StopIteration:
+                self.done = True
+                self.source = None
+                raise
+            self.pos += 1
+            new_next = self.next_idx + self.step
+            if self.stop is not None and new_next > self.stop:
+                new_next = self.stop
+            self.next_idx = new_next
+            return item
+
+        def state(self):
+            return (self.source, self.next_idx, self.pos, self.stop, self.step,
+                    self.done)
+
+
+    class _PyRepeatCore(_PyCoreBase):
+        __slots__ = ("obj", "times")
+
+        def __init__(self, obj, times):
+            self.obj = obj
+            self.times = times
+
+        def __next__(self):
+            t = self.times
+            if t is None:
+                return self.obj
+            if t <= 0:
+                raise StopIteration
+            self.times = t - 1
+            return self.obj
+
+        def state(self):
+            return (self.obj, self.times)
+
+
+    class _PyTeeCore(_PyCoreBase):
+        __slots__ = ("data", "index")
+
+        def __init__(self, data, index):
+            self.data = data
+            self.index = index
+
+        def __next__(self):
+            sh = self.data
+            buf = sh.buffer
+            i = self.index
+            if i < len(buf):
+                value = buf[i]
+            else:
+                if sh.source is None:
+                    raise StopIteration
+                if sh.busy:
+                    raise RuntimeError("cannot re-enter the tee iterator")
+                sh.busy = True
+                try:
+                    try:
+                        value = next(sh.source)
+                    except StopIteration:
+                        sh.source = None
+                        raise
+                finally:
+                    sh.busy = False
+                buf.append(value)
+            self.index = i + 1
+            return value
+
+        def state(self):
+            return (self.data, self.index)
+
+
+    class _PyCountCore(_PyCoreBase):
+        __slots__ = ("current", "step")
+
+        def __init__(self, current, step):
+            self.current = current
+            self.step = step
+
+        def __next__(self):
+            v = self.current
+            self.current = v + self.step
+            return v
+
+        def state(self):
+            return (self.current, self.step)
+
+
+    class _PyCycleCore(_PyCoreBase):
+        __slots__ = ("source", "saved", "index", "firstpass")
+
+        def __init__(self, source, saved, index, firstpass):
+            self.source = source
+            self.saved = saved
+            self.index = index
+            self.firstpass = firstpass
+
+        def __next__(self):
+            src = self.source
+            if src is not None:
+                try:
+                    item = next(src)
+                except StopIteration:
+                    self.source = None
+                else:
+                    if not self.firstpass:
+                        self.saved.append(item)
+                    return item
+            saved = self.saved
+            if not saved:
+                raise StopIteration
+            i = self.index
+            item = saved[i]
+            i += 1
+            if i >= len(saved):
+                i = 0
+            self.index = i
+            return item
+
+        def state(self):
+            return (self.source, self.saved, self.index, self.firstpass)
+
+
+    class _PyChainCore(_PyCoreBase):
+        __slots__ = ("source", "active")
+
+        def __init__(self, source, active):
+            self.source = source
+            self.active = active
+
+        def __next__(self):
+            while True:
+                source = self.source
+                if source is None:
+                    raise StopIteration
+                active = self.active
+                if active is None:
+                    try:
+                        iterable = next(source)
+                    except StopIteration:
+                        self.source = None
+                        raise
+                    except BaseException:
+                        self.source = None
+                        raise
+                    try:
+                        active = iter(iterable)
+                    except BaseException:
+                        self.source = None
+                        raise
+                    self.active = active
+                try:
+                    return next(active)
+                except StopIteration:
+                    self.active = None
+                except BaseException:
+                    self.source = None
+                    self.active = None
+                    raise
+
+        def state(self):
+            return (self.source, self.active)
+
+
+    class _PyCompressCore(_PyCoreBase):
+        __slots__ = ("data", "selectors")
+
+        def __init__(self, data, selectors):
+            self.data = data
+            self.selectors = selectors
+
+        def __next__(self):
+            data = self.data
+            selectors = self.selectors
+            while True:
+                item = next(data)
+                keep = next(selectors)
+                if keep:
+                    return item
+
+        def state(self):
+            return (self.data, self.selectors)
+
+
+    class _PyDropWhileCore(_PyCoreBase):
+        __slots__ = ("func", "source", "started")
+
+        def __init__(self, func, source, started):
+            self.func = func
+            self.source = source
+            self.started = started
+
+        def __next__(self):
+            it = self.source
+            func = self.func
+            while True:
+                item = next(it)
+                if self.started:
+                    return item
+                if not func(item):
+                    self.started = True
+                    return item
+
+        def state(self):
+            return (self.func, self.source, self.started)
+
+
+    class _PyTakeWhileCore(_PyCoreBase):
+        __slots__ = ("func", "source", "stopped")
+
+        def __init__(self, func, source, stopped):
+            self.func = func
+            self.source = source
+            self.stopped = stopped
+
+        def __next__(self):
+            if self.stopped:
+                raise StopIteration
+            item = next(self.source)
+            if self.func(item):
+                return item
+            self.stopped = True
+            raise StopIteration
+
+        def state(self):
+            return (self.func, self.source, self.stopped)
+
+
+    class _PyFilterFalseCore(_PyCoreBase):
+        __slots__ = ("func", "source")
+
+        def __init__(self, func, source):
+            self.func = func
+            self.source = source
+
+        def __next__(self):
+            func = self.func
+            it = self.source
+            while True:
+                item = next(it)
+                if func is None or func is bool:
+                    if not item:
+                        return item
+                elif not func(item):
+                    return item
+
+        def state(self):
+            return (self.func, self.source)
+
+
+    class _PyStarMapCore(_PyCoreBase):
+        __slots__ = ("func", "source")
+
+        def __init__(self, func, source):
+            self.func = func
+            self.source = source
+
+        def __next__(self):
+            args = next(self.source)
+            if not isinstance(args, tuple):
+                args = tuple(args)
+            return self.func(*args)
+
+        def state(self):
+            return (self.func, self.source)
+
+
+    class _PyPairwiseCore(_PyCoreBase):
+        __slots__ = ("source", "old")
+
+        def __init__(self, source):
+            self.source = source
+            self.old = None
+
+        def __next__(self):
+            it = self.source
+            if it is None:
+                raise StopIteration
+            old = self.old
+            if old is None:
+                try:
+                    old = next(it)
+                except StopIteration:
+                    self.source = None
+                    self.old = None
+                    raise
+            try:
+                new = next(it)
+            except StopIteration:
+                self.source = None
+                self.old = None
+                raise
+            self.old = new
+            return (old, new)
+
+        def state(self):
+            return (self.source, self.old)
+
+
+    class _PyZipLongestCore(_PyCoreBase):
+        __slots__ = ("iters", "fillvalue", "numactive")
+
+        def __init__(self, fillvalue, iters):
+            self.iters = list(iters)
+            self.fillvalue = fillvalue
+            self.numactive = sum(1 for it in self.iters if it is not None)
+
+        def __next__(self):
+            iters = self.iters
+            if not iters or self.numactive <= 0:
+                raise StopIteration
+            fillvalue = self.fillvalue
+            result = []
+            for i, it in enumerate(iters):
+                if it is None:
+                    result.append(fillvalue)
+                    continue
+                try:
+                    value = next(it)
+                except StopIteration:
+                    self.numactive -= 1
+                    if self.numactive <= 0:
+                        raise
+                    iters[i] = None
+                    result.append(fillvalue)
+                else:
+                    result.append(value)
+            return tuple(result)
+
+        def state(self):
+            return (self.fillvalue, self.numactive, tuple(self.iters))
+
+
+    class _PyAccumulateCore(_PyCoreBase):
+        __slots__ = ("source", "func", "has_total", "total", "initial")
+
+        def __init__(self, source, func, has_total, total, initial):
+            self.source = source
+            self.func = func
+            self.has_total = bool(has_total)
+            self.total = total
+            self.initial = initial
+
+        def __next__(self):
+            initial = self.initial
+            if initial is not None:
+                self.initial = None
+                self.has_total = True
+                self.total = initial
+                return initial
+            if not self.has_total:
+                total = next(self.source)
+                self.has_total = True
+                self.total = total
+                return total
+            item = next(self.source)
+            func = self.func
+            if func is None:
+                total = self.total + item
+            else:
+                total = func(self.total, item)
+            self.total = total
+            return total
+
+        def state(self):
+            return (self.source, self.func, self.has_total, self.total,
+                    self.initial)
+
+
+    class _PyProductCore(_PyCoreBase):
+        __slots__ = ("pools", "indices", "started", "stopped")
+
+        def __init__(self, pools, indices, started, stopped):
+            self.pools = pools
+            self.indices = list(indices) if indices is not None else [0] * len(pools)
+            self.started = started
+            self.stopped = stopped
+
+        def __next__(self):
+            if self.stopped:
+                raise StopIteration
+            pools = self.pools
+            n = len(pools)
+            indices = self.indices
+            if not self.started:
+                for pool in pools:
+                    if not pool:
+                        self.stopped = True
+                        raise StopIteration
+                self.started = True
+                return tuple(pool[0] for pool in pools)
+            i = n - 1
+            while i >= 0:
+                indices[i] += 1
+                if indices[i] < len(pools[i]):
+                    break
+                indices[i] = 0
+                i -= 1
+            else:
+                self.stopped = True
+                raise StopIteration
+            return tuple(pool[idx] for pool, idx in zip(pools, indices))
+
+        def state(self):
+            return (self.pools, tuple(self.indices), self.started, self.stopped)
+
+
+    class _PyPermutationsCore(_PyCoreBase):
+        __slots__ = ("pool", "r", "indices", "cycles", "started", "stopped")
+
+        def __init__(self, pool, r, indices, cycles, started, stopped):
+            n = len(pool)
+            self.pool = pool
+            self.r = r
+            self.indices = list(indices) if indices is not None else list(range(n))
+            self.cycles = list(cycles) if cycles is not None else list(range(n, n - r, -1))
+            self.started = started
+            self.stopped = stopped
+
+        def __next__(self):
+            if self.stopped:
+                raise StopIteration
+            pool = self.pool
+            indices = self.indices
+            cycles = self.cycles
+            r = self.r
+            n = len(pool)
+            if not self.started:
+                self.started = True
+                return tuple(pool[indices[i]] for i in range(r))
+            if not n:
+                self.stopped = True
+                raise StopIteration
+            i = r - 1
+            while i >= 0:
+                cycles[i] -= 1
+                if cycles[i] == 0:
+                    indices[i:] = indices[i + 1:] + indices[i:i + 1]
+                    cycles[i] = n - i
+                else:
+                    j = cycles[i]
+                    indices[i], indices[-j] = indices[-j], indices[i]
+                    return tuple(pool[indices[k]] for k in range(r))
+                i -= 1
+            self.stopped = True
+            raise StopIteration
+
+        def state(self):
+            return (self.pool, self.r, tuple(self.indices), tuple(self.cycles),
+                    self.started, self.stopped)
+
+
+    class _PyCombinationsCore(_PyCoreBase):
+        __slots__ = ("pool", "r", "indices", "started", "stopped")
+
+        def __init__(self, pool, r, indices, started, stopped):
+            self.pool = pool
+            self.r = r
+            self.indices = list(indices) if indices is not None else list(range(r))
+            self.started = started
+            self.stopped = stopped
+
+        def __next__(self):
+            if self.stopped:
+                raise StopIteration
+            pool = self.pool
+            indices = self.indices
+            r = self.r
+            n = len(pool)
+            if not self.started:
+                self.started = True
+                return tuple(pool[i] for i in indices)
+            i = r - 1
+            while i >= 0 and indices[i] == i + n - r:
+                i -= 1
+            if i < 0:
+                self.stopped = True
+                raise StopIteration
+            indices[i] += 1
+            for j in range(i + 1, r):
+                indices[j] = indices[j - 1] + 1
+            return tuple(pool[i] for i in indices)
+
+        def state(self):
+            return (self.pool, self.r, tuple(self.indices), self.started,
+                    self.stopped)
+
+
+    class _PyCwrCore(_PyCoreBase):
+        __slots__ = ("pool", "r", "indices", "started", "stopped")
+
+        def __init__(self, pool, r, indices, started, stopped):
+            self.pool = pool
+            self.r = r
+            self.indices = list(indices) if indices is not None else [0] * r
+            self.started = started
+            self.stopped = stopped
+
+        def __next__(self):
+            if self.stopped:
+                raise StopIteration
+            pool = self.pool
+            indices = self.indices
+            r = self.r
+            n = len(pool)
+            if not self.started:
+                self.started = True
+                return tuple(pool[i] for i in indices)
+            i = r - 1
+            while i >= 0 and indices[i] == n - 1:
+                i -= 1
+            if i < 0:
+                self.stopped = True
+                raise StopIteration
+            indices[i:] = [indices[i] + 1] * (r - i)
+            return tuple(pool[i] for i in indices)
+
+        def state(self):
+            return (self.pool, self.r, tuple(self.indices), self.started,
+                    self.stopped)
+
+
+    class _PyBatchedCore(_PyCoreBase):
+        __slots__ = ("source", "n", "strict")
+
+        def __init__(self, source, n, strict):
+            self.source = source
+            self.n = n
+            self.strict = strict
+
+        def __next__(self):
+            it = self.source
+            if it is None:
+                raise StopIteration
+            batch = []
+            try:
+                for _ in range(self.n):
+                    batch.append(next(it))
+            except StopIteration:
+                self.source = None
+                if not batch:
+                    raise
+                if self.strict:
+                    raise ValueError("batched(): incomplete batch") from None
+            return tuple(batch)
+
+        def state(self):
+            return (self.source, self.n, self.strict)
+
     _islice_core = _PyIsliceCore
     _repeat_core = _PyRepeatCore
     _tee_core = _PyTeeCore
@@ -1253,129 +1253,6 @@ class starmap:
 # groupby / _grouper
 # ---------------------------------------------------------------------------
 
-class groupby:
-    """groupby(iterable, key=None) -> make an iterator that returns
-    consecutive keys and groups from the iterable.
-    """
-
-    def __new__(cls, iterable=_NULL, key=None, *rest):
-        if rest:
-            raise TypeError(
-                f"groupby() takes at most 2 arguments ({2 + len(rest)} given)"
-            )
-        if iterable is _NULL:
-            raise TypeError("groupby() missing required argument 'iterable' (pos 1)")
-        self = object.__new__(cls)
-        self._it = iter(iterable)
-        self._keyfunc = key
-        self._tgtkey = _NULL
-        self._currkey = _NULL
-        self._currvalue = _NULL
-        self._currgrouper = None
-        return self
-
-    def __iter__(self):
-        return self
-
-    def _groupby_step(self):
-        # Pull the next (value, key) pair; assign both only after both
-        # succeeded (CPython groupby_step's temporaries — re-entrant
-        # key functions must not observe a half-updated state).
-        newvalue = next(self._it)
-        keyfunc = self._keyfunc
-        if keyfunc is None:
-            newkey = newvalue
-        else:
-            newkey = keyfunc(newvalue)
-        self._currkey = newkey
-        self._currvalue = newvalue
-
-    def __next__(self):
-        self._currgrouper = None
-        # Skip to the next iteration group.
-        while True:
-            currkey = self._currkey
-            if currkey is _NULL:
-                pass
-            elif self._tgtkey is _NULL:
-                break
-            else:
-                tgtkey = self._tgtkey
-                if not (tgtkey is currkey or tgtkey == currkey):
-                    break
-            self._groupby_step()
-        self._tgtkey = self._currkey
-        grouper = _grouper(self, self._tgtkey)
-        self._currgrouper = grouper
-        return (self._currkey, grouper)
-
-    def __reduce__(self):
-        _pickle_deprecated()
-        if (
-            self._tgtkey is not _NULL
-            and self._currkey is not _NULL
-            and self._currvalue is not _NULL
-        ):
-            return (
-                type(self),
-                (self._it, self._keyfunc),
-                (self._currkey, self._currvalue, self._tgtkey),
-            )
-        return (type(self), (self._it, self._keyfunc))
-
-    def __setstate__(self, state):
-        _pickle_deprecated()
-        if not (isinstance(state, tuple) and len(state) == 3):
-            raise TypeError("state is not a 3-tuple")
-        currkey, currvalue, tgtkey = state
-        self._currkey = currkey
-        self._currvalue = currvalue
-        self._tgtkey = tgtkey
-
-
-class _grouper:
-
-    def __new__(cls, parent, tgtkey):
-        if not isinstance(parent, groupby):
-            raise TypeError("incorrect usage of internal _grouper")
-        self = object.__new__(cls)
-        self._parent = parent
-        self._tgtkey = tgtkey
-        # CPython's _grouper_new runs _grouper_create, which installs
-        # the new grouper as the parent's current one — unpickled
-        # groupers must resume the in-progress group.
-        parent._currgrouper = self
-        return self
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        gbo = self._parent
-        if gbo._currgrouper is not self:
-            raise StopIteration
-        if gbo._currvalue is _NULL:
-            gbo._groupby_step()
-        currkey = gbo._currkey
-        tgtkey = self._tgtkey
-        if not (tgtkey is currkey or tgtkey == currkey):
-            raise StopIteration
-        # The == above may run user __eq__ that re-enters this grouper
-        # (gh-146613) — re-check the state it could have mutated.
-        if gbo._currgrouper is not self or gbo._currvalue is _NULL:
-            raise StopIteration
-        r = gbo._currvalue
-        gbo._currvalue = _NULL
-        gbo._currkey = _NULL
-        return r
-
-    def __reduce__(self):
-        _pickle_deprecated()
-        if self._parent._currgrouper is self:
-            return (type(self), (self._parent, self._tgtkey))
-        return (iter, ((),))
-
-
 if _HAVE_NATIVE and hasattr(_n, "groupby_core"):
     # Native cores: the exact classes build them directly (an exact
     # `groupby`'s groups are native `_grouper`s), and these classes serve
@@ -1441,7 +1318,128 @@ if _HAVE_NATIVE and hasattr(_n, "groupby_core"):
             if current:
                 return (type(self), (parent, tgtkey))
             return (iter, ((),))
+else:
+    class groupby:
+        """groupby(iterable, key=None) -> make an iterator that returns
+        consecutive keys and groups from the iterable.
+        """
 
+        def __new__(cls, iterable=_NULL, key=None, *rest):
+            if rest:
+                raise TypeError(
+                    f"groupby() takes at most 2 arguments ({2 + len(rest)} given)"
+                )
+            if iterable is _NULL:
+                raise TypeError("groupby() missing required argument 'iterable' (pos 1)")
+            self = object.__new__(cls)
+            self._it = iter(iterable)
+            self._keyfunc = key
+            self._tgtkey = _NULL
+            self._currkey = _NULL
+            self._currvalue = _NULL
+            self._currgrouper = None
+            return self
+
+        def __iter__(self):
+            return self
+
+        def _groupby_step(self):
+            # Pull the next (value, key) pair; assign both only after both
+            # succeeded (CPython groupby_step's temporaries — re-entrant
+            # key functions must not observe a half-updated state).
+            newvalue = next(self._it)
+            keyfunc = self._keyfunc
+            if keyfunc is None:
+                newkey = newvalue
+            else:
+                newkey = keyfunc(newvalue)
+            self._currkey = newkey
+            self._currvalue = newvalue
+
+        def __next__(self):
+            self._currgrouper = None
+            # Skip to the next iteration group.
+            while True:
+                currkey = self._currkey
+                if currkey is _NULL:
+                    pass
+                elif self._tgtkey is _NULL:
+                    break
+                else:
+                    tgtkey = self._tgtkey
+                    if not (tgtkey is currkey or tgtkey == currkey):
+                        break
+                self._groupby_step()
+            self._tgtkey = self._currkey
+            grouper = _grouper(self, self._tgtkey)
+            self._currgrouper = grouper
+            return (self._currkey, grouper)
+
+        def __reduce__(self):
+            _pickle_deprecated()
+            if (
+                self._tgtkey is not _NULL
+                and self._currkey is not _NULL
+                and self._currvalue is not _NULL
+            ):
+                return (
+                    type(self),
+                    (self._it, self._keyfunc),
+                    (self._currkey, self._currvalue, self._tgtkey),
+                )
+            return (type(self), (self._it, self._keyfunc))
+
+        def __setstate__(self, state):
+            _pickle_deprecated()
+            if not (isinstance(state, tuple) and len(state) == 3):
+                raise TypeError("state is not a 3-tuple")
+            currkey, currvalue, tgtkey = state
+            self._currkey = currkey
+            self._currvalue = currvalue
+            self._tgtkey = tgtkey
+
+
+    class _grouper:
+
+        def __new__(cls, parent, tgtkey):
+            if not isinstance(parent, groupby):
+                raise TypeError("incorrect usage of internal _grouper")
+            self = object.__new__(cls)
+            self._parent = parent
+            self._tgtkey = tgtkey
+            # CPython's _grouper_new runs _grouper_create, which installs
+            # the new grouper as the parent's current one — unpickled
+            # groupers must resume the in-progress group.
+            parent._currgrouper = self
+            return self
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            gbo = self._parent
+            if gbo._currgrouper is not self:
+                raise StopIteration
+            if gbo._currvalue is _NULL:
+                gbo._groupby_step()
+            currkey = gbo._currkey
+            tgtkey = self._tgtkey
+            if not (tgtkey is currkey or tgtkey == currkey):
+                raise StopIteration
+            # The == above may run user __eq__ that re-enters this grouper
+            # (gh-146613) — re-check the state it could have mutated.
+            if gbo._currgrouper is not self or gbo._currvalue is _NULL:
+                raise StopIteration
+            r = gbo._currvalue
+            gbo._currvalue = _NULL
+            gbo._currkey = _NULL
+            return r
+
+        def __reduce__(self):
+            _pickle_deprecated()
+            if self._parent._currgrouper is self:
+                return (type(self), (self._parent, self._tgtkey))
+            return (iter, ((),))
 
 
 # ---------------------------------------------------------------------------

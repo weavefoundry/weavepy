@@ -1164,7 +1164,7 @@ fn fh_fatal_error_c_thread(_args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn flush_std_streams() {
     use std::io::Write;
-    let _ = std::io::stdout().flush();
+    let _ = crate::vm_singletons::flush_host_stdout();
     let _ = std::io::stderr().flush();
 }
 

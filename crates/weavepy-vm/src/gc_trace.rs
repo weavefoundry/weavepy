@@ -1894,6 +1894,7 @@ impl GcState {
         if !due || self.observed_span.load(Ordering::Acquire) {
             return false;
         }
+        crate::memory_tick();
         // The older objects found dead (a slice of the older generations
         // sized to the threshold, so a program that frees what it
         // allocates is seen to) offset the young survivors. Deaths beyond

@@ -482,7 +482,7 @@ fn run_source_with_options_impl(
         // CPython: a failed `Py_FinalizeEx` (here: `sys.stdout` would
         // not flush) turns the whole run into exit status 120,
         // overriding even a `SystemExit` code.
-        std::process::exit(120);
+        vm::vm_singletons::exit_process(120);
     }
     (Some(interpreter), result.map(|_| ()))
 }

@@ -1495,52 +1495,107 @@ enum ChildOutcome {
 /// waiting for us to read, while we block in `wait()` waiting for it to
 /// exit. A `unittest` file with hundreds of failing assertions trips this
 /// instantly, so the reader threads are load-bearing for subprocess mode.
+///
+/// The readers see end-of-file only once *every* holder of the pipe's
+/// write end is gone, and a test's own children inherit it. So once the
+/// child has exited (or been killed) the readers get a bounded grace
+/// period, after which whatever they have read so far is the output: a
+/// grandchild that outlives its parent (a `multiprocessing` worker, a
+/// re-exec'd interpreter that hangs) costs the run a few seconds instead
+/// of holding the whole runner until its job times out. On Windows there
+/// is no process group to kill, so a timeout also asks `taskkill` to end
+/// the child's tree.
 fn wait_with_timeout(mut child: std::process::Child, timeout: Duration) -> ChildOutcome {
-    fn drain(
-        pipe: Option<impl std::io::Read + Send + 'static>,
-    ) -> Option<std::thread::JoinHandle<Vec<u8>>> {
-        pipe.map(|mut s| {
-            std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                let _ = s.read_to_end(&mut buf);
-                buf
-            })
-        })
-    }
-    fn collect(handle: Option<std::thread::JoinHandle<Vec<u8>>>) -> String {
-        handle
-            .and_then(|h| h.join().ok())
-            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-            .unwrap_or_default()
+    use std::sync::{Arc, Mutex};
+
+    /// How long the readers get to reach end-of-file once the child is
+    /// gone. What is still in the pipe drains in milliseconds; only a
+    /// surviving holder of the write end takes longer.
+    const DRAIN_GRACE: Duration = Duration::from_secs(5);
+
+    struct Reader {
+        thread: std::thread::JoinHandle<()>,
+        bytes: Arc<Mutex<Vec<u8>>>,
     }
 
-    let out_handle = drain(child.stdout.take());
-    let err_handle = drain(child.stderr.take());
+    fn drain(pipe: Option<impl std::io::Read + Send + 'static>) -> Option<Reader> {
+        pipe.map(|mut s| {
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&bytes);
+            let thread = std::thread::spawn(move || {
+                let mut chunk = vec![0u8; 64 * 1024];
+                loop {
+                    match s.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if let Ok(mut held) = sink.lock() {
+                                held.extend_from_slice(&chunk[..n]);
+                            }
+                        }
+                    }
+                }
+            });
+            Reader { thread, bytes }
+        })
+    }
+    /// The readers' output, waiting until `deadline` for them to finish.
+    fn collect(reader: Option<Reader>, deadline: Instant) -> String {
+        let Some(Reader { thread, bytes }) = reader else {
+            return String::new();
+        };
+        while !thread.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if thread.is_finished() {
+            let _ = thread.join();
+        }
+        // (A reader still blocked on a held pipe keeps running detached;
+        // it ends with whoever holds the pipe.)
+        let held = bytes.lock().map(|b| b.clone()).unwrap_or_default();
+        String::from_utf8_lossy(&held).into_owned()
+    }
+
+    let out_reader = drain(child.stdout.take());
+    let err_reader = drain(child.stderr.take());
     let start = Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                return ChildOutcome::Exited(status, collect(out_handle), collect(err_handle));
+                let deadline = Instant::now() + DRAIN_GRACE;
+                return ChildOutcome::Exited(
+                    status,
+                    collect(out_reader, deadline),
+                    collect(err_reader, deadline),
+                );
             }
             Ok(None) => {
                 if start.elapsed() > timeout {
                     // SIGKILL the *whole process group* (the child is a group
-                    // leader, see `spawn_subprocess`) so any grandchildren that
+                    // leader, see `run_subprocess`) so any grandchildren that
                     // re-exec'd `weavepy` (multiprocessing resource_tracker /
                     // pool workers, subprocess re-execs) die too and release the
-                    // inherited stdout/stderr pipe — otherwise `read_to_end`
-                    // below never reaches EOF and the runner hangs.
+                    // inherited stdout/stderr pipe.
                     #[cfg(unix)]
                     unsafe {
                         libc::kill(-(child.id() as i32), libc::SIGKILL);
                     }
+                    // (Windows has no group to signal: the tree by pid.)
+                    #[cfg(windows)]
+                    {
+                        let _ = std::process::Command::new("taskkill")
+                            .args(["/T", "/F", "/PID", &child.id().to_string()])
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status();
+                    }
                     let _ = child.kill();
                     let _ = child.wait();
-                    // Join the readers so the threads don't outlive us;
-                    // the pipes close once the whole group is gone, so they
-                    // return promptly.
-                    let _ = collect(out_handle);
-                    let _ = collect(err_handle);
+                    // The readers finish promptly once the tree is gone; the
+                    // grace period covers a holder the kill missed.
+                    let deadline = Instant::now() + DRAIN_GRACE;
+                    let _ = collect(out_reader, deadline);
+                    let _ = collect(err_reader, deadline);
                     return ChildOutcome::TimedOut;
                 }
                 std::thread::sleep(Duration::from_millis(50));

@@ -149,41 +149,34 @@ class local:
         self = object.__new__(cls)
         impl = _localimpl(args, kw)
         object.__setattr__(self, '_local__impl', impl)
+        # The creating thread's namespace exists from the start: the
+        # ``__init__`` call that follows ``__new__`` is this thread's, and
+        # a first touch from inside it mustn't run ``__init__`` again
+        # (CPython's ``local_new`` and ``_threading_local`` do the same).
+        impl.dicts[_get_ident()] = {}
         _register_impl(impl)
         return self
 
-    def __getattribute__(self, name):
-        impl = object.__getattribute__(self, '_local__impl')
-        slot = _slot(self, impl)
-        # ``local().__dict__`` is the calling thread's namespace, mirroring the
-        # C type (and ``test__threading_local``).
-        if name == '__dict__':
-            return slot
-        # The per-thread slot acts as the instance dict: a value stored here
-        # shadows a like-named class attribute, exactly like the C type.
-        if name in slot:
-            return slot[name]
-        return object.__getattribute__(self, name)
+    def _local__namespace(self):
+        """The calling thread's namespace, made on its first touch."""
+        return _slot(self, object.__getattribute__(self, '_local__impl'))
 
-    def __setattr__(self, name, value):
-        if name == '__dict__':
-            raise AttributeError(
-                "%r object attribute '__dict__' is read-only"
-                % type(self).__name__)
-        impl = object.__getattribute__(self, '_local__impl')
-        _slot(self, impl)[name] = value
-
-    def __delattr__(self, name):
-        if name == '__dict__':
-            raise AttributeError(
-                "%r object attribute '__dict__' is read-only"
-                % type(self).__name__)
-        impl = object.__getattribute__(self, '_local__impl')
-        slot = _slot(self, impl)
-        if name in slot:
-            del slot[name]
-        else:
-            raise AttributeError(name)
+    # The hooks are native builtins (`_weave_local`, see
+    # ``crates/weavepy-vm/src/stdlib/local_native.rs``). They do what the
+    # C type's do with the thread's dict:
+    #
+    # * ``__getattribute__``: ``__dict__`` is the thread's namespace
+    #   (mirroring the C type, and ``test__threading_local``); a name
+    #   stored there shadows a like-named class attribute; anything else
+    #   is ``object.__getattribute__``'s.
+    # * ``__setattr__`` and ``__delattr__``: an entry of the thread's
+    #   namespace; ``__dict__`` itself is read-only.
+    #
+    # Each thread remembers the namespace ``_local__namespace`` gave it,
+    # so only a thread's first touch runs Python.
+    from _weave_local import local_getattribute as __getattribute__
+    from _weave_local import local_setattr as __setattr__
+    from _weave_local import local_delattr as __delattr__
 
 
 # CPython ships ``local`` as the C type ``_thread._local`` and ``threading``

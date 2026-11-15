@@ -20,8 +20,9 @@ are how it measures progress.
 | --- | --- | --- |
 | CPython test suite | 464 of 468 `Lib/test` entries pass | November 2, 2026, on macOS |
 | Real packages | 48 of 48 install and pass a behavior check | September 2026, on macOS and Linux; kept in CI |
-| Warm speed | 0.87 times CPython's time | November 10, 2026, over 33 workloads |
-| Peak memory | 1.27 times CPython's | November 10, 2026, over 33 workloads |
+| Warm speed | 0.85 times CPython's time | November 13, 2026, over 33 workloads |
+| Peak memory | 1.14 times CPython's resident set, 1.22 times its footprint | November 13, 2026, over 33 workloads |
+| Everyday library code | 1.44 times CPython's time | November 13, 2026, over 54 short loops |
 
 The sections below explain what these numbers cover and where they fall short.
 
@@ -96,21 +97,46 @@ See [Conformance](docs/CONFORMANCE.md) for how the grading works.
 ## Performance
 
 These ratios compare WeavePy with CPython 3.14.8, so lower is better. They're
-the geometric mean of 33 realistic workloads, measured on November 10, 2026, at
-`57960cea` on an Intel Core i9 Mac.
+the geometric mean of 33 realistic workloads, measured on November 13, 2026, at
+`4e230310` on an Intel Core i9 Mac.
 
 | Measure | WeavePy / CPython |
 | ---: | ---: |
-| Warm time | 0.87 |
-| Cold time (first call, including compilation) | 0.98 |
-| Peak resident memory | 1.27 |
+| Warm time | 0.85 |
+| Cold time (first call, including compilation) | 0.96 |
+| Whole process (start-up, import, four calls) | 0.90 |
+| Start-up (`-c pass`) | 0.70 to 0.75 |
+| Start-up of a script that imports a module of its own | 0.75 |
+| Peak resident memory | 1.14 |
+| Peak memory footprint | 1.22 |
 
-Warm time is well under CPython's overall, but results vary widely by workload.
-`scimark` (0.51), `pickle_roundtrip` and `unpack_sequence` (0.59), and
-`float_points` (0.62) lead, while `async_tree` (1.27), `logging_mix` (1.15),
-`context_managers` (1.14), and `deepcopy` (1.12) still trail CPython. CPython's
+Warm time is well under CPython's overall, but results vary widely by workload:
+WeavePy is ahead on 22 of the 33. `scimark` (0.51), `pickle_roundtrip` (0.57),
+and `raytrace` (0.60) lead, while `async_tree` (1.25), `sudoku` (1.14),
+`context_managers` (1.12), and `deepcopy` (1.11) still trail CPython. CPython's
 own times move by a few percent between sessions, and single workloads by more,
-so treat any one ratio as approximate.
+so treat any one ratio as approximate. Start-up times of two builds differ by
+several percent from run to run with nothing changed, hence the range. (The
+start-up of a script with a module of its own was last measured at
+`11c293b4`.)
+
+The suite isn't the whole picture. Over 153 single operations
+(`tools/pybench/microops.py`) WeavePy retires about as many instructions as
+CPython overall (a geometric mean of 0.97 before the latest fixes), with wide
+spread: integer and float arithmetic, plain calls and attribute reads run in a
+small fraction of CPython's instructions, while `zip`, `Enum` lookups, dict
+copies and calls through `*args` still take one and a half to two and a half
+times as many. The [progress note](docs/PERFORMANCE-PROGRESS.md) lists them.
+
+Ordinary library-heavy code is where WeavePy is behind. A battery of 54
+everyday operations (`tools/pybench/everyday.py`: file and directory work,
+text, data formats, classes, threads, common modules) runs at 1.44 times
+CPython's time on average (1.79 before the work that followed its first run).
+WeavePy is ahead on 12 of the 54 and past twice CPython's time on 14, with
+thread queues, `inspect` and `typing`, `weakref`, class-protocol code, and
+`enum` with `dataclasses` between 3 and 4 times. File and stream I/O, which was
+far slower still (a line read took a system call per byte), is now level with
+CPython or ahead of it. The rest is the current work.
 
 Code that the JIT compiles fully can run far faster. The numeric loops in the
 [bench gate fixtures](docs/PERFORMANCE-CPYTHON-PARITY.md) took 5% to 8% of
@@ -131,11 +157,21 @@ measurements and the work behind them.
 ## Known limitations
 
 - **No releases.** Building from source is the only way to get WeavePy today.
-- **Memory.** WeavePy uses more memory than CPython, and the gap on Linux is
-  larger than the macOS figures above.
+- **Memory.** WeavePy uses more memory than CPython: 1.12 times its resident
+  set and 1.22 times its footprint (the memory it dirties) on these
+  workloads, and the gap on Linux is larger than the macOS figures above. The
+  resident-set figure relies on a profile-guided build, which releases the
+  code pages a program is done with once its imports are over; a plain
+  release build does that only in processes that run for more than a tenth
+  of a second.
 - **Imports and warm-up.** Importing large parts of the standard library costs
-  more than in CPython. Cold time is level with CPython's overall, but some
-  workloads, such as `async_tree`, still start slower until the JIT warms up.
+  about 1.4 times CPython's instructions; a faster start-up hides most of it
+  in short scripts. Cold time is a little under CPython's overall, but some
+  workloads, such as `async_tree` and `logging_mix`, still start slower until
+  the JIT warms up.
+- **Object-heavy code.** Programs built from many small methods on class
+  hierarchies can run slower than on CPython: the `deltablue` bench fixture
+  takes about 1.5 times CPython's time.
 - **Windows.** WeavePy builds and is tested on Windows, but the CPython and
   package baselines are measured on macOS and Linux. On Windows, those lanes
   report results without blocking.

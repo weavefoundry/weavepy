@@ -1028,6 +1028,7 @@ impl Drop for NoYieldGuard {
 /// waiting for it and the switch interval has elapsed.
 #[inline]
 pub fn yield_checkpoint() {
+    crate::memory_tick_from_countdown();
     maybe_yield_gil();
 }
 

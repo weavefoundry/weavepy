@@ -121,9 +121,9 @@ pub(crate) fn simplify(f: &mut Function) {
         };
         let candidate = pure(&d.op) && d.results.1 > d.results.0;
         for (s, e) in ranges {
-            for i in s as usize..e as usize {
-                let v = resolve(&alias, f.dfg.pool[i]);
-                f.dfg.pool[i] = v;
+            for slot in &mut f.dfg.pool[s as usize..e as usize] {
+                let v = resolve(&alias, *slot);
+                *slot = v;
                 uses[v.index()] += 1;
             }
         }

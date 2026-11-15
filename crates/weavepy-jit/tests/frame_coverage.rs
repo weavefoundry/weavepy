@@ -7,8 +7,8 @@
 
 use weavepy_compiler::{compile_module, CodeObject, Constant};
 use weavepy_jit::{
-    analyze_frame, JitType, JitVerdict, PathArena, Probes, ResolvedGlobal, SliceOrigin, TFunc, TOp,
-    TTerm,
+    analyze_frame, Carved, JitType, JitVerdict, PathArena, Probes, ResolvedGlobal, SliceOrigin,
+    TFunc, TOp, TTerm,
 };
 use weavepy_parser::parse_module;
 
@@ -52,6 +52,16 @@ fn analyze_cfg(src: &str, cfg: &Cfg) -> Result<TFunc, JitVerdict> {
 }
 
 fn analyze_code_cfg(code: &CodeObject, cfg: &Cfg) -> Result<TFunc, JitVerdict> {
+    analyze_code_carved(code, cfg, None)
+}
+
+/// [`analyze_code_cfg`] starting from, and adding to, what earlier
+/// analyses of `code` carved out.
+fn analyze_code_carved(
+    code: &CodeObject,
+    cfg: &Cfg,
+    carved: Option<&mut Carved>,
+) -> Result<TFunc, JitVerdict> {
     let missing = cfg.missing.clone();
     let mut resolve = |name: &str| -> ResolvedGlobal {
         if let Some((_, resolution)) = cfg.globals.iter().find(|(key, _)| *key == name) {
@@ -116,6 +126,7 @@ fn analyze_code_cfg(code: &CodeObject, cfg: &Cfg) -> Result<TFunc, JitVerdict> {
         pairs: &mut |_| None,
         entry_pc: None,
         carve_env: false,
+        carved,
         paths: &mut paths,
     };
     analyze_frame(code, &mut resolve, &mut probes)
@@ -530,6 +541,31 @@ fn missing_global_still_rejects() {
     assert!(matches!(err, JitVerdict::UnsupportedOpcode(_)), "{err:?}");
 }
 
+#[test]
+fn a_kept_carving_starts_the_next_analysis_where_planning_left_it() {
+    // The two comprehensions bind targets the function also assigns, a
+    // shape the plan doesn't take (the target can't be proven unbound),
+    // so the plan fails at each in turn and carving leaves both to the
+    // interpreter. An analysis that starts from the kept carving ends as
+    // one that finds the two again does.
+    let code = compile_first_fn(
+        "def k(n, xs):\n    t = 0\n    for i in range(n):\n        t = t + i\n    x = 1\n    a = [x for x in xs]\n    y = 2\n    b = [y for y in xs]\n    return t\n",
+    );
+    let cfg = Cfg {
+        list: Some((1, JitType::Int)),
+        ..Cfg::default()
+    };
+    let fresh = analyze_code_cfg(&code, &cfg);
+
+    let mut carved = Carved::default();
+    let first = analyze_code_carved(&code, &cfg, Some(&mut carved));
+    assert_eq!(carved.steps(), 2);
+    let second = analyze_code_carved(&code, &cfg, Some(&mut carved));
+    assert_eq!(carved.steps(), 2);
+    assert_eq!(first, fresh);
+    assert_eq!(second, fresh);
+}
+
 // ---------------------------------------------------------------- WS2
 
 #[test]
@@ -753,6 +789,7 @@ fn shadowed_enumerate_gets_no_trained_lanes() {
         pairs: &mut |_| None,
         entry_pc: None,
         carve_env: false,
+        carved: None,
         paths: &mut paths,
     };
     let tf = analyze_frame(&code, &mut resolve, &mut probes)

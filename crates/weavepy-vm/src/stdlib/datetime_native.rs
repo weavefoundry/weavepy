@@ -687,6 +687,22 @@ const SHORTCUT_NAMES: &[(u8, &str)] = &[
     (KIND_DATETIME, "tzinfo"),
     (KIND_DATETIME, "fold"),
     (KIND_DATETIME, "fromisoformat"),
+    // The slots behind the fields, which `leaf_field` reads by name too.
+    (KIND_TIMEDELTA, "_days"),
+    (KIND_TIMEDELTA, "_seconds"),
+    (KIND_TIMEDELTA, "_microseconds"),
+    (KIND_DATE, "_year"),
+    (KIND_DATE, "_month"),
+    (KIND_DATE, "_day"),
+    (KIND_DATETIME, "_year"),
+    (KIND_DATETIME, "_month"),
+    (KIND_DATETIME, "_day"),
+    (KIND_DATETIME, "_hour"),
+    (KIND_DATETIME, "_minute"),
+    (KIND_DATETIME, "_second"),
+    (KIND_DATETIME, "_microsecond"),
+    (KIND_DATETIME, "_tzinfo"),
+    (KIND_DATETIME, "_fold"),
 ];
 
 /// Whether `cls` (of `kind`) still resolves every shortcut name to what
@@ -2505,16 +2521,24 @@ pub(crate) fn leaf_field(i: &PyInstance, name: &SharedStr) -> Option<Object> {
         return None;
     }
     let n = &st.names;
+    // (A field by its public name or by its slot's own: `_pydatetime`'s
+    // methods read `self._year`, and a packed value has no slot to read.)
+    let is = |public: &SharedStr, private: &SharedStr| {
+        SharedStr::ptr_eq(name, public) || SharedStr::ptr_eq(name, private)
+    };
     if kind == KIND_TIMEDELTA {
-        let ix = if SharedStr::ptr_eq(name, &n.f_days) {
+        let ix = if is(&n.f_days, &n.days) {
             0
-        } else if SharedStr::ptr_eq(name, &n.f_seconds) {
+        } else if is(&n.f_seconds, &n.seconds) {
             1
-        } else if SharedStr::ptr_eq(name, &n.f_microseconds) {
+        } else if is(&n.f_microseconds, &n.microseconds) {
             2
         } else {
             return None;
         };
+        let private = [&n.days, &n.seconds, &n.microseconds]
+            .iter()
+            .any(|p| SharedStr::ptr_eq(name, p));
         // The public slots themselves (a Python-built value's are written
         // apart from the private ones).
         return with_slots(i, |s| match s.as_packed() {
@@ -2523,28 +2547,29 @@ pub(crate) fn leaf_field(i: &PyInstance, name: &SharedStr) -> Option<Object> {
                 Some(Object::Int([d, s, us][ix]))
             }
             Some(_) => None,
+            None if private => Some(s.get_hinted(ix, name)?.clone()),
             None => Some(s.get_hinted(4 + ix, name)?.clone()),
         });
     }
-    let (idx, slot) = if SharedStr::ptr_eq(name, &n.f_year) {
+    let (idx, slot) = if is(&n.f_year, &n.year) {
         (D_YEAR, &n.year)
-    } else if SharedStr::ptr_eq(name, &n.f_month) {
+    } else if is(&n.f_month, &n.month) {
         (D_MONTH, &n.month)
-    } else if SharedStr::ptr_eq(name, &n.f_day) {
+    } else if is(&n.f_day, &n.day) {
         (D_DAY, &n.day)
     } else if kind != KIND_DATETIME {
         return None;
-    } else if SharedStr::ptr_eq(name, &n.f_hour) {
+    } else if is(&n.f_hour, &n.hour) {
         (DT_HOUR, &n.hour)
-    } else if SharedStr::ptr_eq(name, &n.f_minute) {
+    } else if is(&n.f_minute, &n.minute) {
         (DT_MINUTE, &n.minute)
-    } else if SharedStr::ptr_eq(name, &n.f_second) {
+    } else if is(&n.f_second, &n.second) {
         (DT_SECOND, &n.second)
-    } else if SharedStr::ptr_eq(name, &n.f_microsecond) {
+    } else if is(&n.f_microsecond, &n.microsecond) {
         (DT_US, &n.microsecond)
-    } else if SharedStr::ptr_eq(name, &n.f_tzinfo) {
+    } else if is(&n.f_tzinfo, &n.tzinfo) {
         (DT_TZINFO, &n.tzinfo)
-    } else if SharedStr::ptr_eq(name, &n.f_fold) {
+    } else if is(&n.f_fold, &n.fold) {
         (DT_FOLD, &n.fold)
     } else {
         return None;

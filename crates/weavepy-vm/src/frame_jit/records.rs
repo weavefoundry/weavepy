@@ -40,13 +40,38 @@ use weavepy_compiler::CodeObject;
 
 use super::{State, DIRECT_CALL_DEPTH};
 
-/// An instance operator's call (see [`super::direct_call`]).
-pub(super) type Binop<'a> = Option<(
-    weavepy_compiler::BinOpKind,
-    bool,
-    &'a Rc<crate::types::TypeObject>,
-    &'a Rc<crate::types::TypeObject>,
-)>;
+/// The operator whose method a direct call runs (see
+/// [`super::direct_call`]), as [`crate::MethodOp`] keeps it on an
+/// activation the core loop finishes.
+#[derive(Clone, Copy)]
+pub(super) enum MethodOp<'a> {
+    /// A `BINARY_OP`'s method that runs alone: the operator, whether
+    /// augmented, and the left and right operands' classes.
+    Binary(
+        weavepy_compiler::BinOpKind,
+        bool,
+        &'a Rc<crate::types::TypeObject>,
+        &'a Rc<crate::types::TypeObject>,
+    ),
+    /// A `COMPARE_OP`'s first method, the instruction's oparg: the
+    /// operands wait under the call on the caller's stack.
+    Compare(u32),
+}
+
+impl MethodOp<'_> {
+    /// The operator as an activation keeps it.
+    pub(super) fn owned(self) -> crate::MethodOp {
+        match self {
+            MethodOp::Binary(op, inplace, l, r) => {
+                crate::MethodOp::Binary(op, inplace, l.clone(), r.clone())
+            }
+            MethodOp::Compare(arg) => crate::MethodOp::Compare(arg),
+        }
+    }
+}
+
+/// A direct call's operator, if it is one's method.
+pub(super) type Op<'a> = Option<MethodOp<'a>>;
 
 /// One nesting level of direct calls (see the module docs). The state comes
 /// first: a callee's state pointer is its record's.
@@ -1419,14 +1444,14 @@ unsafe fn left_slowly(s: &mut State, rec: &mut DirectRec, status: u32) -> u32 {
 
 /// The end of a call on `rec`, whose native code returned `status`: its
 /// return finished here when clean, or whatever it left synced for the
-/// core loop. `binop` is an instance operator's (see
+/// core loop. `op` is an instance operator's (see
 /// [`super::direct_call`]).
 ///
 /// # Safety
 ///
 /// As `h_direct_leave`'s.
 #[inline(always)]
-unsafe fn leave(st: &mut State, rec: &mut DirectRec, status: u32, binop: Binop<'_>) -> u32 {
+unsafe fn leave(st: &mut State, rec: &mut DirectRec, status: u32, op: Op<'_>) -> u32 {
     // SAFETY: the caller's contract.
     unsafe {
         let interp = &mut *st.interp.cast_mut();
@@ -1441,7 +1466,13 @@ unsafe fn leave(st: &mut State, rec: &mut DirectRec, status: u32, binop: Binop<'
             && !interp.countdown_out(2)
             && crate::hot_gates::loop_gen() == rec.st.snap_gen
         {
-            return finish_clean(st, rec, interp);
+            let r = finish_clean(st, rec, interp);
+            if r != 0 {
+                if let Some(op) = op {
+                    super::op_after_reload(st, op);
+                }
+            }
+            return r;
         }
         // A `__new__` that made an instance of its class, whose `__init__`
         // has native code: that runs next, straight from here.
@@ -1460,7 +1491,7 @@ unsafe fn leave(st: &mut State, rec: &mut DirectRec, status: u32, binop: Binop<'
         // Anything else is the core loop's to finish: the callee registers
         // first. (The record stays this level's until that's done: anything
         // the core loop's paths run nests above it.)
-        let r = left_uncleanly(st, rec, status, binop);
+        let r = left_uncleanly(st, rec, status, op);
         interp.recs.set_top(rec_at);
         r
     }
@@ -1688,12 +1719,7 @@ impl DirectRec {
 /// [`leave`] when the return isn't clean.
 #[cold]
 #[inline(never)]
-unsafe fn left_uncleanly(
-    st: &mut State,
-    rec: &mut DirectRec,
-    status: u32,
-    binop: Binop<'_>,
-) -> u32 {
+unsafe fn left_uncleanly(st: &mut State, rec: &mut DirectRec, status: u32, op: Op<'_>) -> u32 {
     // SAFETY: as `leave`'s.
     unsafe {
         super::register_lazy(&mut rec.st);
@@ -1706,7 +1732,7 @@ unsafe fn left_uncleanly(
             callee,
             0,
             std::ptr::null_mut(),
-            binop,
+            op,
             status,
             &mut rec.st,
         )
@@ -1724,13 +1750,13 @@ pub(super) unsafe fn run(
     st: &mut State,
     rec_at: *mut DirectRec,
     native: &super::Native,
-    binop: Binop<'_>,
+    op: Op<'_>,
 ) -> u32 {
     // SAFETY: the caller's contract.
     unsafe {
         let rec = &mut *rec_at;
         (*st.interp).recs.set_top(rec_at.add(1));
         let status = native.run_direct(&mut rec.st, 0);
-        leave(st, rec, status, binop)
+        leave(st, rec, status, op)
     }
 }

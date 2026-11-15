@@ -219,7 +219,7 @@ pub extern "C" fn PyStatus_Exception(status: PyStatus) -> c_int {
 #[no_mangle]
 pub unsafe extern "C" fn Py_ExitStatusException(status: PyStatus) -> ! {
     if status._type == _PyStatus_TYPE_EXIT {
-        std::process::exit(status.exitcode);
+        weavepy_vm::vm_singletons::exit_process(status.exitcode);
     }
     if status._type == _PyStatus_TYPE_ERROR {
         let msg = if status.err_msg.is_null() {
@@ -238,7 +238,7 @@ pub unsafe extern "C" fn Py_ExitStatusException(status: PyStatus) -> ! {
             )
         };
         eprintln!("Fatal Python error: {func}{msg}");
-        std::process::exit(1);
+        weavepy_vm::vm_singletons::exit_process(1);
     }
     std::process::abort();
 }

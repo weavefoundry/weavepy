@@ -151,6 +151,63 @@ pub(crate) fn strong_word<T: ?Sized>(value: *const T) -> *const AtomicUsize {
     }
 }
 
+/// Whether the `Arc` allocation holding `value` has one strong owner and
+/// no weak one (its weak count is the strong owners' own). With the bias
+/// held no other thread changes either count, so two plain reads decide
+/// what `Arc::get_mut` and `Arc::try_unwrap` decide with a locked
+/// compare-and-swap (about twenty cycles each on x86).
+///
+/// # Safety
+///
+/// `value` is the payload of a live `Arc` allocation, and the bias holds.
+#[inline(always)]
+pub(crate) unsafe fn sole_owner<T: ?Sized>(value: *const T) -> bool {
+    // SAFETY: per the caller; the weak count is the word after the strong
+    // one (`ArcInner` is `repr(C)`).
+    unsafe {
+        let strong = strong_word(value);
+        (*strong).load(Ordering::Relaxed) == 1 && (*strong.add(1)).load(Ordering::Relaxed) == 1
+    }
+}
+
+/// The layout of the `Arc` allocation holding `value`: the two counters
+/// followed by the payload's layout, padded, which is how `Arc` sizes it
+/// (`arcinner_layout_for_value_layout`).
+///
+/// # Safety
+///
+/// `value` is the payload of an `Arc` allocation that hasn't been freed
+/// (the payload itself may have been dropped or moved out: its layout is
+/// its type's and its pointer's to tell).
+#[inline(always)]
+unsafe fn arc_layout<T: ?Sized>(value: *const T) -> std::alloc::Layout {
+    // SAFETY: per the caller.
+    let payload = std::alloc::Layout::for_value(unsafe { &*value });
+    let (inner, _) = std::alloc::Layout::new::<[usize; 2]>()
+        .extend(payload)
+        .expect("Arc layout");
+    inner.pad_to_align()
+}
+
+/// Free the `Arc` allocation holding `value`, with the layout `Arc`
+/// allocated it with ([`arc_layout`]).
+///
+/// # Safety
+///
+/// As [`arc_layout`]'s, and the caller holds the allocation's last
+/// reference, strong or weak: the payload is dropped, moved out or in no
+/// need of a drop, and nothing uses the allocation afterwards.
+#[inline(always)]
+pub(crate) unsafe fn free_arc<T: ?Sized>(value: *const T) {
+    // SAFETY: per the caller; the allocation starts at its strong count.
+    unsafe {
+        std::alloc::dealloc(
+            strong_word(value).cast::<u8>().cast_mut(),
+            arc_layout(value),
+        );
+    }
+}
+
 /// Add one strong owner of the `Arc` payload at `value`.
 ///
 /// # Safety
@@ -213,21 +270,9 @@ pub(crate) unsafe fn try_free_last<T: ?Sized>(value: *const T) -> bool {
     if strong.load(Ordering::Relaxed) != 1 || weak.load(Ordering::Relaxed) != 1 {
         return false;
     }
-    // `Arc` sizes its allocation as the two counters followed by the
-    // payload's layout, padded (`arcinner_layout_for_value_layout`).
-    // SAFETY: as above; the payload is live until the deallocation.
-    let payload = std::alloc::Layout::for_value(unsafe { &*value });
-    let (inner, _) = std::alloc::Layout::new::<[usize; 2]>()
-        .extend(payload)
-        .expect("Arc layout");
-    // SAFETY: the sole owner frees the allocation it owns, with the layout
-    // `Arc` allocated it with; the payload needs no drop.
-    unsafe {
-        std::alloc::dealloc(
-            ptr::from_ref(strong).cast::<u8>().cast_mut(),
-            inner.pad_to_align(),
-        );
-    }
+    // SAFETY: the sole owner frees the allocation it owns; the payload
+    // needs no drop.
+    unsafe { free_arc(value) };
     true
 }
 
@@ -279,13 +324,7 @@ unsafe fn drop_arc_in<T: ?Sized>(slot: &mut ManuallyDrop<Arc<T>>) {
 unsafe fn release_last<T: ?Sized>(value: *const T, strong: &AtomicUsize) {
     // SAFETY: the weak count is the word after the strong one (`ArcInner`
     // is `repr(C)`); the payload is live until it is dropped below.
-    let (weak, layout) = unsafe {
-        let payload = std::alloc::Layout::for_value(&*value);
-        let (inner, _) = std::alloc::Layout::new::<[usize; 2]>()
-            .extend(payload)
-            .expect("Arc layout");
-        (&*ptr::from_ref(strong).add(1), inner.pad_to_align())
-    };
+    let (weak, layout) = unsafe { (&*ptr::from_ref(strong).add(1), arc_layout(value)) };
     // As `Arc::drop_slow`: the payload drops with the strong count at zero
     // (a weak reference no longer upgrades), then the strong owners'
     // implicit weak reference goes.
@@ -306,7 +345,7 @@ unsafe fn release_last<T: ?Sized>(value: *const T, strong: &AtomicUsize) {
     };
     if free {
         // SAFETY: no strong or weak reference remains; the layout is the
-        // one `Arc` allocated with (see `try_free_last`).
+        // one `Arc` allocated with (see `arc_layout`).
         unsafe { std::alloc::dealloc(ptr::from_ref(strong).cast::<u8>().cast_mut(), layout) };
     }
 }
@@ -345,7 +384,7 @@ pub struct Rc<T: ?Sized + 'static>(ManuallyDrop<Arc<T>>);
 
 /// A weak reference to an [`Rc`] allocation.
 #[repr(transparent)]
-pub struct Weak<T: ?Sized>(std::sync::Weak<T>);
+pub struct Weak<T: ?Sized>(ManuallyDrop<std::sync::Weak<T>>);
 
 impl<T: 'static> Rc<T> {
     #[inline]
@@ -353,19 +392,50 @@ impl<T: 'static> Rc<T> {
         Self(ManuallyDrop::new(Arc::new(value)))
     }
 
+    /// The payload of a sole owner (see [`sole_owner`]) moved out and its
+    /// allocation freed, with the bias held: `Arc::try_unwrap` without its
+    /// locked compare-and-swap and its weak handle's locked decrement.
+    /// Anything else is handed back untouched.
+    #[inline]
+    fn take_sole(this: Self) -> Result<T, Self> {
+        if !refcounts_biased() {
+            return Err(this);
+        }
+        let p = Arc::as_ptr(&this.0);
+        // SAFETY: `this` keeps the allocation alive. Its sole owner moves
+        // the payload out exactly once and frees the allocation; `this` is
+        // never dropped.
+        unsafe {
+            if !sole_owner(p) {
+                return Err(this);
+            }
+            let value = ptr::read(p);
+            let _ = ManuallyDrop::new(this);
+            free_arc(p);
+            Ok(value)
+        }
+    }
+
     pub fn try_unwrap(this: Self) -> Result<T, Self> {
-        Arc::try_unwrap(Self::into_arc(this)).map_err(Self::from_arc)
+        Self::take_sole(this)
+            .or_else(|this| Arc::try_unwrap(Self::into_arc(this)).map_err(Self::from_arc))
     }
 
     pub fn into_inner(this: Self) -> Option<T> {
-        Arc::into_inner(Self::into_arc(this))
+        match Self::take_sole(this) {
+            Ok(value) => Some(value),
+            Err(this) => Arc::into_inner(Self::into_arc(this)),
+        }
     }
 
     pub fn unwrap_or_clone(this: Self) -> T
     where
         T: Clone,
     {
-        Arc::unwrap_or_clone(Self::into_arc(this))
+        match Self::take_sole(this) {
+            Ok(value) => value,
+            Err(this) => Arc::unwrap_or_clone(Self::into_arc(this)),
+        }
     }
 
     pub fn new_cyclic(data_fn: impl FnOnce(&Weak<T>) -> T) -> Self {
@@ -427,14 +497,22 @@ impl<T: ?Sized + 'static> Rc<T> {
             unsafe {
                 let weak = &*strong_word(p).add(1);
                 weak.store(weak.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
-                return Weak(std::sync::Weak::from_raw(p));
+                return Weak(ManuallyDrop::new(std::sync::Weak::from_raw(p)));
             }
         }
-        Weak(Arc::downgrade(&this.0))
+        Weak(ManuallyDrop::new(Arc::downgrade(&this.0)))
     }
 
     #[inline]
     pub fn get_mut(this: &mut Self) -> Option<&mut T> {
+        if refcounts_biased() {
+            // `Arc::get_mut` locks the weak count against another thread's
+            // `downgrade`, which the bias rules out.
+            let p = Arc::as_ptr(&this.0);
+            // SAFETY: `this` keeps the allocation alive, and a sole owner's
+            // exclusive borrow is the payload's only access.
+            return unsafe { sole_owner(p).then(|| &mut *p.cast_mut()) };
+        }
         Arc::get_mut(&mut this.0)
     }
 
@@ -474,6 +552,15 @@ impl<T: ?Sized + 'static> Rc<T> {
 impl<T: Clone + 'static> Rc<T> {
     #[inline]
     pub fn make_mut(this: &mut Self) -> &mut T {
+        if refcounts_biased() {
+            let p = Arc::as_ptr(&this.0);
+            // SAFETY: as `get_mut`'s.
+            unsafe {
+                if sole_owner(p) {
+                    return &mut *p.cast_mut();
+                }
+            }
+        }
         Arc::make_mut(&mut this.0)
     }
 }
@@ -746,7 +833,7 @@ impl<T: ?Sized + 'static> From<Arc<T>> for Rc<T> {
 
 impl<T: 'static> Weak<T> {
     pub const fn new() -> Self {
-        Self(std::sync::Weak::new())
+        Self(ManuallyDrop::new(std::sync::Weak::new()))
     }
 }
 
@@ -799,9 +886,69 @@ impl<T: ?Sized + 'static> Weak<T> {
     }
 }
 
+impl<T: ?Sized> Weak<T> {
+    /// The weak count of the allocation this handle refers to, or `None`
+    /// for one that refers to none (`Weak::new`).
+    ///
+    /// # Safety
+    ///
+    /// The bias holds. (The handle keeps its allocation, though not its
+    /// payload, in place.)
+    #[inline(always)]
+    unsafe fn weak_word(&self) -> Option<&AtomicUsize> {
+        let p = self.0.as_ptr();
+        // (A handle with no allocation holds the address `usize::MAX`.)
+        if p.cast::<()>() as usize == usize::MAX {
+            return None;
+        }
+        // SAFETY: the allocation is live (this handle keeps it), and the
+        // weak count is the word after the strong one. A dropped payload
+        // still has its alignment, which is all `strong_word` reads.
+        Some(unsafe { &*strong_word(p).add(1) })
+    }
+}
+
 impl<T: ?Sized> Clone for Weak<T> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        if refcounts_biased() {
+            // SAFETY: the bias holds; the copy is the owner the bumped
+            // count accounts for.
+            unsafe {
+                if let Some(weak) = self.weak_word() {
+                    weak.store(weak.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+                    return Self(ManuallyDrop::new(ptr::read(&raw const *self.0)));
+                }
+            }
+        }
+        Self(ManuallyDrop::new((*self.0).clone()))
+    }
+}
+
+impl<T: ?Sized> Drop for Weak<T> {
+    #[inline]
+    fn drop(&mut self) {
+        if refcounts_biased() {
+            // `Weak`'s drop is a locked decrement. With the bias held a
+            // handle that isn't the allocation's last reference gives its
+            // count up in place. The last one (the strong owners hold a
+            // weak reference between them, so the payload is gone) frees
+            // the allocation.
+            // SAFETY: the bias holds, and this handle's reference is
+            // released exactly once, here or below.
+            unsafe {
+                // (No allocation, so nothing to release.)
+                let Some(weak) = self.weak_word() else { return };
+                let n = weak.load(Ordering::Relaxed);
+                if n > 1 {
+                    weak.store(n - 1, Ordering::Relaxed);
+                    return;
+                }
+                free_arc(self.0.as_ptr());
+                return;
+            }
+        }
+        // SAFETY: the handle's one drop.
+        unsafe { ManuallyDrop::drop(&mut self.0) }
     }
 }
 
@@ -842,6 +989,56 @@ mod tests {
         check::<str>(&Arc::from("text"));
         check::<[u64]>(&Arc::from(vec![1u64, 2, 3]));
         check::<dyn std::any::Any + Send + Sync>(&(Arc::new(5u32) as Arc<_>));
+    }
+
+    #[test]
+    fn sole_owner_reads_both_counts() {
+        let arc = Arc::new(String::from("x"));
+        // SAFETY: live allocations, and nothing else touches their counts.
+        unsafe {
+            assert!(sole_owner(Arc::as_ptr(&arc)));
+            let second = arc.clone();
+            assert!(!sole_owner(Arc::as_ptr(&arc)));
+            drop(second);
+            let weak = Arc::downgrade(&arc);
+            assert!(!sole_owner(Arc::as_ptr(&arc)));
+            drop(weak);
+            assert!(sole_owner(Arc::as_ptr(&arc)));
+            let slice: Arc<[u64]> = Arc::from(vec![1u64, 2, 3]);
+            assert!(sole_owner(Arc::as_ptr(&slice)));
+        }
+    }
+
+    #[test]
+    fn unique_owners_and_weak_handles_keep_arc_counts() {
+        let mut rc = Rc::new(vec![1, 2, 3]);
+        Rc::get_mut(&mut rc).expect("a sole owner").push(4);
+        let weak = Rc::downgrade(&rc);
+        assert!(Rc::get_mut(&mut rc).is_none());
+        let copy = weak.clone();
+        assert_eq!(Rc::weak_count(&rc), 2);
+        drop(copy);
+        assert_eq!(Rc::weak_count(&rc), 1);
+        // (A weak handle doesn't stop the last strong owner unwrapping:
+        // it just no longer upgrades.)
+        let values = Rc::try_unwrap(rc).expect("the one strong owner");
+        assert!(weak.upgrade().is_none());
+        drop(weak);
+        let rc = Rc::new(values);
+        Rc::make_mut(&mut { rc.clone() }).push(5);
+        assert_eq!(*rc, [1, 2, 3, 4]);
+        let shared = rc.clone();
+        let rc = Rc::try_unwrap(rc).expect_err("another owner remains");
+        drop(shared);
+        assert_eq!(Rc::try_unwrap(rc).expect("a sole owner"), [1, 2, 3, 4]);
+        assert_eq!(Rc::into_inner(Rc::new(7)), Some(7));
+        // A handle that outlives its payload frees the allocation; one
+        // with no allocation releases nothing.
+        let weak = Rc::downgrade(&Rc::new(String::from("gone")));
+        assert!(weak.upgrade().is_none());
+        drop(weak.clone());
+        drop(weak);
+        drop(Weak::<u8>::new().clone());
     }
 
     #[test]
