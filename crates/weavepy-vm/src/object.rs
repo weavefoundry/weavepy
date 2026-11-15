@@ -42,11 +42,6 @@ const _: () = {
     assert_sync::<Object>();
 };
 
-/// Code-point length of a `str`: O(1) from the count memoised in the
-/// string itself (see [`SharedStr::char_count`]). WeavePy stores `str` as
-/// UTF-8, so the first count is a scan; scanners and tokenisers that ask
-/// for the length of the same large string repeatedly stay linear.
-#[inline]
 /// Push `b` as two lowercase hex digits.
 #[inline]
 pub(crate) fn push_hex_byte(out: &mut String, b: u8) {
@@ -64,6 +59,11 @@ pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
+/// Code-point length of a `str`: O(1) from the count memoised in the
+/// string itself (see [`SharedStr::char_count`]). WeavePy stores `str` as
+/// UTF-8, so the first count is a scan; scanners and tokenisers that ask
+/// for the length of the same large string repeatedly stay linear.
+#[inline]
 pub(crate) fn str_char_len(s: &SharedStr) -> usize {
     SharedStr::char_count(s)
 }
