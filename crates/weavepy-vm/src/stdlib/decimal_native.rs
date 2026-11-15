@@ -1575,8 +1575,10 @@ impl State {
             drop(Rc::into_arc(inst));
         }
         let cls = self.decimal.upgrade()?;
-        let mut i = PyInstance::new(cls);
-        *i.slots.get_mut() = SlotStorage::from_packed(PackedSlots::new_decimal(parts));
+        let i = PyInstance::with_slots(
+            cls,
+            SlotStorage::from_packed(PackedSlots::new_decimal(parts)),
+        );
         Some(Object::Instance(Rc::new(i)))
     }
 
@@ -1584,15 +1586,17 @@ impl State {
     fn make_fixed(&self, d: &Fin) -> Option<Object> {
         let cls = self.decimal.upgrade()?;
         let digits = Object::Str(d.coef.with_digits(SharedStr::from_ascii));
-        let mut i = PyInstance::new(cls);
-        *i.slots.get_mut() = SlotStorage::from_layout(
-            self.layout.clone(),
-            vec![
-                Object::Int(i64::from(d.sign)),
-                digits,
-                Object::Int(d.exp),
-                Object::Bool(false),
-            ],
+        let i = PyInstance::with_slots(
+            cls,
+            SlotStorage::from_layout(
+                self.layout.clone(),
+                vec![
+                    Object::Int(i64::from(d.sign)),
+                    digits,
+                    Object::Int(d.exp),
+                    Object::Bool(false),
+                ],
+            ),
         );
         Some(Object::Instance(Rc::new(i)))
     }
@@ -1626,8 +1630,10 @@ impl State {
     /// A new exact `Decimal` with the slot values `v` (a copy).
     fn make_raw(&self, v: [Object; 4]) -> Option<Object> {
         let cls = self.decimal.upgrade()?;
-        let mut i = PyInstance::new(cls);
-        *i.slots.get_mut() = SlotStorage::from_layout(self.layout.clone(), v.to_vec());
+        let i = PyInstance::with_slots(
+            cls,
+            SlotStorage::from_layout(self.layout.clone(), v.to_vec()),
+        );
         Some(Object::Instance(Rc::new(i)))
     }
 

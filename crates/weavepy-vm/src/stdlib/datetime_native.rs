@@ -42,7 +42,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::error::{overflow_error, type_error, RuntimeError};
 use crate::object::{BuiltinFn, DictKey, Object};
 use crate::shared_value::{SharedSlice, SharedStr};
-use crate::sync::{Rc, RefCell, Weak};
+use crate::sync::{Rc, Weak};
 use crate::types::{PyInstance, SlotStorage, TypeObject};
 
 pub(crate) const KIND_TIMEDELTA: u8 = 1;
@@ -1032,8 +1032,7 @@ fn entry(k: &SharedStr, v: Object) -> (DictKey, Object) {
 }
 
 fn instance(cls: Rc<TypeObject>, entries: Vec<(DictKey, Object)>) -> Object {
-    let mut i = PyInstance::new(cls);
-    i.slots = RefCell::new(SlotStorage::from_entries(entries));
+    let i = PyInstance::with_slots(cls, SlotStorage::from_entries(entries));
     Object::Instance(Rc::new(i))
 }
 
@@ -1043,8 +1042,7 @@ fn instance_fixed(
     layout: &SharedSlice<DictKey>,
     values: Vec<Object>,
 ) -> Object {
-    let mut i = PyInstance::new(cls);
-    i.slots = RefCell::new(SlotStorage::from_layout(layout.clone(), values));
+    let i = PyInstance::with_slots(cls, SlotStorage::from_layout(layout.clone(), values));
     Object::Instance(Rc::new(i))
 }
 
@@ -1377,8 +1375,10 @@ fn new_packed(
         drop(Rc::into_arc(inst));
     }
     let cls = cls.upgrade()?;
-    let mut i = PyInstance::new(cls);
-    *i.slots.get_mut() = SlotStorage::from_packed(PackedSlots::new(kind, word, aux));
+    let i = PyInstance::with_slots(
+        cls,
+        SlotStorage::from_packed(PackedSlots::new(kind, word, aux)),
+    );
     Some(Object::Instance(Rc::new(i)))
 }
 

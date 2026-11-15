@@ -126,8 +126,7 @@ fn with_interp<R>(
 }
 
 fn build(cls: Rc<TypeObject>, layout: &SharedSlice<DictKey>, values: Vec<Object>) -> Object {
-    let mut i = PyInstance::new(cls);
-    i.slots = RefCell::new(SlotStorage::from_layout(layout.clone(), values));
+    let i = PyInstance::with_slots(cls, SlotStorage::from_layout(layout.clone(), values));
     Object::Instance(Rc::new(i))
 }
 
@@ -433,7 +432,7 @@ fn new_match(
         .match_cls
         .upgrade()
         .ok_or_else(|| type_error("re.Match is gone"))?;
-    let values = vec![
+    let values = [
         pattern.clone(),
         string.clone(),
         Object::Int(pos as i64),
@@ -441,7 +440,10 @@ fn new_match(
         marks_tuple(found),
         Object::Int(found.lastindex as i64),
     ];
-    Ok(build(cls, &st.match_layout, values))
+    let slots = SlotStorage::from_layout_array(st.match_layout.clone(), values);
+    Ok(Object::Instance(Rc::new(PyInstance::with_slots(
+        cls, slots,
+    ))))
 }
 
 // ---------------------------------------------------------------------
