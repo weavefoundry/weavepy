@@ -524,6 +524,59 @@ fn pattern_exec(args: &[Object], mode: i64) -> Option<Result<Object, RuntimeErro
     })
 }
 
+/// A pattern's `pattern` and `flags` slots, read in place.
+fn pattern_key(o: &Object) -> Option<(Rc<crate::types::TypeObject>, Object, Object)> {
+    let Object::Instance(inst) = o else {
+        return None;
+    };
+    with_state(inst, |st| {
+        let slots = inst.slots.try_borrow().ok()?;
+        let v = slots.values_for_layout(&st.pattern_layout)?;
+        Some((inst.cls(), v[1].clone(), v[2].clone()))
+    })?
+}
+
+/// `Pattern.__hash__`: `hash((Pattern, self.pattern, self.flags))`, as the
+/// Python method computes it, for a `str` or `bytes` pattern and `int`
+/// flags (whose hashes run no code).
+fn pattern_hash(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [p] = args else {
+        return None;
+    };
+    let (cls, pat, flags) = pattern_key(p)?;
+    if !matches!(pat, Object::Str(_) | Object::Bytes(_)) || !matches!(flags, Object::Int(_)) {
+        return None;
+    }
+    let key = Object::new_tuple_array([Object::Type(cls), pat, flags]);
+    crate::object::py_hash_value(&key).map(|h| Ok(Object::Int(h)))
+}
+
+/// `Pattern.__eq__` of two patterns with `str` or `bytes` patterns and
+/// `int` flags.
+fn pattern_eq(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [a, b] = args else {
+        return None;
+    };
+    if a.is_same(b) {
+        return Some(Ok(Object::Bool(true)));
+    }
+    let ((ca, pa, fa), (cb, pb, fb)) = (pattern_key(a)?, pattern_key(b)?);
+    if !Rc::ptr_eq(&ca, &cb) {
+        return None;
+    }
+    let eq = match (&pa, &pb, &fa, &fb) {
+        (Object::Str(x), Object::Str(y), Object::Int(f), Object::Int(g)) => x == y && f == g,
+        (Object::Bytes(x), Object::Bytes(y), Object::Int(f), Object::Int(g)) => {
+            x[..] == y[..] && f == g
+        }
+        (Object::Str(_), Object::Bytes(_), _, _) | (Object::Bytes(_), Object::Str(_), _, _) => {
+            false
+        }
+        _ => return None,
+    };
+    Some(Ok(Object::Bool(eq)))
+}
+
 fn pattern_match(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     pattern_exec(args, 1)
 }
@@ -1202,6 +1255,22 @@ struct Spec {
 const EXEC_PARAMS: &[&str] = &["string", "pos", "endpos"];
 
 const SPECS: &[Spec] = &[
+    Spec {
+        cls: 0,
+        name: "__hash__",
+        key: "Pattern.__hash__",
+        fast: pattern_hash,
+        full: None,
+        params: &[],
+    },
+    Spec {
+        cls: 0,
+        name: "__eq__",
+        key: "Pattern.__eq__",
+        fast: pattern_eq,
+        full: None,
+        params: &[],
+    },
     Spec {
         cls: 0,
         name: "match",
