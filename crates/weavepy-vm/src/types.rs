@@ -1822,7 +1822,14 @@ impl TypeObject {
         let mut names: Vec<String> = Vec::new();
         for t in self.mro.borrow().iter().rev() {
             if t.flags.is_builtin {
-                if t.name == "object" {
+                // (A value type's payload lives apart from the slots, and
+                // nothing native adds slots of its own to its subclasses'
+                // instances, as `OrderedDict`'s order does to a dict's:
+                // `configparser`'s `_Line(str)` reads its members compiled.)
+                if matches!(
+                    t.name.as_str(),
+                    "object" | "str" | "int" | "float" | "complex" | "bytes" | "tuple"
+                ) {
                     continue;
                 }
                 return None;
