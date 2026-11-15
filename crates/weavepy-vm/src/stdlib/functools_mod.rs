@@ -774,9 +774,11 @@ fn native_lru_tuple_key(key: &Object, depth: usize, remaining: &mut usize) -> bo
                 || Rc::ptr_eq(cls, &builtins.str_)
                 || Rc::ptr_eq(cls, &builtins.bytes_)
                 || Rc::ptr_eq(cls, &builtins.tuple_)
-                // (Or any class that hashes and compares by identity; see
-                // the instance arm below.)
-                || crate::object::type_hash_is_identity(cls)
+                // (Or a user class that hashes and compares by identity,
+                // `typing`'s generics; see the instance arm below. The
+                // other builtin classes stay off this path: a typed key's
+                // `float` or `bool` would meet `1 == 1.0 == True`.)
+                || (!cls.flags.is_builtin && crate::object::type_hash_is_identity(cls))
         }
         Object::Tuple(items) if depth > 0 && items.len() <= *remaining => items
             .iter()
