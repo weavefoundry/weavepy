@@ -7091,7 +7091,8 @@ unsafe extern "C" fn h_global(st: *mut State, c: *mut GlobalCache) -> u32 {
 /// [`h_global`] at a site whose cache holds the fused `len(local)` (see
 /// [`GlobalCache::len_of`]), the namespaces matching: the length of a
 /// list, tuple, str or dict straight off the local, as `h_load_global`
-/// fuses it; anything else through the miss, which tries the rest.
+/// fuses it (an instance's through its leaf `__len__`); anything else
+/// through the miss, which tries the rest.
 #[inline(never)]
 unsafe fn global_len_of(st: *mut State, c: *mut GlobalCache) -> u32 {
     // SAFETY: as `h_global`'s; `len_of` names one of the code's locals.
@@ -7104,6 +7105,10 @@ unsafe fn global_len_of(st: *mut State, c: *mut GlobalCache) -> u32 {
                 Object::Tuple(t) => Some(t.len()),
                 Object::Str(s) => Some(crate::object::str_char_len(s)),
                 Object::Dict(d) => d.try_borrow().ok().map(|d| d.len()),
+                v @ Object::Instance(_) => match (*st_ref.interp).leaf_instance_len(v) {
+                    Some(Object::Int(n)) => usize::try_from(n).ok(),
+                    _ => None,
+                },
                 _ => None,
             };
             if let Some(n) = n.and_then(|n| i64::try_from(n).ok()) {

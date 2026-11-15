@@ -30909,16 +30909,19 @@ impl Interpreter {
             Some(K::Method(w)) => {
                 let f = w.upgrade()?;
                 let code = f.code();
+                let depth = crate::recursion::current_depth();
                 if !code_is_pure_leaf(&code)
                     || !pure_leaf_warm(&code)
-                    || crate::recursion::current_depth() >= crate::recursion::recursion_limit()
+                    || depth >= crate::recursion::recursion_limit()
                 {
                     return None;
                 }
-                return match self.pure_leaf_eval::<false, false>(
+                return match self.pure_leaf_call(
                     &code,
                     &f,
                     &[std::ptr::from_ref(v)],
+                    false,
+                    depth,
                 )? {
                     Object::Int(n) if n >= 0 => Some(Object::Int(n)),
                     _ => None,
@@ -32955,18 +32958,23 @@ impl Interpreter {
         let leaf_str = |o: &Object| matches!(o, O::Str(_));
         let leaf_int = |o: &Object| matches!(o, O::Int(_) | O::Bool(_));
         let admitted = match kind {
-            K::Len if matches!(args, [O::Instance(_)]) => {
-                return self.leaf_instance_len(&args[0]).map(Ok);
-            }
             K::Len => {
+                // (The common containers' lengths read in line.)
+                let n = match args {
+                    [O::Instance(_)] => return self.leaf_instance_len(&args[0]).map(Ok),
+                    [O::List(l)] => Some(l.try_borrow().ok()?.len()),
+                    [O::Tuple(t)] => Some(t.len()),
+                    [O::Str(s)] => Some(crate::object::str_char_len(s)),
+                    [O::Dict(d)] => Some(d.try_borrow().ok()?.len()),
+                    _ => None,
+                };
+                if let Some(n) = n {
+                    return i64::try_from(n).ok().map(|n| Ok(O::Int(n)));
+                }
                 args.len() == 1
                     && matches!(
                         args[0],
-                        O::List(_)
-                            | O::Tuple(_)
-                            | O::Dict(_)
-                            | O::Str(_)
-                            | O::Bytes(_)
+                        O::Bytes(_)
                             | O::ByteArray(_)
                             | O::Set(_)
                             | O::FrozenSet(_)
@@ -64541,6 +64549,7 @@ impl Interpreter {
         // nothing here runs code that could replace it.
         let code = unsafe { &*f.code.as_ptr() };
         let n = args.len() + usize::from(recv.is_some());
+        let depth = crate::recursion::current_depth();
         // (A surplus positional must raise, not bind a keyword-only
         // parameter: the full binder's.)
         if n > MAX_ARGS
@@ -64549,7 +64558,7 @@ impl Interpreter {
             || !pure_leaf_warm(code)
             || crate::trace::any_observers_active()
             || !self.inline_calls_ok()
-            || crate::recursion::current_depth() >= crate::recursion::recursion_limit()
+            || depth >= crate::recursion::recursion_limit()
         {
             return None;
         }
@@ -64557,7 +64566,8 @@ impl Interpreter {
         for (p, a) in ptrs.iter_mut().zip(recv.into_iter().chain(args)) {
             *p = a;
         }
-        self.pure_leaf_eval::<false, false>(code, f, &ptrs[..n])
+        // (A warm callee's compiled plan is entered directly.)
+        self.pure_leaf_call(code, f, &ptrs[..n], false, depth)
     }
 
     /// The full argument binder for [`Self::call_python_owned`]: CPython's
