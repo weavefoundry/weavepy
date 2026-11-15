@@ -485,6 +485,25 @@ branch and pull request.
     in a `yield from` of its own steps without running its body, so each
     level resumed as an activation: 4.45 to 1.71 (one level was 1.85,
     three or more 1.0 or less).
+  - A sweep of common idioms (`target/mb/idioms.py`-style loops, one
+    function a case) found `datetime.datetime.now()` at 6.1 times
+    CPython's instructions: `_pydatetime` ran `fromtimestamp` in Python
+    (`time.localtime()` unpacked, the constructor, and the fold probe's two
+    more `localtime` calls and datetime arithmetic). `now`, `fromtimestamp`
+    and `date.today` are native for the exact classes with no `tzinfo` or
+    an exact `timezone`, following `_fromtimestamp` step for step, with
+    results identical to the Python methods' across DST gaps and folds in
+    eight zones, and bound by the dispatch loop without the descriptor:
+    `now()` 6.14 to 1.15, `date.today()` 0.56. f-string fields with a
+    format spec left compiled code for the core loop at every field, and
+    the formatter rendered `str(value)` before reading the spec:
+    `f"{x:.2f}"` 1.49 to 0.46. `dict((k, v) for ...)` copied each pair into
+    a vector and set up a key-comparison scope per insert: 1.40 to 1.01.
+    `str.startswith` of a tuple took the generic call; a method read off a
+    built-in value hashed its name into the method memo at every call (164
+    instructions, 68 with a per-thread cache of each call site's last
+    answer); `zip` of three to eight sequences stepped each source through
+    the general checks (2.41 to 2.17).
   - Python dunders from native code. `str(x)`, `len(x)`, f-string
     formatting and `x in obj` of a plain instance call the class's
     `__str__`, `__len__` or `__contains__` without a bound method, in
@@ -3667,6 +3686,19 @@ builds, synchronous compiles):
   of a multiplication's 1,600 (CPython 1,100).
 - `dataclasses.asdict` (2.3) and `replace` (2.3), `IntFlag` `|` (1.7),
   a dataclass `repr` (1.9): flat profiles of interpreted library code.
+- The frame JIT's generic call helper, `h_call` (about 250 to 300
+  instructions before the callee runs: a chain of shape checks for
+  `lru_cache` wrappers, `__call__`, `__reduce_ex__`, leaf builtins, then
+  the general path), which an instance with a native `__call__`
+  (`operator.itemgetter` 1.6), a builtin with keywords and
+  `functools.partial` (1.8) all take. A call site that remembered its
+  callee's shape could skip to it.
+- Tier 2's method calls on built-in values it can't type: the counting
+  idiom `d[k] = d.get(k, 0) + 1` runs 1.9 times CPython's instructions in
+  tier 2 against 0.94 in the frame JIT alone, because tier 2 reads
+  `d.get` dynamically, builds a bound method every iteration and calls it
+  through its dynamic helper. A typed `DictGet` with a default (the
+  analyzer already lowers `d[k]` on a dict lane) would close it.
 - Two-argument `super(C, obj)` used other than for an immediate attribute
   read (5.95), and `super(...).__class__` (7.8).
 
