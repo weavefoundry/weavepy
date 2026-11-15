@@ -460,6 +460,40 @@ pub fn lookup_method(obj: &Object, name: &str) -> Option<Object> {
     let Some(tag) = method_memo_tag(obj) else {
         return lookup_method_uncached(obj, name);
     };
+    // A call site's name sits at one address: its last answer, checked by
+    // the name's text (another string may come to sit there).
+    let slot = ((name.as_ptr() as usize >> 3) ^ usize::from(tag)) % RECENT_METHODS;
+    if let Ok(Some(hit)) = RECENT_METHOD.try_with(|r| {
+        // SAFETY: a thread-local array no code reaches while this reads.
+        let e = unsafe { &(*r.get())[slot] };
+        (e.0 == tag && *e.1 == *name).then(|| e.2.clone())
+    }) {
+        return hit;
+    }
+    let found = lookup_method_memo(obj, name, tag);
+    let _ = RECENT_METHOD.try_with(|r| {
+        // SAFETY: as above; the replaced entry drops after the write.
+        let old = std::mem::replace(
+            unsafe { &mut (*r.get())[slot] },
+            (tag, name.into(), found.clone()),
+        );
+        drop(old);
+    });
+    found
+}
+
+/// Entries of [`RECENT_METHOD`].
+const RECENT_METHODS: usize = 64;
+
+std::thread_local! {
+    /// The last few `(receiver kind, name)` answers of [`lookup_method`],
+    /// direct-mapped by the name's address.
+    static RECENT_METHOD: std::cell::UnsafeCell<[(u8, Box<str>, Option<Object>); RECENT_METHODS]> =
+        std::cell::UnsafeCell::new(std::array::from_fn(|_| (u8::MAX, Box::from(""), None)));
+}
+
+/// [`lookup_method`] through the per-kind memo.
+fn lookup_method_memo(obj: &Object, name: &str, tag: u8) -> Option<Object> {
     let memo = METHOD_MEMO.get_or_init(|| RefCell::new(Vec::new()));
     if let Some(hit) = memo
         .borrow()

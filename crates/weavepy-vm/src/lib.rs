@@ -33183,10 +33183,14 @@ impl Interpreter {
                 !deferred
             }
             K::StrStartswith | K::StrEndswith => {
-                (args.len() == 2 && leaf_str(&args[0]) && leaf_str(&args[1]))
+                // (The affix a `str` or a tuple of them, `s.startswith(("a",
+                // "b"))`.)
+                let affix =
+                    |o: &Object| leaf_str(o) || matches!(o, O::Tuple(t) if t.iter().all(leaf_str));
+                (args.len() == 2 && leaf_str(&args[0]) && affix(&args[1]))
                     || (args.len() == 3
                         && leaf_str(&args[0])
-                        && leaf_str(&args[1])
+                        && affix(&args[1])
                         && leaf_int(&args[2]))
             }
             K::StrLower | K::StrUpper | K::StrIsdigit | K::StrIsalpha | K::StrIsspace => {
