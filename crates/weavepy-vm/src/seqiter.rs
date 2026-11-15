@@ -1108,6 +1108,29 @@ pub(crate) fn lazy_pure_pair(l: &PyLazyIter) -> Option<(Object, Object)> {
     Some((src_step(a)?, src_step(b)?))
 }
 
+/// `next(it[, default])`'s fast half: the next item of a plain sequence
+/// cursor or a native adapter that steps without running code. `None`
+/// (nothing consumed) for anything else, an exhausted iterator included,
+/// which the full call answers.
+pub(crate) fn next_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let it = match args {
+        [it] | [it, _] => it,
+        _ => return None,
+    };
+    let v = match it {
+        Object::Iter(c) => {
+            // SAFETY: a view that runs no code and ends with the step.
+            let cursor = unsafe { c.peek_mut() }?;
+            let v = cursor.pure_peek()?;
+            cursor.pure_skip();
+            v
+        }
+        Object::LazyIter(l) => lazy_pure_next(l)??,
+        _ => return None,
+    };
+    Some(Ok(v))
+}
+
 /// The most sources [`cursors_next`] steps at once.
 const CURSORS_MAX: usize = 8;
 

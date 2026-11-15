@@ -31966,6 +31966,7 @@ impl Interpreter {
                     ("pow", LeafKind::Fast(crate::seqiter::pow_fast)),
                     ("round", LeafKind::Fast(crate::seqiter::round_fast)),
                     ("repr", LeafKind::Fast(crate::seqiter::repr_fast)),
+                    ("next", LeafKind::Fast(crate::seqiter::next_fast)),
                 ] {
                     if let Some(Object::Builtin(f)) = b.get(&crate::object::StrKey(name)) {
                         calls.insert(Rc::as_ptr(f) as usize, kind);
