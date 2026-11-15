@@ -5715,6 +5715,32 @@ unsafe fn unpack_fast(
     unsafe {
         let n = n as usize;
         let s = &*src;
+        // A tuple subclass's instance (a `namedtuple`'s) whose class has no
+        // Python `__iter__` unpacks its tuple, as the generic unpack's
+        // iteration of it would.
+        if let Object::Instance(inst) = s {
+            let Some(Object::Tuple(t)) = inst.native.get() else {
+                return 1;
+            };
+            if t.len() != n
+                || (owned != 0 && !droppable(s))
+                || Interpreter::instance_dunder_function(
+                    inst,
+                    crate::types::AttrKey::vm(crate::types::vm_key::ITER_FN),
+                    "__iter__",
+                )
+                .is_some()
+            {
+                return 1;
+            }
+            for (k, item) in t.iter().rev().enumerate() {
+                dst.add(k).write(crate::clone_hot(item));
+            }
+            if owned != 0 {
+                crate::drop_hot(src.read());
+            }
+            return 0;
+        }
         let fits = match s {
             Object::Tuple(t) => t.len() == n,
             Object::List(l) => l.peek().is_some_and(|xs| xs.len() == n),

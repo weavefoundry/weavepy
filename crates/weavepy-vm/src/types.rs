@@ -747,6 +747,7 @@ pub(crate) mod vm_key {
     pub(crate) const LT_FN: u32 = 24;
     pub(crate) const NEXT_FN: u32 = 25;
     pub(crate) const FORMAT_LACKS: u32 = 26;
+    pub(crate) const ITER_FN: u32 = 27;
     /// Per comparison (eight).
     pub(crate) const CMP: u32 = 32;
     /// Per binary operator (sixteen each): its method, and whether the
