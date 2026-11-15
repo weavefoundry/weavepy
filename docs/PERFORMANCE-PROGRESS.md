@@ -445,6 +445,59 @@ branch and pull request.
 
 ## Done
 
+- **Threads that have exited, lock hand-offs, and more cliffs** (PR #112,
+  November 15). Ratios are WeavePy's instructions over CPython's, before
+  and after, with synchronous compiles.
+  - Single-thread reference counting comes back. Starting any thread made
+    reference counts atomic and cell borrows locked for the rest of the
+    process, and frames register before every native body so other
+    threads can look. A `queue.Queue` put and get after one finished
+    thread cost 26,500 instructions instead of 16,000. A `join()` now
+    joins the OS threads of the workers that have finished, and once none
+    is left (and no thread the VM didn't start ever took the GIL) the
+    joining thread restores the bias. The everyday battery runs every
+    case in one process, so the six cases after `threading_queue_ops`
+    paid for it: by wall time on quick builds, `asyncio_ops` 0.69 of the
+    earlier build's, `print_to_buffer` 0.74, `weakref_gc_ops` 0.79,
+    `sqlite_ops` 0.80, `inspect_typing_ops` 0.81.
+  - Lock hand-offs. A contended acquire took the lock as soon as it was
+    free, while the GIL holder ran on; the holder then blocked at its next
+    acquire of the same lock, so a producer and a consumer sharing a
+    queue's mutex switched threads at every operation (34,000 context
+    switches for 60,000 items against CPython's 45). The waiter now waits
+    for the lock to come free with the GIL released and takes it only
+    once the GIL is back, as CPython's does. `threading_queue_ops` 2.79 to
+    1.82.
+  - `yield from` two levels deep. The direct chain step declined a
+    delegate whose own body no fast step runs, though a delegate resting
+    in a `yield from` of its own steps without running its body, so each
+    level resumed as an activation: 4.45 to 1.71 (one level was 1.85,
+    three or more 1.0 or less).
+  - Python dunders from native code. `str(x)`, `len(x)`, f-string
+    formatting and `x in obj` of a plain instance call the class's
+    `__str__`, `__len__` or `__contains__` without a bound method, in
+    place when it's a pure leaf; a class without `__format__` is cached as
+    such. The frame JIT's fused `len(local)` read declined instances, so
+    each `len(obj)` reran the whole global load. `str(t)` 2.14 to 1.03,
+    `f"{t}"` 2.31 to 1.36, `len(t)` 1.43 to 1.05, `3 in obj` 1.86 to
+    0.68.
+  - Smaller ones: a Python `__next__` called without a bound method by
+    `for` and `next()` (and `iter()` of a builtin iterator subclass's
+    instance is the instance, which fixed a subclass's `__next__` being
+    skipped); `BUILD_SLICE` and slice subscripts in pure leaves; native
+    `re.Pattern` hashing and equality; a keyword leaf half for
+    `bytes.translate`; `list.sort()`'s leaf half comparing strings and
+    ints directly; a property with a native getter read in the compiled
+    attribute site.
+  - Fixed on the way: a method leaf called unbound with no receiver
+    (`list.pop()`) indexed an empty argument list and panicked
+    (`test_types.test_call_unbound_crash`).
+  - Tried and dropped: `LOAD_GLOBAL`'s cache hit emitted in line. A loop
+    reading a module global went from 182 instructions an iteration to
+    116, but in real code (`dataclasses.asdict`, whose 35 global reads a
+    call were all helper calls) the in-line guards cost what the helper
+    did, for more code.
+
 - **Operation-level cliffs in the everyday battery** (PR #112, November
   14). Each case broken into single operations, each operation's
   instructions counted against CPython's with synchronous compiles
@@ -3576,9 +3629,31 @@ builds, synchronous compiles):
   `next` of a generator, `print` with keywords, `StringIO.write`,
   `setattr` on plain instances, `len` and `hash` through Python methods.
 - A raise caught in its caller (2.2) and three frames up (2.4).
-- Thread start and join (4.5 times CPython's instructions): each thread
+- Thread start and join (4.6 times CPython's instructions): each thread
   zeroes and later drops a 4,096-entry type cache (128 KB) and tier 2
-  analyzes again what another thread compiled.
+  analyzes again what another thread compiled. And code that runs while a
+  second thread is alive: every reference count is atomic and frames
+  register before native bodies, so a queue put and get costs 27,500
+  instructions against CPython's 12,400 (16,000 with one thread).
+- Keyword calls of a function with keyword-only parameters in a tier-2
+  loop: tier 2's static binding requires `kwonly_count == 0`, so `f(i,
+  c=4)` goes through its dynamic keyword helper (1,240 instructions
+  against CPython's 1,060), where the frame JIT alone inlines the call in
+  330.
+- Exceptions raised in a callee (2.1 times CPython's instructions) and in
+  the same frame (1.6): about 40 layered helpers of 50 to 300 instructions
+  each (normalization, the instance, its traceback, frame shells for the
+  traceback, the handler search per frame), no single one dominant.
+- Generators: a resume through `gen_native_next` is about 300
+  instructions, `lazy_gen_resume` (a body that calls) about 360, and
+  creating one about 1,000, against CPython's 150 or so a resume (`for x
+  in gen` 1.63, `all(f(x) for x in xs)` 1.40, a generator created and
+  drained 1.94). Plan item 2.
+- `decimal`: each operation finds the current context through the
+  `contextvars` mapping and the context's fields, about 390 instructions
+  of a multiplication's 1,600 (CPython 1,100).
+- `dataclasses.asdict` (2.3) and `replace` (2.3), `IntFlag` `|` (1.7),
+  a dataclass `repr` (1.9): flat profiles of interpreted library code.
 - Two-argument `super(C, obj)` used other than for an immediate attribute
   read (5.95), and `super(...).__class__` (7.8).
 
