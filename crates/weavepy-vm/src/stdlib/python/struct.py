@@ -147,6 +147,11 @@ def pack(format, /, *v):
         raise error(str(e)) from None
 
 
+# The public `pack` packs plain values natively and calls the function
+# above for anything else (coercions, and every error).
+pack = _impl._native_pack(pack)
+
+
 def _writable(buffer):
     """Resolve `buffer` to a read-write target the Rust core can pack into.
 

@@ -922,6 +922,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         register(&mut d, "_value_codes", b_value_codes);
         register(&mut d, "pack", b_pack);
         register(&mut d, "_pack_plain", b_pack_plain);
+        register(&mut d, "_native_pack", b_native_pack);
         register(&mut d, "_clearcache", b_clearcache);
         register(&mut d, "unpack", b_unpack);
         register(&mut d, "pack_into", b_pack_into);
@@ -1211,15 +1212,76 @@ fn b_value_codes(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn b_pack(args: &[Object]) -> Result<Object, RuntimeError> {
-    let fmt = fmt_arg(args, 0)?;
-    let cf = compiled(&fmt)?;
+    let cf = format_of(args)?;
     let bytes = cf.pack(&args[1..])?;
     Ok(Object::new_bytes(bytes))
 }
 
+/// The compiled format `args[0]` names: a `str` by its identity (a call
+/// site's literal is one string every call), a bytes-like one by text.
+fn format_of(args: &[Object]) -> Result<std::rc::Rc<CompiledFormat>, RuntimeError> {
+    if let Some(Object::Str(s)) = args.first() {
+        if let Some(cf) = compiled_for(s) {
+            return Ok(cf);
+        }
+    }
+    compiled(&fmt_arg(args, 0)?)
+}
+
+/// `struct.pack(format, *v)`'s fast half: a `str` format and plain values
+/// packed at once; `None` (nothing done) for anything else or any error,
+/// which the Python function raises as `struct.error`.
+fn pack_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let (Some(Object::Str(fmt)), Some(values)) = (args.first(), args.get(1..)) else {
+        return None;
+    };
+    let plain = values.iter().all(|v| {
+        matches!(
+            v,
+            Object::Int(_)
+                | Object::Long(_)
+                | Object::Bool(_)
+                | Object::Float(_)
+                | Object::Complex(_)
+                | Object::Str(_)
+                | Object::Bytes(_)
+                | Object::ByteArray(_)
+        )
+    });
+    if !plain {
+        return None;
+    }
+    let bytes = compiled_for(fmt)?.pack(values).ok()?;
+    Some(Ok(Object::new_bytes(bytes)))
+}
+
+/// `_native_pack(python_pack)`: the public `struct.pack`, which packs
+/// plain values in place (see [`pack_fast`]) and calls the Python
+/// function `python_pack` for anything else.
+fn b_native_pack(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [fallback] = args else {
+        return Err(type_error("_native_pack() takes the Python pack"));
+    };
+    let fallback = fallback.clone();
+    let b = Rc::new(BuiltinFn {
+        name: "pack",
+        binds_instance: false,
+        call: Box::new(move |a: &[Object]| match pack_fast(a) {
+            Some(r) => r,
+            None => {
+                let interp = crate::builtins::reentrant_interp()?;
+                let globals = interp.builtins_dict();
+                interp.call(&fallback, a, &[], &globals)
+            }
+        }),
+        call_kw: None,
+    });
+    crate::leaf_builtins::register_fast(&b, pack_fast);
+    Ok(Object::Builtin(b))
+}
+
 fn b_unpack(args: &[Object]) -> Result<Object, RuntimeError> {
-    let fmt = fmt_arg(args, 0)?;
-    let cf = compiled(&fmt)?;
+    let cf = format_of(args)?;
     // (A `bytes` buffer is read in place.)
     let vals = match &args[1] {
         Object::Bytes(b) => cf.unpack(b)?,
