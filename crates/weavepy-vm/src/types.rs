@@ -745,6 +745,7 @@ pub(crate) mod vm_key {
     pub(crate) const NATIVE_GETITEM_ANY: u32 = 22;
     pub(crate) const EQ_FN: u32 = 23;
     pub(crate) const LT_FN: u32 = 24;
+    pub(crate) const NEXT_FN: u32 = 25;
     /// Per comparison (eight).
     pub(crate) const CMP: u32 = 32;
     /// Per binary operator (sixteen each): its method, and whether the

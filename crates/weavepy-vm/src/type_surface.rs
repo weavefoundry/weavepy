@@ -1270,7 +1270,14 @@ fn unwrap_shim(inner: Rc<BuiltinFn>, owner: &Rc<TypeObject>) -> Object {
                 if !keep_instance {
                     let unwrapped = as_native(first);
                     if !unwrapped.is_same(first) {
-                        return with_receiver(args, unwrapped, |v| (inner_pos.call)(v));
+                        let r = with_receiver(args, unwrapped.clone(), |v| (inner_pos.call)(v))?;
+                        // An iterator type's `__iter__` returns its receiver:
+                        // for a subclass's instance, that's the instance
+                        // (`iter(e) is e`), whose class may step it its own way.
+                        if inner_pos.name == "__iter__" && r.is_same(&unwrapped) {
+                            return Ok(first.clone());
+                        }
+                        return Ok(r);
                     }
                 }
             }

@@ -37029,12 +37029,24 @@ impl Interpreter {
                         }
                         Err(e) => return Err(e),
                     },
-                    Object::Instance(_) => {
+                    Object::Instance(inst) => {
                         // Call __next__; treat StopIteration as exhaustion.
-                        let next = match instance_native_dunder(&it_obj, "__next__", None) {
-                            Some(r) => Some(r),
-                            None => instance_method(&it_obj, "__next__")
-                                .map(|m| self.call(&m, &[], &[], &frame.globals)),
+                        // (A Python `__next__`, cached on the class, is
+                        // called with the instance, without a bound method.)
+                        let py_next = Self::instance_dunder_function(
+                            inst,
+                            crate::types::AttrKey::vm(crate::types::vm_key::NEXT_FN),
+                            "__next__",
+                        );
+                        let next = match py_next {
+                            Some(f) => {
+                                Some(self.call_python(&f, std::slice::from_ref(&it_obj), &[]))
+                            }
+                            None => match instance_native_dunder(&it_obj, "__next__", None) {
+                                Some(r) => Some(r),
+                                None => instance_method(&it_obj, "__next__")
+                                    .map(|m| self.call(&m, &[], &[], &frame.globals)),
+                            },
                         };
                         match next {
                             Some(r) => match r {
@@ -49167,6 +49179,18 @@ impl Interpreter {
             // ``next()`` must advance it with ``send(None)`` like a generator.
             Object::Coroutine(_) => self.gen_method_send(iter, Object::None).map(Some),
             Object::Instance(inst) => {
+                // A Python `__next__` (cached on the class; it overrides a
+                // built-in iterator payload's): called with the instance,
+                // without a bound method.
+                if let Some(f) = Self::instance_dunder_function(
+                    inst,
+                    crate::types::AttrKey::vm(crate::types::vm_key::NEXT_FN),
+                    "__next__",
+                ) {
+                    return self
+                        .call_python(&f, std::slice::from_ref(iter), &[])
+                        .map(Some);
+                }
                 // A registered native leaf `__next__` (the class cache the
                 // core loop's `FOR_ITER` uses): called directly.
                 if !crate::gil::free_threading_enabled() && !crate::trace::any_observers_active() {
