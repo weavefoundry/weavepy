@@ -32075,6 +32075,10 @@ impl Interpreter {
                         ("istitle", LeafKind::Opaque),
                         ("isupper", LeafKind::Opaque),
                         ("encode", LeafKind::Fast(crate::builtins::str_encode_leaf)),
+                        (
+                            "format_map",
+                            LeafKind::Fast(crate::builtins::str_format_map_leaf),
+                        ),
                     ],
                 ),
                 (

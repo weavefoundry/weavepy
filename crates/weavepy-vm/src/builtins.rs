@@ -12935,6 +12935,36 @@ fn str_format_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object,
     crate::str_format_impl(&template, rest, kwargs).map(|s| str_result(args, s))
 }
 
+/// `str.format_map(mapping)`'s fast half: an exact `str` template over a
+/// small exact `dict` whose values are all strings or numbers (whose
+/// formatting runs no code), through the native engine. `None` (nothing
+/// done) for anything else or any error, which the interpreter's engine
+/// raises.
+pub(crate) fn str_format_map_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Str(template), Object::Dict(d)] = args else {
+        return None;
+    };
+    // SAFETY: a read that runs no code, ended before the engine borrows.
+    let plain = unsafe { d.peek() }.is_some_and(|m| {
+        m.len() <= 32
+            && m.values().all(|v| {
+                matches!(
+                    v,
+                    Object::Str(_)
+                        | Object::Int(_)
+                        | Object::Float(_)
+                        | Object::Bool(_)
+                        | Object::None
+                )
+            })
+    });
+    if !plain {
+        return None;
+    }
+    let out = crate::str_format_map_impl(template, d).ok()?;
+    Some(Ok(Object::from_str(out)))
+}
+
 fn str_format_map(args: &[Object]) -> Result<Object, RuntimeError> {
     let template = str_self(args)?.into_owned();
     let mapping = match args.get(1) {
