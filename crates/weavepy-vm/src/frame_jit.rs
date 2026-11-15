@@ -5733,11 +5733,16 @@ unsafe fn unpack_fast(
             {
                 return 1;
             }
-            for (k, item) in t.iter().rev().enumerate() {
+            // An owned instance sits in `dst`'s first slot, which the items
+            // overwrite: it moves out first (and keeps the tuple alive).
+            let held = if owned != 0 { Some(src.read()) } else { None };
+            let items = t.clone();
+            for (k, item) in items.iter().rev().enumerate() {
                 dst.add(k).write(crate::clone_hot(item));
             }
-            if owned != 0 {
-                crate::drop_hot(src.read());
+            drop(items);
+            if let Some(held) = held {
+                crate::drop_hot(held);
             }
             return 0;
         }
