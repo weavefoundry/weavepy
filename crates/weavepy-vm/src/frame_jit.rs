@@ -7585,10 +7585,11 @@ pub(crate) struct MethodSite {
     desc: Option<(u64, bool, Object)>,
     /// The class version whose attribute the site found isn't one.
     desc_miss: u64,
-    /// A builtin type receiver the site loaded an unbound attribute of
-    /// (`object.__setattr__(self, ...)`, `int.from_bytes(...)`): the type,
-    /// its version, and the attribute, which leaves the self slot empty.
-    type_attr: Option<(usize, u64, Object)>,
+    /// A builtin type receiver the site loaded an attribute of
+    /// (`object.__setattr__(self, ...)`, `dict.fromkeys(...)`): the type,
+    /// its version, the attribute, and whether the type itself goes in the
+    /// self slot (a class method) or it stays empty.
+    type_attr: Option<(usize, u64, Object, bool)>,
 }
 
 /// `LOAD_ATTR` with the method flag at `site`: the method in the
@@ -7686,11 +7687,16 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
         let type_recv = match &*top {
             Object::Type(t) if t.flags.is_builtin => {
                 let (ptr, ver) = (Rc::as_ptr(t) as usize, t.attr_version.get());
-                if let Some((p, v, attr)) = &s.type_attr {
+                if let Some((p, v, attr, binds)) = &s.type_attr {
                     if *p == ptr && *v == ver {
                         let attr = crate::clone_hot(attr);
-                        crate::drop_hot(std::mem::replace(&mut *top, attr));
-                        (*st).stack.add(s.len as usize).write(Object::Unbound);
+                        let recv = std::mem::replace(&mut *top, attr);
+                        if *binds {
+                            (*st).stack.add(s.len as usize).write(recv);
+                        } else {
+                            crate::drop_hot(recv);
+                            (*st).stack.add(s.len as usize).write(Object::Unbound);
+                        }
                         return 0;
                     }
                 }
@@ -7764,10 +7770,13 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
         // A builtin type's unbound function or builtin: for the next time.
         if let Some((ptr, ver)) = type_recv {
             let callable = &*(*st).stack.add(s.len as usize - 1);
-            if matches!(&*(*st).stack.add(s.len as usize), Object::Unbound)
-                && matches!(callable, Object::Builtin(_) | Object::Function(_))
-            {
-                s.type_attr = Some((ptr, ver, callable.clone()));
+            let binds = match &*(*st).stack.add(s.len as usize) {
+                Object::Unbound => Some(false),
+                Object::Type(t) if Rc::as_ptr(t) as usize == ptr => Some(true),
+                _ => None,
+            };
+            if let (Some(binds), Object::Builtin(_) | Object::Function(_)) = (binds, callable) {
+                s.type_attr = Some((ptr, ver, callable.clone(), binds));
             }
         }
         // A `staticmethod`'s or `classmethod`'s function: the descriptor, for
