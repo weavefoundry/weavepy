@@ -15805,8 +15805,38 @@ impl Object {
         Object::Str(rc)
     }
 
+    /// A `str` of a literal's text, shared per thread through a small
+    /// direct-mapped cache keyed by the literal's address and length: code
+    /// that builds keys from literals over and over (`os.stat`'s fields,
+    /// attribute names) gets the same hash-caching string back instead of
+    /// allocating and rehashing it. A collision just replaces the entry.
     pub fn from_static(s: &'static str) -> Self {
-        Object::Str(SharedStr::from(s))
+        const SLOTS: usize = 1024;
+        type Slot = Option<((usize, usize), SharedStr)>;
+        thread_local! {
+            static STATICS: std::cell::RefCell<Option<Box<[Slot]>>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        if s.len() <= 2 {
+            return Object::Str(SharedStr::from(s));
+        }
+        let key = (s.as_ptr() as usize, s.len());
+        let ix = ((key.0 >> 3) ^ (key.0 >> 13) ^ key.1) & (SLOTS - 1);
+        let hit = STATICS.try_with(|t| {
+            let Ok(mut t) = t.try_borrow_mut() else {
+                return SharedStr::from(s);
+            };
+            let table = t.get_or_insert_with(|| (0..SLOTS).map(|_| None).collect());
+            match &table[ix] {
+                Some((k, v)) if *k == key => v.clone(),
+                _ => {
+                    let v = SharedStr::from(s);
+                    table[ix] = Some((key, v.clone()));
+                    v
+                }
+            }
+        });
+        Object::Str(hit.unwrap_or_else(|_| SharedStr::from(s)))
     }
 
     pub fn new_list(items: Vec<Object>) -> Self {

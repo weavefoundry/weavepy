@@ -577,6 +577,36 @@ struct DialectCfg {
     strict: bool,
 }
 
+impl DialectCfg {
+    /// Whether `f` holds none of the characters [`join_append`] quotes or
+    /// escapes (an ASCII dialect's, checked a byte at a time).
+    fn plain_field(&self, f: &str) -> bool {
+        let ascii = |c: Option<char>| c.is_none_or(|c| c.is_ascii());
+        if !(self.delimiter.is_ascii()
+            && ascii(self.quotechar)
+            && ascii(self.escapechar)
+            && self.lineterminator.is_ascii())
+        {
+            return false;
+        }
+        let byte = |c: Option<char>| c.map_or(0, |c| c as u8);
+        let (d, q, e) = (
+            self.delimiter as u8,
+            byte(self.quotechar),
+            byte(self.escapechar),
+        );
+        let term = self.lineterminator.as_bytes();
+        f.bytes().all(|b| {
+            b != d
+                && b != b'\n'
+                && b != b'\r'
+                && (b != q || q == 0)
+                && (b != e || e == 0)
+                && !term.contains(&b)
+        })
+    }
+}
+
 fn read_cfg(dialect: &Object) -> Result<DialectCfg, RuntimeError> {
     let inst = match dialect {
         Object::Instance(i) => i,
@@ -1169,7 +1199,11 @@ fn writer_disallow_new(_args: &[Object]) -> Result<Object, RuntimeError> {
 /// Number predicate for `QUOTE_NONNUMERIC` (`PyNumber_Check`).
 fn is_number(o: &Object) -> bool {
     match o {
-        Object::Int(_) | Object::Float(_) | Object::Complex(_) | Object::Bool(_) => true,
+        Object::Int(_)
+        | Object::Long(_)
+        | Object::Float(_)
+        | Object::Complex(_)
+        | Object::Bool(_) => true,
         Object::Instance(_) => {
             crate::instance_method(o, "__index__").is_some()
                 || crate::instance_method(o, "__int__").is_some()
@@ -1188,6 +1222,23 @@ fn join_append(
     field: Option<&str>,
     quoted_in: bool,
 ) -> Result<(), RuntimeError> {
+    // A field with nothing to quote or escape (the common case) is copied
+    // whole.
+    if let Some(f) = field {
+        if !f.is_empty() && cfg.plain_field(f) {
+            if num_fields > 0 {
+                rec.push(cfg.delimiter);
+            }
+            if quoted_in {
+                rec.push(cfg.quotechar.unwrap_or('"'));
+            }
+            rec.push_str(f);
+            if quoted_in {
+                rec.push(cfg.quotechar.unwrap_or('"'));
+            }
+            return Ok(());
+        }
+    }
     let field_len = field.map_or(0, |f| f.chars().count());
     let mut quoted = quoted_in;
     if field_len == 0 && cfg.delimiter == ' ' && cfg.skipinitialspace {
@@ -1254,11 +1305,8 @@ fn join_append(
     Ok(())
 }
 
-fn writer_writerow_inner(
-    interp: &mut Interpreter,
-    inst: &Rc<PyInstance>,
-    seq: Object,
-) -> Result<Object, RuntimeError> {
+/// A writer's `write` method and its dialect's settings.
+fn writer_parts(inst: &Rc<PyInstance>) -> Result<(Object, DialectCfg), RuntimeError> {
     let (write, dialect_obj) = {
         let d = inst.dict_cell().borrow();
         (
@@ -1268,8 +1316,15 @@ fn writer_writerow_inner(
     };
     let write = write.ok_or_else(|| type_error("writer is missing its write method"))?;
     let dialect_obj = dialect_obj.ok_or_else(|| type_error("writer is missing its dialect"))?;
-    let cfg = read_cfg(&dialect_obj)?;
+    Ok((write, read_cfg(&dialect_obj)?))
+}
 
+fn writer_writerow_inner(
+    interp: &mut Interpreter,
+    write: &Object,
+    cfg: &DialectCfg,
+    seq: Object,
+) -> Result<Object, RuntimeError> {
     let iter = match interp.iter_object(seq.clone()) {
         Ok(it) => it,
         Err(RuntimeError::PyException(e)) if e.type_name() == "TypeError" => {
@@ -1298,19 +1353,28 @@ fn writer_writerow_inner(
         };
         last_null = matches!(field, Object::None);
         if let Some(s) = str_chars(&field) {
-            join_append(&mut rec, &cfg, num_fields, Some(&s), quoted)?;
+            join_append(&mut rec, cfg, num_fields, Some(&s), quoted)?;
             num_fields += 1;
         } else if last_null {
-            join_append(&mut rec, &cfg, num_fields, None, quoted)?;
+            join_append(&mut rec, cfg, num_fields, None, quoted)?;
             num_fields += 1;
         } else {
-            let s = interp.call_object(
-                Object::Type(builtin_types().str_.clone()),
-                std::slice::from_ref(&field),
-                &[],
-            )?;
+            // (`str()` of a plain number is its own text.)
+            let text = match &field {
+                Object::Int(n) => Some(itoa::Buffer::new().format(*n).to_owned()),
+                Object::Float(x) => Some(crate::object::float_repr(*x)),
+                _ => None,
+            };
+            let s = match text {
+                Some(t) => Object::from_str(t),
+                None => interp.call_object(
+                    Object::Type(builtin_types().str_.clone()),
+                    std::slice::from_ref(&field),
+                    &[],
+                )?,
+            };
             let s = str_chars(&s).unwrap_or_default();
-            join_append(&mut rec, &cfg, num_fields, Some(&s), quoted)?;
+            join_append(&mut rec, cfg, num_fields, Some(&s), quoted)?;
             num_fields += 1;
         }
     }
@@ -1321,12 +1385,12 @@ fn writer_writerow_inner(
         {
             return Err(csv_error("single empty field record must be quoted"));
         }
-        join_append(&mut rec, &cfg, num_fields - 1, None, true)?;
+        join_append(&mut rec, cfg, num_fields - 1, None, true)?;
     }
 
     rec.push_str(&cfg.lineterminator);
     let line = Object::from_str(rec);
-    interp.call_object(write, &[line], &[])
+    interp.call_object(write.clone(), &[line], &[])
 }
 
 fn writer_writerow(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1335,7 +1399,8 @@ fn writer_writerow(args: &[Object]) -> Result<Object, RuntimeError> {
         .get(1)
         .cloned()
         .ok_or_else(|| type_error("writerow() takes exactly one argument (0 given)"))?;
-    with_interp(|interp| writer_writerow_inner(interp, &inst, seq))
+    let (write, cfg) = writer_parts(&inst)?;
+    with_interp(|interp| writer_writerow_inner(interp, &write, &cfg, seq))
 }
 
 fn writer_writerows(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1344,6 +1409,9 @@ fn writer_writerows(args: &[Object]) -> Result<Object, RuntimeError> {
         .get(1)
         .cloned()
         .ok_or_else(|| type_error("writerows() takes exactly one argument (0 given)"))?;
+    // (CPython's writer holds its `write` and dialect from creation; both
+    // are read-only attributes there.)
+    let (write, cfg) = writer_parts(&inst)?;
     with_interp(|interp| {
         let row_iter = interp.iter_object(seqseq)?;
         loop {
@@ -1351,7 +1419,7 @@ fn writer_writerows(args: &[Object]) -> Result<Object, RuntimeError> {
                 Some(r) => r,
                 None => break,
             };
-            writer_writerow_inner(interp, &inst, row)?;
+            writer_writerow_inner(interp, &write, &cfg, row)?;
         }
         Ok(Object::None)
     })
