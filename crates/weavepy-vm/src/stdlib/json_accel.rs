@@ -2035,8 +2035,18 @@ fn encode_dict(
 /// (`test_speedups.test_unsortable_keys`).
 fn sort_items(
     interp: &mut Interpreter,
-    items: Vec<(Object, Object)>,
+    mut items: Vec<(Object, Object)>,
 ) -> Result<Vec<(Object, Object)>, RuntimeError> {
+    // All `str` keys (a dict's are distinct, so no two items ever compare
+    // their values): the keys' code-point order, which their UTF-8 bytes
+    // sort in, with no tuples built and no `list.sort` call.
+    if items.iter().all(|(k, _)| matches!(k, Object::Str(_))) {
+        items.sort_unstable_by(|(a, _), (b, _)| match (a, b) {
+            (Object::Str(a), Object::Str(b)) => a.as_bytes().cmp(b.as_bytes()),
+            _ => std::cmp::Ordering::Equal,
+        });
+        return Ok(items);
+    }
     let tuples: Vec<Object> = items
         .into_iter()
         .map(|(k, v)| Object::new_tuple_array([k, v]))

@@ -1108,9 +1108,6 @@ fn analyze_admitted(
     if attr_bound(&tfunc) {
         return Err(JitVerdict::UnsupportedOpcode("attribute-bound loop"));
     }
-    if call_bound(&tfunc) {
-        return Err(JitVerdict::UnsupportedOpcode("call-bound loop"));
-    }
     if unpacks_pairs(&tfunc) {
         return Err(JitVerdict::UnsupportedOpcode("tuple-target loop"));
     }
@@ -1256,45 +1253,6 @@ fn attr_bound(tfunc: &TFunc) -> bool {
         }
     }
     attrs > typed
-}
-
-/// Whether `tfunc`'s loops call Python functions on objects more often
-/// than they do typed arithmetic. Tier 2 enters such a callee through its
-/// framed native entry (or the generic call protocol), which costs four
-/// times the frame JIT's direct call: a loop over `parse(item)` or
-/// `self.visit(node)` ran 2,470 instructions an iteration in tier 2
-/// against 573 in the frame JIT (CPython 918). A call returning a scalar
-/// lane (a numeric helper, which tier 2 calls natively) and a
-/// self-recursive call don't count; `WEAVEPY_T2_CALLS=0` turns the rule
-/// off.
-fn call_bound(tfunc: &TFunc) -> bool {
-    use crate::ir::TOp;
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if GENERIC_LOOPS_ADMITTED.load(std::sync::atomic::Ordering::Relaxed)
-        || !*ON.get_or_init(|| std::env::var_os("WEAVEPY_T2_CALLS").is_none_or(|v| v != "0"))
-        || !has_loop(tfunc)
-    {
-        return false;
-    }
-    let scalar = |t: JitType| matches!(t, JitType::Int | JitType::Float | JitType::Bool);
-    let (mut calls, mut typed) = (0usize, 0usize);
-    for st in loop_blocks(tfunc).flat_map(|b| &b.stmts) {
-        match st.op {
-            TOp::CallPy { ret, is_self, .. } if !is_self && !scalar(ret) => calls += 1,
-            TOp::CallPyKw { ret, .. } if !scalar(ret) => calls += 1,
-            TOp::CallDyn { .. } => calls += 1,
-            TOp::IntArith(_)
-            | TOp::FloatArith(_)
-            | TOp::IntTrueDiv
-            | TOp::IntCmp(_)
-            | TOp::FloatCmp(_)
-            | TOp::IntNeg
-            | TOp::FloatNeg
-            | TOp::IntInvert => typed += 1,
-            _ => {}
-        }
-    }
-    calls > typed
 }
 
 /// The generic share [`mostly_generic`] admits, in percent, and whether it

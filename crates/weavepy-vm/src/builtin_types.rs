@@ -5890,6 +5890,32 @@ fn install_value_type_new(bt: &BuiltinTypes) {
             make_default_new()
         };
         register_new_metadata(&wrapper, ty);
+        // `str.__new__(cls, s)`, `tuple.__new__(cls, t)` and
+        // `int.__new__(cls, n)` of a value already of the type (a
+        // subclass's `super().__new__(cls, value)`, as `email`'s `Terminal`
+        // tokens make): the allocation, which runs no code for these.
+        if let Object::Builtin(b) = &wrapper {
+            if Rc::ptr_eq(ty, &bt.str_) {
+                crate::leaf_builtins::register_fast(b, |args| match args {
+                    [Object::Type(_), Object::Str(_)] => Some(object_new(args)),
+                    _ => None,
+                });
+            } else if Rc::ptr_eq(ty, &bt.tuple_) {
+                crate::leaf_builtins::register_fast(b, |args| match args {
+                    [Object::Type(_), Object::Tuple(_)] => Some(object_new(args)),
+                    _ => None,
+                });
+            } else if Rc::ptr_eq(ty, &bt.int_) {
+                crate::leaf_builtins::register_fast(b, |args| match args {
+                    [Object::Type(cls), Object::Int(_)]
+                        if !(cls.flags.is_builtin && cls.name == "bool") =>
+                    {
+                        Some(object_new(args))
+                    }
+                    _ => None,
+                });
+            }
+        }
         ty.dict
             .borrow_mut()
             .insert(DictKey(Object::from_static("__new__")), wrapper);
