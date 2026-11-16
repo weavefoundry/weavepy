@@ -31573,6 +31573,7 @@ impl Interpreter {
                     NativeTruth::Len(b) => Ok((Rc::as_ptr(b), true, 0)),
                     NativeTruth::PyLen => Ok((std::ptr::null(), true, PY_LEN_TRUTH)),
                     NativeTruth::PyBool(_) => Ok((std::ptr::null(), false, PY_BOOL_TRUTH)),
+                    NativeTruth::Payload => Ok((std::ptr::null(), false, PAYLOAD_TRUTH)),
                     NativeTruth::Decline => Err(false),
                 }
             };
@@ -31594,6 +31595,9 @@ impl Interpreter {
             Err(true) => return Some(true),
             Err(false) => return None,
         };
+        if op == PAYLOAD_TRUTH {
+            return payload_truth(v);
+        }
         // A Python `__len__` evaluated in place, or the full path's.
         if op == PY_LEN_TRUTH {
             return match self.leaf_instance_len(v)? {
@@ -31660,6 +31664,11 @@ impl Interpreter {
                     is_len: true,
                     op: 0,
                 },
+                NativeTruth::Payload => NativeTruthPlan {
+                    f: std::ptr::null(),
+                    is_len: false,
+                    op: PAYLOAD_TRUTH,
+                },
                 _ => return None,
             },
             _ => return None,
@@ -31691,6 +31700,38 @@ impl Interpreter {
         // context (a TypeError since 3.14): the full path raises it.
         if v.is_same(&crate::vm_singletons::not_implemented()) || !Self::default_getattribute(cls) {
             return NativeTruth::Decline;
+        }
+        // A builtin value or container subclass that keeps its base's
+        // `__bool__` and `__len__`.
+        if let Object::Instance(inst) = v {
+            let payload = inst.native.get().is_some_and(|p| {
+                matches!(
+                    p,
+                    Object::Str(_)
+                        | Object::Bytes(_)
+                        | Object::Tuple(_)
+                        | Object::FrozenSet(_)
+                        | Object::Int(_)
+                        | Object::Float(_)
+                        | Object::List(_)
+                        | Object::Dict(_)
+                        | Object::Set(_)
+                        | Object::ByteArray(_)
+                )
+            });
+            let builtin = |name: &str| match cls.lookup_with_owner(name) {
+                None => true,
+                Some((Object::Builtin(_), owner)) => owner.flags.is_builtin,
+                Some(_) => false,
+            };
+            if payload
+                && cls.native_kind.get() == 0
+                && cls.c_ext_ptr.get() == 0
+                && builtin("__bool__")
+                && builtin("__len__")
+            {
+                return NativeTruth::Payload;
+            }
         }
         for (name, is_len) in [("__bool__", false), ("__len__", true)] {
             match cls.lookup(name) {
@@ -87342,7 +87383,7 @@ impl NativeTruthPlan {
     #[inline]
     pub(crate) fn run(self, v: &Object) -> Option<bool> {
         if self.f.is_null() {
-            return None;
+            return (self.op == PAYLOAD_TRUTH).then(|| payload_truth(v)).flatten();
         }
         if self.op == crate::stdlib::collections_native::OP_BOOL {
             if let Some(Object::Bool(b)) =
@@ -87381,6 +87422,9 @@ enum NativeTruth {
     PyLen,
     /// A Python `__bool__`: its result when it evaluates as a pure leaf.
     PyBool(Rc<crate::object::PyFunction>),
+    /// A subclass of a builtin value or container type whose `__bool__` and
+    /// `__len__` are builtin: its native payload's truth.
+    Payload,
     /// Anything else: the full path decides.
     Decline,
 }
@@ -87389,6 +87433,33 @@ enum NativeTruth {
 const PY_LEN_TRUTH: u8 = u8::MAX;
 /// [`NativeTruth::PyBool`]'s.
 const PY_BOOL_TRUTH: u8 = u8::MAX - 1;
+/// [`NativeTruth::Payload`]'s.
+const PAYLOAD_TRUTH: u8 = u8::MAX - 2;
+
+/// The truth of `v`'s native payload, `v` an instance of a class whose
+/// truth is its payload's (see [`NativeTruth::Payload`]): `None` for a
+/// payload it doesn't know, or one borrowed now.
+fn payload_truth(v: &Object) -> Option<bool> {
+    let Object::Instance(inst) = v else {
+        return None;
+    };
+    // SAFETY: reads between two instructions (nothing here runs code).
+    unsafe {
+        Some(match inst.native.get()? {
+            Object::Str(s) => !s.is_empty(),
+            Object::Bytes(b) => !b.is_empty(),
+            Object::Tuple(t) => !t.is_empty(),
+            Object::FrozenSet(f) => !f.is_empty(),
+            Object::Int(i) => *i != 0,
+            Object::Float(f) => *f != 0.0,
+            Object::List(l) => !l.peek()?.is_empty(),
+            Object::Dict(d) => !d.peek()?.is_empty(),
+            Object::Set(set) => !set.peek()?.is_empty(),
+            Object::ByteArray(b) => !b.peek()?.is_empty(),
+            _ => return None,
+        })
+    }
+}
 
 /// [`inst_may_shadow`] first settled by a leaf site's bound (see
 /// [`LeafSiteData::limit`]): values laid over the class's names `keys`
