@@ -1260,22 +1260,27 @@ impl Interpreter {
                 break 'lean;
             };
             let pc = frame.pc as usize;
-            // Resting in a `yield from` over a generator (its delegate tops
-            // its stack): the delegate steps directly (see
-            // `gen_chain_step`).
-            if level < CHAIN_LEVELS
-                && matches!(frame.stack.last(), Some(Object::Generator(_)))
-                && crate::yield_from_resend(&code.instructions, pc).is_some()
-            {
-                return self.gen_chain_step(g, snap_gen, dead, depth_cell, level);
-            }
-            // Resting in a `yield from` over a range, tuple or list iterator
-            // with an item left: the item, the frame untouched (a `SEND` of
-            // `None` to it and the `YIELD_VALUE` after are just that). Its
-            // end, and every other iterator, take the general resume.
-            if let Some(Object::Iter(it)) = frame.stack.last() {
-                if let Some(v) = Self::yield_from_iter_item(frame, code, pc, it) {
-                    return GenNext::Yielded(v);
+            // (A loop's iterator tops the stack at most plain yields: the
+            // shortcuts below are for a `yield from`'s resume point alone.)
+            if crate::yield_from_resend(&code.instructions, pc).is_some() {
+                match frame.stack.last() {
+                    // Resting in a `yield from` over a generator (its
+                    // delegate tops its stack): the delegate steps directly
+                    // (see `gen_chain_step`).
+                    Some(Object::Generator(_)) if level < CHAIN_LEVELS => {
+                        return self.gen_chain_step(g, snap_gen, dead, depth_cell, level);
+                    }
+                    // Resting in a `yield from` over a range, tuple or list
+                    // iterator with an item left: the item, the frame
+                    // untouched (a `SEND` of `None` to it and the
+                    // `YIELD_VALUE` after are just that). Its end, and every
+                    // other iterator, take the general resume.
+                    Some(Object::Iter(it)) => {
+                        if let Some(v) = Self::yield_from_iter_item(frame, code, pc, it) {
+                            return GenNext::Yielded(v);
+                        }
+                    }
+                    _ => {}
                 }
             }
             let Some(native) = ext.frame_jit.get(frame.locals.len()) else {
@@ -1353,14 +1358,29 @@ impl Interpreter {
     /// `frame` (at `pc` of `code`) rests on in a `yield from`, when stepping
     /// it runs no code and doesn't end it (see `gen_native_next`).
     #[inline]
+    #[inline]
     pub(crate) fn yield_from_iter_item(
         frame: &Frame,
         code: &CodeObject,
         pc: usize,
         it: &Rc<crate::sync::RefCell<PyIterator>>,
     ) -> Option<Object> {
-        use std::sync::atomic::Ordering;
+        // (A loop's iterator tops the stack at a plain yield: only a
+        // `yield from`'s resume point goes on.)
         let send = crate::yield_from_resend(&code.instructions, pc)?;
+        Self::yield_from_iter_step(frame, code, send, it)
+    }
+
+    /// [`Self::yield_from_iter_item`] past its resume-point check (`send`
+    /// is the `SEND`'s pc).
+    #[inline(never)]
+    fn yield_from_iter_step(
+        frame: &Frame,
+        code: &CodeObject,
+        send: usize,
+        it: &Rc<crate::sync::RefCell<PyIterator>>,
+    ) -> Option<Object> {
+        use std::sync::atomic::Ordering;
         if code.instructions[send].arg & crate::GEN_SEND != 0
             || frame.sent_consumed
             || frame.py_frame.is_some()
