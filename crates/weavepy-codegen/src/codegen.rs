@@ -432,12 +432,15 @@ impl<A: Asm> Gen<'_, A> {
     }
 
     fn reset(&mut self) {
-        for v in std::mem::take(&mut self.live) {
+        // (The vector keeps its room: a reset comes at every block.)
+        let mut live = std::mem::take(&mut self.live);
+        for v in live.drain(..) {
             let i = v.index();
             self.tracked[i] = false;
             self.reg_of[i] = NOREG;
             self.home_ok[i] = false;
         }
+        self.live = live;
         self.holds = [NONE; 64];
     }
 

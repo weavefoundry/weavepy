@@ -2794,10 +2794,22 @@ fn compute_c3(
     bases: &[Rc<TypeObject>],
     name: &str,
 ) -> Result<Vec<Rc<TypeObject>>, RuntimeError> {
+    // One base (most classes, and `email`'s header classes made per
+    // header): the class, then the base's MRO, which the merge below
+    // would give one head at a time.
+    if let [base] = bases {
+        let mro = base.mro.borrow();
+        let mut merged = Vec::with_capacity(mro.len() + 1);
+        merged.push(self_ty.clone());
+        merged.extend(mro.iter().cloned());
+        return Ok(merged);
+    }
     let mut lists: Vec<Vec<Rc<TypeObject>>> =
         bases.iter().map(|b| b.mro.borrow().clone()).collect();
     lists.push(bases.to_vec());
-    let mut merged: Vec<Rc<TypeObject>> = vec![self_ty.clone()];
+    let mut merged: Vec<Rc<TypeObject>> =
+        Vec::with_capacity(1 + lists.iter().map(Vec::len).sum::<usize>());
+    merged.push(self_ty.clone());
     loop {
         lists.retain(|l| !l.is_empty());
         if lists.is_empty() {
