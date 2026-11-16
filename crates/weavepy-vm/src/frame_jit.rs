@@ -8525,14 +8525,14 @@ unsafe fn attr_miss(st: *mut State, site: &AttrSite, at: *mut Object, local: boo
                 .method_slot(site.pc as usize)
                 .is_some_and(|m| m.holds_getter())
                 && property_leaf_here(
-                &mut *st,
-                site.code,
-                site.pc as usize,
-                site.slot as usize,
-                at,
-                u64::from(local),
-            )
-            .is_some()
+                    &mut *st,
+                    site.code,
+                    site.pc as usize,
+                    site.slot as usize,
+                    at,
+                    u64::from(local),
+                )
+                .is_some()
             {
                 site_property_note(site, ver);
                 return 0;

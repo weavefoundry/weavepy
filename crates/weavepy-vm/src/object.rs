@@ -5215,6 +5215,11 @@ impl Clone for DictData {
 }
 
 impl DictData {
+    /// Room for `additional` more entries without growing.
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        self.map.reserve(additional);
+    }
+
     #[inline]
     pub fn with_capacity_and_hasher(n: usize, h: crate::fasthash::FxBuildHasher) -> Self {
         Self {

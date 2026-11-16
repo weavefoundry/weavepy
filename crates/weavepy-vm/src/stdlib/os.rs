@@ -2757,11 +2757,87 @@ fn stat_seq_finish(inst: &crate::types::PyInstance) {
     }
 }
 
+/// A `stat_result`'s named fields as a builder collects them (each name
+/// once), for [`stat_fields_finish`].
+struct StatFields(Vec<(&'static str, Object)>);
+
+impl StatFields {
+    fn insert(&mut self, name: &'static str, value: Object) {
+        debug_assert!(self.0.iter().all(|(n, _)| *n != name), "{name} twice");
+        self.0.push((name, value));
+    }
+
+    fn get(&self, name: &str) -> Option<&Object> {
+        self.0.iter().find(|(n, _)| *n == name).map(|(_, v)| v)
+    }
+}
+
+/// [`stat_seq_finish`] of the fields a builder collected: the tuple view
+/// from them directly, and the instance dict laid down in one go, its keys
+/// (and their hashes) made once per thread for each position a builder
+/// fills.
+fn stat_fields_finish(inst: &crate::types::PyInstance, mut fields: StatFields) {
+    #[cfg(target_os = "macos")]
+    {
+        for f in ["st_flags", "st_gen"] {
+            if fields.get(f).is_none() {
+                fields.insert(f, Object::Int(0));
+            }
+        }
+        if fields.get("st_birthtime").is_none() {
+            let v = fields
+                .get("st_ctime")
+                .cloned()
+                .unwrap_or(Object::Float(0.0));
+            fields.insert("st_birthtime", v);
+        }
+    }
+    let mut seq: Vec<Object> = Vec::with_capacity(10);
+    for f in [
+        "st_mode", "st_ino", "st_dev", "st_nlink", "st_uid", "st_gid", "st_size",
+    ] {
+        seq.push(fields.get(f).cloned().unwrap_or(Object::Int(0)));
+    }
+    for f in ["st_atime", "st_mtime", "st_ctime"] {
+        seq.push(match fields.get(f) {
+            Some(Object::Float(x)) => Object::Int(*x as i64),
+            Some(other) => other.clone(),
+            None => Object::Int(0),
+        });
+    }
+    let _ = inst.native.set(Object::new_tuple(seq));
+    thread_local! {
+        static KEYS: std::cell::RefCell<Vec<(usize, i64, DictKey)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let n = fields.0.len();
+    let mut values = fields.0.into_iter();
+    let map = KEYS.with(|keys| {
+        let mut keys = keys.borrow_mut();
+        crate::dictmap::DictMap::from_unique_hashed(n, |i| {
+            let (name, value) = values.next().expect("n fields");
+            let at = name.as_ptr() as usize;
+            if keys.get(i).is_none_or(|k| k.0 != at) {
+                let key = DictKey(Object::from_static(name));
+                let entry = (at, crate::object::dict_key_hash(&key.0), key);
+                if i < keys.len() {
+                    keys[i] = entry;
+                } else {
+                    keys.push(entry);
+                }
+            }
+            let (_, hash, key) = &keys[i];
+            (*hash, key.clone(), value)
+        })
+    });
+    *inst.dict_cell().borrow_mut() = DictData::from(map);
+}
+
 fn stat_result_from_meta(meta: &std::fs::Metadata) -> Object {
     use crate::types::PyInstance;
     let ty = stat_result_type();
     let inst = PyInstance::new(ty);
-    let mut d = inst.dict_cell().borrow_mut();
+    let mut d = StatFields(Vec::with_capacity(24));
     // On Unix the OS already encodes the full `st_mode` — file-type bits
     // (S_IFREG / S_IFDIR / S_IFCHR / S_IFBLK / S_IFLNK / S_IFIFO / S_IFSOCK)
     // *and* permissions — so use it verbatim; otherwise char/block devices,
@@ -2791,11 +2867,8 @@ fn stat_result_from_meta(meta: &std::fs::Metadata) -> Object {
         };
         kind_bits | perm_bits
     };
-    d.insert(
-        DictKey(Object::from_static("st_size")),
-        Object::Int(meta.len() as i64),
-    );
-    d.insert(DictKey(Object::from_static("st_mode")), Object::Int(mode));
+    d.insert("st_size", Object::Int(meta.len() as i64));
+    d.insert("st_mode", Object::Int(mode));
     // On Unix derive the float `st_*time` straight from the integer
     // nanosecond fields below, so `st_atime` and `st_atime_ns` describe the
     // *same* instant (CPython invariant: `test_stat_attributes` checks they
@@ -2830,18 +2903,9 @@ fn stat_result_from_meta(meta: &std::fs::Metadata) -> Object {
             .map_or(mtime, |d| d.as_secs_f64());
         (atime, mtime, ctime)
     };
-    d.insert(
-        DictKey(Object::from_static("st_mtime")),
-        Object::Float(mtime),
-    );
-    d.insert(
-        DictKey(Object::from_static("st_atime")),
-        Object::Float(atime),
-    );
-    d.insert(
-        DictKey(Object::from_static("st_ctime")),
-        Object::Float(ctime),
-    );
+    d.insert("st_mtime", Object::Float(mtime));
+    d.insert("st_atime", Object::Float(atime));
+    d.insert("st_ctime", Object::Float(ctime));
     // The remaining fields come straight from the OS `stat(2)` record on
     // Unix. Real `st_ino`/`st_dev` are essential: `posixpath.samefile`/
     // `samestat` compare exactly those two, so leaving them 0 made every
@@ -2851,77 +2915,41 @@ fn stat_result_from_meta(meta: &std::fs::Metadata) -> Object {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        d.insert("st_ino", Object::Int(meta.ino() as i64));
+        d.insert("st_dev", Object::Int(meta.dev() as i64));
+        d.insert("st_nlink", Object::Int(meta.nlink() as i64));
+        d.insert("st_uid", Object::Int(i64::from(meta.uid())));
+        d.insert("st_gid", Object::Int(i64::from(meta.gid())));
+        d.insert("st_rdev", Object::Int(meta.rdev() as i64));
+        d.insert("st_blocks", Object::Int(meta.blocks() as i64));
+        d.insert("st_blksize", Object::Int(meta.blksize() as i64));
         d.insert(
-            DictKey(Object::from_static("st_ino")),
-            Object::Int(meta.ino() as i64),
-        );
-        d.insert(
-            DictKey(Object::from_static("st_dev")),
-            Object::Int(meta.dev() as i64),
-        );
-        d.insert(
-            DictKey(Object::from_static("st_nlink")),
-            Object::Int(meta.nlink() as i64),
-        );
-        d.insert(
-            DictKey(Object::from_static("st_uid")),
-            Object::Int(i64::from(meta.uid())),
-        );
-        d.insert(
-            DictKey(Object::from_static("st_gid")),
-            Object::Int(i64::from(meta.gid())),
-        );
-        d.insert(
-            DictKey(Object::from_static("st_rdev")),
-            Object::Int(meta.rdev() as i64),
-        );
-        d.insert(
-            DictKey(Object::from_static("st_blocks")),
-            Object::Int(meta.blocks() as i64),
-        );
-        d.insert(
-            DictKey(Object::from_static("st_blksize")),
-            Object::Int(meta.blksize() as i64),
-        );
-        d.insert(
-            DictKey(Object::from_static("st_mtime_ns")),
+            "st_mtime_ns",
             Object::Int(meta.mtime() * 1_000_000_000 + meta.mtime_nsec()),
         );
         d.insert(
-            DictKey(Object::from_static("st_atime_ns")),
+            "st_atime_ns",
             Object::Int(meta.atime() * 1_000_000_000 + meta.atime_nsec()),
         );
         d.insert(
-            DictKey(Object::from_static("st_ctime_ns")),
+            "st_ctime_ns",
             Object::Int(meta.ctime() * 1_000_000_000 + meta.ctime_nsec()),
         );
     }
     #[cfg(not(unix))]
     {
-        d.insert(DictKey(Object::from_static("st_ino")), Object::Int(0));
-        d.insert(DictKey(Object::from_static("st_dev")), Object::Int(0));
-        d.insert(DictKey(Object::from_static("st_nlink")), Object::Int(1));
-        d.insert(DictKey(Object::from_static("st_uid")), Object::Int(0));
-        d.insert(DictKey(Object::from_static("st_gid")), Object::Int(0));
-        d.insert(DictKey(Object::from_static("st_rdev")), Object::Int(0));
-        d.insert(DictKey(Object::from_static("st_blocks")), Object::Int(0));
-        d.insert(
-            DictKey(Object::from_static("st_blksize")),
-            Object::Int(4096),
-        );
+        d.insert("st_ino", Object::Int(0));
+        d.insert("st_dev", Object::Int(0));
+        d.insert("st_nlink", Object::Int(1));
+        d.insert("st_uid", Object::Int(0));
+        d.insert("st_gid", Object::Int(0));
+        d.insert("st_rdev", Object::Int(0));
+        d.insert("st_blocks", Object::Int(0));
+        d.insert("st_blksize", Object::Int(4096));
         let mtime_ns = (mtime * 1e9) as i64;
-        d.insert(
-            DictKey(Object::from_static("st_mtime_ns")),
-            Object::Int(mtime_ns),
-        );
-        d.insert(
-            DictKey(Object::from_static("st_atime_ns")),
-            Object::Int((atime * 1e9) as i64),
-        );
-        d.insert(
-            DictKey(Object::from_static("st_ctime_ns")),
-            Object::Int((ctime * 1e9) as i64),
-        );
+        d.insert("st_mtime_ns", Object::Int(mtime_ns));
+        d.insert("st_atime_ns", Object::Int((atime * 1e9) as i64));
+        d.insert("st_ctime_ns", Object::Int((ctime * 1e9) as i64));
     }
     // Windows-only extras CPython adds to `stat_result` (posixmodule.c's
     // `STRUCT_STAT` under `MS_WINDOWS`): the raw `dwFileAttributes` word —
@@ -2932,16 +2960,12 @@ fn stat_result_from_meta(meta: &std::fs::Metadata) -> Object {
     {
         use std::os::windows::fs::MetadataExt;
         d.insert(
-            DictKey(Object::from_static("st_file_attributes")),
+            "st_file_attributes",
             Object::Int(i64::from(meta.file_attributes())),
         );
-        d.insert(
-            DictKey(Object::from_static("st_reparse_tag")),
-            Object::Int(0),
-        );
+        d.insert("st_reparse_tag", Object::Int(0));
     }
-    drop(d);
-    stat_seq_finish(&inst);
+    stat_fields_finish(&inst, d);
     Object::Instance(Rc::new(inst))
 }
 
