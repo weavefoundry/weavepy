@@ -3528,11 +3528,21 @@ fn build_scandir_iterator(entries: Vec<Object>) -> Object {
         }
         let bt = crate::builtin_types::builtin_types();
         let mut dict = DictData::default();
-        scandir_method(&mut dict, "__iter__", scandir_self);
-        scandir_method(&mut dict, "__next__", scandir_next);
-        scandir_method(&mut dict, "__enter__", scandir_self);
-        scandir_method(&mut dict, "__exit__", scandir_exit);
-        scandir_method(&mut dict, "close", scandir_exit);
+        // (These run no Python code: compiled code and the core loop step
+        // the iterator through its `__next__` in place.)
+        for (name, body) in [
+            (
+                "__iter__",
+                scandir_self as fn(&[Object]) -> Result<Object, RuntimeError>,
+            ),
+            ("__next__", scandir_next),
+            ("__enter__", scandir_self),
+            ("__exit__", scandir_exit),
+            ("close", scandir_exit),
+        ] {
+            let b = scandir_method(&mut dict, name, body);
+            crate::leaf_builtins::register(&b);
+        }
         // CPython's `ScandirIterator` keeps an open `DIR*`; if it is dropped
         // without being exhausted or closed, `__del__` emits a
         // `ResourceWarning` (`test_os.TestScandir.test_resource_warning`).
@@ -3563,16 +3573,18 @@ fn scandir_method(
     dict: &mut DictData,
     name: &'static str,
     body: fn(&[Object]) -> Result<Object, RuntimeError>,
-) {
+) -> Rc<crate::object::BuiltinFn> {
+    let b = Rc::new(crate::object::BuiltinFn {
+        name,
+        binds_instance: true,
+        call: Box::new(body),
+        call_kw: None,
+    });
     dict.insert(
         DictKey(Object::from_static(name)),
-        Object::Builtin(Rc::new(crate::object::BuiltinFn {
-            name,
-            binds_instance: true,
-            call: Box::new(body),
-            call_kw: None,
-        })),
+        Object::Builtin(b.clone()),
     );
+    b
 }
 
 fn scandir_self(args: &[Object]) -> Result<Object, RuntimeError> {
