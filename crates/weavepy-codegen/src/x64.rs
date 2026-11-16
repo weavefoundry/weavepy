@@ -1164,6 +1164,13 @@ impl X64 {
             let j = sites.partition_point(|s| s.0 < o);
             o - saved[j]
         };
+        // (The sites are in code order: a branch is the `j`th to start, and
+        // its target's place among them is found once.)
+        debug_assert!(sites.windows(2).all(|w| w[0].0 < w[1].0));
+        let target_at: Vec<usize> = sites
+            .iter()
+            .map(|s| sites.partition_point(|t| t.0 < s.2))
+            .collect();
         loop {
             fill(&mut saved, &short);
             let mut changed = false;
@@ -1171,8 +1178,8 @@ impl X64 {
                 if !short[j] {
                     continue;
                 }
-                let from = i64::from(moved(&saved, sites[j].0)) + 2;
-                let to = i64::from(moved(&saved, sites[j].2));
+                let from = i64::from(sites[j].0 - saved[j]) + 2;
+                let to = i64::from(sites[j].2 - saved[target_at[j]]);
                 if !(-128..=127).contains(&(to - from)) {
                     short[j] = false;
                     changed = true;
@@ -1197,8 +1204,8 @@ impl X64 {
             } else {
                 0xeb
             };
-            let from = i64::from(moved(&saved, start)) + 2;
-            let rel = i64::from(moved(&saved, target)) - from;
+            let from = i64::from(start - saved[j]) + 2;
+            let rel = i64::from(target - saved[target_at[j]]) - from;
             out.push(op);
             out.push(rel as i8 as u8);
             prev = (start + len) as usize;
