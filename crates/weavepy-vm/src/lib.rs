@@ -17480,6 +17480,52 @@ impl Interpreter {
         }
     }
 
+    /// A compiled consumer's inlined drain of the fresh generator `g` (an
+    /// inlined `list(...)` or `any(...)` loop's first `FOR_ITER`, at `pc`
+    /// of `sw`'s running activation `frame`, synced with the generator on
+    /// top) whose body the fast steps don't run (it calls): the
+    /// generator's lean resume folds the yields `fold` takes, as `sum()`'s
+    /// does (see [`Self::gen_drain_next`]), with the activation waiting on
+    /// the pending list, or, `lazy`, running lazily (as
+    /// [`Self::core_native_body`] runs a builtin's body). `None` once the
+    /// generator is exhausted, else the first yield the sink declined.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::core_native_body`]'s, `lazy` null or the running lazy
+    /// activation's state.
+    #[cfg(feature = "jit")]
+    #[inline(never)]
+    pub(crate) unsafe fn core_gen_fold(
+        &mut self,
+        sw: &mut CoreSwitch,
+        frame: &mut Frame,
+        pc: usize,
+        g: &Rc<PyGenerator>,
+        fold: FoldSink,
+        lazy: *mut frame_jit::State,
+    ) -> Result<Option<Object>, RuntimeError> {
+        frame.pc = pc as u32 + 1;
+        // SAFETY: the caller's contract (as `core_native_body`'s).
+        unsafe {
+            let pending = if lazy.is_null() {
+                self.core_pending_enter_fast(sw, frame, pc)
+            } else {
+                (*lazy).wait_pc = pc;
+                None
+            };
+            let result = self.gen_drain_next(g, Some(fold), false);
+            let pending = if lazy.is_null() {
+                pending
+            } else {
+                (*lazy).wait_pc = usize::MAX;
+                (*lazy).wait_pending.take()
+            };
+            self.core_pending_exit(sw, pending);
+            result
+        }
+    }
+
     /// A `BINARY_OP` or `COMPARE_OP` at `sw`'s running activation's `pc`
     /// the core loop's arms declined (a Python dunder, `Vector.__sub__`; a
     /// `%` of a `dict`): the full handler's own step, run with the activation

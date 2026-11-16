@@ -2935,16 +2935,18 @@ unsafe fn for_iter_drain(
         if !matches!(
             g.state_raw().peek(),
             Some(crate::object::GeneratorState::Created(_))
-        ) || !crate::gen_fast::steps_body(g)
-        {
+        ) {
             return None;
         }
+        // (A body the fast steps don't run, one that calls, drains by its
+        // lean resume instead: see `for_iter_fold`.)
+        let steps = crate::gen_fast::steps_body(g);
         let ins = &(&*st.frame).code.instructions;
         let (append, back) = (ins.get(pc + 1)?, ins.get(pc + 2)?);
         // An inlined `all(...)` or `any(...)` (`FOR_ITER; TO_BOOL;
         // POP_JUMP_IF_FALSE/TRUE; NOT_TAKEN; JUMP_BACKWARD`).
         if append.op == OpCode::ToBool {
-            return for_iter_truth(st, it, out, pc);
+            return for_iter_truth(st, it, out, pc, steps);
         }
         if append.op != OpCode::ListAppend
             || append.arg != 2
@@ -2962,6 +2964,25 @@ unsafe fn for_iter_drain(
         };
         if Rc::strong_count(list) != 1 {
             return None;
+        }
+        if !steps {
+            // (Code runs while the body does: the items gather apart and
+            // join the list as the drain stops, before the loop's own
+            // append of a yield it hands back.)
+            let mut gathered = Vec::new();
+            let list = list.clone();
+            return for_iter_fold(
+                st,
+                it,
+                out,
+                pc,
+                crate::FoldSink::Collect(&raw mut gathered),
+                || {
+                    if let Some(items) = list.peek_mut() {
+                        items.append(&mut gathered);
+                    }
+                },
+            );
         }
         // (Growing the list runs no code: nothing reaches it while it's
         // peeked at.)
@@ -3017,6 +3038,7 @@ unsafe fn for_iter_truth(
     it: *mut Object,
     out: *mut Object,
     pc: usize,
+    steps: bool,
 ) -> Option<u32> {
     use crate::gen_fast::GenNext;
     // SAFETY: the caller's contract.
@@ -3033,6 +3055,9 @@ unsafe fn for_iter_truth(
             || (pc + 5).checked_sub(back.arg as usize) != Some(pc)
         {
             return None;
+        }
+        if !steps {
+            return for_iter_fold(st, it, out, pc, crate::FoldSink::Truth(decides), || {});
         }
         let Object::Generator(g) = &*it else {
             return None;
@@ -3066,6 +3091,130 @@ unsafe fn for_iter_truth(
             }
             GenNext::Declined => None,
         }
+    }
+}
+
+/// [`for_iter_drain`] of a fresh generator whose body the fast steps
+/// don't run (it calls): its lean resume drains it into `fold` (see
+/// `Interpreter::core_gen_fold`), the frame synced as a native call's is
+/// (see [`native_body_here`]), and `joined` runs as the drain stops. Its
+/// end leaves the loop (`2`); a yield the sink declined is the
+/// instruction's result (`1`); a raise is the instruction's (`FOR_RAISED`).
+/// When the drain left the activation's code (a switch, a pending exit),
+/// the frame is left as the core loop's `FOR_ITER` would leave it
+/// (`FOR_SWITCHED`).
+///
+/// # Safety
+///
+/// As [`for_iter_drain`]'s, `it` holding a fresh generator.
+#[inline(never)]
+unsafe fn for_iter_fold(
+    st: &mut State,
+    it: *mut Object,
+    out: *mut Object,
+    pc: usize,
+    fold: crate::FoldSink,
+    joined: impl FnOnce(),
+) -> Option<u32> {
+    // SAFETY: the caller's contract; the stack slot keeps the generator
+    // alive while it runs.
+    unsafe {
+        if st.sw.is_null()
+            || !(*st.sw).calls_ok
+            || crate::hot_gates::loop_gen() != st.snap_gen
+            || (*st.maybe_dead).get()
+        {
+            return None;
+        }
+        let Object::Generator(g) = &*it else {
+            return None;
+        };
+        let g = g.clone();
+        let at = it.offset_from(st.stack) as usize;
+        // The frame synced, as the core loop's arm syncs it.
+        let frame = &mut *st.frame;
+        frame.stack.set_len(at + 1);
+        let lazy = !st.lazy.is_null() && !crate::sync::cells_unguarded();
+        if !lazy {
+            settle(st);
+            *(*st.sw).last = st.last;
+        }
+        let sw = &mut *st.sw;
+        let interp = &mut *st.interp.cast_mut();
+        let r = interp.core_gen_fold(
+            sw,
+            frame,
+            pc,
+            &g,
+            fold,
+            if lazy {
+                std::ptr::from_mut(st)
+            } else {
+                std::ptr::null_mut()
+            },
+        );
+        drop(g);
+        joined();
+        let mut in_place = false;
+        if !st.lazy.is_null() {
+            in_place = sw.pending.is_none() && crate::hot_gates::loop_gen() == st.snap_gen;
+            if !in_place {
+                settle(st);
+            }
+        }
+        let sw = &mut *st.sw;
+        in_place = in_place
+            || (sw.pending.is_none()
+                && std::ptr::eq(sw.cur, st.frame)
+                && crate::hot_gates::loop_gen() == st.snap_gen);
+        if in_place {
+            return Some(match r {
+                Ok(Some(v)) => {
+                    out.write(v);
+                    1
+                }
+                Ok(None) => {
+                    // The finished generator leaves the stack.
+                    drop(it.read());
+                    if (*st.maybe_dead).get() {
+                        return Some(for_iter_gen_marked(st, it, pc as u64));
+                    }
+                    2
+                }
+                Err(e) => {
+                    st.len = at + 1;
+                    st.pc = pc + 1;
+                    st.err = Some(e);
+                    FOR_RAISED
+                }
+            });
+        }
+        // The core loop goes on from the frame, left as its `FOR_ITER`
+        // leaves it.
+        let frame = &mut *st.frame;
+        match r {
+            Ok(Some(v)) => {
+                out.write(v);
+                frame.stack.set_len(at + 2);
+                frame.pc = pc as u32 + 1;
+            }
+            Ok(None) => {
+                drop(it.read());
+                frame.stack.set_len(at);
+                frame.pc = for_iter_exit(&frame.code, pc) as u32;
+            }
+            Err(e) => {
+                frame.stack.set_len(at + 1);
+                frame.pc = pc as u32 + 1;
+                sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Raised(e)));
+                return Some(FOR_SWITCHED);
+            }
+        }
+        *sw.last = pc;
+        if sw.pending.is_none() && (*sw.maybe_dead).get() {
+            sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Marked));
+        }
+        Some(FOR_SWITCHED)
     }
 }
 
