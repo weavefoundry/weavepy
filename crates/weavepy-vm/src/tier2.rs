@@ -564,6 +564,8 @@ struct CacheEntry {
     /// Framed native entries of this code (saturating), the
     /// denominator of the generic-call retirement ratio below.
     native_entries: u32,
+    /// Compile attempts that failed (saturating): see [`gave_up_often`].
+    failed_compiles: u8,
     /// OSR entries this code made (saturating), and requests at its region
     /// roots turned down as too short (see [`note_short_region`]).
     osr_runs: u32,
@@ -623,6 +625,7 @@ impl CacheEntry {
             calls: 0,
             deopts: 0,
             native_entries: 0,
+            failed_compiles: 0,
             osr_runs: 0,
             short_regions: 0,
             guard_failures: 0,
@@ -1734,6 +1737,11 @@ impl JitState {
                 first
             }
         };
+        if res.is_err() {
+            if let Some(e) = self.cache.get_mut(&key) {
+                e.failed_compiles = e.failed_compiles.saturating_add(1);
+            }
+        }
         if matches!(
             res,
             Err(weavepy_jit::JitVerdict::UnsupportedOpcode(why)) if why == weavepy_jit::NO_HOST_ENGINE
@@ -16506,6 +16514,28 @@ pub(crate) fn missed_call_entry(code: &CodeObject) -> bool {
                 .get(&std::ptr::from_ref(code))
                 .is_some_and(|entry| {
                     matches!(entry.tier, Tier::Cold) && entry.probe_misses.contains(&0)
+                })
+        })
+    })
+}
+
+/// Compile attempts that fail before the frame JIT takes code whose loops
+/// tier 2 keeps trying (see [`gave_up_often`]).
+const FAILED_COMPILES_HANDOVER: u8 = 3;
+
+/// Whether tier 2 has failed to compile `code` [`FAILED_COMPILES_HANDOVER`]
+/// times and holds nothing compiled for it: code it keeps trying from new
+/// entries (`argparse`'s `_parse_known_args`, whose every attempt meets an
+/// unsupported shape), which the frame JIT would otherwise leave to it,
+/// interpreted, for good.
+pub(crate) fn gave_up_often(code: &CodeObject) -> bool {
+    JIT.with(|cell| {
+        cell.try_borrow().is_ok_and(|st| {
+            st.cache
+                .get(&std::ptr::from_ref(code))
+                .is_some_and(|entry| {
+                    entry.failed_compiles >= FAILED_COMPILES_HANDOVER
+                        && !matches!(entry.tier, Tier::Compiled(_))
                 })
         })
     })

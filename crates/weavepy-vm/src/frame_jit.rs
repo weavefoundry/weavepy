@@ -818,7 +818,9 @@ impl Slot {
             let taken_for_calls = left == 0
                 && crate::tier2::missed_call_entry(code)
                 && self.call_waits.fetch_add(1, Ordering::Relaxed) + 1 >= CALL_WAITS;
-            let left_to_tier2 = left < LEFT_TO_TIER2 && !taken_for_calls;
+            // (Nor is code tier 2 keeps failing to compile its to keep.)
+            let left_to_tier2 =
+                left < LEFT_TO_TIER2 && !taken_for_calls && !crate::tier2::gave_up_often(code);
             if left_to_tier2 || crate::tier2::holds_compiled(code) {
                 if stats::enabled() {
                     let kind = if left > 0 { "loop" } else { "call" };
