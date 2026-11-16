@@ -503,6 +503,25 @@ branch and pull request.
   - `(x,) * n` and `[x] * n` of a short sequence repeat in place in
     compiled code and the core loop (argparse's metavar formatter left 13
     times a parse).
+  - `dataclasses.replace` ends in `self.__class__(**changes)`, which had
+    no lane for a class: it left compiled code and took the generic call.
+    The mapping's keywords now bind to `__init__` as a keyword call's do,
+    and the call runs inline (27,452 instructions to 19,239, CPython
+    11,984; cycles 3.9 times CPython's to 2.1). The keyword and mapping
+    constructions share one body.
+  - `super(C, obj).__class__` built the proxy's dict one probe at a time,
+    and the class read, finding the proxy's last reference on the stack,
+    declined to release it and took the attribute miss path: it releases
+    it now, a queued finalizer running before the next instruction
+    (4,269 instructions to 1,785, CPython 1,236).
+  - A `list` or `tuple` subclass's `self[0]` (`email`'s `TokenList`) and
+    `for entry in os.scandir(...)` (`glob`) were slow steps; they read the
+    payload and step the iterator in place. Branch relaxation in the code
+    generator found each branch's place by binary search on every pass:
+    32% less of the compiles' finishing work.
+  - The battery stands at 1.233 times CPython's instructions on quick
+    builds (1.237 this morning): `class_features` ran 10% fewer,
+    `configparser_ops` 8%, `enum_dataclass_ops` 5%, `email_html_ops` 3%.
   - Why the short cases trail. Argparse's case runs each operation 180
     times. CPython's instructions an iteration are flat from the first
     (1.5 million); WeavePy's fall from 5.6 million over the first 20 to
