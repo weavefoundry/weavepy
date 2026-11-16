@@ -96,6 +96,9 @@ struct PartialReg {
     cls: crate::sync::Weak<crate::types::TypeObject>,
     placeholder: Object,
     py_new: Object,
+    /// Whether the class lays out exactly [`PARTIAL_SLOTS`], in order (its
+    /// instances' slots are then built in one piece).
+    laid_out: std::sync::OnceLock<bool>,
 }
 
 /// `_partial_new_for(partial, Placeholder, _partial_new)`: the native
@@ -111,6 +114,7 @@ fn partial_new_for(args: &[Object]) -> Result<Object, RuntimeError> {
         cls: Rc::downgrade(cls),
         placeholder: placeholder.clone(),
         py_new: py_new.clone(),
+        laid_out: std::sync::OnceLock::new(),
     });
     let reg_kw = reg.clone();
     Ok(Object::Builtin(Rc::new(BuiltinFn {
@@ -263,10 +267,33 @@ fn partial_new(
         Object::Int(0),
         Object::None,
     ];
-    let inst = crate::types::PyInstance::new(sub.clone());
-    for (name, v) in PARTIAL_SLOTS.iter().zip(values) {
-        inst.slot_set(name, v);
-    }
+    // (The exact class's slots in one piece; a subclass's own layout has
+    // its own slots after these.)
+    let layout = Rc::ptr_eq(sub, &cls)
+        .then(|| cls.own_slot_layout())
+        .flatten()
+        .filter(|layout| {
+            *reg.laid_out.get_or_init(|| {
+                layout.len() == PARTIAL_SLOTS.len()
+                    && layout
+                        .iter()
+                        .zip(PARTIAL_SLOTS)
+                        .all(|(k, n)| matches!(&k.0, Object::Str(s) if s.as_ref() == n))
+            })
+        });
+    let inst = match layout {
+        Some(layout) => crate::types::PyInstance::with_slots(
+            sub.clone(),
+            crate::types::SlotStorage::from_layout_array(layout.clone(), values),
+        ),
+        None => {
+            let inst = crate::types::PyInstance::new(sub.clone());
+            for (name, v) in PARTIAL_SLOTS.iter().zip(values) {
+                inst.slot_set(name, v);
+            }
+            inst
+        }
+    };
     let obj = Object::Instance(Rc::new(inst));
     crate::gc_trace::track(&obj);
     Ok(obj)

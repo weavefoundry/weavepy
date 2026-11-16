@@ -9316,6 +9316,7 @@ impl Interpreter {
                 Err(binop_type_error(op, inplace, &l, &r))
             }
             (Some(MethodOp::Compare(arg)), Ok(v)) => self.compare_finish(frame, arg, v),
+            (Some(MethodOp::Iter), Ok(v)) => iter_result(v),
             (_, result) => result,
         };
         // A `functools.lru_cache` miss's function returned: its result is
@@ -11076,6 +11077,24 @@ impl Interpreter {
     /// class's version (see [`Self::try_inline_getitem`]), else the
     /// class's own. For a class whose metaclass isn't `type`
     /// (`Color["RED"]`, which `EnumType` serves), the metaclass's.
+    /// The plain Python function the class of instance `v` answers
+    /// `__iter__` with (no native payload, no native or C class): compiled
+    /// `GET_ITER` calls it directly.
+    pub(crate) fn iter_dunder(v: &Object) -> Option<Rc<crate::object::PyFunction>> {
+        let Object::Instance(inst) = v else {
+            return None;
+        };
+        let cls = inst.cls_raw();
+        if inst.native.get().is_some() || cls.native_kind.get() != 0 || cls.c_ext_ptr.get() != 0 {
+            return None;
+        }
+        Self::instance_dunder_function(
+            inst,
+            crate::types::AttrKey::vm(crate::types::vm_key::ITER_FN),
+            "__iter__",
+        )
+    }
+
     pub(crate) fn getitem_dunder(
         code: &CodeObject,
         pc: usize,
@@ -16782,6 +16801,11 @@ impl Interpreter {
                                 | Object::Str(_)
                         ) || !Self::core_droppable(v)
                         {
+                            // (Compiled code calls an instance's Python
+                            // `__iter__` directly at a site that has seen one.)
+                            if let (Object::Instance(_), Some(e)) = (v, ext) {
+                                instance_site_note(e, ninstrs, pc);
+                            }
                             offload!(OFFLOAD_HELPER);
                         }
                         let Ok(it) = v.make_iter() else {
@@ -17802,6 +17826,23 @@ impl Interpreter {
         }
     }
 
+    /// A Python class whose construction runs no Python code of its own
+    /// (`functools.partial`): a native `__new__`, `object`'s `__init__`,
+    /// and `type`'s call. [`Self::core_builtin_kw_lane`] runs a compiled
+    /// `CALL_KW` of one as it does a native callee's.
+    pub(crate) fn native_ctor_kw_callee(&self, callee: &Object, slot: &Object) -> bool {
+        let (Object::Type(t), Object::Unbound) = (callee, slot) else {
+            return false;
+        };
+        if t.flags.is_builtin || t.native_kind.get() != 0 || !Self::metaclass_calls_like_type(t) {
+            return false;
+        }
+        let plan = self.instance_plan(t);
+        plan.abstract_error.is_none()
+            && plan.init_from_object
+            && matches!(plan.user_new, Some(Object::Builtin(_)))
+    }
+
     /// [`Self::core_builtin_lane`] for the `CALL_KW` at `pc` of a native
     /// callee (see [`Self::kw_lane_callee`]: `sorted(xs, key=f)`,
     /// `xs.sort(reverse=True)`, `int(s, base=2)`), in `sw`'s synced running
@@ -17833,7 +17874,8 @@ impl Interpreter {
         let Some(callee_at) = n.checked_sub(argc + kwc + 3) else {
             return false;
         };
-        if !Self::kw_lane_callee(&frame.stack[callee_at], &frame.stack[callee_at + 1])
+        let (callee, slot) = (&frame.stack[callee_at], &frame.stack[callee_at + 1]);
+        if !(Self::kw_lane_callee(callee, slot) || self.native_ctor_kw_callee(callee, slot))
             || !names.iter().all(|name| matches!(name, Object::Str(_)))
         {
             return false;
@@ -75051,6 +75093,23 @@ pub(crate) enum MethodOp {
     /// the operands wait under the call on the caller's stack, and the
     /// result goes through [`Interpreter::compare_finish`].
     Compare(u32),
+    /// A `GET_ITER`'s `__iter__` (see `Interpreter::iter_dunder`): its
+    /// result goes through [`iter_result`].
+    Iter,
+}
+
+/// `__iter__`'s result `v` as `GET_ITER` takes it: an instance without
+/// `__next__` is the `TypeError` `Interpreter::make_iter` raises.
+pub(crate) fn iter_result(v: Object) -> Result<Object, RuntimeError> {
+    if let Object::Instance(inst) = &v {
+        if inst.cls().lookup("__next__").is_none() {
+            return Err(type_error(format!(
+                "iter() returned non-iterator of type '{}'",
+                v.type_name_owned()
+            )));
+        }
+    }
+    Ok(v)
 }
 
 /// A lean activation the quiet loop runs *inline*: its frame lives in

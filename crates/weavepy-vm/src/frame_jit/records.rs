@@ -56,6 +56,8 @@ pub(super) enum MethodOp<'a> {
     /// A `COMPARE_OP`'s first method, the instruction's oparg: the
     /// operands wait under the call on the caller's stack.
     Compare(u32),
+    /// A `GET_ITER`'s `__iter__`: its result must be an iterator.
+    Iter,
 }
 
 impl MethodOp<'_> {
@@ -66,6 +68,7 @@ impl MethodOp<'_> {
                 crate::MethodOp::Binary(op, inplace, l.clone(), r.clone())
             }
             MethodOp::Compare(arg) => crate::MethodOp::Compare(arg),
+            MethodOp::Iter => crate::MethodOp::Iter,
         }
     }
 }

@@ -2610,6 +2610,7 @@ unsafe fn op_after_reload(st: &mut State, op: records::MethodOp<'_>) {
             }
             records::MethodOp::Binary(..) => Ok(v),
             records::MethodOp::Compare(arg) => interp.compare_finish(frame, arg, v),
+            records::MethodOp::Iter => crate::iter_result(v),
         };
         match r {
             Ok(v) => frame.stack.push(v),
@@ -11235,6 +11236,34 @@ unsafe extern "C" fn h_binop_dunder(
     }
 }
 
+/// `GET_ITER` (the `pc`th instruction of `code`) of the plain instance at
+/// stack slot `slot`, which [`h_get_iter`] declined, whose class's
+/// `__iter__` is a plain Python function: the method called directly
+/// ([`dunder_call`]), its result (checked to be an iterator) at `slot`.
+/// `0` done, `CALL_DECLINED` declined untouched, `RAISED` or `RELOAD` as
+/// [`h_call`]'s.
+unsafe extern "C" fn h_iter_dunder(
+    st: *mut State,
+    pc: u64,
+    slot: u64,
+    site: *mut DirectSite,
+) -> u32 {
+    // SAFETY: the code passes its live state, one of its `GET_ITER`s, the
+    // operand's slot (nothing virtual below it), and the site's cache.
+    unsafe {
+        let st = &mut *st;
+        let (pc, slot) = (pc as usize, slot as usize);
+        // (The call takes the slot above the operand for the method.)
+        if st.sw.is_null() || slot + 2 > st.cap {
+            return CALL_DECLINED;
+        }
+        let Some(f) = Interpreter::iter_dunder(&*st.stack.add(slot)) else {
+            return CALL_DECLINED;
+        };
+        dunder_call(st, pc, slot, 1, f, site, Some(records::MethodOp::Iter))
+    }
+}
+
 /// `BINARY_SUBSCR` (the `pc`th instruction of `code`) of the plain
 /// instance and key at stack slots `slot` and above it, which the in-place
 /// helpers declined, whose class's `__getitem__` is a plain Python
@@ -11342,6 +11371,7 @@ unsafe fn dunder_call(
     // SAFETY: the caller's contract.
     unsafe {
         let at = st.stack.add(slot);
+        // (What the operator owes a result returned in place: `true` raised.)
         let not_implemented = |st: &mut State, v: &Object| match op {
             Some(records::MethodOp::Binary(op, inplace, a, b))
                 if v.is_same(&crate::vm_singletons::not_implemented()) =>
@@ -11350,6 +11380,17 @@ unsafe fn dunder_call(
                 st.pc = pc + 1;
                 st.err = Some(crate::binop_type_error(op, inplace, a, b));
                 true
+            }
+            Some(records::MethodOp::Iter) if matches!(v, Object::Instance(_)) => {
+                match crate::iter_result(v.clone()) {
+                    Ok(_) => false,
+                    Err(e) => {
+                        st.len = slot;
+                        st.pc = pc + 1;
+                        st.err = Some(e);
+                        true
+                    }
+                }
             }
             _ => false,
         };
@@ -14461,7 +14502,10 @@ unsafe extern "C" fn h_call_kw(st: *mut State, code: *const CodeObject, pc: u64,
             // (`sorted` with a `key=` lambda, `xs.sort(key=f)`,
             // `enumerate(xs, start=1)`): the core loop's lane for it, the
             // activation published, the result in place.
-            if Interpreter::kw_lane_callee(&ops[0], &ops[1]) && !st.sw.is_null() {
+            if (Interpreter::kw_lane_callee(&ops[0], &ops[1])
+                || interp.native_ctor_kw_callee(&ops[0], &ops[1]))
+                && !st.sw.is_null()
+            {
                 let frame = &mut *st.frame;
                 frame.stack.set_len(len);
                 frame.pc = pc as u32;
@@ -19144,7 +19188,47 @@ impl<'a> Lower<'a> {
                     .call(h_get_iter as *const () as usize, &[at], true)
                     .expect("returns");
                 let out = self.exit_with(pc, &[], INTERP);
-                self.branch_out(r, out);
+                // An instance whose class's `__iter__` is a Python function,
+                // at a site that has run one: the method, called directly
+                // (it can raise or switch, which leaves the whole stack on
+                // the frame's).
+                let raisable =
+                    !self.inlining() && self.vs.iter().all(|i| matches!(i, Item::Mem(_)));
+                if raisable && crate::instance_site(self.ext, pc) {
+                    let dunder = self.b.create_block();
+                    let ok = self.b.create_block();
+                    self.b.ins().brif(r, dunder, &[], ok, &[]);
+                    self.b.switch_to_block(dunder);
+                    let site: Box<DirectSite> = Box::default();
+                    let site_at = self
+                        .b
+                        .ins()
+                        .iconst(self.ptr, std::ptr::from_ref::<DirectSite>(&site) as i64);
+                    self.direct_sites.push(site);
+                    let pcv = self.b.ins().iconst(types::I64, pc as i64);
+                    let slotv = self.b.ins().iconst(types::I64, s as i64);
+                    let d = self
+                        .call(
+                            h_iter_dunder as *const () as usize,
+                            &[self.st, pcv, slotv, site_at],
+                            true,
+                        )
+                        .expect("returns");
+                    let other = self.b.create_block();
+                    self.b.ins().brif(d, other, &[], ok, &[]);
+                    self.b.switch_to_block(other);
+                    let declined = self
+                        .b
+                        .ins()
+                        .icmp_imm(IntCC::Equal, d, i64::from(CALL_DECLINED));
+                    let leave = self.b.create_block();
+                    self.b.ins().brif(declined, out, &[], leave, &[]);
+                    self.b.switch_to_block(leave);
+                    self.leave(d);
+                    self.b.switch_to_block(ok);
+                } else {
+                    self.branch_out(r, out);
+                }
                 self.set_last(pc);
                 self.check_released(pc + 1);
                 true
