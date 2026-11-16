@@ -567,10 +567,9 @@ pub(crate) fn native_hash(inst: &PyInstance) -> Option<i64> {
     let v = slots.values_for_layout(&st.pattern_layout)?;
     let pat = match &v[1] {
         Object::Str(s) => SharedStr::hash_cached(s),
-        Object::Bytes(b) => crate::shared_value::SharedSlice::hash_cached(
-            b,
-            crate::object::py_hash_bytes_slice,
-        ),
+        Object::Bytes(b) => {
+            crate::shared_value::SharedSlice::hash_cached(b, crate::object::py_hash_bytes_slice)
+        }
         _ => return None,
     };
     let Object::Int(flags) = v[2] else {
