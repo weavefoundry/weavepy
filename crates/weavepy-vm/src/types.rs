@@ -1783,6 +1783,11 @@ impl TypeObject {
 
     /// [`Self::slot_layout`], decided now if it isn't yet.
     #[inline]
+    /// The class's member layout (see [`Self::fresh_slots`]), if it has one.
+    pub(crate) fn own_slot_layout(&self) -> Option<&SharedSlice<DictKey>> {
+        self.slot_layout_init()
+    }
+
     fn slot_layout_init(&self) -> Option<&SharedSlice<DictKey>> {
         self.slot_layout
             .get_or_init(|| {

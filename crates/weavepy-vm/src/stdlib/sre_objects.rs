@@ -1439,6 +1439,23 @@ fn interned(s: &str) -> SharedStr {
     }
 }
 
+/// `cls`'s own member layout when it lays out exactly `names` in order (so
+/// compiled code reads a member of an instance built natively in line, as
+/// it reads one its class's `__init__` set), else a layout of `names`.
+fn class_layout(cls: &TypeObject, names: &[&str]) -> SharedSlice<DictKey> {
+    if let Some(own) = cls.own_slot_layout() {
+        let same = own.len() == names.len()
+            && own
+                .iter()
+                .zip(names)
+                .all(|(k, n)| matches!(&k.0, Object::Str(s) if s.as_ref() == *n));
+        if same {
+            return own.clone();
+        }
+    }
+    layout(names)
+}
+
 fn layout(names: &[&str]) -> SharedSlice<DictKey> {
     names
         .iter()
@@ -1483,9 +1500,9 @@ pub(crate) fn install(args: &[Object]) -> Result<Object, RuntimeError> {
     let state = Rc::new(State {
         match_cls: Rc::downgrade(matchc),
         scanner_cls: Rc::downgrade(scanner),
-        pattern_layout: layout(&PATTERN_SLOTS),
-        match_layout: layout(&MATCH_SLOTS),
-        scanner_layout: layout(&SCANNER_SLOTS),
+        pattern_layout: class_layout(pattern, &PATTERN_SLOTS),
+        match_layout: class_layout(matchc, &MATCH_SLOTS),
+        scanner_layout: class_layout(scanner, &SCANNER_SLOTS),
         orig,
         compile_template: compile_template.clone(),
         templates: parking_lot::Mutex::new(HashMap::new()),
