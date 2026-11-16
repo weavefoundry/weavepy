@@ -207,6 +207,10 @@ pub(crate) enum Verdict {
     /// native method (see `stdlib::sre_objects::native_hash`); `name`
     /// unused.
     NativePatternHash = 12,
+    /// The class answers `str(x)` of its instances with their `str`
+    /// payload: no `__str__` of its own (see
+    /// `Interpreter::str_payload_class`); `name` unused.
+    StrPayload = 13,
 }
 
 pub struct AttrVersion(std::sync::atomic::AtomicU64);

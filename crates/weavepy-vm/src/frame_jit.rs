@@ -8744,21 +8744,35 @@ unsafe fn attr_miss(st: *mut State, site: &AttrSite, at: *mut Object, local: boo
             }
             // (Read now: a stack receiver leaves with the read.)
             let ver = inst.cls_raw().attr_version.get();
-            if (*site.ext)
+            if let Some(ms) = (*site.ext)
                 .method_slot(site.pc as usize)
-                .is_some_and(|m| m.holds_getter())
-                && property_leaf_here(
-                    &mut *st,
-                    site.code,
-                    site.pc as usize,
-                    site.slot as usize,
-                    at,
-                    u64::from(local),
-                )
-                .is_some()
+                .filter(|m| m.holds_getter())
             {
-                site_property_note(site, ver);
-                return 0;
+                let (pc, slot) = (site.pc as usize, site.slot as usize);
+                if property_leaf_here(&mut *st, site.code, pc, slot, at, u64::from(local)).is_some()
+                {
+                    site_property_note(site, ver);
+                    return 0;
+                }
+                // A getter the site cached for the class that runs as an
+                // activation (`TokenList.value` read over a token tree's
+                // nodes): the property wins over every read below, so it's
+                // called now.
+                if !(*st).sw.is_null() && !site.direct.is_null() {
+                    if let Some(getter) = ms.getter(ver).map(|(f, _)| f) {
+                        if let Some(r) = property_call(
+                            &mut *st,
+                            pc,
+                            slot,
+                            at,
+                            u64::from(local),
+                            site.direct,
+                            getter,
+                        ) {
+                            return r;
+                        }
+                    }
+                }
             }
         }
         if let Some(v) = attr_miss_quick(site, &*at, local, running)
@@ -11737,6 +11751,28 @@ unsafe extern "C" fn h_property(
         else {
             return lane(st);
         };
+        property_call(st, pc, slot, recv, local, site, getter).unwrap_or_else(|| lane(st))
+    }
+}
+
+/// [`h_property`]'s call of `getter`, the `property` getter the site
+/// cached for the receiver's class, directly ([`direct_call_out`]): its
+/// status, or `None` declined untouched.
+///
+/// # Safety
+///
+/// As [`h_property`]'s, with a switch, `local` without [`PROPERTY_ONLY`].
+unsafe fn property_call(
+    st: &mut State,
+    pc: usize,
+    slot: usize,
+    recv: *const Object,
+    local: u64,
+    site: *mut DirectSite,
+    getter: Rc<crate::object::PyFunction>,
+) -> Option<u32> {
+    // SAFETY: the caller's contract.
+    unsafe {
         let at = st.stack.add(slot);
         // `[recv]` becomes the method call `[getter, recv]`.
         if local != 0 {
@@ -11745,28 +11781,26 @@ unsafe extern "C" fn h_property(
             at.add(1).write(at.read());
         }
         at.write(Object::Function(getter));
-        match direct_call_out(st, pc, slot, slot + 2, &mut *site, None) {
-            None => {
-                let f = at.read();
-                // The getter of compiled code runs as a switched call: it
-                // warms as one (see `Slot::warm_switched`).
-                if let Object::Function(f) = &f {
-                    let code = f.code();
-                    if let Some(ext) = crate::code_vm_ext(&code) {
-                        ext.frame_jit
-                            .warm_switched(&code, ext, code.varnames.len().max(1));
-                    }
+        let r = direct_call_out(st, pc, slot, slot + 2, &mut *site, None);
+        if r.is_none() {
+            let f = at.read();
+            // The getter of compiled code runs as a switched call: it
+            // warms as one (see `Slot::warm_switched`).
+            if let Object::Function(f) = &f {
+                let code = f.code();
+                if let Some(ext) = crate::code_vm_ext(&code) {
+                    ext.frame_jit
+                        .warm_switched(&code, ext, code.varnames.len().max(1));
                 }
-                if local != 0 {
-                    crate::drop_hot_at(at.add(1));
-                } else {
-                    at.write(at.add(1).read());
-                }
-                drop(f);
-                lane(st)
             }
-            Some(r) => r,
+            if local != 0 {
+                crate::drop_hot_at(at.add(1));
+            } else {
+                at.write(at.add(1).read());
+            }
+            drop(f);
         }
+        r
     }
 }
 

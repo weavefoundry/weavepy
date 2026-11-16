@@ -44095,6 +44095,45 @@ impl Interpreter {
         Ok(Object::None)
     }
 
+    /// `str(inst)` of a `str` subclass's instance whose class keeps
+    /// `str`'s own `__str__` (no Python override, remembered per class
+    /// version): its payload, as [`Self::do_str_call`]'s last resort for
+    /// such an instance answers, without looking `__str__` up each time
+    /// (`email`'s `Terminal.value` is `str(self)`). `None` for anything
+    /// else.
+    pub(crate) fn str_payload(inst: &Rc<crate::types::PyInstance>) -> Option<Object> {
+        let native @ (Object::Str(_) | Object::WStr(_)) = inst.native.get()? else {
+            return None;
+        };
+        let cls = inst.cls_raw();
+        if !cls.memo_verdict(crate::types::Verdict::StrPayload, "", || {
+            Self::str_payload_class(cls)
+        }) {
+            return None;
+        }
+        Some(native.clone())
+    }
+
+    /// Whether `cls`'s `__str__` is `str`'s own (see [`Self::str_payload`]):
+    /// the first class on its MRO that defines it is `str`.
+    fn str_payload_class(cls: &crate::types::TypeObject) -> bool {
+        let str_ty = &builtin_types().str_;
+        let mro = cls.mro.borrow();
+        for owner in mro.iter() {
+            if Rc::ptr_eq(owner, str_ty) {
+                return true;
+            }
+            if owner
+                .dict
+                .borrow()
+                .contains_key(&crate::object::StrKey("__str__"))
+            {
+                return false;
+            }
+        }
+        false
+    }
+
     fn do_str_call(
         &mut self,
         v: &Object,
@@ -44110,6 +44149,9 @@ impl Interpreter {
             return Ok(text);
         }
         if let Object::Instance(inst) = v {
+            if let Some(s) = Self::str_payload(inst) {
+                return Ok(s);
+            }
             // An exact `decimal.Decimal` (see `stdlib::decimal_native`).
             if crate::stdlib::decimal_native::is_decimal_instance(inst) {
                 if let Some(r) = crate::stdlib::decimal_native::leaf_str(inst) {
@@ -84283,11 +84325,11 @@ pub(crate) fn property_site_getter(
     // SAFETY: GIL-serialized; the borrows end here. The class holds the
     // property while its version stands.
     unsafe {
-        let (ver, MethodSlotFn::Getter { prop, .. }) = &*slot.0.get() else {
+        let (ver, MethodSlotFn::Getter(g)) = &*slot.0.get() else {
             return None;
         };
         let (f, _) = slot.getter(*ver)?;
-        let cell = (*prop.as_ptr()).fget.as_ptr().cast_const();
+        let cell = (*g.prop.as_ptr()).fget.as_ptr().cast_const();
         Some((f, *ver, cell))
     }
 }
@@ -85774,10 +85816,63 @@ struct MethodSlot(
 const POLY_METHODS: usize = 3;
 
 /// A [`MethodSlot`]'s earlier plain or static functions, by class
-/// version (`0` marks an empty entry), replaced round-robin.
+/// version (`0` marks an empty entry), replaced round-robin, and its
+/// earlier `property` getters likewise (see [`MethodSlotFn::Getter`]).
 struct PolyMethods {
     entries: [(u64, crate::sync::Weak<crate::object::PyFunction>, bool); POLY_METHODS],
     next: usize,
+    getters: [(u64, GetterRef); POLY_GETTERS],
+    getter_next: usize,
+}
+
+/// Earlier `property` getters a polymorphic [`MethodSlot`] keeps (a read
+/// of `x.value` over a token tree's two node classes).
+const POLY_GETTERS: usize = 2;
+
+/// A cached `property` getter: the property, its getter function and
+/// that function's code when the slot was filled.
+#[derive(Clone)]
+struct GetterRef {
+    prop: crate::sync::Weak<crate::object::PyProperty>,
+    func: crate::sync::Weak<crate::object::PyFunction>,
+    code: crate::sync::Weak<CodeObject>,
+}
+
+impl GetterRef {
+    const fn empty() -> Self {
+        Self {
+            prop: crate::sync::Weak::new(),
+            func: crate::sync::Weak::new(),
+            code: crate::sync::Weak::new(),
+        }
+    }
+
+    /// The getter, while the property (which the class holds while it
+    /// reads the entry's version) still holds that function and the
+    /// function that code.
+    ///
+    /// # Safety
+    ///
+    /// GIL-serialized; the references must not outlive anything that
+    /// could rebind the property's getter or the function's code, or
+    /// change the class.
+    #[inline]
+    unsafe fn peek(&self) -> Option<(&crate::object::PyFunction, &Rc<CodeObject>)> {
+        if self.prop.strong_count() == 0 {
+            return None;
+        }
+        // SAFETY: the caller's contract; a raw read of the property's
+        // getter cell, compared before anything runs.
+        let Object::Function(f) = (unsafe { &*(*self.prop.as_ptr()).fget.as_ptr() }) else {
+            return None;
+        };
+        if Rc::as_ptr(f) != self.func.as_ptr() {
+            return None;
+        }
+        // SAFETY: as `PyFunction::code` (the function holds its code).
+        let c: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
+        (Rc::as_ptr(c) == self.code.as_ptr()).then_some((&**f, c))
+    }
 }
 
 /// What a [`MethodSlot`] resolved: a Python function off a class (keyed
@@ -85816,11 +85911,7 @@ enum MethodSlotFn {
     /// A `LOAD_ATTR` site's `property` getter for instances of the class
     /// at the key's version, and the code it was checked against (see
     /// `Interpreter::try_inline_property`).
-    Getter {
-        prop: crate::sync::Weak<crate::object::PyProperty>,
-        func: crate::sync::Weak<crate::object::PyFunction>,
-        code: crate::sync::Weak<CodeObject>,
-    },
+    Getter(GetterRef),
     /// A `LOAD_ATTR` site's plain class value (an enum member, a class's
     /// function or constant) for the class at the key's version under a
     /// metaclass at `meta_ver` (`0` for `type`), which reads it as `type`
@@ -85889,6 +85980,8 @@ impl MethodSlot {
             Box::new(PolyMethods {
                 entries: std::array::from_fn(|_| (0, crate::sync::Weak::new(), false)),
                 next: 0,
+                getters: std::array::from_fn(|_| (0, GetterRef::empty())),
+                getter_next: 0,
             })
         });
         if poly.entries.iter().any(|(v, _, _)| v == old_ver) {
@@ -86235,30 +86328,18 @@ impl MethodSlot {
     /// reads `ver` (see `get_held`), so no upgrade is needed.
     #[inline]
     fn getter(&self, ver: u64) -> Option<(Rc<crate::object::PyFunction>, Rc<CodeObject>)> {
-        // SAFETY: GIL-serialized; no `&mut` escapes `set_getter`.
-        let (v, MethodSlotFn::Getter { prop, func, code }) = (unsafe { &*self.0.get() }) else {
-            return None;
-        };
-        if *v != ver || prop.strong_count() == 0 {
-            return None;
-        }
-        // SAFETY: the class holds the property (see above); a raw read of
-        // its getter cell, compared before anything runs.
-        let Object::Function(f) = (unsafe { &*(*prop.as_ptr()).fget.as_ptr() }) else {
-            return None;
-        };
-        if Rc::as_ptr(f) != func.as_ptr() {
-            return None;
-        }
-        let c = f.code();
-        (Rc::as_ptr(&c) == code.as_ptr()).then(|| (f.clone(), c))
+        // SAFETY: the handles are taken before anything runs.
+        let (f, c) = unsafe { self.getter_peek(ver) }?;
+        // SAFETY: `f` is a live function (an `Rc` allocation) its property
+        // holds.
+        Some((unsafe { Self::held(f) }, c.clone()))
     }
 
     /// Whether the site has cached a `property` getter (for any class).
     #[cfg(feature = "jit")]
     pub(crate) fn holds_getter(&self) -> bool {
         // SAFETY: GIL-serialized; no `&mut` escapes `set_getter`.
-        matches!(unsafe { &*self.0.get() }, (_, MethodSlotFn::Getter { .. }))
+        matches!(unsafe { &*self.0.get() }, (_, MethodSlotFn::Getter(_)))
     }
 
     /// [`Self::getter`] borrowed, for a read that runs no Python.
@@ -86269,24 +86350,37 @@ impl MethodSlot {
     /// could rebind the property's getter or the function's code, or
     /// change the class.
     #[inline]
-    unsafe fn getter_peek(&self, ver: u64) -> Option<(&crate::object::PyFunction, &CodeObject)> {
-        // SAFETY: as `getter`.
-        let (v, MethodSlotFn::Getter { prop, func, code }) = (unsafe { &*self.0.get() }) else {
-            return None;
-        };
-        if *v != ver || prop.strong_count() == 0 {
-            return None;
+    unsafe fn getter_peek(
+        &self,
+        ver: u64,
+    ) -> Option<(&crate::object::PyFunction, &Rc<CodeObject>)> {
+        // SAFETY: GIL-serialized; no `&mut` escapes `set_getter`; the
+        // forwarded contract keeps both alive.
+        unsafe {
+            match &*self.0.get() {
+                (v, MethodSlotFn::Getter(g)) if *v == ver => g.peek(),
+                _ => self.poly_getter(ver),
+            }
         }
-        // SAFETY: as `getter`; the forwarded contract keeps both alive.
-        let Object::Function(f) = (unsafe { &*(*prop.as_ptr()).fget.as_ptr() }) else {
-            return None;
-        };
-        if Rc::as_ptr(f) != func.as_ptr() {
-            return None;
-        }
-        // SAFETY: as `PyFunction::code` (the function holds its code).
-        let c: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
-        (Rc::as_ptr(c) == code.as_ptr()).then_some((&**f, &**c))
+    }
+
+    /// An earlier getter the slot keeps for the class at `ver` (see
+    /// [`PolyMethods::getters`]).
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::getter_peek`]'s.
+    #[cold]
+    #[inline(never)]
+    unsafe fn poly_getter(
+        &self,
+        ver: u64,
+    ) -> Option<(&crate::object::PyFunction, &Rc<CodeObject>)> {
+        // SAFETY: as `getter_peek`.
+        let poly = unsafe { &*self.1.get() }.as_deref()?;
+        let (_, g) = poly.getters.iter().find(|(v, _)| *v == ver && ver != 0)?;
+        // SAFETY: as above.
+        unsafe { g.peek() }
     }
 
     #[inline]
@@ -86297,15 +86391,35 @@ impl MethodSlot {
         func: &Rc<crate::object::PyFunction>,
         code: &Rc<CodeObject>,
     ) {
-        // SAFETY: as `set`.
+        // SAFETY: as `set`; the references end before the slot is
+        // rewritten.
         unsafe {
+            // The getter it replaces, for another class, stays among the
+            // earlier ones.
+            if let (old_ver, MethodSlotFn::Getter(old)) = &*self.0.get() {
+                if *old_ver != 0 && *old_ver != ver && old.prop.strong_count() > 0 {
+                    let poly = (*self.1.get()).get_or_insert_with(|| {
+                        Box::new(PolyMethods {
+                            entries: std::array::from_fn(|_| (0, crate::sync::Weak::new(), false)),
+                            next: 0,
+                            getters: std::array::from_fn(|_| (0, GetterRef::empty())),
+                            getter_next: 0,
+                        })
+                    });
+                    if !poly.getters.iter().any(|(v, _)| v == old_ver) {
+                        let i = poly.getter_next;
+                        poly.getters[i] = (*old_ver, old.clone());
+                        poly.getter_next = (i + 1) % POLY_GETTERS;
+                    }
+                }
+            }
             *self.0.get() = (
                 ver,
-                MethodSlotFn::Getter {
+                MethodSlotFn::Getter(GetterRef {
                     prop: Rc::downgrade(prop),
                     func: Rc::downgrade(func),
                     code: Rc::downgrade(code),
-                },
+                }),
             );
         };
     }

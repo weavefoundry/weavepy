@@ -1685,6 +1685,15 @@ pub(crate) fn builtin_ctor_pure(cls: &Rc<TypeObject>, args: &[Object]) -> Option
             receiver_class,
         ));
     }
+    // `str(x)` of a `str` subclass's instance that keeps `str`'s own
+    // `__str__`: its payload (as `Interpreter::do_str_call` answers).
+    if Rc::ptr_eq(cls, &bt.str_) {
+        return match args {
+            [Object::Str(_)] => Some(args[0].clone()),
+            [Object::Instance(inst)] => Interpreter::str_payload(inst),
+            _ => None,
+        };
+    }
     // `type(x)`: the object's class (`b_type`'s one-argument form).
     if Rc::ptr_eq(cls, &bt.type_) {
         return match args {
