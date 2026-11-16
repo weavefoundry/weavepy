@@ -523,16 +523,28 @@ branch and pull request.
     (argparse's `_parse_known_args` had stayed interpreted for good), and
     `ref.__new__` and `_sre.exec_match` over a `str` run in place (a
     100-entry `WeakValueDictionary`: 1,241,587 instructions to 877,688).
+  - Where compiled code still left for the core loop, per site: an
+    exception's `args` (its own slot layout), an f-string's `!r` of a
+    list, a generator expression's dict view at its end, an exhausted
+    tuple of objects (enum's `for flag in self, other`), and an `IntFlag`
+    operator (a builtin subclass's Python method). Enum flag operations
+    ran 14% fewer instructions, a dataclass's `repr` 25%,
+    `dataclasses.asdict` 24%, `e.args` 44%.
+  - Native helpers: `binascii.hexlify` ran a branch and a growing push a
+    digit (33 instructions a byte, now under CPython's), and `upper()`,
+    `lower()` and `casefold()` sent every character of non-ASCII text
+    through the Unicode tables (a mixed 400-character string: 36% fewer
+    instructions).
   - Tried and dropped: native `LOAD_GLOBAL` hits in compiled code (the
     helper costs as much as its guards would in line), native reads of
     polymorphic split fields (their IR pushed `deltablue`'s hot functions
     over the inline budget), and a Linux-only symbol order (the release
     build's fat LTO renames most of what the profiles name; start-up RSS
     moved 2%), and a lower frame-JIT threshold (60: the battery ran 1% more
-    instructions). The battery stands at 1.262 times CPython's
+    instructions). The battery stands at 1.252 times CPython's
     instructions on quick builds, against 1.285 at the start of the day;
     `class_features` ran 21% fewer instructions, `email_html_ops` 13%,
-    `configparser_ops` 8%.
+    `configparser_ops` 8%, `enum_dataclass_ops` 7%.
 
 - **Tier 2's wasted work, a start-up deadlock, and more cliffs** (PR #112,
   November 15). Ratios are instructions, WeavePy's over CPython's unless
