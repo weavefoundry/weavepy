@@ -488,16 +488,19 @@ fn ref_type() -> Rc<TypeObject> {
         // `MyRef` call `ref.__new__(cls, ob, callback)` and expect an
         // instance of `cls` wired to a live slot. The base type's own
         // call path stays on the VM's `construct_ref` special-case.
+        let new = Rc::new(BuiltinFn {
+            name: "weakref.__new__",
+            binds_instance: false,
+            call: Box::new(|args| ref_subclass_new(args, &[])),
+            call_kw: Some(Box::new(ref_subclass_new)),
+        });
+        // (It runs no Python code: `KeyedRef.__new__`'s `ref.__new__(type,
+        // ob, callback)`, one for every `WeakValueDictionary` entry, is
+        // called in place.)
+        crate::leaf_builtins::register(&new);
         type_dict.insert(
             DictKey(Object::from_static("__new__")),
-            Object::StaticMethod(crate::object::MethodWrapper::new(Object::Builtin(Rc::new(
-                BuiltinFn {
-                    name: "weakref.__new__",
-                    binds_instance: false,
-                    call: Box::new(|args| ref_subclass_new(args, &[])),
-                    call_kw: Some(Box::new(ref_subclass_new)),
-                },
-            )))),
+            Object::StaticMethod(crate::object::MethodWrapper::new(Object::Builtin(new))),
         );
         let init = Rc::new(BuiltinFn {
             name: "__init__",
