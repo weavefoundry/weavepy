@@ -1725,6 +1725,77 @@ fn any_elements(obj: &Object) -> Option<Vec<Object>> {
     concrete_elements(obj).or_else(|| elements_via_interp(obj))
 }
 
+/// What `object.__new__` asks of a user class's bases, from one walk of its
+/// MRO: the position in `kinds` (see [`native_seed_for_new`]) of the value or
+/// container type it derives from, and whether it derives from `module`,
+/// `type` or `types.GenericAlias`. Memoized by the class's version, which is
+/// unique across classes and moves with any reshaping of its MRO.
+#[derive(Clone, Copy)]
+struct BaseFacts {
+    seed: Option<usize>,
+    module: bool,
+    type_: bool,
+    alias: bool,
+}
+
+fn base_facts(cls: &Rc<TypeObject>, kinds: &[&Rc<TypeObject>; 11]) -> BaseFacts {
+    thread_local! {
+        static SEEN: [std::cell::Cell<(u64, u8)>; 64] =
+            const { [const { std::cell::Cell::new((0, 0)) }; 64] };
+    }
+    const NONE: u8 = 0x0f;
+    let ver = cls.attr_version.get();
+    let slot = (ver as usize ^ (ver >> 6) as usize) & 63;
+    let unpack = |tag: u8| BaseFacts {
+        seed: (tag & NONE != NONE).then_some(usize::from(tag & NONE)),
+        module: tag & 0x10 != 0,
+        type_: tag & 0x20 != 0,
+        alias: tag & 0x40 != 0,
+    };
+    let memo = SEEN.with(|s| s[slot].get());
+    if ver != 0 && memo.0 == ver {
+        return unpack(memo.1);
+    }
+    let bt = builtin_types();
+    let mut tag = NONE;
+    for t in cls.mro.borrow().iter().skip(1) {
+        if tag & NONE == NONE {
+            if let Some(i) = kinds.iter().position(|k| Rc::ptr_eq(t, k)) {
+                tag = (tag & !NONE) | i as u8;
+            }
+        }
+        if Rc::ptr_eq(t, &bt.module_) {
+            tag |= 0x10;
+        } else if Rc::ptr_eq(t, &bt.type_) {
+            tag |= 0x20;
+        } else if Rc::ptr_eq(t, &bt.generic_alias_) {
+            tag |= 0x40;
+        }
+    }
+    if ver != 0 {
+        SEEN.with(|s| s[slot].set((ver, tag)));
+    }
+    unpack(tag)
+}
+
+/// The value or container kinds [`native_seed_for_new`] seeds, in the order
+/// [`BaseFacts::seed`] numbers them.
+fn seed_kinds(bt: &BuiltinTypes) -> [&Rc<TypeObject>; 11] {
+    [
+        &bt.int_,
+        &bt.float_,
+        &bt.complex_,
+        &bt.str_,
+        &bt.bytearray_,
+        &bt.bytes_,
+        &bt.tuple_,
+        &bt.frozenset_,
+        &bt.list_,
+        &bt.set_,
+        &bt.dict_,
+    ]
+}
+
 /// Build the native payload `object.__new__(cls, value?)` should stash
 /// on an instance of a value/container built-in subclass, or `None` for
 /// an ordinary `object` subclass. Mutable containers (`list`/`dict`/
@@ -1740,25 +1811,8 @@ fn native_seed_for_new(cls: &Rc<TypeObject>, value: Option<&Object>) -> Option<O
     // The one value or container type among these the class derives from
     // (no class derives from two: their layouts conflict), found in one
     // walk of its MRO instead of a subclass test per kind.
-    let kinds: [&Rc<TypeObject>; 11] = [
-        &bt.int_,
-        &bt.float_,
-        &bt.complex_,
-        &bt.str_,
-        &bt.bytearray_,
-        &bt.bytes_,
-        &bt.tuple_,
-        &bt.frozenset_,
-        &bt.list_,
-        &bt.set_,
-        &bt.dict_,
-    ];
-    let found = cls
-        .mro
-        .borrow()
-        .iter()
-        .skip(1)
-        .find_map(|t| kinds.iter().position(|k| Rc::ptr_eq(t, k)));
+    let kinds = seed_kinds(bt);
+    let found = base_facts(cls, &kinds).seed;
     let is_strict = |base: &Rc<TypeObject>| {
         found.is_some_and(|i| Rc::ptr_eq(kinds[i], base)) && !Rc::ptr_eq(cls, base)
     };
@@ -1872,7 +1926,7 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
     // `.args` but never runs `__init__` (CPython `BaseException_new`).
     // `UnicodeDecodeError.__new__(UnicodeDecodeError)` must succeed
     // with zero constructor arguments.
-    if cls.mro.borrow().iter().any(|t| t.name == "BaseException") {
+    if cls.flags.is_exception && cls.mro.borrow().iter().any(|t| t.name == "BaseException") {
         let new_args = if args.len() > 1 { &args[1..] } else { &[][..] };
         if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
             // SAFETY: published by an enclosing VM frame still live on
@@ -1896,7 +1950,8 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
     // `module.__new__(module)` allocates an *uninitialized* module —
     // empty dict, no `__name__` — exactly CPython's `module_new` (the
     // name/doc seeding lives in `module.__init__` only).
-    if cls.is_subclass_of(&builtin_types().module_) {
+    let facts = base_facts(&cls, &seed_kinds(builtin_types()));
+    if facts.module || Rc::ptr_eq(&cls, &builtin_types().module_) {
         let inst = Object::Instance(Rc::new(PyInstance::new(cls)));
         crate::gc_trace::track(&inst);
         return Ok(inst);
@@ -1906,7 +1961,7 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
     // intercepted upstream (the 4-arg `__new__` route / `Meta(name,
     // bases, ns)`), so e.g. `type(typing.Any)()` must raise like
     // CPython's `type_new` ("takes exactly 3 arguments (0 given)").
-    if cls.is_subclass_of(&builtin_types().type_) && args.len() != 4 {
+    if (facts.type_ || Rc::ptr_eq(&cls, &builtin_types().type_)) && args.len() != 4 {
         return Err(crate::error::type_error(format!(
             "type.__new__() takes exactly 3 arguments ({} given)",
             args.len() - 1
@@ -1931,10 +1986,7 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
     // `collections.abc.Callable[..., Any]` exactly this way during import.)
     {
         let bt = builtin_types();
-        if args.len() == 3
-            && !Rc::ptr_eq(&cls, &bt.generic_alias_)
-            && cls.is_subclass_of(&bt.generic_alias_)
-        {
+        if args.len() == 3 && facts.alias {
             let alias = crate::make_generic_alias_public(args[1].clone(), args[2].clone());
             // CPython `ga_new` allocates through `cls`, so the instance
             // reports the subclass as its type (test_dataclasses
