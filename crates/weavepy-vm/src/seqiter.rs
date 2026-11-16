@@ -92,6 +92,24 @@ fn pure_iter(obj: &Object) -> Option<Object> {
         | Object::Set(_)
         | Object::FrozenSet(_)
         | Object::Bytes(_) => Some(Object::Iter(Rc::new(RefCell::new(obj.make_iter().ok()?)))),
+        // A list or tuple subclass inheriting `__iter__` (a named tuple's
+        // `_asdict`, `dict(zip(self._fields, self))`): its value's iterator,
+        // as `h_get_iter` makes it.
+        Object::Instance(inst) => {
+            let native @ (Object::List(_) | Object::Tuple(_)) = inst.native.get()? else {
+                return None;
+            };
+            let cls = inst.cls_raw();
+            if cls.native_kind.get() != 0
+                || cls.c_ext_ptr.get() != 0
+                || !cls.dunder(crate::types::Dunder::Iter).builtin_owner()
+            {
+                return None;
+            }
+            Some(Object::Iter(Rc::new(RefCell::new(
+                native.make_iter().ok()?,
+            ))))
+        }
         _ => None,
     }
 }
