@@ -13809,10 +13809,7 @@ unsafe extern "C" fn h_call(
                 let sw = &mut *st.sw;
                 let interp = &mut *st.interp.cast_mut();
                 if interp.core_builtin_lane(sw, pc, via_call) {
-                    if finished_in_place(st, start) {
-                        return 0;
-                    }
-                    return RELOAD;
+                    return lane_outcome(st, pc, start);
                 }
             }
         }
@@ -13845,6 +13842,14 @@ unsafe extern "C" fn h_call(
                 }
                 (LeafKind::ListPop, 0) => match items.pop() {
                     Some(v) => (v, len),
+                    // (Raised in place, for the code's handler.)
+                    None if !st.sw.is_null() => {
+                        crate::release_run(base.add(start), len - start);
+                        st.len = start;
+                        st.pc = pc + 1;
+                        st.err = Some(crate::error::index_error("pop from empty list"));
+                        return RAISED;
+                    }
                     None => return CALL_DECLINED,
                 },
                 _ => return CALL_DECLINED,
@@ -14461,11 +14466,43 @@ unsafe fn leaf_call_lane(st: &mut State, pc: usize, start: usize, len: usize) ->
         if !interp.core_leaf_call_lane(sw) {
             return CALL_DECLINED;
         }
+        lane_outcome(st, pc, start)
+    }
+}
+
+/// How compiled code goes on after a core-loop lane ran the `CALL` at `pc`
+/// (its operands from `start`): `0` the result in place at `start` (see
+/// [`finished_in_place`]); `RAISED` for an exception the lane raised in
+/// place, the operands gone, which the code's own handler takes (see
+/// [`h_catch`]), as a native body's raise is; `RELOAD` for anything else.
+///
+/// # Safety
+///
+/// As [`finished_in_place`]'s.
+unsafe fn lane_outcome(st: &mut State, pc: usize, start: usize) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe {
         if finished_in_place(st, start) {
-            0
-        } else {
-            RELOAD
+            return 0;
         }
+        let sw = &mut *st.sw;
+        if std::ptr::eq(sw.cur, st.frame)
+            && crate::hot_gates::loop_gen() == st.snap_gen
+            && !(*st.maybe_dead).get()
+            && (*st.frame).stack.len() == start
+        {
+            if let Some(crate::CoreExit::Stop(crate::LeafStop::Raised(_))) = &sw.pending {
+                let Some(crate::CoreExit::Stop(crate::LeafStop::Raised(e))) = sw.pending.take()
+                else {
+                    unreachable!("matched above")
+                };
+                st.len = start;
+                st.pc = pc + 1;
+                st.err = Some(e);
+                return RAISED;
+            }
+        }
+        RELOAD
     }
 }
 
