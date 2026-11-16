@@ -2979,7 +2979,19 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             ("_cache_get", sre_cache_get),
             ("_cache_put", sre_cache_put),
         ] {
-            d.insert(DictKey(Object::from_static(name)), b(name, f));
+            let builtin = b(name, f);
+            // (`Pattern._exec`'s match, once a search: over a `str` or
+            // `bytes` subject it runs no Python code, and compiled code
+            // calls it in place.)
+            if name == "exec_match" {
+                if let Object::Builtin(bf) = &builtin {
+                    crate::leaf_builtins::register_fast(bf, |args| {
+                        matches!(args.get(1), Some(Object::Str(_) | Object::Bytes(_)))
+                            .then(|| super::sre_objects::exec_match(args))
+                    });
+                }
+            }
+            d.insert(DictKey(Object::from_static(name)), builtin);
         }
         d.insert(
             DictKey(Object::from_static("compile_cached")),
