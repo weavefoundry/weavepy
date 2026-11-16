@@ -17275,6 +17275,12 @@ impl Interpreter {
                 if native_init_call(b, recv) || container_init_call(b, recv) {
                     return Some(false);
                 }
+                // A builtin subclass's instance (`Counter.items`): the
+                // method the site loaded from its class, called as the full
+                // handler calls it.
+                if matches!(recv, Object::Instance(i) if i.native.get().is_some()) {
+                    return Some(true);
+                }
                 // The names below are dispatched by the interpreter, which
                 // knows them on the builtin kinds' receivers.
                 builtins::method_memo_tag(recv)?;
@@ -18966,7 +18972,13 @@ impl Interpreter {
         }
         let ok = match recv {
             None => !b.binds_instance,
-            Some(recv) => b.binds_instance && builtins::method_memo_tag(recv).is_some(),
+            // (A builtin subclass's instance too, `Counter.items`: the
+            // method its class gave the site, which unwraps the payload.)
+            Some(recv) => {
+                b.binds_instance
+                    && (builtins::method_memo_tag(recv).is_some()
+                        || matches!(recv, Object::Instance(i) if i.native.get().is_some()))
+            }
         } && self.leaf_call_kind(b).is_some();
         // A method body safe to call directly runs as such.
         let via_call = recv.is_none() || !native_call_ic_safe(b.name);
@@ -82650,6 +82662,10 @@ fn lane_recv_ok(b: &crate::object::BuiltinFn, recv: &Object, via_call: bool) -> 
         && (via_call || b.name != "__init__" || native_init_call(b, recv) || container_init_call(b, recv))
         && (!via_call
             || builtins::method_memo_tag(recv).is_some()
+            // A builtin subclass's instance (`Counter.items`): the method
+            // the site loaded from its class, whose body (or the shim
+            // around it) unwraps the payload itself.
+            || matches!(recv, Object::Instance(i) if i.native.get().is_some())
             || exception_init_call(b, recv)
             || (matches!(b.name, ".object_reduce_ex" | ".object_reduce")
                 && matches!(recv, Object::Instance(_))))
