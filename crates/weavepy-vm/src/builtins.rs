@@ -9874,11 +9874,13 @@ pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     match obj {
         Object::Instance(inst) => {
-            for k in inst.dict_cell().borrow().keys() {
+            // (The names alone: a split instance keeps its layout, whose
+            // attribute reads compiled code takes in line.)
+            inst.for_each_attr(|k, _| {
                 if let Object::Str(s) = &k.0 {
                     names.insert(s.to_string());
                 }
-            }
+            });
             class_hidden = matches!(
                 inst.cls().lookup("__class__"),
                 Some(Object::SlotDescriptor(_))
