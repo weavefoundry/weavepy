@@ -17214,7 +17214,7 @@ impl Interpreter {
                 // another native `__init__`) on a plain instance: the
                 // dispatch's only `__init__` case is a dict payload's,
                 // whose `dict.__init__` body reads the payload itself.
-                if native_init_call(b, recv) || dict_init_call(b, recv) {
+                if native_init_call(b, recv) || container_init_call(b, recv) {
                     return Some(false);
                 }
                 // The names below are dispatched by the interpreter, which
@@ -82379,7 +82379,7 @@ fn lane_recv_ok(b: &crate::object::BuiltinFn, recv: &Object, via_call: bool) -> 
     b.binds_instance
         // (A site settled on a plain instance's native `__init__` may see
         // a dict payload later, which the dispatch routes.)
-        && (via_call || b.name != "__init__" || native_init_call(b, recv) || dict_init_call(b, recv))
+        && (via_call || b.name != "__init__" || native_init_call(b, recv) || container_init_call(b, recv))
         && (!via_call
             || builtins::method_memo_tag(recv).is_some()
             || exception_init_call(b, recv)
@@ -82387,39 +82387,46 @@ fn lane_recv_ok(b: &crate::object::BuiltinFn, recv: &Object, via_call: bool) -> 
                 && matches!(recv, Object::Instance(_))))
 }
 
-/// Whether `b` called on `recv` is `dict.__init__` on a dict or an instance
-/// of a `dict` subclass (`super().__init__()` in a subclass's `__init__`):
-/// its body (`dict_init_kw`) reads the receiver's payload itself and runs
-/// what the dispatch's call of it would, so the core loop's lane runs it.
-fn dict_init_call(b: &crate::object::BuiltinFn, recv: &Object) -> bool {
+/// Whether `b` called on `recv` is `dict.__init__`, `list.__init__` or
+/// `set.__init__` on that container or an instance of a subclass of it
+/// (`super().__init__()` in a subclass's `__init__`): its body reads the
+/// receiver's payload itself and runs what the dispatch's call of it would
+/// (iterating its argument through the interpreter), so the core loop's lane
+/// runs it.
+fn container_init_call(b: &crate::object::BuiltinFn, recv: &Object) -> bool {
     thread_local! {
-        static DICT_INIT: Cell<usize> = const { Cell::new(0) };
+        /// The three `__init__` bodies, once found: dict's, list's, set's.
+        static INITS: [Cell<usize>; 3] = const { [Cell::new(0), Cell::new(0), Cell::new(0)] };
     }
-    if b.name != "__init__" || b.call_kw.is_none() {
+    if b.name != "__init__" {
         return false;
     }
-    let dict_payload = match recv {
-        Object::Dict(_) => true,
-        Object::Instance(i) => matches!(i.native.get(), Some(Object::Dict(_))),
-        _ => false,
+    let payload = match recv {
+        Object::Instance(i) => match i.native.get() {
+            Some(p) => p,
+            None => return false,
+        },
+        other => other,
     };
-    if !dict_payload {
-        return false;
-    }
+    let (kind, ty) = match payload {
+        Object::Dict(_) => (0, &builtin_types().dict_),
+        Object::List(_) => (1, &builtin_types().list_),
+        Object::Set(_) => (2, &builtin_types().set_),
+        _ => return false,
+    };
     let at = std::ptr::from_ref(b) as usize;
-    DICT_INIT.with(|c| {
-        if c.get() == at {
+    INITS.with(|c| {
+        if c[kind].get() == at {
             return true;
         }
-        let found = builtin_types()
-            .dict_
+        let found = ty
             .dict
             .try_borrow()
             .ok()
             .and_then(|d| d.get(&crate::object::StrKey("__init__")).cloned());
         let is = matches!(found, Some(Object::Builtin(d)) if std::ptr::eq(Rc::as_ptr(&d), b));
         if is {
-            c.set(at);
+            c[kind].set(at);
         }
         is
     })
