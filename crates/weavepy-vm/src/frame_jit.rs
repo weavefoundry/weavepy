@@ -6206,6 +6206,17 @@ unsafe extern "C" fn h_binop(at: *mut Object, kind: u32) -> u32 {
             {
                 Interpreter::core_seq_concat(a, b)
             }
+            // A short tuple's or list's repetition (a list's `*=` repeats
+            // it in place: the core loop's).
+            (Object::Tuple(_) | Object::List(_), Object::Int(_))
+            | (Object::Int(_), Object::Tuple(_) | Object::List(_))
+                if kind == BinOpKind::Mult
+                    && (!inplace || !matches!(a, Object::List(_)))
+                    && droppable(a)
+                    && droppable(b) =>
+            {
+                Interpreter::core_seq_repeat(a, b)
+            }
             // Two `bytes`' concatenation (`_ALWAYS_SAFE_BYTES + safe`;
             // immutable, so `+=` is the same).
             (Object::Bytes(x), Object::Bytes(y))

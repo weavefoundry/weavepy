@@ -13694,6 +13694,40 @@ impl Interpreter {
                                 after_release!();
                                 continue;
                             }
+                            // `seq * n` and `n * seq` for a tuple or list,
+                            // out of line (a list's `*=` repeats it in place:
+                            // the full handler's).
+                            (Object::Tuple(_) | Object::List(_), Object::Int(_))
+                            | (Object::Int(_), Object::Tuple(_) | Object::List(_))
+                                if kind == BinOpKind::Mult
+                                    && (matches!(a, Object::Tuple(_) | Object::Int(_))
+                                        || ins.arg & weavepy_compiler::BINARY_OP_INPLACE_FLAG
+                                            == 0) =>
+                            {
+                                if !Self::core_droppable(a) || !Self::core_droppable(b) {
+                                    break None;
+                                }
+                                let Some(r) = Self::core_seq_repeat(a, b) else {
+                                    break None;
+                                };
+                                // (A heap result: compiled code takes the
+                                // helper that keeps one, not the numbers'.)
+                                if let Some(e) = ext {
+                                    heap_site_note(e, ninstrs, pc);
+                                }
+                                // SAFETY: both operand slots are initialized and
+                                // leave the stack; the result takes the first.
+                                unsafe {
+                                    drop_hot_at(base.add(len - 1));
+                                    drop_hot_at(base.add(len - 2));
+                                }
+                                len -= 1;
+                                unsafe { base.add(len - 1).write(r) };
+                                last = pc;
+                                pc += 1;
+                                after_release!();
+                                continue;
+                            }
                             // `bytes + bytes`; `ba += b` extends the bytearray
                             // in place (unless a buffer export pins its size)
                             // and leaves it as the result.
@@ -21144,6 +21178,58 @@ impl Interpreter {
                 items.extend(x.iter().cloned());
                 items.extend(y.iter().cloned());
                 let obj = Object::new_list(items);
+                gc_trace::track(&obj);
+                Some(obj)
+            }
+            _ => None,
+        }
+    }
+
+    /// The largest result [`Self::core_seq_repeat`] builds; a longer one
+    /// is the full handler's (its size checks and `MemoryError`).
+    const CORE_REPEAT_MAX: usize = 4096;
+
+    /// `seq * n` or `n * seq` for an exact tuple or list and an int (the
+    /// full handler's repetition: `t * 1` is `t` itself), when the result
+    /// is short, or `None` for it: a list is tracked like `BUILD_LIST`'s,
+    /// so one whose allocation would start a collection is left to the
+    /// full handler. (A list's `*=` repeats it in place: not this.)
+    #[inline(never)]
+    fn core_seq_repeat(a: &Object, b: &Object) -> Option<Object> {
+        let (seq, n) = match (a, b) {
+            (Object::Tuple(_) | Object::List(_), Object::Int(n)) => (a, *n),
+            (Object::Int(n), Object::Tuple(_) | Object::List(_)) => (b, *n),
+            _ => return None,
+        };
+        let times = usize::try_from(n).unwrap_or(0);
+        match seq {
+            Object::Tuple(x) => {
+                if n == 1 {
+                    return Some(seq.clone());
+                }
+                if x.len().checked_mul(times)? > Self::CORE_REPEAT_MAX {
+                    return None;
+                }
+                let mut out = Vec::with_capacity(x.len() * times);
+                for _ in 0..times {
+                    out.extend(x.iter().cloned());
+                }
+                Some(Object::new_tuple(out))
+            }
+            Object::List(x) => {
+                if crate::stdlib::tracemalloc_real::is_tracking() || gc_trace::auto_collect_due() {
+                    return None;
+                }
+                let x = x.try_borrow().ok()?;
+                if x.len().checked_mul(times)? > Self::CORE_REPEAT_MAX {
+                    return None;
+                }
+                let mut out = Vec::with_capacity(x.len() * times);
+                for _ in 0..times {
+                    out.extend(x.iter().cloned());
+                }
+                drop(x);
+                let obj = Object::new_list(out);
                 gc_trace::track(&obj);
                 Some(obj)
             }
