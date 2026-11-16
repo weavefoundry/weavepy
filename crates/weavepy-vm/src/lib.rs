@@ -33797,10 +33797,7 @@ impl Interpreter {
             // `inst.__class__`, as `load_attr_instance` answers it: `object`'s
             // descriptor, which the instance dict can't shadow, when nothing
             // on the MRO overrides it.
-            if name == "__class__"
-                && inst.c_body.get() == 0
-                && cls.class_read_is_plain()
-            {
+            if name == "__class__" && inst.c_body.get() == 0 && cls.class_read_is_plain() {
                 return Some((LeafAttr::Value(Object::Type(inst.cls())), None));
             }
             // A native method the class itself supplies under a dunder name
@@ -87383,7 +87380,9 @@ impl NativeTruthPlan {
     #[inline]
     pub(crate) fn run(self, v: &Object) -> Option<bool> {
         if self.f.is_null() {
-            return (self.op == PAYLOAD_TRUTH).then(|| payload_truth(v)).flatten();
+            return (self.op == PAYLOAD_TRUTH)
+                .then(|| payload_truth(v))
+                .flatten();
         }
         if self.op == crate::stdlib::collections_native::OP_BOOL {
             if let Some(Object::Bool(b)) =

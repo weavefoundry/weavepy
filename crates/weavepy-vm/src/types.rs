@@ -2453,7 +2453,11 @@ impl TypeObject {
     /// may answer otherwise), or of `super` itself, whose `super_getattro`
     /// serves `__class__` as the proxy's own class.
     pub fn class_read_is_plain(&self) -> bool {
-        (!self.flags.is_builtin || std::ptr::eq(self, &*crate::builtin_types::builtin_types().super_))
+        (!self.flags.is_builtin
+            || std::ptr::eq(
+                self,
+                Rc::as_ptr(&crate::builtin_types::builtin_types().super_),
+            ))
             && self.class_attr_is_plain()
     }
 

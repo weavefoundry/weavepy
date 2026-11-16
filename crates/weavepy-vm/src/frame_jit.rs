@@ -9267,8 +9267,7 @@ fn instance_class_read(site: &AttrSite, inst: &Rc<crate::types::PyInstance>) -> 
         return None;
     }
     let cls = inst.cls_raw();
-    (inst.c_body.get() == 0 && cls.class_read_is_plain())
-        .then(|| Object::Type(inst.cls()))
+    (inst.c_body.get() == 0 && cls.class_read_is_plain()).then(|| Object::Type(inst.cls()))
 }
 
 /// `x.__class__` of the value at `src` into the stack slot `dst` (the same
@@ -11471,7 +11470,12 @@ unsafe fn property_leaf_here(
 ///
 /// As [`h_property`]'s.
 #[inline]
-unsafe fn site_property_leaf(st: &mut State, site: &AttrSite, at: *mut Object, local: bool) -> bool {
+unsafe fn site_property_leaf(
+    st: &mut State,
+    site: &AttrSite,
+    at: *mut Object,
+    local: bool,
+) -> bool {
     // SAFETY: the caller's contract; the pointers are live while the checks
     // above each use hold.
     unsafe {

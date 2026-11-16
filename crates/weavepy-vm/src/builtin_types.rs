@@ -1985,7 +1985,6 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
     // duck-typed generic alias. (numpy's `_array_like` builds
     // `collections.abc.Callable[..., Any]` exactly this way during import.)
     {
-        let bt = builtin_types();
         if args.len() == 3 && facts.alias {
             let alias = crate::make_generic_alias_public(args[1].clone(), args[2].clone());
             // CPython `ga_new` allocates through `cls`, so the instance
