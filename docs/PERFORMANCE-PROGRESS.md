@@ -476,6 +476,41 @@ branch and pull request.
 
 ## Done
 
+- **Builtin subclasses, generator steps, and a misread fixture gate** (PR
+  #112, November 16). Ratios are instructions, WeavePy's over CPython's.
+  - The local fixture A/B tools ran every bench fixture at a work size of
+    one, so a tier-2 policy that weighed a loop's dynamic calls three times
+    read even locally and cost `nbody` 35% (the bench gate flagged it 41%
+    to 56% slower on all three platforms). The policy is reverted, and the
+    tools take the gate's work sizes from `fixtures.rs`.
+  - `email`'s header parser builds `TokenList`, a `list` subclass, and
+    `Terminal`, a `str` subclass, and runs generator expressions over them.
+    `super().__init__()` reaching `list.__init__` or `set.__init__` left
+    compiled code for the core loop on every call (only `dict.__init__`
+    was admitted), `GET_ITER` of a list subclass left too, a property read
+    in a generator's fast step declined outright although a pure getter
+    runs no activation, and `TO_BOOL` of a `str` subclass left because the
+    native truth admitted only one kind of builtin `__len__`. With those
+    fixed, and attribute sites remembering the pure getter they last ran,
+    a `TokenList()` ran 11,607 instructions to 5,375 (CPython 3,296),
+    `TokenList.value` 35,107 to 13,154 (6,339), and the email case 12%
+    fewer.
+  - An explicit `super(C, obj)` as a value built through every call lane
+    (5,540 instructions to 2,224 against CPython's 979), and its
+    `__class__` took the generic attribute path (9,790 to 3,951).
+  - `object.__new__` walked a builtin subclass's MRO five times a call; one
+    walk now answers all of its questions, memoized by class version.
+    `os.stat` laid its result's nineteen fields into a dict one probe at a
+    time and read ten back by name (13,457 instructions to 9,272).
+  - Tried and dropped: native `LOAD_GLOBAL` hits in compiled code (the
+    helper costs as much as its guards would in line), native reads of
+    polymorphic split fields (their IR pushed `deltablue`'s hot functions
+    over the inline budget), and a Linux-only symbol order (the release
+    build's fat LTO renames most of what the profiles name; start-up RSS
+    moved 2%). The battery stands at 1.272 times CPython's instructions on
+    quick builds, against 1.285 at the start of the day; `class_features`
+    ran 21% fewer instructions and `email_html_ops` 12%.
+
 - **Tier 2's wasted work, a start-up deadlock, and more cliffs** (PR #112,
   November 15). Ratios are instructions, WeavePy's over CPython's unless
   stated, with synchronous compiles.
