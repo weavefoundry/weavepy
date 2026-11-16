@@ -2175,6 +2175,17 @@ unsafe fn plain_release(v: &Object) -> bool {
     true
 }
 
+/// Whether releasing one reference to `v` leaves it alive (another owner
+/// holds it) and nothing observes releases: a container holding it can
+/// free with no finalizer queued (`for flag in self, other`).
+#[inline]
+fn held_elsewhere(v: &Object) -> bool {
+    crate::sync::release_gates() == 0
+        && v.strong_word()
+            // SAFETY: `v` owns a reference to the live allocation.
+            .is_some_and(|w| unsafe { &*w }.load(Ordering::Relaxed) > 1)
+}
+
 /// One operand a flush writes to the frame's stack (see [`h_copies`]).
 pub(crate) struct CopyItem {
     /// The stack slot it goes to.
@@ -4400,7 +4411,7 @@ unsafe extern "C" fn h_for_iter_rest(
                 // tuple of names, `for k in key[:-1]`.)
                 if unique
                     && crate::shared_value::ThinArc::strong_count(items) == 1
-                    && !items.iter().all(plain_scalar)
+                    && !items.iter().all(|x| plain_scalar(x) || held_elsewhere(x))
                 {
                     return 3;
                 }
