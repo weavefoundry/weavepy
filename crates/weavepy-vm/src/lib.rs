@@ -84785,7 +84785,9 @@ pub(crate) unsafe extern "C" fn h_dict_get<const OWNED: u32>(
 /// `BINARY_SUBSCR` of the instance at `cont` of a `dict` subclass that
 /// keeps `dict.__getitem__` (a `defaultdict`, an `OrderedDict`), by a
 /// present key that compares natively: as [`h_dict_get`] (a miss, which
-/// may run `__missing__`, declines).
+/// may run `__missing__`, declines). A `list` or `tuple` subclass's that
+/// keeps the builtin `__getitem__` (`email`'s `TokenList`), by an `int` in
+/// range: as [`h_seq_get`].
 pub(crate) unsafe extern "C" fn h_inst_dict_get<const OWNED: u32>(
     out: *mut Object,
     cont: *const Object,
@@ -84798,8 +84800,32 @@ pub(crate) unsafe extern "C" fn h_inst_dict_get<const OWNED: u32>(
             return 1;
         };
         // (The payload first: most instances have none.)
-        let Some(Object::Dict(d)) = inst.native.get() else {
-            return 1;
+        let d = match inst.native.get() {
+            Some(Object::Dict(d)) => d,
+            Some(seq @ (Object::List(_) | Object::Tuple(_))) => {
+                let Object::Int(i) = *k else {
+                    return 1;
+                };
+                let cls = inst.cls_raw();
+                if cls.native_kind.get() != 0
+                    || cls.c_ext_ptr.get() != 0
+                    || !inst
+                        .class_dunder(crate::types::Dunder::GetItem)
+                        .builtin_owner()
+                {
+                    return 1;
+                }
+                let Some(rc) = PlainRelease::of(c, OWNED & 1 != 0) else {
+                    return 1;
+                };
+                let Some(v) = Interpreter::seq_get_hot(seq, i) else {
+                    return 1;
+                };
+                rc.run();
+                out.write(v);
+                return 0;
+            }
+            _ => return 1,
         };
         if !inst
             .class_dunder(crate::types::Dunder::GetItem)
