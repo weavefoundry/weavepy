@@ -22891,7 +22891,12 @@ impl Interpreter {
             return DictStep::Decline;
         }
         let Some((k, v)) = data.get_index(*index) else {
-            if !unique || owner.is_some() || Rc::strong_count(d) == 1 {
+            // (A dict subclass's instance the iterator keeps alive: its
+            // release when the iterator goes must not be its last.)
+            let owner_dies = owner
+                .as_ref()
+                .is_some_and(|o| !matches!(o, Object::Instance(i) if Rc::strong_count(i) > 1));
+            if !unique || owner_dies || Rc::strong_count(d) == 1 {
                 return DictStep::Decline;
             }
             // CPython clears `di_dict` on the first StopIteration.
