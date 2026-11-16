@@ -91190,16 +91190,18 @@ assert loop(2000) == 1999000
                     assert!(crate::tier2::code_compiled_for_test(&function.code.borrow()), "{name} must compile during sustained import work");
                 }
                 crate::tier2::force_enable_for_test(50);
-                // The lean budget counts warm-up intervals (24 calls, not the
-                // threshold's 50): 64 of them fall due within 1600 calls, well
-                // short of 64 thresholds.
-                let source = "def leaf(x):\n    return x + 1\nfor i in range(1600):\n    assert leaf(i) == i + 1\n";
+                // A pure leaf's calls from module code are frameless: each
+                // warm-up interval of them is credited to the tier-2 counter
+                // (`note_frameless_calls`), so during an import it compiles
+                // after 64 thresholds of calls (64 * 50), where a lean
+                // activation's warm compile counts 64 intervals of 24.
+                let source = "def leaf(x):\n    return x + 1\nfor i in range(3300):\n    assert leaf(i) == i + 1\n";
                 let module = interp
                     .load_from_source("budget_relative", source, false, "budget_relative.py")
                     .expect("default relative lean budget");
                 let Object::Module(module) = module else { panic!("module") };
                 let Object::Function(function) = module.dict.borrow().get(&crate::object::StrKey("leaf")).unwrap().clone() else { panic!("function") };
-                assert!(crate::tier2::code_compiled_for_test(&function.code.borrow()), "lean code must retain its earlier relative warm point");
+                assert!(crate::tier2::code_compiled_for_test(&function.code.borrow()), "frameless calls must reach the import budget");
             })
             .expect("spawn import-budget worker")
             .join()
