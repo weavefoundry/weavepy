@@ -15145,7 +15145,7 @@ unsafe extern "C" fn h_call_forward(
         *sw.last = st.last;
         let saved_last = sw.last;
         let interp = &mut *st.interp.cast_mut();
-        if !interp.core_call_forward(sw, pc) {
+        if !interp.core_call_forward(sw, pc, st.snap_gen) {
             return if sw.pending.is_some() || stack_moved(st) {
                 RELOAD
             } else {

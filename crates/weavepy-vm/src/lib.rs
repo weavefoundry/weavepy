@@ -15005,7 +15005,7 @@ impl Interpreter {
                         unsafe { frame.stack.set_len(len) };
                         frame.pc = pc as u32;
                         *last_pc = last;
-                        if self.core_call_forward(sw, pc) || sw.pending.is_some() {
+                        if self.core_call_forward(sw, pc, snap_gen) || sw.pending.is_some() {
                             break Some(CoreExit::Reload);
                         }
                         // Declined untouched: the leaf arm builds the dict.
@@ -19101,7 +19101,7 @@ impl Interpreter {
             }
             // A plain class's construction, as a `CALL`'s.
             Some(Object::Type(_)) => {
-                if self.core_new_ex(sw, pc, snap_gen) {
+                if self.core_new_ex(sw, pc, snap_gen) || self.core_new_mapping(sw, pc, snap_gen) {
                     return true;
                 }
             }
@@ -19376,7 +19376,7 @@ impl Interpreter {
     /// `CALL_FUNCTION_EX` three instructions on runs inline. `false`
     /// touches nothing (the instructions run one by one).
     #[inline(never)]
-    fn core_call_forward(&mut self, sw: &mut CoreSwitch, pc: usize) -> bool {
+    fn core_call_forward(&mut self, sw: &mut CoreSwitch, pc: usize, snap_gen: u64) -> bool {
         if !self.inline_calls_ok() {
             return false;
         }
@@ -19393,8 +19393,19 @@ impl Interpreter {
                 Some(Object::Dict(d)) => Object::Dict(d.clone()),
                 _ => return false,
             };
+            // (`[callee, NULL, tuple]` before the mapping goes on.)
+            let class = frame
+                .stack
+                .len()
+                .checked_sub(3)
+                .is_some_and(|k| matches!(frame.stack[k], Object::Type(_)))
+                && std::ptr::eq(sw.cur, &raw const *frame);
             frame.stack.push(mapping);
             if self.try_leaf_call_ex(frame, pc + 3) {
+                return true;
+            }
+            // A plain class's construction, its keywords from the mapping.
+            if class && self.core_new_mapping(sw, pc + 3, snap_gen) {
                 return true;
             }
             self.try_inline_call_ex(frame, &mut *shell.cast::<QuietShell<'_>>(), pc + 3)
@@ -19957,6 +19968,130 @@ impl Interpreter {
         frame.stack.push(spread);
         frame.stack.push(mapping);
         false
+    }
+
+    /// `cls(*args, **kwargs)` (the `CALL_FUNCTION_EX` at `pc` of `sw`'s
+    /// synced running activation, `[cls, NULL, tuple, dict]` atop its
+    /// stack) of a plain class whose `__init__` a lean activation can run,
+    /// with a mapping of `str` keys (`dataclasses.replace`'s
+    /// `self.__class__(**changes)`): bound and run as
+    /// [`Self::core_new_kw`] binds and runs a keyword call. `false` touches
+    /// nothing.
+    #[inline(never)]
+    fn core_new_mapping(&mut self, sw: &mut CoreSwitch, pc: usize, snap_gen: u64) -> bool {
+        if !self.inline_calls_ok()
+            || crate::stdlib::tracemalloc_real::is_tracking()
+            || crate::stdlib::testinternalcapi_mod::reftrace_print_active()
+            || crate::stdlib::testinternalcapi_mod::nomem_alloc_fails()
+            || self.lean_snapshot() != Some(snap_gen)
+        {
+            return false;
+        }
+        // SAFETY: see `CoreSwitch`.
+        let frame = unsafe { &mut *sw.cur };
+        let Some(callee_slot) = frame.stack.len().checked_sub(4) else {
+            return false;
+        };
+        let [Object::Type(ty), Object::Unbound, Object::Tuple(items), Object::Dict(d)] =
+            &frame.stack[callee_slot..]
+        else {
+            return false;
+        };
+        if ty.flags.is_builtin || ty.native_kind.get() != 0 || !Self::metaclass_calls_like_type(ty)
+        {
+            return false;
+        }
+        let ty = ty.clone();
+        let plan = self.instance_plan(&ty);
+        if plan.seeds_exception_args {
+            return false;
+        }
+        let Some((init, code)) = plan.lean_init.as_ref() else {
+            return false;
+        };
+        // SAFETY: GIL-serialized raw read of the function's code cell;
+        // only the pointer is compared.
+        if !std::ptr::eq(
+            unsafe { Rc::as_ptr(&*init.code.as_ptr()) },
+            Rc::as_ptr(code),
+        ) || !Self::lean_code_ok(code)
+            // The instance binds to the first positional parameter.
+            || code.arg_count == 0
+            || (init.defaults_maybe_overridden()
+                && (init.slot("__defaults__").is_some() || init.slot("__kwdefaults__").is_some()))
+        {
+            return false;
+        }
+        let Some(cells) = init.lean_cells_ref(code) else {
+            return false;
+        };
+        let cells: *const Rc<Vec<Rc<RefCell<Object>>>> = cells;
+        // SAFETY: a read that runs no code (the binding below only clones).
+        let Some(kw) = (unsafe { d.peek() }) else {
+            return false;
+        };
+        let act = self.inline_slot();
+        // SAFETY: a parked slot's locals storage is its own, and empty.
+        let locals = unsafe { act.frame.locals.storage() };
+        // (The instance isn't made until the binding holds: `None` keeps
+        // its parameter's place.)
+        let receiver = Object::None;
+        let bound = Self::lean_bind_keywords(
+            init,
+            code,
+            std::slice::from_ref(&receiver),
+            items,
+            kw.iter().map(|(k, v)| (&k.0, v)),
+            locals,
+        );
+        let guard = match (bound, crate::recursion::enter_with(sw.depth_cell)) {
+            (Some(()), crate::recursion::Enter::Ok(guard)) => guard,
+            _ => {
+                locals.clear();
+                self.inline_unslot(act);
+                return false;
+            }
+        };
+        // Committed.
+        let (init, code) = (init.clone(), code.clone());
+        let (inst, tracked) = self.alloc_lean_instance_obj(&ty, &plan.native);
+        drop(plan);
+        locals[0] = inst.clone();
+        if tracked && gc_trace::maybe_auto_collect() {
+            self.run_pending_finalizers();
+        }
+        // SAFETY: as above (finalizers ran against the synced frame).
+        let frame = unsafe { &mut *sw.cur };
+        // The operands leave the stack, as the full call handler releases
+        // them once the parameters are bound.
+        self.release_call_operands(&mut frame.stack, callee_slot);
+        drop(ty);
+        fill_unbound(locals, code.varnames.len());
+        frame.pc = pc as u32 + 1;
+        let mut tmp = None;
+        // SAFETY: see `CoreSwitch`.
+        let mut act = unsafe {
+            let depth = (*sw.inl).len();
+            let (frame, _, shell) = sw.activation(depth, &mut tmp);
+            self.inline_bind_cells(
+                &mut *frame,
+                &mut *shell.cast::<QuietShell<'_>>(),
+                pc,
+                act,
+                code,
+                Object::Function(init),
+                guard,
+                cells,
+            )
+        };
+        act.init_inst = Some(inst);
+        let callee: *mut Frame = &raw mut *act.frame;
+        // SAFETY: as above.
+        unsafe { push_fast(&mut *sw.inl, act) };
+        sw.cur = callee;
+        sw.scratch = usize::MAX;
+        sw.last = &raw mut sw.scratch;
+        true
     }
 
     /// `cls(..., name=value)` (the `CALL_KW` at `pc` of `sw`'s synced
