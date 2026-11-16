@@ -1358,7 +1358,6 @@ impl Interpreter {
     /// `frame` (at `pc` of `code`) rests on in a `yield from`, when stepping
     /// it runs no code and doesn't end it (see `gen_native_next`).
     #[inline]
-    #[inline]
     pub(crate) fn yield_from_iter_item(
         frame: &Frame,
         code: &CodeObject,
