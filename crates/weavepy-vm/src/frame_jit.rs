@@ -9177,20 +9177,27 @@ fn class_poly_prove(site: &AttrSite, inst: &crate::types::PyInstance, code: &Cod
 ///
 /// `site`'s code is live.
 unsafe fn class_poly_note(site: &AttrSite, inst: &crate::types::PyInstance, v: &Object) {
-    if !matches!(
-        v,
+    // (Values a read through an instance gives back as they are: plain
+    // data, or an object or class whose type has no `__get__`, such as a
+    // compiled pattern a class keeps.)
+    let plain = match v {
         Object::Str(_)
-            | Object::Int(_)
-            | Object::Float(_)
-            | Object::Bool(_)
-            | Object::None
-            | Object::Bytes(_)
-            | Object::Tuple(_)
-            | Object::FrozenSet(_)
-            | Object::List(_)
-            | Object::Dict(_)
-            | Object::Set(_)
-    ) {
+        | Object::Int(_)
+        | Object::Float(_)
+        | Object::Bool(_)
+        | Object::None
+        | Object::Bytes(_)
+        | Object::Tuple(_)
+        | Object::FrozenSet(_)
+        | Object::List(_)
+        | Object::Dict(_)
+        | Object::Set(_) => true,
+        Object::Instance(_) | Object::Type(_) => {
+            crate::builtins::class_of(v).lookup("__get__").is_none()
+        }
+        _ => false,
+    };
+    if !plain {
         return;
     }
     let cls = inst.cls_raw();
