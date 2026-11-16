@@ -86485,6 +86485,35 @@ fn effect_setter_shape(code: &CodeObject) -> bool {
 ///
 /// `top` is an initialized slot nothing else reads while this runs.
 #[inline]
+/// The repr of a list (`[`, `]`) or tuple (`(`, `)`) of `items` when each is
+/// a plain scalar (`None`, `bool`, `int`, `float`, `str`), whose reprs run no
+/// Python: `None` for anything else.
+fn scalar_seq_repr(items: &[Object], open: char, close: char) -> Option<String> {
+    if items.len() > 64
+        || !items.iter().all(|x| {
+            matches!(
+                x,
+                Object::None | Object::Bool(_) | Object::Int(_) | Object::Float(_) | Object::Str(_)
+            )
+        })
+    {
+        return None;
+    }
+    let mut out = String::with_capacity(2 + items.len() * 4);
+    out.push(open);
+    for (i, x) in items.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&x.repr());
+    }
+    if close == ')' && items.len() == 1 {
+        out.push(',');
+    }
+    out.push(close);
+    Some(out)
+}
+
 pub(crate) unsafe fn convert_in_place(top: *mut Object, arg: u32) -> bool {
     // SAFETY: the caller's contract.
     let v = match (arg & 0x03, unsafe { &*top }) {
@@ -86500,10 +86529,27 @@ pub(crate) unsafe fn convert_in_place(top: *mut Object, arg: u32) -> bool {
         }
         // SAFETY: as above.
         (2, Object::Str(_)) => Object::Str(SharedStr::from(unsafe { &*top }.repr().as_str())),
+        // A list or tuple of plain scalars (a dataclass's `tags=[]` in its
+        // generated `__repr__`): no item's repr runs Python.
+        (2, Object::List(l)) => {
+            // SAFETY: a read with nothing running.
+            let Some(items) = (unsafe { l.peek() }) else {
+                return false;
+            };
+            match scalar_seq_repr(items, '[', ']') {
+                Some(r) => Object::Str(SharedStr::from(r.as_str())),
+                None => return false,
+            }
+        }
+        (2, Object::Tuple(t)) => match scalar_seq_repr(t, '(', ')') {
+            Some(r) => Object::Str(SharedStr::from(r.as_str())),
+            None => return false,
+        },
         _ => return false,
     };
     // SAFETY: the replaced value is a scalar, which owes no drop, or a
-    // string, released here (its repr ran no Python).
+    // string, or a list or tuple of scalars, released here (no release of
+    // theirs runs Python).
     unsafe { top.replace(v) };
     true
 }

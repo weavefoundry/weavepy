@@ -4515,7 +4515,10 @@ unsafe extern "C" fn h_for_iter_rest(
         // the core loop's arm steps it (a change of size, a reverse view, an
         // exhaustion that could release anything are its own).
         view @ PyIterator::DictKeys { .. } => {
-            match Interpreter::core_dict_next(view, false, unique) {
+            // (A shared iterator, a generator expression's `.0`, exhausts
+            // as a sole one does: its other holder finds it exhausted, and
+            // the stack's reference leaves by a plain decrement.)
+            match Interpreter::core_dict_next(view, false, true) {
                 crate::DictStep::Item(v, _) => v,
                 crate::DictStep::Exhausted => {
                     // SAFETY: the iterator, held by the stack alone, leaves
