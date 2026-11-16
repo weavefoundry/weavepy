@@ -502,14 +502,37 @@ branch and pull request.
     walk now answers all of its questions, memoized by class version.
     `os.stat` laid its result's nineteen fields into a dict one probe at a
     time and read ten back by name (13,457 instructions to 9,272).
+  - Objects whose `__dict__` was published (`copy`, `pickle`, `vars()`,
+    and `dir()`, which configparser's `ConverterMapping` runs on its
+    parser) lost compiled code's field reads: every attribute read went
+    the whole miss path, about 800 instructions. `dir()` no longer
+    publishes, and attribute sites remember where a name sat in a
+    published dict (two reads of a copied object: 1,875 instructions to
+    509, CPython 896). Class attributes read through an instance now
+    memoize objects without `__get__` too (configparser's compiled
+    patterns), and native `re` objects lay their slots over their
+    classes' own layouts. `ConfigParser.read_string` ran 10% fewer
+    instructions, `ConfigParser.get` 20%.
+  - `typing`'s subscripts (`List[int]`, `Optional[str]`) went through
+    `_tp_cache`, whose `f(*args, **kwds)` forward to an `lru_cache`
+    wrapper had no lane in compiled code, whose cache probe hashed only
+    builtin scalars, and whose subscript site, compiled before the core
+    loop ran it, had no direct `__getitem__` call: `typing.Optional[str]`
+    ran 13,031 instructions to 3,164 (CPython 2,683).
+  - The frame JIT now takes code tier 2 failed to compile three times
+    (argparse's `_parse_known_args` had stayed interpreted for good), and
+    `ref.__new__` and `_sre.exec_match` over a `str` run in place (a
+    100-entry `WeakValueDictionary`: 1,241,587 instructions to 877,688).
   - Tried and dropped: native `LOAD_GLOBAL` hits in compiled code (the
     helper costs as much as its guards would in line), native reads of
     polymorphic split fields (their IR pushed `deltablue`'s hot functions
     over the inline budget), and a Linux-only symbol order (the release
     build's fat LTO renames most of what the profiles name; start-up RSS
-    moved 2%). The battery stands at 1.272 times CPython's instructions on
-    quick builds, against 1.285 at the start of the day; `class_features`
-    ran 21% fewer instructions and `email_html_ops` 12%.
+    moved 2%), and a lower frame-JIT threshold (60: the battery ran 1% more
+    instructions). The battery stands at 1.262 times CPython's
+    instructions on quick builds, against 1.285 at the start of the day;
+    `class_features` ran 21% fewer instructions, `email_html_ops` 13%,
+    `configparser_ops` 8%.
 
 - **Tier 2's wasted work, a start-up deadlock, and more cliffs** (PR #112,
   November 15). Ratios are instructions, WeavePy's over CPython's unless
