@@ -208,7 +208,7 @@ pub(crate) enum Verdict {
     /// unused.
     NativePatternHash = 12,
     /// The class answers `str(x)` of its instances with their `str`
-    /// payload: no `__str__` of its own (see
+    /// payload: no `__str__` that dispatch reaches (see
     /// `Interpreter::str_payload_class`); `name` unused.
     StrPayload = 13,
 }

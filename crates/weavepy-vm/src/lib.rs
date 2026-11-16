@@ -44107,31 +44107,25 @@ impl Interpreter {
         };
         let cls = inst.cls_raw();
         if !cls.memo_verdict(crate::types::Verdict::StrPayload, "", || {
-            Self::str_payload_class(cls)
+            Self::str_payload_class(inst)
         }) {
             return None;
         }
         Some(native.clone())
     }
 
-    /// Whether `cls`'s `__str__` is `str`'s own (see [`Self::str_payload`]):
-    /// the first class on its MRO that defines it is `str`.
-    fn str_payload_class(cls: &crate::types::TypeObject) -> bool {
-        let str_ty = &builtin_types().str_;
-        let mro = cls.mro.borrow();
-        for owner in mro.iter() {
-            if Rc::ptr_eq(owner, str_ty) {
-                return true;
-            }
-            if owner
-                .dict
-                .borrow()
-                .contains_key(&crate::object::StrKey("__str__"))
-            {
-                return false;
-            }
-        }
-        false
+    /// Whether `inst`'s class has no `__str__` dispatch reaches (see
+    /// [`Self::str_payload`]): `str`'s own is an introspection-only entry
+    /// that the walk passes over, so a mixed `str` enum's `Enum.__str__`
+    /// after it on the MRO answers. The checks [`Self::do_str_call`] makes.
+    fn str_payload_class(inst: &Rc<crate::types::PyInstance>) -> bool {
+        Self::instance_dunder_function(
+            inst,
+            crate::types::AttrKey::vm(crate::types::vm_key::STR_FN),
+            "__str__",
+        )
+        .is_none()
+            && instance_method(&Object::Instance(inst.clone()), "__str__").is_none()
     }
 
     fn do_str_call(

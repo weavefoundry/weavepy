@@ -3,9 +3,12 @@
 `email`'s `Terminal.value` is `str(self)`. An instance whose class keeps
 `str`'s own `__str__` gives back its payload as an exact `str`; a class
 that overrides `__str__`, directly, through a base, or after the fact,
-is called. Surrogates in the payload survive. Run it past the compile
-threshold.
+is called, as is `Enum.__str__` of a mixed `str` enum, which comes after
+`str` on its MRO (`str`'s own `__str__` doesn't stop the lookup).
+Surrogates in the payload survive. Run it past the compile threshold.
 """
+
+import enum
 
 
 class S(str):
@@ -25,6 +28,10 @@ class Later(str):
     pass
 
 
+class Mixed(str, enum.Enum):
+    one = "1"
+
+
 def conv(x):
     return str(x)
 
@@ -39,3 +46,4 @@ for i in range(3000):
     if i == 1999:
         Later.__str__ = lambda self: "later"
     assert str(S("q")) == "q"
+    assert conv(Mixed.one) == "Mixed.one" and format(Mixed.one) == "Mixed.one"
