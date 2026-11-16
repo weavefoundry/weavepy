@@ -8206,6 +8206,10 @@ pub(crate) struct AttrSite {
     /// [`site_property_leaf`]): the class version it read for, the getter
     /// function and its code, and the property's getter cell.
     prop_leaf: Cell<(u64, usize, usize, usize)>,
+    /// Where an instance with a published dict (one `copy`, `pickle` or
+    /// `vars()` made) last had the site's name: its class's version and
+    /// the dict position (see [`pub_hit`]).
+    pub_hint: Cell<(u64, u32)>,
 }
 
 /// The value `recv`'s read at `site` finds through the site's caches past
@@ -8511,6 +8515,19 @@ unsafe fn attr_miss(st: *mut State, site: &AttrSite, at: *mut Object, local: boo
                 if r != CALL_DECLINED {
                     return r;
                 }
+            }
+            // A published dict's own value, its position remembered.
+            if let Some(v) = pub_note(site, inst) {
+                if local {
+                    (*st).stack.add(site.slot as usize).write(v);
+                } else {
+                    if !droppable(&*at) {
+                        drop(v);
+                        return left(st, site.pc, site.last, site.slot as usize + 1);
+                    }
+                    crate::drop_hot(std::mem::replace(&mut *at, v));
+                }
+                return 0;
             }
             // A property whose getter the site's slot holds for the class
             // (settled after the code compiled, or read in a generator's
@@ -8834,7 +8851,56 @@ unsafe fn field_hit<'a>(site: &AttrSite, inst: &'a crate::types::PyInstance) -> 
         if want == ver && want != 0 {
             return inst.split_field(idx as usize);
         }
+        if inst.dict.published().is_some() {
+            return pub_hit(site, inst);
+        }
         None
+    }
+}
+
+/// The value at the position [`AttrSite::pub_hint`] remembers in `inst`'s
+/// published dict, if the class is at the hint's version (so no data
+/// descriptor has come to shadow the dict) and that entry is still the
+/// site's name.
+///
+/// # Safety
+///
+/// As [`attr_hit`].
+#[inline(never)]
+unsafe fn pub_hit<'a>(site: &AttrSite, inst: &'a crate::types::PyInstance) -> Option<&'a Object> {
+    let (ver, idx) = site.pub_hint.get();
+    if ver == 0 || inst.cls_raw().attr_version.get() != ver {
+        return None;
+    }
+    // SAFETY: the caller's contract; the site's code is live.
+    unsafe {
+        let (k, v) = inst.attr_peek_index(idx as usize)?;
+        let code = &*site.code;
+        crate::slot_name_matches(code, code.instructions[site.pc as usize].arg, k).then_some(v)
+    }
+}
+
+/// A read at `site` of an instance with a published dict, resolved as the
+/// leaf path resolves it: the dict's own value, its position remembered for
+/// [`pub_hit`]; `None` for anything else.
+///
+/// # Safety
+///
+/// As [`attr_hit`].
+unsafe fn pub_note(site: &AttrSite, inst: &crate::types::PyInstance) -> Option<Object> {
+    if inst.dict.published().is_none() {
+        return None;
+    }
+    // SAFETY: the site's code is live.
+    let code = unsafe { &*site.code };
+    let arg = code.instructions[site.pc as usize].arg;
+    let ver = inst.cls_raw().attr_version.get();
+    match Interpreter::leaf_resolve_instance_attr_ix(code, inst, arg)? {
+        (crate::LeafAttr::Value(v), Some(ix)) if ver != 0 => {
+            site.pub_hint.set((ver, ix));
+            Some(v)
+        }
+        _ => None,
     }
 }
 
@@ -21844,6 +21910,7 @@ impl<'a> Lower<'a> {
             no_shadow_limit: Cell::new(0),
             builtin_attr: std::cell::RefCell::new(None),
             prop_leaf: Cell::new((0, 0, 0, 0)),
+            pub_hint: Cell::new((0, 0)),
         });
         let c = self
             .b
