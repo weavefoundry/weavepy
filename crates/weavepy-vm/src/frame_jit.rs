@@ -8888,9 +8888,7 @@ unsafe fn pub_hit<'a>(site: &AttrSite, inst: &'a crate::types::PyInstance) -> Op
 ///
 /// As [`attr_hit`].
 unsafe fn pub_note(site: &AttrSite, inst: &crate::types::PyInstance) -> Option<Object> {
-    if inst.dict.published().is_none() {
-        return None;
-    }
+    inst.dict.published()?;
     // SAFETY: the site's code is live.
     let code = unsafe { &*site.code };
     let arg = code.instructions[site.pc as usize].arg;

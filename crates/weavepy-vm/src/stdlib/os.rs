@@ -2776,9 +2776,10 @@ impl StatFields {
 /// from them directly, and the instance dict laid down in one go, its keys
 /// (and their hashes) made once per thread for each position a builder
 /// fills.
-fn stat_fields_finish(inst: &crate::types::PyInstance, mut fields: StatFields) {
+fn stat_fields_finish(inst: &crate::types::PyInstance, fields: StatFields) {
     #[cfg(target_os = "macos")]
-    {
+    let fields = {
+        let mut fields = fields;
         for f in ["st_flags", "st_gen"] {
             if fields.get(f).is_none() {
                 fields.insert(f, Object::Int(0));
@@ -2791,7 +2792,8 @@ fn stat_fields_finish(inst: &crate::types::PyInstance, mut fields: StatFields) {
                 .unwrap_or(Object::Float(0.0));
             fields.insert("st_birthtime", v);
         }
-    }
+        fields
+    };
     let mut seq: Vec<Object> = Vec::with_capacity(10);
     for f in [
         "st_mode", "st_ino", "st_dev", "st_nlink", "st_uid", "st_gid", "st_size",
