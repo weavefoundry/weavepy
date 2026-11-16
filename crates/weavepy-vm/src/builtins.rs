@@ -12884,21 +12884,38 @@ fn str_encode(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
     if !recv.is_str() {
         return Err(type_error("expected str method receiver"));
     }
+    for (k, _) in kwargs {
+        let pos = match k.as_str() {
+            "encoding" => 1,
+            "errors" => 2,
+            _ => {
+                return Err(type_error(format!(
+                    "encode() got an unexpected keyword argument '{k}'"
+                )))
+            }
+        };
+        if args.len() > pos {
+            return Err(type_error(format!(
+                "argument for encode() given by name ('{k}') and position ({pos})"
+            )));
+        }
+    }
     // UTF-8 with no error handler, the common call: a `str` holds valid
     // UTF-8 (lone surrogates live in `WStr`), so its bytes are the answer,
     // as CPython's C fast path for the codec gives them.
     if let Object::Str(text) = recv {
-        let utf8 = kwargs.is_empty()
-            && match args {
-                [_] => true,
-                [_, Object::Str(enc)] => {
+        // (Keywords too.)
+        // (The names were checked above.)
+        let utf8 = kwargs.len() <= 2
+            && args.len() <= 3
+            && match arg_or_kw(args, 1, kwargs, "encoding") {
+                None => true,
+                Some(Object::Str(enc)) => {
                     matches!(&**enc, "utf-8" | "utf8" | "UTF-8" | "UTF8" | "utf_8")
                 }
-                [_, Object::Str(enc), errors] if is_builtin_error_handler(errors) => {
-                    matches!(&**enc, "utf-8" | "utf8" | "UTF-8" | "UTF8" | "utf_8")
-                }
-                _ => false,
-            };
+                Some(_) => false,
+            }
+            && arg_or_kw(args, 2, kwargs, "errors").is_none_or(is_builtin_error_handler);
         if utf8 {
             return Ok(Object::new_bytes(text.as_bytes().to_vec()));
         }
@@ -12911,7 +12928,12 @@ fn str_encode(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
     let encoding = match arg_or_kw(args, 1, kwargs, "encoding") {
         Some(o) => match str_arg_bridged(o) {
             Some(e) => e.into_owned(),
-            None => return Err(type_error("encode() expected str")),
+            None => {
+                return Err(type_error(format!(
+                    "encode() argument 'encoding' must be str, not {}",
+                    o.type_name()
+                )))
+            }
         },
         None => "utf-8".to_owned(),
     };
