@@ -9857,8 +9857,7 @@ const CODE_ATTR_NAMES: &[&str] = &[
 /// this loose because runtime helpers (typing, dataclasses, abc)
 /// only need it to enumerate user attributes.
 pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
-    use std::collections::BTreeSet;
-    let mut names: BTreeSet<String> = BTreeSet::new();
+    let mut names = DirNames(Vec::new());
     let obj = one(args, "dir")?;
     // Set when `getattr(obj, '__class__')` would fail — an *unset*
     // `__class__` slot (`__slots__ = ['__class__', …]`) hides the type
@@ -9880,9 +9879,7 @@ pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
             // (The names alone: a split instance keeps its layout, whose
             // attribute reads compiled code takes in line.)
             inst.for_each_attr(|k, _| {
-                if let Object::Str(s) = &k.0 {
-                    names.insert(s.to_string());
-                }
+                names.key(&k.0);
             });
             class_hidden = matches!(
                 inst.cls().lookup("__class__"),
@@ -9891,9 +9888,7 @@ pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
             if !class_hidden {
                 for t in inst.cls().mro.borrow().iter() {
                     for k in t.dict.borrow().keys() {
-                        if let Object::Str(s) = &k.0 {
-                            names.insert(s.to_string());
-                        }
+                        names.key(&k.0);
                     }
                 }
             }
@@ -9901,9 +9896,7 @@ pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
         Object::Type(t) => {
             for cls in t.mro.borrow().iter() {
                 for k in cls.dict.borrow().keys() {
-                    if let Object::Str(s) = &k.0 {
-                        names.insert(s.to_string());
-                    }
+                    names.key(&k.0);
                 }
             }
             // `types.CodeType`'s getsets are synthesized in `load_attr`
@@ -9914,7 +9907,7 @@ pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
             // `co_flags`/`co_argcount` on it.
             if t.name == "code" && t.flags.is_builtin {
                 for n in CODE_ATTR_NAMES {
-                    names.insert((*n).to_string());
+                    names.name(n);
                 }
             }
         }
@@ -9934,13 +9927,11 @@ pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
                 .borrow()
                 .contains_key(&crate::object::DictKey(Object::from_static("__spec__")));
             if missing_spec {
-                names.insert("__spec__".to_owned());
-                names.insert("__loader__".to_owned());
+                names.name("__spec__");
+                names.name("__loader__");
             }
             for k in m.dict.borrow().keys() {
-                if let Object::Str(s) = &k.0 {
-                    names.insert(s.to_string());
-                }
+                names.key(&k.0);
             }
         }
         Object::Function(f) => {
@@ -9952,9 +9943,7 @@ pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
             // `@pytest.mark.parametrize` stacked under `@given`.
             if let Some(attrs) = f.attrs.borrow().as_ref() {
                 for k in attrs.borrow().keys() {
-                    if let Object::Str(s) = &k.0 {
-                        names.insert(s.to_string());
-                    }
+                    names.key(&k.0);
                 }
             }
             for n in [
@@ -9974,13 +9963,11 @@ pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
                 "__qualname__",
                 "__type_params__",
             ] {
-                names.insert(n.to_string());
+                names.name(n);
             }
             for t in class_of(obj).mro.borrow().iter() {
                 for k in t.dict.borrow().keys() {
-                    if let Object::Str(s) = &k.0 {
-                        names.insert(s.to_string());
-                    }
+                    names.key(&k.0);
                 }
             }
         }
@@ -9992,18 +9979,14 @@ pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
             // `dir(obj.f)` too (test_funcattrs).
             if let Object::List(items) = b_dir(&[bm.function.clone()])? {
                 for it in items.borrow().iter() {
-                    if let Object::Str(s) = it {
-                        names.insert(s.to_string());
-                    }
+                    names.key(it);
                 }
             }
-            names.insert("__func__".to_string());
-            names.insert("__self__".to_string());
+            names.name("__func__");
+            names.name("__self__");
             for t in class_of(obj).mro.borrow().iter() {
                 for k in t.dict.borrow().keys() {
-                    if let Object::Str(s) = &k.0 {
-                        names.insert(s.to_string());
-                    }
+                    names.key(&k.0);
                 }
             }
         }
@@ -10011,9 +9994,7 @@ pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
             // Generic objects: `object.__dir__` ≈ the type's attributes.
             for t in class_of(other).mro.borrow().iter() {
                 for k in t.dict.borrow().keys() {
-                    if let Object::Str(s) = &k.0 {
-                        names.insert(s.to_string());
-                    }
+                    names.key(&k.0);
                 }
             }
             // A namespace-shaped object (PEP 585 GenericAlias,
@@ -10022,9 +10003,7 @@ pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
             // (`'__origin__' in dir(list[int])`).
             if let Object::SimpleNamespace(d) = other {
                 for k in d.borrow().keys() {
-                    if let Object::Str(s) = &k.0 {
-                        names.insert(s.to_string());
-                    }
+                    names.key(&k.0);
                 }
                 // A PEP 604 union (3.14 `types.UnionType`) exposes its
                 // getsets -- `__args__`, `__parameters__`, `__origin__`,
@@ -10035,7 +10014,7 @@ pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
                     names.remove("__is_pep604_union__");
                     names.remove("__weave_unhashable_args__");
                     for n in ["__origin__", "__name__", "__qualname__"] {
-                        names.insert(n.to_string());
+                        names.name(n);
                     }
                 }
                 // CPython `ga_dir`: a generic alias reports `dir(origin)`
@@ -10048,9 +10027,7 @@ pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
                 if let Some(Object::Type(t)) = origin {
                     for cls in t.mro.borrow().iter() {
                         for k in cls.dict.borrow().keys() {
-                            if let Object::Str(s) = &k.0 {
-                                names.insert(s.to_string());
-                            }
+                            names.key(&k.0);
                         }
                     }
                 }
@@ -10060,7 +10037,7 @@ pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
             // dicts; surface the same names CPython's type dicts hold.
             if matches!(other, Object::Code(_)) {
                 for n in CODE_ATTR_NAMES {
-                    names.insert((*n).to_string());
+                    names.name(n);
                 }
             }
             let extra: &[&str] = match other {
@@ -10147,7 +10124,7 @@ pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
                 _ => &[],
             };
             for n in extra {
-                names.insert((*n).to_string());
+                names.name(n);
             }
         }
     }
@@ -10166,12 +10143,46 @@ pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
             "__sizeof__",
             "__str__",
         ] {
-            names.insert(n.to_string());
+            names.name(n);
         }
     }
-    Ok(Object::new_list(
-        names.into_iter().map(Object::from_str).collect(),
-    ))
+    Ok(Object::new_list(names.sorted()))
+}
+
+/// `dir()`'s names as it collects them: the dict keys' own `str` objects
+/// (a reference each, nothing copied), sorted and deduplicated once at
+/// the end.
+struct DirNames(Vec<Object>);
+
+impl DirNames {
+    /// A dict key, if it's a `str`.
+    fn key(&mut self, k: &Object) {
+        if matches!(k, Object::Str(_)) {
+            self.0.push(k.clone());
+        }
+    }
+
+    fn name(&mut self, n: &'static str) {
+        self.0.push(Object::from_static(n));
+    }
+
+    /// Drop `n` from the names collected so far.
+    fn remove(&mut self, n: &str) {
+        self.0
+            .retain(|k| !matches!(k, Object::Str(s) if s.as_ref() == n));
+    }
+
+    fn sorted(mut self) -> Vec<Object> {
+        fn as_str(o: &Object) -> &str {
+            match o {
+                Object::Str(s) => s.as_ref(),
+                _ => "",
+            }
+        }
+        self.0.sort_unstable_by(|a, b| as_str(a).cmp(as_str(b)));
+        self.0.dedup_by(|a, b| as_str(a) == as_str(b));
+        self.0
+    }
 }
 
 fn b_hex(args: &[Object]) -> Result<Object, RuntimeError> {
