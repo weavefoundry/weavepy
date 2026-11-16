@@ -8525,6 +8525,31 @@ unsafe fn attr_miss(st: *mut State, site: &AttrSite, at: *mut Object, local: boo
             }
             _ => None,
         };
+        // A namespace's own entry (a `typing` union's `__args__`, a
+        // `SimpleNamespace`'s field): the full handler's first answer.
+        if let Object::SimpleNamespace(d) = &*at {
+            let code = &*site.code;
+            let v = code
+                .names
+                .get(code.instructions[site.pc as usize].arg as usize)
+                .and_then(|name| {
+                    d.try_borrow()
+                        .ok()
+                        .and_then(|d| d.get(&crate::object::StrKey(name)).cloned())
+                });
+            if let Some(v) = v {
+                if local {
+                    (*st).stack.add(site.slot as usize).write(v);
+                } else {
+                    if !droppable(&*at) {
+                        drop(v);
+                        return left(st, site.pc, site.last, site.slot as usize + 1);
+                    }
+                    crate::drop_hot(std::mem::replace(&mut *at, v));
+                }
+                return 0;
+            }
+        }
         // An instance of a class with a `__getattribute__` of its own: no
         // cached read applies, and the full handler runs the hook.
         if let Object::Instance(inst) = &*at {
