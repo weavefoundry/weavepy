@@ -9421,9 +9421,14 @@ unsafe extern "C" fn h_class_read(dst: *mut Object, src: *const Object) -> u32 {
         }
         let ty = Object::Type(inst.cls());
         if std::ptr::eq(dst.cast_const(), src) && !plain_release(&*src) {
-            // (The receiver's last reference: its release is the helper's.)
-            drop(ty);
-            return 1;
+            // The receiver's last reference (a fresh `super(C, obj)`'s): it
+            // dies here, and a finalizer its release queues runs before the
+            // next instruction (the code checks after the read).
+            if !droppable(&*src) {
+                drop(ty);
+                return 1;
+            }
+            crate::drop_hot_at(src);
         }
         dst.write(ty);
         0
@@ -22219,6 +22224,11 @@ impl<'a> Lower<'a> {
         }
         self.push(Item::Mem(slot));
         self.set_last(pc);
+        // (A receiver `h_class_read` released last may have queued a
+        // finalizer.)
+        if class_read {
+            self.check_released(pc + 1);
+        }
         true
     }
 

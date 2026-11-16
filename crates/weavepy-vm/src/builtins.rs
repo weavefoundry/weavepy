@@ -8993,28 +8993,31 @@ pub(crate) fn build_super_proxy(
     receiver: Object,
     receiver_class: Rc<crate::types::TypeObject>,
 ) -> Object {
+    thread_local! {
+        /// The proxy's keys, in the order its dict holds them, with their
+        /// hashes.
+        static KEYS: [(i64, DictKey); 3] = ["__self__", "__thisclass__", "__self_class__"]
+            .map(|name| {
+                let key = DictKey(Object::from_static(name));
+                (crate::object::dict_key_hash(&key.0), key)
+            });
+    }
+    // `__self_class__` is CPython's `su->obj_type` — the class whose MRO is
+    // walked, passed as `owner` to descriptor `__get__`s. Also used to
+    // detect the class-bound form (`su->obj == starttype`), where
+    // descriptors get a NULL instance (so plain functions come back
+    // *unbound*: `super().__new__(cls, v)` must not prepend a second
+    // `cls`).
+    let mut values = [receiver, Object::Type(class), Object::Type(receiver_class)].into_iter();
+    let map = KEYS.with(|keys| {
+        crate::dictmap::DictMap::from_unique_hashed(3, |i| {
+            let (hash, key) = &keys[i];
+            (*hash, key.clone(), values.next().expect("three values"))
+        })
+    });
     let inst = crate::types::PyInstance {
         class: RefCell::new(proxy_type),
-        dict: Rc::new(RefCell::new({
-            let mut d = DictData::default();
-            d.insert(DictKey(Object::from_static("__self__")), receiver);
-            d.insert(
-                DictKey(Object::from_static("__thisclass__")),
-                Object::Type(class),
-            );
-            // CPython's `su->obj_type` — the class whose MRO is walked,
-            // passed as `owner` to descriptor `__get__`s. Also used to
-            // detect the class-bound form (`su->obj == starttype`),
-            // where descriptors get a NULL instance (so plain functions
-            // come back *unbound*: `super().__new__(cls, v)` must not
-            // prepend a second `cls`).
-            d.insert(
-                DictKey(Object::from_static("__self_class__")),
-                Object::Type(receiver_class),
-            );
-            d
-        }))
-        .into(),
+        dict: Rc::new(RefCell::new(DictData::from(map))).into(),
         native: crate::sync::OnceBox::new(),
         inline_values: crate::sync::Cell::new(true),
         slots: crate::sync::RefCell::new(crate::types::SlotStorage::default()),
