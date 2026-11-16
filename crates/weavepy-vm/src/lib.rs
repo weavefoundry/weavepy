@@ -85925,7 +85925,7 @@ impl MethodSlot {
 
     /// Whether the site has cached a `property` getter (for any class).
     #[cfg(feature = "jit")]
-    fn holds_getter(&self) -> bool {
+    pub(crate) fn holds_getter(&self) -> bool {
         // SAFETY: GIL-serialized; no `&mut` escapes `set_getter`.
         matches!(unsafe { &*self.0.get() }, (_, MethodSlotFn::Getter { .. }))
     }

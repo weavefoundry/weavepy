@@ -8521,7 +8521,10 @@ unsafe fn attr_miss(st: *mut State, site: &AttrSite, at: *mut Object, local: boo
             }
             // (Read now: a stack receiver leaves with the read.)
             let ver = inst.cls_raw().attr_version.get();
-            if property_leaf_here(
+            if (*site.ext)
+                .method_slot(site.pc as usize)
+                .is_some_and(|m| m.holds_getter())
+                && property_leaf_here(
                 &mut *st,
                 site.code,
                 site.pc as usize,
