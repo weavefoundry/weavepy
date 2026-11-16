@@ -509,6 +509,14 @@ branch and pull request.
     is its payload, from the pure constructor lane: 1,795 instructions to
     541 (CPython 814). A tree's `value` ran 210,471 instructions to
     138,758 (62,258).
+  - `dir()` gathered names into a `BTreeSet<String>`, copying each and
+    allocating it again as a `str`: it now collects the dict keys' own
+    strings and sorts once (`inspect.getmembers` of a class 211,206
+    instructions to 190,518, CPython 136,682). `s.encode(encoding="utf-8")`
+    took the codec lookup, normalizing the name each call (3,975 to 2,198,
+    against 1,494), and now raises CPython's `TypeError`s for unknown or
+    repeated keywords, which it ignored. A one-base class's MRO is the
+    base's with the class in front, no merge (`type()` 17,599 to 16,376).
   - Where the time goes. `email`'s `HeaderRegistry` builds a new class
     with `type()` for every header it makes, so every header's lookups
     start on a cold class; WeavePy's `type()` is cheaper than CPython's
@@ -520,6 +528,24 @@ branch and pull request.
     return alone; compiled and warm it's 1.6 times CPython's. A plain
     `for v in gen()` loop spends 685 instructions an item to CPython's
     400, 291 of them in the resume's checks (`gen_native_next`).
+  - Across seven of the worst cases (`argparse`, `email`, `configparser`,
+    `enum_dataclass`, `inspect_typing`, `class_features`, `collections`;
+    synchronous compiles), compiling is 8.3% of the instructions, the core
+    loop's own code 10.9%, calls 10%, allocation 10.3%, attribute paths
+    10.3%, and the rest is spread over hundreds of functions: the largest
+    single one, `leaf_burst`, is 7.7%. Cachegrind puts `argparse_ops` at a
+    3.8% instruction-cache miss rate (32.7 million misses in 858 million
+    instructions); compiled code takes 1.6% of the misses and the VM's own
+    code 92%, so for short cases the footprint is the interpreter's and the
+    runtime's, not the JITs'. The core loop's dispatch jump mispredicts 1.9
+    million times there.
+  - Threads. A two-thread ping-pong through `queue.Queue` costs 173,884
+    instructions and 249,454 cycles a round trip to CPython's 65,984 and
+    67,867, with twice the context switches. While a second thread runs,
+    every container's cell borrow takes an atomic compare-and-swap
+    instead of the biased check; starting and joining a bare thread costs
+    281,455 instructions to 86,833 (per-thread tables zeroed and dropped,
+    the allocator's per-thread heap, the interpreter's fork).
 
 - **Configparser's constructions, compiled patterns, and where the short
   cases spend** (PR #112, November 16, later). Ratios are instructions,
