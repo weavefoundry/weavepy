@@ -19979,12 +19979,7 @@ impl Interpreter {
     /// nothing.
     #[inline(never)]
     fn core_new_mapping(&mut self, sw: &mut CoreSwitch, pc: usize, snap_gen: u64) -> bool {
-        if !self.inline_calls_ok()
-            || crate::stdlib::tracemalloc_real::is_tracking()
-            || crate::stdlib::testinternalcapi_mod::reftrace_print_active()
-            || crate::stdlib::testinternalcapi_mod::nomem_alloc_fails()
-            || self.lean_snapshot() != Some(snap_gen)
-        {
+        if !self.core_new_ok(snap_gen) {
             return false;
         }
         // SAFETY: see `CoreSwitch`.
@@ -19992,106 +19987,22 @@ impl Interpreter {
         let Some(callee_slot) = frame.stack.len().checked_sub(4) else {
             return false;
         };
-        let [Object::Type(ty), Object::Unbound, Object::Tuple(items), Object::Dict(d)] =
+        let [Object::Type(_), Object::Unbound, Object::Tuple(items), Object::Dict(d)] =
             &frame.stack[callee_slot..]
         else {
             return false;
         };
-        if ty.flags.is_builtin || ty.native_kind.get() != 0 || !Self::metaclass_calls_like_type(ty)
-        {
-            return false;
-        }
-        let ty = ty.clone();
-        let plan = self.instance_plan(&ty);
-        if plan.seeds_exception_args {
-            return false;
-        }
-        let Some((init, code)) = plan.lean_init.as_ref() else {
-            return false;
-        };
-        // SAFETY: GIL-serialized raw read of the function's code cell;
-        // only the pointer is compared.
-        if !std::ptr::eq(
-            unsafe { Rc::as_ptr(&*init.code.as_ptr()) },
-            Rc::as_ptr(code),
-        ) || !Self::lean_code_ok(code)
-            // The instance binds to the first positional parameter.
-            || code.arg_count == 0
-            || (init.defaults_maybe_overridden()
-                && (init.slot("__defaults__").is_some() || init.slot("__kwdefaults__").is_some()))
-        {
-            return false;
-        }
-        let Some(cells) = init.lean_cells_ref(code) else {
-            return false;
-        };
-        let cells: *const Rc<Vec<Rc<RefCell<Object>>>> = cells;
-        // SAFETY: a read that runs no code (the binding below only clones).
+        // SAFETY: a read that runs no code (the binding only clones).
         let Some(kw) = (unsafe { d.peek() }) else {
             return false;
         };
-        let act = self.inline_slot();
-        // SAFETY: a parked slot's locals storage is its own, and empty.
-        let locals = unsafe { act.frame.locals.storage() };
-        // (The instance isn't made until the binding holds: `None` keeps
-        // its parameter's place.)
-        let receiver = Object::None;
-        let bound = Self::lean_bind_keywords(
-            init,
-            code,
-            std::slice::from_ref(&receiver),
+        self.core_new_bind(
+            sw,
+            pc,
+            callee_slot,
             items,
-            kw.iter().map(|(k, v)| (&k.0, v)),
-            locals,
-        );
-        let guard = match (bound, crate::recursion::enter_with(sw.depth_cell)) {
-            (Some(()), crate::recursion::Enter::Ok(guard)) => guard,
-            _ => {
-                locals.clear();
-                self.inline_unslot(act);
-                return false;
-            }
-        };
-        // Committed.
-        let (init, code) = (init.clone(), code.clone());
-        let (inst, tracked) = self.alloc_lean_instance_obj(&ty, &plan.native);
-        drop(plan);
-        locals[0] = inst.clone();
-        if tracked && gc_trace::maybe_auto_collect() {
-            self.run_pending_finalizers();
-        }
-        // SAFETY: as above (finalizers ran against the synced frame).
-        let frame = unsafe { &mut *sw.cur };
-        // The operands leave the stack, as the full call handler releases
-        // them once the parameters are bound.
-        self.release_call_operands(&mut frame.stack, callee_slot);
-        drop(ty);
-        fill_unbound(locals, code.varnames.len());
-        frame.pc = pc as u32 + 1;
-        let mut tmp = None;
-        // SAFETY: see `CoreSwitch`.
-        let mut act = unsafe {
-            let depth = (*sw.inl).len();
-            let (frame, _, shell) = sw.activation(depth, &mut tmp);
-            self.inline_bind_cells(
-                &mut *frame,
-                &mut *shell.cast::<QuietShell<'_>>(),
-                pc,
-                act,
-                code,
-                Object::Function(init),
-                guard,
-                cells,
-            )
-        };
-        act.init_inst = Some(inst);
-        let callee: *mut Frame = &raw mut *act.frame;
-        // SAFETY: as above.
-        unsafe { push_fast(&mut *sw.inl, act) };
-        sw.cur = callee;
-        sw.scratch = usize::MAX;
-        sw.last = &raw mut sw.scratch;
-        true
+            &mut kw.iter().map(|(k, v)| (&k.0, v)),
+        )
     }
 
     /// `cls(..., name=value)` (the `CALL_KW` at `pc` of `sw`'s synced
@@ -20102,12 +20013,7 @@ impl Interpreter {
     /// touches nothing.
     #[inline(never)]
     fn core_new_kw(&mut self, sw: &mut CoreSwitch, pc: usize, snap_gen: u64) -> bool {
-        if !self.inline_calls_ok()
-            || crate::stdlib::tracemalloc_real::is_tracking()
-            || crate::stdlib::testinternalcapi_mod::reftrace_print_active()
-            || crate::stdlib::testinternalcapi_mod::nomem_alloc_fails()
-            || self.lean_snapshot() != Some(snap_gen)
-        {
+        if !self.core_new_ok(snap_gen) {
             return false;
         }
         // SAFETY: see `CoreSwitch`.
@@ -20124,6 +20030,45 @@ impl Interpreter {
         let Some(callee_slot) = len.checked_sub(kwc + argc + 3) else {
             return false;
         };
+        let values = &frame.stack[len - 1 - kwc..len - 1];
+        self.core_new_bind(
+            sw,
+            pc,
+            callee_slot,
+            &frame.stack[callee_slot + 2..len - 1 - kwc],
+            &mut names.iter().zip(values),
+        )
+    }
+
+    /// Whether the interpreter may construct an instance inline: nothing
+    /// that watches allocations or calls, and the snapshot `snap_gen` still
+    /// current.
+    #[inline]
+    fn core_new_ok(&self, snap_gen: u64) -> bool {
+        self.inline_calls_ok()
+            && !crate::stdlib::tracemalloc_real::is_tracking()
+            && !crate::stdlib::testinternalcapi_mod::reftrace_print_active()
+            && !crate::stdlib::testinternalcapi_mod::nomem_alloc_fails()
+            && self.lean_snapshot() == Some(snap_gen)
+    }
+
+    /// The construction [`Self::core_new_kw`] and [`Self::core_new_mapping`]
+    /// share: the class at `callee_slot` of `sw`'s synced running
+    /// activation (an empty self slot above it, every operand from there
+    /// up the stack's), called by the instruction at `pc` with `positional`
+    /// and the keywords `kw`. Bound as the generic binder would, the
+    /// instance made, and its `__init__` made the running activation.
+    /// `false` touches nothing.
+    fn core_new_bind<'a>(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        callee_slot: usize,
+        positional: &'a [Object],
+        kw: &mut dyn Iterator<Item = (&'a Object, &'a Object)>,
+    ) -> bool {
+        // SAFETY: see `CoreSwitch`.
+        let frame = unsafe { &mut *sw.cur };
         let Object::Type(ty) = &frame.stack[callee_slot] else {
             return false;
         };
@@ -20165,13 +20110,12 @@ impl Interpreter {
         // (The instance isn't made until the binding holds: `None` keeps
         // its parameter's place.)
         let receiver = Object::None;
-        let values = &frame.stack[len - 1 - kwc..len - 1];
         let bound = Self::lean_bind_keywords(
             init,
             code,
             std::slice::from_ref(&receiver),
-            &frame.stack[callee_slot + 2..len - 1 - kwc],
-            names.iter().zip(values),
+            positional,
+            kw,
             locals,
         );
         let guard = match (bound, crate::recursion::enter_with(sw.depth_cell)) {
