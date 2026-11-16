@@ -8202,6 +8202,10 @@ pub(crate) struct AttrSite {
     /// as a value last (see [`builtin_attr_read`]): the receiver's kind
     /// and the method.
     builtin_attr: std::cell::RefCell<Option<(u8, Rc<crate::object::BuiltinFn>)>>,
+    /// The pure leaf getter of a property the site last read in place (see
+    /// [`site_property_leaf`]): the class version it read for, the getter
+    /// function and its code, and the property's getter cell.
+    prop_leaf: Cell<(u64, usize, usize, usize)>,
 }
 
 /// The value `recv`'s read at `site` finds through the site's caches past
@@ -8512,6 +8516,11 @@ unsafe fn attr_miss(st: *mut State, site: &AttrSite, at: *mut Object, local: boo
             // (settled after the code compiled, or read in a generator's
             // step), evaluated in place when it's a pure leaf. (A property
             // is a data descriptor: nothing the reads below find wins.)
+            if site_property_leaf(&mut *st, site, at, local) {
+                return 0;
+            }
+            // (Read now: a stack receiver leaves with the read.)
+            let ver = inst.cls_raw().attr_version.get();
             if property_leaf_here(
                 &mut *st,
                 site.code,
@@ -8522,6 +8531,7 @@ unsafe fn attr_miss(st: *mut State, site: &AttrSite, at: *mut Object, local: boo
             )
             .is_some()
             {
+                site_property_note(site, ver);
                 return 0;
             }
         }
@@ -8888,6 +8898,9 @@ unsafe extern "C" fn attr_local_slow(st: *mut State, site: *const AttrSite) -> u
             }
             // (A class attribute the site has read before.)
             Object::Instance(inst) => {
+                if site_property_leaf(&mut *st, site, at, true) {
+                    return 0;
+                }
                 if let Some(v) =
                     class_poly_hit(site, inst).or_else(|| instance_class_read(site, inst))
                 {
@@ -9669,6 +9682,9 @@ unsafe extern "C" fn attr_stack_slow(st: *mut State, site: *const AttrSite) -> u
             }
             // (A class attribute the site has read before.)
             Object::Instance(inst) => {
+                if site_property_leaf(&mut *st, site, at, false) {
+                    return 0;
+                }
                 let v = class_poly_hit(site, inst)
                     .or_else(|| instance_class_read(site, inst))
                     .or_else(|| {
@@ -11441,6 +11457,66 @@ unsafe fn property_leaf_here(
         }
         at.write(v);
         Some(())
+    }
+}
+
+/// A read at `site` of the receiver at `at` (a local's when `local`, the
+/// result then going to the site's slot) through the pure leaf getter the
+/// site last ran in place for the receiver's class version (see
+/// [`site_property_note`]): `true` with the value written, `false` with
+/// nothing done. The class holds the property while its version stands,
+/// and the property its getter while the getter cell still holds it.
+///
+/// # Safety
+///
+/// As [`h_property`]'s.
+#[inline]
+unsafe fn site_property_leaf(st: &mut State, site: &AttrSite, at: *mut Object, local: bool) -> bool {
+    // SAFETY: the caller's contract; the pointers are live while the checks
+    // above each use hold.
+    unsafe {
+        let Object::Instance(inst) = &*at else {
+            return false;
+        };
+        let (ver, f, code, cell) = site.prop_leaf.get();
+        if ver == 0 || inst.cls_raw().attr_version.get() != ver {
+            return false;
+        }
+        if !matches!(&*(cell as *const Object), Object::Function(g) if Rc::as_ptr(g) as usize == f)
+            || (!local && !droppable(&*at))
+            || crate::recursion::current_depth() >= crate::recursion::recursion_limit()
+        {
+            return false;
+        }
+        let interp = &*st.interp;
+        let Some(v) = interp.pure_leaf_eval::<false, false>(
+            &*(code as *const CodeObject),
+            &*(f as *const crate::object::PyFunction),
+            &[at.cast_const()],
+        ) else {
+            return false;
+        };
+        let dst = st.stack.add(site.slot as usize);
+        if !local {
+            crate::drop_hot_at(dst);
+        }
+        dst.write(v);
+        true
+    }
+}
+
+/// Remember at `site` the pure leaf getter its slot holds for the class
+/// version `ver`, which [`property_leaf_here`] just ran (see
+/// [`site_property_leaf`]).
+fn site_property_note(site: &AttrSite, ver: u64) {
+    // SAFETY: the site's code and extension are live.
+    let ext = unsafe { &*site.ext };
+    if let Some((f, held, cell)) = crate::property_site_getter(ext, site.pc as usize) {
+        if held == ver {
+            let code = Rc::as_ptr(&f.code()) as usize;
+            site.prop_leaf
+                .set((ver, Rc::as_ptr(&f) as usize, code, cell as usize));
+        }
     }
 }
 
@@ -21753,6 +21829,7 @@ impl<'a> Lower<'a> {
             no_shadow_keys: Cell::new(0),
             no_shadow_limit: Cell::new(0),
             builtin_attr: std::cell::RefCell::new(None),
+            prop_leaf: Cell::new((0, 0, 0, 0)),
         });
         let c = self
             .b
