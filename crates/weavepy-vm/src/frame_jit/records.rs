@@ -1003,7 +1003,10 @@ unsafe fn new_direct(st: &mut State, call: CallAt, len: usize) -> Option<u32> {
         // `Interpreter::core_new_user` declines them; a named tuple's is
         // its own lane's.)
         if plan.abstract_error.is_some()
-            || !matches!(plan.native, crate::types::NativeKind::Plain)
+            || !matches!(
+                plan.native,
+                crate::types::NativeKind::Plain | crate::types::NativeKind::Value { .. }
+            )
             || plan.seeds_exception_args
             || plan.tuple_new.is_some()
             || ty.is_type_subclass()

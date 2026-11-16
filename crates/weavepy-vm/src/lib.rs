@@ -20485,9 +20485,14 @@ impl Interpreter {
         plan: &Rc<crate::types::InstancePlan>,
         new_f: &Rc<crate::object::PyFunction>,
     ) -> bool {
-        // (The shapes `instantiate` treats before or around `__new__`.)
+        // (The shapes `instantiate` treats before or around `__new__`. A
+        // value type's subclass makes its payload in the `__new__` it
+        // chains to, `configparser`'s `_Line(str)`.)
         if plan.abstract_error.is_some()
-            || !matches!(plan.native, crate::types::NativeKind::Plain)
+            || !matches!(
+                plan.native,
+                crate::types::NativeKind::Plain | crate::types::NativeKind::Value { .. }
+            )
             || plan.seeds_exception_args
             || ty.is_type_subclass()
             || ty.native_kind.get() != 0
