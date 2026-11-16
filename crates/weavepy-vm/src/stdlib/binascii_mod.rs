@@ -206,6 +206,17 @@ fn hex_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     }
 }
 
+/// `data` as lowercase hex digits, two a byte, through a table.
+fn hex_encode(data: &[u8]) -> Vec<u8> {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = vec![0u8; data.len() * 2];
+    for (pair, &b) in out.chunks_exact_mut(2).zip(data) {
+        pair[0] = DIGITS[usize::from(b >> 4)];
+        pair[1] = DIGITS[usize::from(b & 0x0f)];
+    }
+    out
+}
+
 fn b2a_hex_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let data = buffer_bytes(args.first())?;
     // sep / bytes_per_sep, positional or keyword. CPython:
@@ -228,14 +239,7 @@ fn b2a_hex_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
         .and_then(|o| o.as_i64())
         .unwrap_or(1);
 
-    let hex: Vec<u8> = {
-        let mut out = Vec::with_capacity(data.len() * 2);
-        for &b in &data {
-            out.push(hex_digit(b >> 4));
-            out.push(hex_digit(b & 0x0f));
-        }
-        out
-    };
+    let hex = hex_encode(&data);
 
     let sep = match sep_obj {
         None | Some(Object::None) => None,
@@ -291,13 +295,6 @@ fn insert_sep(data: &[u8], hex: &[u8], sep: u8, bytes_per_sep: i64) -> Vec<u8> {
         }
     }
     out
-}
-
-fn hex_digit(nibble: u8) -> u8 {
-    match nibble {
-        0..=9 => b'0' + nibble,
-        _ => b'a' + (nibble - 10),
-    }
 }
 
 fn a2b_hex(args: &[Object]) -> Result<Object, RuntimeError> {
