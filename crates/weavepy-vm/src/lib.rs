@@ -31363,8 +31363,9 @@ impl Interpreter {
         // (Two instances of one class never try its reflected method: the
         // forward one's result stands, `NotImplemented` its `TypeError`, as
         // CPython's `SLOT1BINFULL` has it.)
+        // (A builtin subclass's own Python method, `IntFlag.__or__`, runs
+        // as any class's: only a Python function is ever taken here.)
         if !same
-            || ai.native.get().is_some()
             || (mixed && (cls.native_kind.get() != 0 || cls.c_ext_ptr.get() != 0))
             || (inplace
                 && !Self::class_lacks(
