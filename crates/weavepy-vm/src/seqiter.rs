@@ -1692,10 +1692,10 @@ pub(crate) fn builtin_ctor_pure(cls: &Rc<TypeObject>, args: &[Object]) -> Option
             _ => None,
         };
     }
-    // `weakref.ref(x)` with no callback.
-    if let [target] = args {
-        if crate::stdlib::weakref_real::is_ref_type(cls) {
-            return crate::stdlib::weakref_real::ref_pure(target);
+    // `weakref.ref(x)` and `weakref.ref(x, callback)`.
+    if let [target, callback @ ..] = args {
+        if callback.len() <= 1 && crate::stdlib::weakref_real::is_ref_type(cls) {
+            return crate::stdlib::weakref_real::ref_pure(target, callback.first());
         }
     }
     // `dict(d)` of an exact dict, and `dict(zip(xs, ys))` of plain

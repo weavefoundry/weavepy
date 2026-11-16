@@ -545,14 +545,17 @@ pub(crate) fn is_ref_type(cls: &Rc<TypeObject>) -> bool {
 /// `weakref.ref(target)` with no callback, for a type call that runs no
 /// code (see `seqiter::builtin_ctor_pure`): `None` for a target that
 /// can't be weakly referenced (the full call raises).
-pub(crate) fn ref_pure(target: &Object) -> Option<Object> {
+pub(crate) fn ref_pure(target: &Object, callback: Option<&Object>) -> Option<Object> {
     if !supports_weakref(target) {
         return None;
     }
-    if let Some(cached) = find_cached_wrapper(id_of(target), kind::REF) {
-        return Some(cached);
+    let callback = extract_callback(callback);
+    if callback.is_none() {
+        if let Some(cached) = find_cached_wrapper(id_of(target), kind::REF) {
+            return Some(cached);
+        }
     }
-    Some(make_ref_object(target.clone(), None, kind::REF))
+    Some(make_ref_object(target.clone(), callback, kind::REF))
 }
 
 /// If `obj` is a weakproxy (either flavour), dereference it: CPython's
@@ -1190,6 +1193,24 @@ fn make_ref_object_with_class(
                 b_dyn("__weakref_get__", get_target),
                 callback.clone().unwrap_or(Object::None),
             ),
+        )
+    } else if shared_methods {
+        // A subclass's ref (a `WeakValueDictionary`'s `KeyedRef`): its
+        // three entries laid down in one piece.
+        let mut values = [
+            b_dyn("__weakref_get__", get_target),
+            callback.clone().unwrap_or(Object::None),
+            Object::Int(i64::from(kind_tag)),
+        ]
+        .into_iter();
+        let map = crate::dictmap::DictMap::from_unique_hashed(3, |i| {
+            let key = [WrapperKey::Get, WrapperKey::Callback, WrapperKey::Kind][i].owned();
+            let hash = crate::object::dict_key_hash(&key.0);
+            (hash, key, values.next().expect("three values"))
+        });
+        (
+            Rc::new(RefCell::new(DictData::from(map))).into(),
+            crate::types::SlotStorage::default(),
         )
     } else {
         let dict = Rc::new(RefCell::new(DictData::default()));
