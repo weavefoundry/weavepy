@@ -14715,6 +14715,33 @@ unsafe fn spread_on_frame(st: &mut State, pc: usize, start: usize) -> Option<u32
 ///
 /// As [`h_call_ex`]'s, `st.sw` set.
 #[inline(never)]
+/// A forwarding call (`f(*args)`, the mapping empty) of a
+/// `functools.lru_cache` wrapper whose cache holds the result: the value in
+/// place of the four operands at `start`; `None`, nothing touched, else.
+///
+/// # Safety
+///
+/// As [`spread_native`]'s.
+unsafe fn spread_lru_hit(st: &mut State, start: usize) -> Option<u32> {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let ops = std::slice::from_raw_parts(st.stack.add(start), 4);
+        let (Object::Instance(inst), Object::Unbound, Object::Tuple(args)) =
+            (&ops[0], &ops[1], &ops[2])
+        else {
+            return None;
+        };
+        if !Interpreter::core_all_droppable(ops) {
+            return None;
+        }
+        let v = crate::stdlib::functools_mod::lru_hit_if_wrapper(inst, args)?;
+        crate::release_run(st.stack.add(start), 4);
+        st.stack.add(start).write(v);
+        st.len = start + 1;
+        Some(0)
+    }
+}
+
 unsafe fn spread_native(st: &mut State, pc: usize, start: usize) -> Option<u32> {
     use crate::LeafKind;
     // SAFETY: the caller's contract: four initialized operand slots, and
@@ -14967,6 +14994,9 @@ unsafe extern "C" fn h_call_forward(
             })
         {
             st.stack.add(len).write(Object::Unbound);
+            if let Some(r) = spread_lru_hit(st, start) {
+                return r;
+            }
             if let Some(r) = spread_direct(st, pc + 3, start, &mut *site) {
                 return r;
             }
@@ -20459,12 +20489,13 @@ impl<'a> Lower<'a> {
         let restore: Vec<Item> = (slot..slot + n).map(Item::Mem).collect();
         let out = self.exit_with(pc, &restore, INTERP);
         // A subscript of an instance whose class's `__getitem__` is a
-        // Python function, at a site that has run one: the method, called
-        // directly (it can raise or switch, which leaves the whole stack
-        // on the frame's).
+        // Python function, at a site that has run one (or that no run has
+        // settled: code compiled at its loop's first back edges): the
+        // method, called directly (it can raise or switch, which leaves
+        // the whole stack on the frame's).
         if raisable
             && self.code.instructions[pc].op == OpCode::BinarySubscr
-            && crate::instance_site(self.ext, pc)
+            && (crate::instance_site(self.ext, pc) || !crate::native_site(self.ext, pc))
         {
             let dunder = self.b.create_block();
             let ok = self.b.create_block();
