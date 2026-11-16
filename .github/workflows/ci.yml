@@ -230,7 +230,10 @@ jobs:
         shell: bash
         run: |
           rustc -vV | sed -n 's/^release: /rustc /p'
-          cat target/release/deps/weavepy-*.order-note 2>/dev/null || echo "no order note"
+          # (Cargo 1.100 links the binary under build/<pkg>/<hash>/out/,
+          # earlier cargos under deps/.)
+          notes=$(find target/release/deps target/release/build -name 'weavepy*.order-note' 2>/dev/null)
+          if [ -n "$notes" ]; then cat $notes; else echo "no order note"; fi
       - name: Build merge-base weavepy (A/B reference)
         if: github.event_name == 'pull_request'
         # A separate worktree + target dir so the two builds never
