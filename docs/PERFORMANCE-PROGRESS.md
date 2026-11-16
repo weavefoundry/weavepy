@@ -476,6 +476,51 @@ branch and pull request.
 
 ## Done
 
+- **Generator drains, a warm-up gate, and email's token tree** (PR #112,
+  November 16, evening). Ratios are instructions, WeavePy's over
+  CPython's.
+  - An inlined `any(...)`, `all(...)`, `list(...)` or `tuple(...)` loop
+    over a generator expression drained it in place only when the fast
+    steps run its body; a body that calls a function (`any(pred(x) for x
+    in xs)`) was resumed lazily, about 1,000 instructions an item. Its
+    lean resume now folds the yields into the consumer, as `sum()`'s
+    does: `any(...)` over 30 items ran 34,480 instructions to 12,354
+    (CPython 19,519), `tuple(...)` 36,822 to 15,050 (21,752).
+  - The core loop's calls of a pure leaf took a full lean activation for
+    the callee's first 24 calls, so tier 2's warm compile could give
+    compiled callers a direct lane. Their evaluation already counts each
+    call toward that compile, as the frame JIT's leaf sites' do, so the
+    gate only cost code called a few times each, such as the methods
+    `dataclasses` makes for each class: `enum_dataclass_ops` 6% fewer
+    instructions. It showed up as tier 2 costing the battery 1.3% of its
+    instructions (`WEAVEPY_JIT=0`), while `WEAVEPY_TIER2=0`, which keeps
+    the gates, cost more; a sweep over the gates that ask whether the JIT
+    is on found this one. The other gates in the dunder lanes (`__eq__`,
+    `__hash__`, `__lt__`) keep the wait: dropping theirs cost
+    `oo_patterns` 3%, its leaf plans compiling before their field caches
+    warmed.
+  - `email`'s token tree reads `x.value` and `x.all_defects` over two node
+    classes, each with a property. The site's getter cache held one class,
+    so each switch took the full handler; it keeps two earlier getters by
+    class version now, and compiled code calls a cached getter that runs
+    as an activation right after the leaf attempt, past four lanes a
+    property always wins over. `str(x)` of a `str` subclass's instance
+    whose class keeps `str`'s own `__str__` (remembered per class version)
+    is its payload, from the pure constructor lane: 1,795 instructions to
+    541 (CPython 814). A tree's `value` ran 210,471 instructions to
+    138,758 (62,258).
+  - Where the time goes. `email`'s `HeaderRegistry` builds a new class
+    with `type()` for every header it makes, so every header's lookups
+    start on a cold class; WeavePy's `type()` is cheaper than CPython's
+    (17,537 instructions to 121,421), but an address header still costs
+    1.05 million instructions to CPython's 546,000, at 3.7 times its
+    cycles. In argparse, `parse_args` runs 2,200 bytecodes and 62 Python
+    calls a parse: interpreted, WeavePy spends about 150 instructions a
+    bytecode to CPython's 75, and 724 a call in the core loop's call and
+    return alone; compiled and warm it's 1.6 times CPython's. A plain
+    `for v in gen()` loop spends 685 instructions an item to CPython's
+    400, 291 of them in the resume's checks (`gen_native_next`).
+
 - **Configparser's constructions, compiled patterns, and where the short
   cases spend** (PR #112, November 16, later). Ratios are instructions,
   WeavePy's over CPython's.
