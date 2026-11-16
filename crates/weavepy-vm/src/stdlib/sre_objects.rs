@@ -88,6 +88,8 @@ pub(crate) struct State {
     compile_template: Object,
     /// Per pattern handle, the last replacement template it expanded.
     templates: parking_lot::Mutex<HashMap<i64, (Object, Rc<Vec<Piece>>)>>,
+    /// The address of the native `Pattern.__hash__` (see [`native_hash`]).
+    hash_fn: std::sync::OnceLock<usize>,
 }
 
 #[inline]
@@ -536,6 +538,49 @@ fn pattern_key(o: &Object) -> Option<(Rc<crate::types::TypeObject>, Object, Obje
         let v = slots.values_for_layout(&st.pattern_layout)?;
         Some((inst.cls(), v[1].clone(), v[2].clone()))
     })?
+}
+
+/// The hash of `inst` when it's a pattern whose class still answers
+/// `__hash__` with [`pattern_hash`], computed in place: `hash((Pattern,
+/// self.pattern, self.flags))` for a `str` or `bytes` pattern and `int`
+/// flags. `re._compile` probes its cache with `(type(p), p, flags)` for
+/// every compiled pattern a module function is handed. `None` for anything
+/// else (and under free threading, whose state reads go through the class
+/// cell).
+pub(crate) fn native_hash(inst: &PyInstance) -> Option<i64> {
+    if crate::gil::free_threading_enabled() {
+        return None;
+    }
+    let cls = inst.cls_raw();
+    let st = state_of(cls)?;
+    let hash_is_native = cls.memo_verdict(crate::types::Verdict::NativePatternHash, "", || {
+        let ours = st.hash_fn.get().copied();
+        matches!(
+            cls.lookup("__hash__"),
+            Some(Object::Builtin(b)) if Some(Rc::as_ptr(&b) as usize) == ours
+        )
+    });
+    if !hash_is_native {
+        return None;
+    }
+    let slots = inst.slots.try_borrow().ok()?;
+    let v = slots.values_for_layout(&st.pattern_layout)?;
+    let pat = match &v[1] {
+        Object::Str(s) => SharedStr::hash_cached(s),
+        Object::Bytes(b) => crate::shared_value::SharedSlice::hash_cached(
+            b,
+            crate::object::py_hash_bytes_slice,
+        ),
+        _ => return None,
+    };
+    let Object::Int(flags) = v[2] else {
+        return None;
+    };
+    let mut h = crate::object::TupleHasher::new();
+    h.push(crate::object::pointer_hash(std::ptr::from_ref(cls).cast()));
+    h.push(pat);
+    h.push(crate::object::py_hash_long_i64(flags));
+    Some(h.finish(3))
 }
 
 /// `Pattern.__hash__`: `hash((Pattern, self.pattern, self.flags))`, as the
@@ -1506,6 +1551,7 @@ pub(crate) fn install(args: &[Object]) -> Result<Object, RuntimeError> {
         orig,
         compile_template: compile_template.clone(),
         templates: parking_lot::Mutex::new(HashMap::new()),
+        hash_fn: std::sync::OnceLock::new(),
     });
     for cls in [pattern, matchc, scanner] {
         let _ = cls
@@ -1532,6 +1578,9 @@ pub(crate) fn install(args: &[Object]) -> Result<Object, RuntimeError> {
             call_kw,
         });
         crate::leaf_builtins::register_fast(&b, spec.fast);
+        if spec.key == "Pattern.__hash__" {
+            let _ = state.hash_fn.set(Rc::as_ptr(&b) as usize);
+        }
         classes[spec.cls].dict.borrow_mut().insert(
             DictKey(Object::Str(interned(spec.name))),
             Object::Builtin(b),

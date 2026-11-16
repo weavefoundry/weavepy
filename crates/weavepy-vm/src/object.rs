@@ -3945,7 +3945,13 @@ pub(crate) fn int_order_value(o: &Object) -> Option<i64> {
 fn leaf_tuple_item(o: &Object, depth: u32) -> bool {
     match o {
         Object::Int(_) | Object::Str(_) | Object::Bytes(_) | Object::None => true,
-        Object::Instance(i) => int_like_value(i).is_some() || identity_instance(i),
+        // (A compiled pattern hashes natively, and equals only itself
+        // here: `re._compile`'s `(type(p), p, flags)` cache key.)
+        Object::Instance(i) => {
+            int_like_value(i).is_some()
+                || identity_instance(i)
+                || crate::stdlib::sre_objects::native_hash(i).is_some()
+        }
         Object::Type(t) => type_hash_is_identity(t),
         Object::Tuple(t) => depth < 3 && t.iter().all(|x| leaf_tuple_item(x, depth + 1)),
         _ => false,
@@ -14825,7 +14831,7 @@ fn sip_memo(bytes: &[u8], compute: impl FnOnce(&[u8]) -> i64) -> i64 {
     h
 }
 
-fn py_hash_bytes_slice(bytes: &[u8]) -> i64 {
+pub(crate) fn py_hash_bytes_slice(bytes: &[u8]) -> i64 {
     if bytes.is_empty() {
         return 0;
     }
@@ -15332,6 +15338,11 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
                 && inst.class_dunder(crate::types::Dunder::Hash).object_owner()
             {
                 return Some(identity_hash(obj));
+            }
+            // A compiled pattern hashes natively (see
+            // `stdlib::sre_objects::native_hash`).
+            if let Some(h) = crate::stdlib::sre_objects::native_hash(inst) {
+                return Some(h);
             }
             // An exact `decimal.Decimal` hashes natively (see
             // `stdlib::decimal_native`).

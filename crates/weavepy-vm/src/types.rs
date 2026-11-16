@@ -203,6 +203,10 @@ pub(crate) enum Verdict {
     /// lookup finds first, under `object`'s own `__getattribute__` (see
     /// `slot_member_unset`).
     SlotMember = 11,
+    /// The class is `re.Pattern` and still answers `__hash__` with its
+    /// native method (see `stdlib::sre_objects::native_hash`); `name`
+    /// unused.
+    NativePatternHash = 12,
 }
 
 pub struct AttrVersion(std::sync::atomic::AtomicU64);
