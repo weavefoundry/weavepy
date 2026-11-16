@@ -2447,6 +2447,16 @@ impl TypeObject {
             && self.dunder(Dunder::GetAttribute).object_owner()
     }
 
+    /// Whether `x.__class__` of an instance (with no native body) of this
+    /// class is just the class: [`Self::class_attr_is_plain`], of a class
+    /// that isn't builtin (a builtin's instances, weak proxies among them,
+    /// may answer otherwise), or of `super` itself, whose `super_getattro`
+    /// serves `__class__` as the proxy's own class.
+    pub fn class_read_is_plain(&self) -> bool {
+        (!self.flags.is_builtin || std::ptr::eq(self, &*crate::builtin_types::builtin_types().super_))
+            && self.class_attr_is_plain()
+    }
+
     pub fn lookup_with_owner(&self, name: &str) -> Option<(Object, Rc<TypeObject>)> {
         // Fast pass — see `lookup` for the gate rationale.
         if !crate::object::exotic_str_keys_possible() {

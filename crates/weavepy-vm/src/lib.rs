@@ -33758,8 +33758,7 @@ impl Interpreter {
             // on the MRO overrides it.
             if name == "__class__"
                 && inst.c_body.get() == 0
-                && !cls.flags.is_builtin
-                && cls.class_attr_is_plain()
+                && cls.class_read_is_plain()
             {
                 return Some((LeafAttr::Value(Object::Type(inst.cls())), None));
             }
@@ -41954,7 +41953,7 @@ impl Interpreter {
         // full lookup).
         if name == "__class__" && inst.c_body.get() == 0 {
             let cls = inst.cls();
-            if !cls.flags.is_builtin && cls.class_attr_is_plain() {
+            if cls.class_read_is_plain() {
                 return Ok(Object::Type(cls));
             }
         }

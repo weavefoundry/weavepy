@@ -1653,6 +1653,20 @@ pub(crate) fn builtin_ctor_pure(cls: &Rc<TypeObject>, args: &[Object]) -> Option
             _ => None,
         };
     }
+    // `super(C, obj)` whose receiver passes the plain check (a failing
+    // one, or a duck-typed `__class__`, goes the full way).
+    if Rc::ptr_eq(cls, &bt.super_) {
+        let [Object::Type(class), receiver] = args else {
+            return None;
+        };
+        let receiver_class = crate::builtins::supercheck(class, receiver).ok()?;
+        return Some(crate::builtins::build_super_proxy(
+            cls.clone(),
+            class.clone(),
+            receiver.clone(),
+            receiver_class,
+        ));
+    }
     // `type(x)`: the object's class (`b_type`'s one-argument form).
     if Rc::ptr_eq(cls, &bt.type_) {
         return match args {

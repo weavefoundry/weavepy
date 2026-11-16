@@ -9238,7 +9238,7 @@ fn instance_class_read(site: &AttrSite, inst: &Rc<crate::types::PyInstance>) -> 
         return None;
     }
     let cls = inst.cls_raw();
-    (inst.c_body.get() == 0 && !cls.flags.is_builtin && cls.class_attr_is_plain())
+    (inst.c_body.get() == 0 && cls.class_read_is_plain())
         .then(|| Object::Type(inst.cls()))
 }
 
@@ -9254,7 +9254,7 @@ unsafe extern "C" fn h_class_read(dst: *mut Object, src: *const Object) -> u32 {
             return 1;
         };
         let cls = inst.cls_raw();
-        if inst.c_body.get() != 0 || cls.flags.is_builtin || !cls.class_attr_is_plain() {
+        if inst.c_body.get() != 0 || !cls.class_read_is_plain() {
             return 1;
         }
         let ty = Object::Type(inst.cls());
