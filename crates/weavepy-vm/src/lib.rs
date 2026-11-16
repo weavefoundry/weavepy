@@ -24191,7 +24191,10 @@ impl Interpreter {
         let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
         let pure = code_is_pure_leaf(code_rc);
         let effect = !pure && code_is_effect_leaf(code_rc);
-        if !(pure || effect) || !pure_leaf_warm(code_rc) {
+        // (No warm-up gate: the evaluation's own bookkeeping sends the call
+        // that makes the callee due to the framed path, see
+        // `Self::leaf_call_entry`.)
+        if !(pure || effect) {
             return None;
         }
         let (missing, slot_self) = code_call_slot(code, call_pc)?.hit(fp, Rc::as_ptr(code_rc))?;
@@ -24488,7 +24491,10 @@ impl Interpreter {
         note_predicate_stage(code_rc, 0);
         let pure = code_is_pure_leaf(code_rc);
         let effect = !pure && code_is_effect_leaf(code_rc);
-        if !(pure || effect) || !pure_leaf_warm(code_rc) {
+        // (No warm-up gate: the evaluation's own bookkeeping sends the call
+        // that makes the callee due to the framed path, see
+        // `Self::leaf_call_entry`.)
+        if !(pure || effect) {
             return None;
         }
         #[cfg(test)]
@@ -24732,7 +24738,10 @@ impl Interpreter {
         // `PyFunction::code`); only compared and borrowed below, while the
         // caller's stack keeps the function alive.
         let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
-        if !code_is_pure_leaf(code_rc) || !pure_leaf_warm(code_rc) || !Self::leaf_code_ok(code_rc) {
+        // (No warm-up gate: the evaluation's own bookkeeping sends the call
+        // that makes the callee due to the framed path, see
+        // `Self::leaf_call_entry`.)
+        if !code_is_pure_leaf(code_rc) || !Self::leaf_code_ok(code_rc) {
             return None;
         }
         let (_, covered) = Self::kw_names_bind_cached(code, pc, f, func_id, perm, names, eff_argc)?;
@@ -24846,7 +24855,10 @@ impl Interpreter {
         // SAFETY: GIL-serialized raw read of the function's code cell; the
         // caller keeps the function alive across the evaluation.
         let code_rc: &Rc<CodeObject> = unsafe { &*f.code.as_ptr() };
-        if !code_is_pure_leaf(code_rc) || !pure_leaf_warm(code_rc) || !Self::leaf_code_ok(code_rc) {
+        // (No warm-up gate: the evaluation's own bookkeeping sends the call
+        // that makes the callee due to the framed path, see
+        // `Self::leaf_call_entry`.)
+        if !code_is_pure_leaf(code_rc) || !Self::leaf_code_ok(code_rc) {
             return None;
         }
         let (_, covered) =
@@ -24931,7 +24943,6 @@ impl Interpreter {
         if arity > 8
             || locals.len() < arity
             || !code_is_pure_leaf(code_rc)
-            || !pure_leaf_warm(code_rc)
             || !Self::leaf_code_ok(code_rc)
             || crate::recursion::current_depth() >= crate::recursion::recursion_limit()
         {
@@ -31248,10 +31259,7 @@ impl Interpreter {
                 let f = w.upgrade()?;
                 let code = f.code();
                 let depth = crate::recursion::current_depth();
-                if !code_is_pure_leaf(&code)
-                    || !pure_leaf_warm(&code)
-                    || depth >= crate::recursion::recursion_limit()
-                {
+                if !code_is_pure_leaf(&code) || depth >= crate::recursion::recursion_limit() {
                     return None;
                 }
                 return match self.pure_leaf_call(
@@ -87174,7 +87182,11 @@ fn simple_args_prefix(instrs: &[weavepy_compiler::Instruction], pc: usize) -> bo
 /// Whether a pure leaf's calls may skip the lean activation now: with
 /// the JIT on, a jittable body's first calls still take it, so the warm
 /// compile (`LEAN_WARM_COMPILE_THRESHOLD` lean entries) gives compiled
-/// callers their direct native lane to it.
+/// callers their direct native lane to it. (The core loop's calls of a
+/// pure leaf don't ask: their evaluation counts toward the warm compile
+/// itself, see `Interpreter::leaf_call_entry`. Gating them cost code that
+/// is called a few times each, such as the methods `dataclasses` makes
+/// for each class, 6% of `enum` and `dataclass` work.)
 #[inline(always)]
 fn pure_leaf_warm(code: &CodeObject) -> bool {
     #[cfg(feature = "jit")]
