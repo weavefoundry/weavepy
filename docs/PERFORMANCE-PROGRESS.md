@@ -476,6 +476,53 @@ branch and pull request.
 
 ## Done
 
+- **Configparser's constructions, compiled patterns, and where the short
+  cases spend** (PR #112, November 16, later). Ratios are instructions,
+  WeavePy's over CPython's.
+  - `re.match(p, s)` with a compiled pattern runs `re._compile`, which
+    probes its cache with `(type(p), p, flags)` and catches the
+    `KeyError`. A pattern hashed through the interpreter (a `__hash__`
+    call that built and hashed a tuple), and a tuple holding one wasn't a
+    key compiled code could probe, so the miss left for the core loop,
+    which hashed the key again before raising. A pattern now hashes
+    natively while its class keeps the native `__hash__`, and the miss
+    raises in place: `re._compile(p, 0)` ran 18,402 instructions to 11,430
+    (CPython 6,129), and `ConfigParser.write` 19% fewer.
+  - `functools.partial(f, k=v)` left compiled code (no keyword lane for a
+    Python class with a native `__new__`) and set its five slots one probe
+    at a time: 8,338 instructions to 5,749 (2,216). `for k in mapping`
+    over an instance whose `__iter__` is a Python function left too; it's
+    called directly now, its result checked as `iter()` checks it (5,812
+    to 2,814, against 1,786). Together, a `SectionProxy` ran 58,882 to
+    47,197 (24,155).
+  - A value type's subclass with a Python `__new__` (`configparser`'s
+    `_Line(str)`) went through the generic construction, with `__new__`
+    and `__init__` each a nested run: it now takes the inline activations
+    a plain class's does (10,000 instructions to 5,435, CPython 4,063).
+    The configparser case ran 7% fewer instructions.
+  - `(x,) * n` and `[x] * n` of a short sequence repeat in place in
+    compiled code and the core loop (argparse's metavar formatter left 13
+    times a parse).
+  - Why the short cases trail. Argparse's case runs each operation 180
+    times. CPython's instructions an iteration are flat from the first
+    (1.5 million); WeavePy's fall from 5.6 million over the first 20 to
+    2.3 million after 600, with the frame JIT still compiling functions
+    for the first time after 300 iterations (functions run once an
+    iteration reach the threshold late). Turning either JIT tier off, or
+    both, leaves the case's instructions and time where they are: the
+    gap is the interpreter and the runtime. Even warm, an iteration takes
+    2.3 times CPython's cycles on 1.5 times its instructions: cachegrind
+    finds 5% of instructions missing the instruction cache and 13% of
+    conditional branches mispredicted, both spread over the interpreter,
+    the helpers and compiled code. Tier 2 analyzed 144 functions in the
+    case and compiled 11; the rejections (`dynamic call (loop-free)`
+    after a full analysis, and probe misses that carve loop by loop) took
+    most of its 44 ms of analysis, about 64 million instructions.
+    And calls from native code into Python (`map(partial(cls, k=v), xs)`)
+    cost about 1,200 instructions of nested-run overhead each, with
+    keyword names copied to `String`s at every hop: 11,300 instructions an
+    item to CPython's 6,200.
+
 - **Builtin subclasses, generator steps, and a misread fixture gate** (PR
   #112, November 16). Ratios are instructions, WeavePy's over CPython's.
   - The local fixture A/B tools ran every bench fixture at a work size of
