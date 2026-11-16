@@ -791,6 +791,102 @@ fn native_lru_tuple_key(key: &Object, depth: usize, remaining: &mut usize) -> bo
     }
 }
 
+/// The Python hash of a key item a probe takes (native scalars, objects
+/// that hash by identity, and, `depth` deep, tuples of these), or `None`.
+fn item_hash(item: &Object, depth: u32) -> Option<i64> {
+    Some(match item {
+        Object::Int(i) => crate::object::py_hash_long_i64(*i),
+        Object::Str(s) => crate::shared_value::SharedStr::hash_cached(s),
+        Object::None | Object::Bool(_) | Object::Float(_) | Object::Bytes(_) => {
+            crate::object::py_hash_value(item)?
+        }
+        // An object that hashes and compares by identity (`typing`'s
+        // `_tp_cache` keys an alias and a class), as the native key admits
+        // it (see `native_lru_tuple_key`).
+        Object::Instance(_) | Object::Type(_) if identity_item(item) => {
+            crate::object::identity_hash(item)
+        }
+        // (`Dict[str, Any]`'s parameters.)
+        Object::Tuple(items) if depth > 0 => {
+            let mut hash = crate::object::TupleHasher::new();
+            for it in items.iter() {
+                hash.push(item_hash(it, depth - 1)?);
+            }
+            hash.finish(items.len())
+        }
+        _ => return None,
+    })
+}
+
+/// Whether a probe's key item `arg` equals a stored key's `item`, as the
+/// tuples' comparison would find, when that runs no Python code: `None`
+/// when it might (a pairing only Python's `==` settles).
+fn item_eq(arg: &Object, item: &Object, depth: u32) -> Option<bool> {
+    Some(match (arg, item) {
+        (Object::Int(a), Object::Int(b)) => a == b,
+        (Object::Str(a), Object::Str(b)) => {
+            crate::shared_value::SharedStr::ptr_eq(a, b)
+                || crate::dictmap::key_bytes_eq(a.as_bytes(), b.as_bytes())
+        }
+        (Object::Bytes(a), Object::Bytes(b)) => a[..] == b[..],
+        // Two identity-comparing objects: the same one or unequal (no
+        // `__eq__` of either runs).
+        (a @ (Object::Instance(_) | Object::Type(_)), b)
+            if identity_item(a) && identity_item(b) =>
+        {
+            a.is_same(b)
+        }
+        (Object::Instance(_) | Object::Type(_), _) => return None,
+        (Object::Tuple(a), Object::Tuple(b)) if depth > 0 => {
+            if a.len() != b.len() {
+                return Some(false);
+            }
+            for (x, y) in a.iter().zip(b.iter()) {
+                if !item_eq(x, y, depth - 1)? {
+                    return Some(false);
+                }
+            }
+            true
+        }
+        // A tuple against anything else (or past the depth): Python's.
+        (Object::Tuple(_), _) => return None,
+        // A scalar never equals a tuple.
+        (_, Object::Tuple(_)) => false,
+        // (`bytes` against a `str` may warn under `-b`.)
+        (Object::Bytes(_), _) | (_, Object::Bytes(_)) => return None,
+        // Builtin scalars compare natively (`1 == 1.0 == True`), identity
+        // first as a tuple's items do.
+        (
+            arg,
+            item @ (Object::None
+            | Object::Bool(_)
+            | Object::Int(_)
+            | Object::Long(_)
+            | Object::Float(_)
+            | Object::Str(_)
+            | Object::WStr(_)),
+        ) => arg.is_same(item) || arg.eq_value(item),
+        _ => return None,
+    })
+}
+
+/// Whether `item` hashes and compares by identity with nothing run, as
+/// [`native_lru_tuple_key`] admits an instance or a class.
+fn identity_item(item: &Object) -> bool {
+    match item {
+        Object::Instance(i) => crate::object::identity_instance(i),
+        Object::Type(cls) => {
+            let builtins = crate::builtin_types::builtin_types();
+            Rc::ptr_eq(cls, &builtins.int_)
+                || Rc::ptr_eq(cls, &builtins.str_)
+                || Rc::ptr_eq(cls, &builtins.bytes_)
+                || Rc::ptr_eq(cls, &builtins.tuple_)
+                || (!cls.flags.is_builtin && crate::object::type_hash_is_identity(cls))
+        }
+        _ => false,
+    }
+}
+
 fn invalid_lru_order() -> RuntimeError {
     type_error("lru_cache has inconsistent private recency data")
 }
@@ -1182,6 +1278,20 @@ pub(crate) fn lru_probe(inst: &crate::types::PyInstance, args: &[Object]) -> Opt
     }
 }
 
+/// [`lru_hit`] of `inst` if it's a wrapper (`f(*args)` forwarded to one,
+/// as `typing`'s `_tp_cache` does).
+pub(crate) fn lru_hit_if_wrapper(
+    inst: &crate::types::PyInstance,
+    args: &[Object],
+) -> Option<Object> {
+    if std::ptr::from_ref(inst.cls_raw()) as usize
+        != LRU_TYPE_ADDR.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return None;
+    }
+    lru_hit(inst, args)
+}
+
 /// [`lru_probe`]'s hit for a native caller (`Interpreter::call`), which
 /// can't run a miss in place: `None`, nothing touched, for the full call.
 fn lru_hit(inst: &crate::types::PyInstance, args: &[Object]) -> Option<Object> {
@@ -1312,14 +1422,7 @@ impl<'a> ArgsProbe<'a> {
         };
         let mut hash = crate::object::TupleHasher::new();
         for i in 0..len {
-            hash.push(match probe.item(i) {
-                Object::Int(i) => crate::object::py_hash_long_i64(*i),
-                Object::Str(s) => crate::shared_value::SharedStr::hash_cached(s),
-                item @ (Object::None | Object::Bool(_) | Object::Float(_) | Object::Bytes(_)) => {
-                    crate::object::py_hash_value(item)?
-                }
-                _ => return None,
-            });
+            hash.push(item_hash(probe.item(i), 1)?);
         }
         probe.hash = hash.finish(len);
         Some(probe)
@@ -1365,39 +1468,13 @@ impl crate::dictmap::Probe for ArgsProbe<'_> {
             // unequal pair settles it.
             Object::Tuple(items) if items.len() == self.len => {
                 for (i, item) in items.iter().enumerate() {
-                    let equal = match (self.item(i), item) {
-                        (Object::Int(a), Object::Int(b)) => a == b,
-                        (Object::Str(a), Object::Str(b)) => {
-                            crate::shared_value::SharedStr::ptr_eq(a, b)
-                                || crate::dictmap::key_bytes_eq(a.as_bytes(), b.as_bytes())
-                        }
-                        (Object::Bytes(a), Object::Bytes(b)) => a[..] == b[..],
-                        // A scalar never equals a tuple.
-                        (_, Object::Tuple(_)) => false,
-                        // (`bytes` against a `str` may warn under `-b`.)
-                        (Object::Bytes(_), _) | (_, Object::Bytes(_)) => {
+                    match item_eq(self.item(i), item, 1) {
+                        Some(true) => {}
+                        Some(false) => return false,
+                        None => {
                             self.foreign.set(true);
                             return false;
                         }
-                        // Builtin scalars compare natively (`1 == 1.0 ==
-                        // True`), identity first as a tuple's items do.
-                        (
-                            arg,
-                            item @ (Object::None
-                            | Object::Bool(_)
-                            | Object::Int(_)
-                            | Object::Long(_)
-                            | Object::Float(_)
-                            | Object::Str(_)
-                            | Object::WStr(_)),
-                        ) => arg.is_same(item) || arg.eq_value(item),
-                        _ => {
-                            self.foreign.set(true);
-                            return false;
-                        }
-                    };
-                    if !equal {
-                        return false;
                     }
                 }
                 true
