@@ -8212,6 +8212,9 @@ pub(crate) struct AttrSite {
     /// `vars()` made) last had the site's name: its class's version and
     /// the dict position (see [`pub_hit`]).
     pub_hint: Cell<(u64, u32)>,
+    /// The version of an exception class whose read of the site's name is
+    /// one of its slot descriptors (`e.args`; see [`exc_slot_read`]).
+    exc_slot: Cell<u64>,
 }
 
 /// The value `recv`'s read at `site` finds through the site's caches past
@@ -8518,8 +8521,9 @@ unsafe fn attr_miss(st: *mut State, site: &AttrSite, at: *mut Object, local: boo
                     return r;
                 }
             }
-            // A published dict's own value, its position remembered.
-            if let Some(v) = pub_note(site, inst) {
+            // A published dict's own value, its position remembered, or
+            // an exception's pseudo-slot.
+            if let Some(v) = pub_note(site, inst).or_else(|| exc_slot_read(site, inst)) {
                 if local {
                     (*st).stack.add(site.slot as usize).write(v);
                 } else {
@@ -8880,6 +8884,34 @@ unsafe fn pub_hit<'a>(site: &AttrSite, inst: &'a crate::types::PyInstance) -> Op
         let code = &*site.code;
         crate::slot_name_matches(code, code.instructions[site.pc as usize].arg, k).then_some(v)
     }
+}
+
+/// A read at `site` of an exception's pseudo-slot (`e.args`): the value
+/// its slot storage holds, when the class resolves the site's name to a
+/// slot descriptor (a data descriptor: no instance dict shadows it), as
+/// the site last found for the class's version. `None` for anything else,
+/// an unset slot included.
+fn exc_slot_read(site: &AttrSite, inst: &crate::types::PyInstance) -> Option<Object> {
+    let cls = inst.cls_raw();
+    if !cls.flags.is_exception {
+        return None;
+    }
+    // SAFETY: the site's code is live.
+    let code = unsafe { &*site.code };
+    let name = code
+        .names
+        .get(code.instructions[site.pc as usize].arg as usize)?;
+    let ver = cls.attr_version.get();
+    if ver == 0 {
+        return None;
+    }
+    if site.exc_slot.get() != ver {
+        if !matches!(cls.lookup(name), Some(Object::SlotDescriptor(_))) {
+            return None;
+        }
+        site.exc_slot.set(ver);
+    }
+    inst.slot_get(name)
 }
 
 /// A read at `site` of an instance with a published dict, resolved as the
@@ -21942,6 +21974,7 @@ impl<'a> Lower<'a> {
             builtin_attr: std::cell::RefCell::new(None),
             prop_leaf: Cell::new((0, 0, 0, 0)),
             pub_hint: Cell::new((0, 0)),
+            exc_slot: Cell::new(0),
         });
         let c = self
             .b
