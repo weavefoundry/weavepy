@@ -1537,18 +1537,30 @@ unsafe fn chain_init(st: &mut State, rec: &mut DirectRec, interp: &mut Interpret
             return None;
         }
         let ni: &crate::NewInit = act.new_init.as_deref()?;
-        if ni.plan.init_from_object {
-            return None;
-        }
         let Object::Instance(made) = &*rec.st.stack else {
             return None;
         };
-        if !std::ptr::eq(made.cls_raw(), Rc::as_ptr(&ni.ty)) {
+        // `type(obj).__init__` runs: the class's own, or, for an instance of
+        // a subclass `__new__` made (`Path.__new__`'s `PosixPath`), that
+        // subclass's, from its own plan.
+        let sub_plan;
+        let plan: &crate::types::InstancePlan = if std::ptr::eq(made.cls_raw(), Rc::as_ptr(&ni.ty))
+        {
+            &ni.plan
+        } else {
+            let made_cls = made.cls();
+            if !made_cls.is_subclass_of(&ni.ty) {
+                return None;
+            }
+            sub_plan = interp.instance_plan(&made_cls);
+            &sub_plan
+        };
+        if plan.init_from_object {
             return None;
         }
         // (The plan's `__init__` as `Interpreter::core_push_init` takes it:
         // a class with its own `__new__` keeps no lean form of it.)
-        let Some(Object::Function(init)) = &ni.plan.init_fn else {
+        let Some(Object::Function(init)) = &plan.init_fn else {
             return None;
         };
         // SAFETY: GIL-serialized raw read of the function's code cell.
