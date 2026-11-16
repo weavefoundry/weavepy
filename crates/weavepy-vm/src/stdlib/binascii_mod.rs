@@ -210,7 +210,7 @@ fn hex_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
 fn hex_encode(data: &[u8]) -> Vec<u8> {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = vec![0u8; data.len() * 2];
-    for (pair, &b) in out.chunks_exact_mut(2).zip(data) {
+    for (pair, &b) in out.as_chunks_mut::<2>().0.iter_mut().zip(data) {
         pair[0] = DIGITS[usize::from(b >> 4)];
         pair[1] = DIGITS[usize::from(b & 0x0f)];
     }
