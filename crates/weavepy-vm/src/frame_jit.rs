@@ -8508,6 +8508,22 @@ unsafe fn attr_miss(st: *mut State, site: &AttrSite, at: *mut Object, local: boo
                     return r;
                 }
             }
+            // A property whose getter the site's slot holds for the class
+            // (settled after the code compiled, or read in a generator's
+            // step), evaluated in place when it's a pure leaf. (A property
+            // is a data descriptor: nothing the reads below find wins.)
+            if property_leaf_here(
+                &mut *st,
+                site.code,
+                site.pc as usize,
+                site.slot as usize,
+                at,
+                u64::from(local),
+            )
+            .is_some()
+            {
+                return 0;
+            }
         }
         if let Some(v) = attr_miss_quick(site, &*at, local, running)
             .or_else(|| builtin_attr_read(st, site, &*at, local))
@@ -11270,7 +11286,19 @@ unsafe extern "C" fn h_property(
     unsafe {
         let st = &mut *st;
         if st.sw.is_null() {
-            return CALL_DECLINED;
+            // A generator's fast step: only a getter that runs no
+            // activation (it can't switch).
+            return match property_leaf_here(
+                st,
+                code,
+                pc as usize,
+                slot as usize,
+                recv,
+                local & !PROPERTY_ONLY,
+            ) {
+                Some(()) => 0,
+                None => CALL_DECLINED,
+            };
         }
         let only = local & PROPERTY_ONLY != 0;
         let local = local & !PROPERTY_ONLY;
@@ -11329,32 +11357,19 @@ unsafe extern "C" fn h_property(
                 return 0;
             }
         }
+        if property_leaf_here(st, code, pc, slot, recv, local).is_some() {
+            return 0;
+        }
         let Object::Instance(inst) = &*recv else {
             return lane(st);
         };
-        let Some((getter, gcode)) = crate::code_vm_ext(&*code)
+        let Some((getter, _)) = crate::code_vm_ext(&*code)
             .and_then(|ext| ext.method_slot(pc))
             .and_then(|ms| ms.getter(inst.cls_raw().attr_version.get()))
         else {
             return lane(st);
         };
         let at = st.stack.add(slot);
-        // A pure leaf getter (no native body of its own: it never runs as
-        // an activation) evaluates in place, as the core loop's arm does.
-        if crate::code_is_pure_leaf(&gcode)
-            && crate::pure_leaf_warm(&gcode)
-            && crate::recursion::current_depth() < crate::recursion::recursion_limit()
-            && (local != 0 || droppable(&*recv))
-        {
-            let interp = &*st.interp;
-            if let Some(v) = interp.pure_leaf_eval::<false, false>(&gcode, &getter, &[recv]) {
-                if local == 0 {
-                    crate::drop_hot_at(at);
-                }
-                at.write(v);
-                return 0;
-            }
-        }
         // `[recv]` becomes the method call `[getter, recv]`.
         if local != 0 {
             at.add(1).write(crate::clone_hot(&*recv));
@@ -11384,6 +11399,48 @@ unsafe extern "C" fn h_property(
             }
             Some(r) => r,
         }
+    }
+}
+
+/// [`h_property`]'s read through the site's cached getter when it's a pure
+/// leaf (no native body of its own: it never runs as an activation), which
+/// evaluates in place, as the core loop's arm does: `Some` with the value
+/// written to `slot`, `None` with nothing done.
+///
+/// # Safety
+///
+/// As [`h_property`]'s.
+unsafe fn property_leaf_here(
+    st: &mut State,
+    code: *const CodeObject,
+    pc: usize,
+    slot: usize,
+    recv: *const Object,
+    local: u64,
+) -> Option<()> {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let Object::Instance(inst) = &*recv else {
+            return None;
+        };
+        let (getter, gcode) = crate::code_vm_ext(&*code)
+            .and_then(|ext| ext.method_slot(pc))
+            .and_then(|ms| ms.getter(inst.cls_raw().attr_version.get()))?;
+        if !(crate::code_is_pure_leaf(&gcode)
+            && crate::pure_leaf_warm(&gcode)
+            && crate::recursion::current_depth() < crate::recursion::recursion_limit()
+            && (local != 0 || droppable(&*recv)))
+        {
+            return None;
+        }
+        let interp = &*st.interp;
+        let v = interp.pure_leaf_eval::<false, false>(&gcode, &getter, &[recv])?;
+        let at = st.stack.add(slot);
+        if local == 0 {
+            crate::drop_hot_at(at);
+        }
+        at.write(v);
+        Some(())
     }
 }
 
@@ -15709,6 +15766,27 @@ unsafe extern "C" fn h_get_iter(at: *mut Object) -> u32 {
             v,
             Object::Iter(_) | Object::LazyIter(_) | Object::Generator(_)
         ) {
+            return 0;
+        }
+        // A list or tuple subclass inheriting `__iter__`: its value's
+        // iterator, as `Interpreter::make_iter` makes it.
+        if let Object::Instance(inst) = v {
+            let Some(native @ (Object::List(_) | Object::Tuple(_))) = inst.native.get() else {
+                return 1;
+            };
+            let cls = inst.cls_raw();
+            if cls.native_kind.get() != 0
+                || cls.c_ext_ptr.get() != 0
+                || !cls.dunder(crate::types::Dunder::Iter).builtin_owner()
+                || !droppable(v)
+            {
+                return 1;
+            }
+            let Ok(it) = native.make_iter() else {
+                return 1;
+            };
+            let it = Object::Iter(Rc::new(crate::sync::RefCell::new(it)));
+            crate::drop_hot(std::mem::replace(&mut *at, it));
             return 0;
         }
         if !matches!(
