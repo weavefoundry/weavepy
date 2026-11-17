@@ -20193,9 +20193,7 @@ impl<'a> Lower<'a> {
                         Arg::Small(v) => (false, u32::MAX - v.min(u32::MAX - 1)),
                     })
                     .collect();
-                if args.iter().all(|&(local, v)| local || v < u32::MAX / 2) {
-                    self.inst_native_call(pc, call_pc, &args, ver, fast, f);
-                }
+                self.inst_native_call(pc, call_pc, &args, ver, fast, f);
             }
             return;
         };
@@ -20265,12 +20263,13 @@ impl<'a> Lower<'a> {
         self.b.switch_to_block(declined);
     }
 
-    /// `LOAD_FAST x; x.m(<local or constant arguments>); CALL` on an
-    /// instance whose method site cached a native method: the receiver's
-    /// tag checked in line and the method called through [`h_inst_native`]
-    /// on the operands in place, continuing after the `CALL`. Lowering
-    /// continues (at the general fused call) where the receiver is
-    /// something else or the helper declines.
+    /// `LOAD_FAST x; x.m(<local, constant or small int arguments>); CALL`
+    /// on an instance whose method site cached a native method: the
+    /// receiver's tag checked in line and the method called through
+    /// [`h_inst_native`] on the operands in place (a small int, `(false,
+    /// u32::MAX - v)` in `args`, in the slot it would take), continuing
+    /// after the `CALL`. Lowering continues (at the general fused call)
+    /// where the receiver is something else or the helper declines.
     fn inst_native_call(
         &mut self,
         pc: usize,
@@ -20291,7 +20290,7 @@ impl<'a> Lower<'a> {
             .icmp_imm(IntCC::NotEqual, t, i64::from(self.tags.instance));
         self.branch_out(other, declined);
         let mut addrs = Vec::with_capacity(2);
-        for &(local, i) in args {
+        for (j, &(local, i)) in args.iter().enumerate() {
             let at = if local {
                 let at = self.local_addr(i);
                 if self.maybe_unbound[i as usize] && !self.bound[i as usize] {
@@ -20302,6 +20301,13 @@ impl<'a> Lower<'a> {
                             .icmp_imm(IntCC::Equal, t, i64::from(self.tags.unbound));
                     self.branch_out(unbound, declined);
                 }
+                at
+            } else if i >= u32::MAX / 2 {
+                // A small int, in the slot the argument would take.
+                let at = self.slot_addr(slot + 2 + j);
+                self.write_tag(at, self.tags.int);
+                let v = self.b.ins().iconst(types::I64, i64::from(u32::MAX - i));
+                self.b.ins().store(FLAGS, v, at, 8);
                 at
             } else {
                 self.const_addr(i)
