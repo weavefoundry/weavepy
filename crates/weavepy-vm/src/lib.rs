@@ -1082,6 +1082,11 @@ pub struct Interpreter {
     /// address, and the registry generation it looked under: a call path
     /// asks for the same builtin several times over.
     leaf_miss: std::cell::Cell<(usize, u64)>,
+    /// The last builtin [`Interpreter::leaf_call_kind`] found a leaf kind
+    /// for, the registry generation it looked under, and the kind. The weak
+    /// handle keeps the address from being reused while it is remembered.
+    leaf_hit:
+        std::cell::RefCell<Option<(crate::sync::Weak<crate::object::BuiltinFn>, u64, LeafKind)>>,
     /// The core loop's last native iterator `__next__`, keyed by the
     /// (process-unique) attribute version of the class that resolved it
     /// (see [`Interpreter::core_leaf_next`]): a whole-body leaf with its
@@ -1345,6 +1350,7 @@ impl Default for Interpreter {
                 LeafMisses::default(),
             )),
             leaf_miss: std::cell::Cell::new((0, 0)),
+            leaf_hit: std::cell::RefCell::new(None),
             core_next: ThreadCell::new(None),
             core_truth: ThreadCell::new(None),
             dbg_sample: crate::hot_gates::env_flags::dbg_sample(),
@@ -1505,6 +1511,7 @@ impl Interpreter {
                 LeafMisses::default(),
             )),
             leaf_miss: std::cell::Cell::new((0, 0)),
+            leaf_hit: std::cell::RefCell::new(None),
             core_next: ThreadCell::new(None),
             core_truth: ThreadCell::new(None),
             dbg_sample: crate::hot_gates::env_flags::dbg_sample(),
@@ -32961,6 +32968,13 @@ impl Interpreter {
         if self.leaf_miss.get() == (p, gen) {
             return None;
         }
+        if let Ok(hit) = self.leaf_hit.try_borrow() {
+            if let Some((w, g, k)) = &*hit {
+                if std::ptr::eq(w.as_ptr(), Rc::as_ptr(b)) && *g == gen && w.strong_count() > 0 {
+                    return Some(*k);
+                }
+            }
+        }
         if let Some(k) = self.leaf_fns().calls.get(&p) {
             return Some(*k);
         }
@@ -33001,8 +33015,13 @@ impl Interpreter {
                 }
             }
         };
-        if found.is_none() {
-            self.leaf_miss.set((p, gen));
+        match found {
+            None => self.leaf_miss.set((p, gen)),
+            Some(k) => {
+                if let Ok(mut hit) = self.leaf_hit.try_borrow_mut() {
+                    *hit = Some((Rc::downgrade(b), gen, k));
+                }
+            }
         }
         found
     }
