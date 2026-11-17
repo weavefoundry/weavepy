@@ -7754,10 +7754,17 @@ impl PyFile {
     /// do not carry the `mode`/`name` attributes that OS-backed file objects
     /// do, so callers gate those attributes on this.
     pub fn is_memory(&self) -> bool {
-        matches!(
-            &*self.backend.borrow(),
-            FileBackend::MemBytes { .. } | FileBackend::MemText { .. }
-        )
+        let memory = |b: &FileBackend| {
+            matches!(
+                b,
+                FileBackend::MemBytes { .. } | FileBackend::MemText { .. }
+            )
+        };
+        // SAFETY: the variant is read and the view dropped at once.
+        if let Some(b) = unsafe { self.backend.peek() } {
+            return memory(b);
+        }
+        memory(&self.backend.borrow())
     }
 
     /// Whether the stream is attached to a terminal (`f.isatty()`). The
@@ -8183,42 +8190,60 @@ impl PyFile {
     /// and returns `true`. `false` touches nothing; the general path then
     /// runs (overwrites, newline translation, an explicit codec).
     pub fn mem_text_append(&self, s: &str) -> bool {
-        if self.io_kind.get() != IoKind::StringIO || *self.closed.borrow() {
+        if self.io_kind.get() != IoKind::StringIO {
             return false;
         }
-        if self.encoding.borrow().is_some()
-            || self
-                .errors
-                .borrow()
-                .as_deref()
-                .is_some_and(|e| e != "strict")
+        // The settings are read through guard-free views, each dropped at
+        // once (nothing here runs code), and a borrow when one is live.
+        fn read<T, R>(c: &RefCell<T>, f: impl FnOnce(&T) -> R) -> R {
+            // SAFETY: as above.
+            match unsafe { c.peek() } {
+                Some(v) => f(v),
+                None => f(&c.borrow()),
+            }
+        }
+        if read(&self.closed, |c| *c)
+            || read(&self.encoding, Option::is_some)
+            || read(&self.errors, |e| {
+                e.as_deref().is_some_and(|e| e != "strict")
+            })
         {
             return false;
         }
-        let collapse = match self.newline.borrow().as_deref() {
-            Some("\n" | "") => false,
-            None if self.io_kind.get() == IoKind::StringIO => true,
-            _ => return false,
+        let collapse = match read(&self.newline, |n| match n.as_deref() {
+            Some("\n" | "") => Some(false),
+            None => Some(true),
+            _ => None,
+        }) {
+            Some(c) => c,
+            None => return false,
         };
         if collapse && s.as_bytes().contains(&b'\r') {
             return false;
         }
-        let Ok(mut backend) = self.backend.try_borrow_mut() else {
-            return false;
+        let append = |backend: &mut FileBackend| {
+            let FileBackend::MemText { data, pos } = backend else {
+                return false;
+            };
+            if *pos != data.len() {
+                return false;
+            }
+            data.push_str(s);
+            *pos = data.len();
+            true
         };
-        let FileBackend::MemText { data, pos } = &mut *backend else {
-            return false;
+        // SAFETY: the buffer is extended and the view dropped at once.
+        let done = match unsafe { self.backend.peek_mut() } {
+            Some(b) => append(b),
+            None => match self.backend.try_borrow_mut() {
+                Ok(mut b) => append(&mut b),
+                Err(_) => false,
+            },
         };
-        if *pos != data.len() {
-            return false;
-        }
-        data.push_str(s);
-        *pos = data.len();
-        drop(backend);
-        if collapse {
+        if done && collapse {
             self.record_seen_newlines(s);
         }
-        true
+        done
     }
 
     fn translate_newlines_write(&self, s: &str) -> String {

@@ -557,7 +557,11 @@ pub(crate) fn method_memo_tag(obj: &Object) -> Option<u8> {
         // A native stream's methods follow from its layer and backing (see
         // `lookup_method_uncached`), unless the stream carries attributes
         // of its own, which shadow them.
-        Object::File(f) if f.extra_attrs.borrow().is_empty() => {
+        // SAFETY: the length is read and the view dropped at once.
+        Object::File(f)
+            if unsafe { f.extra_attrs.peek() }
+                .map_or_else(|| f.extra_attrs.borrow().is_empty(), Vec::is_empty) =>
+        {
             16 + (f.io_kind.get() as u8) * 4 + u8::from(f.binary) * 2 + u8::from(f.is_memory())
         }
         // A class's `__dict__` view (`cls.__dict__.get(name)`, as enum and

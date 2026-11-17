@@ -7998,6 +7998,11 @@ pub(crate) struct MethodSite {
     desc: Option<(u64, bool, Object)>,
     /// The class version whose attribute the site found isn't one.
     desc_miss: u64,
+    /// A native stream's method the site loaded last (`out.write`): the
+    /// stream's kind, as `builtins::method_memo_tag` keys it (its methods
+    /// follow from the kind alone while it has no attributes of its own),
+    /// and the method.
+    stream: Option<(u8, Object)>,
     /// A class receiver the site loaded an attribute of
     /// (`object.__setattr__(self, ...)`, `dict.fromkeys(...)`, a user
     /// class's static or class method): the class, its version, its
@@ -8099,6 +8104,21 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
                     (*st).stack.add(s.len as usize).write(recv);
                     return 0;
                 }
+            }
+        }
+        // A native stream's method of the kind the site loaded it for, the
+        // stream in the self slot.
+        let stream_tag = match &*top {
+            Object::File(_) => crate::builtins::method_memo_tag(&*top),
+            _ => None,
+        };
+        if let (Some(t), Some((want, f))) = (stream_tag, &s.stream) {
+            if t == *want {
+                let f = crate::clone_hot(f);
+                let recv = top.read();
+                top.write(f);
+                (*st).stack.add(s.len as usize).write(recv);
+                return 0;
             }
         }
         // A class's attribute the site loaded last, while the class's and
@@ -8215,6 +8235,19 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
             if let (Some(binds), Object::Builtin(_) | Object::Function(_)) = (binds, callable) {
                 if builtin || class_method_plain(s, ptr, binds) {
                     s.type_attr = Some((ptr, ver, meta, callable.clone(), binds));
+                }
+            }
+        }
+        // A native stream's method bound to it: for the next stream of the
+        // kind.
+        if let Some(t) = stream_tag {
+            let (callable, self_slot) = (
+                &*(*st).stack.add(s.len as usize - 1),
+                &*(*st).stack.add(s.len as usize),
+            );
+            if let (Object::Builtin(b), Object::File(_)) = (callable, self_slot) {
+                if b.binds_instance {
+                    s.stream = Some((t, callable.clone()));
                 }
             }
         }
@@ -23093,6 +23126,7 @@ impl<'a> Lower<'a> {
             desc: None,
             desc_miss: 0,
             type_attr: None,
+            stream: None,
         });
         let c = self
             .b
