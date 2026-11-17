@@ -15082,40 +15082,82 @@ thread_local! {
     /// `test_hash_collision_concurrent_add`, where a hash-colliding
     /// `__eq__` calls `s.add(...)` during another `s.add`). Rather than
     /// panic on the re-entrant `borrow_mut`, the inner call records its op
-    /// here keyed by the set's identity; the outer frame replays it once
-    /// its own mutation completes, so the final contents match CPython.
-    static SET_DEFERRED_OPS: std::cell::RefCell<Vec<(usize, SetInplaceOp)>> =
+    /// here against the set; the outer frame replays it once its own
+    /// mutation completes, so the final contents match CPython. An op whose
+    /// outer frame was some other operation (a comparison, `remove`) waits
+    /// for the set's next in-place mutation, which replays it first.
+    ///
+    /// Each entry holds a weak handle, which keeps the set's allocation (and
+    /// so its address) from being reused while the op waits: a set that dies
+    /// with ops pending drops them, and a new set never inherits them.
+    static SET_DEFERRED_OPS: std::cell::RefCell<Vec<(DeferredSet, SetInplaceOp)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+type DeferredSet = crate::sync::Weak<RefCell<crate::object::SetData>>;
+
+/// Queue `op` against `set` (see `SET_DEFERRED_OPS`).
+fn defer_set_op(set: &Rc<RefCell<crate::object::SetData>>, op: SetInplaceOp) {
+    let dead = SET_DEFERRED_OPS.with(|q| {
+        let mut q = q.borrow_mut();
+        let dead = take_dead_set_ops(&mut q);
+        q.push((Rc::downgrade(set), op));
+        dead
+    });
+    // (Released with the queue free: their drop glue can run code.)
+    drop(dead);
+}
+
+/// Remove the entries whose set has died.
+fn take_dead_set_ops(q: &mut Vec<(DeferredSet, SetInplaceOp)>) -> Vec<SetInplaceOp> {
+    let mut dead = Vec::new();
+    let mut i = 0;
+    while i < q.len() {
+        if q[i].0.strong_count() == 0 {
+            dead.push(q.remove(i).1);
+        } else {
+            i += 1;
+        }
+    }
+    dead
 }
 
 /// Drain and return any deferred ops queued against `ptr`. The queue
 /// borrow is released before the caller applies them, so a further
 /// re-entrant mutation during replay can queue again without conflict.
-fn take_deferred_set_ops(ptr: usize) -> Vec<SetInplaceOp> {
-    SET_DEFERRED_OPS.with(|q| {
+fn take_deferred_set_ops(set: &Rc<RefCell<crate::object::SetData>>) -> Vec<SetInplaceOp> {
+    let (drained, dead) = SET_DEFERRED_OPS.with(|q| {
         let mut q = q.borrow_mut();
         if q.is_empty() {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
+        let dead = take_dead_set_ops(&mut q);
+        let ptr = Rc::as_ptr(set);
         let mut drained = Vec::new();
         let mut i = 0;
         while i < q.len() {
-            if q[i].0 == ptr {
+            if std::ptr::eq(q[i].0.as_ptr(), ptr) {
                 drained.push(q.remove(i).1);
             } else {
                 i += 1;
             }
         }
-        drained
-    })
+        (drained, dead)
+    });
+    drop(dead);
+    drained
 }
 
 fn set_apply_inplace(args: &[Object], op: SetInplaceOp) -> Result<Object, RuntimeError> {
     match set_self(args)? {
         Object::Set(s) => {
-            let ptr = Rc::as_ptr(&s) as usize;
             match s.try_borrow_mut() {
                 Ok(mut b) => {
+                    // Ops deferred while another operation held the set came
+                    // first.
+                    for op in take_deferred_set_ops(&s) {
+                        apply_set_inplace_op(&mut b, op);
+                    }
                     // A colliding `__eq__` that raises during `add`/`discard`
                     // aborts the mutation in CPython (test_badcmp `s.add`/
                     // `s.discard`/`s.remove` of a `BadCmp`).
@@ -15123,7 +15165,7 @@ fn set_apply_inplace(args: &[Object], op: SetInplaceOp) -> Result<Object, Runtim
                     // Replay anything a re-entrant callback deferred while we
                     // held the borrow. Looping handles nested re-entrancy.
                     loop {
-                        let replay = take_deferred_set_ops(ptr);
+                        let replay = take_deferred_set_ops(&s);
                         if replay.is_empty() {
                             break;
                         }
@@ -15137,7 +15179,7 @@ fn set_apply_inplace(args: &[Object], op: SetInplaceOp) -> Result<Object, Runtim
                     // An outer frame holds the borrow (re-entrant mutation
                     // from a `__hash__`/`__eq__` callback). Defer; the outer
                     // frame replays once it finishes.
-                    SET_DEFERRED_OPS.with(|q| q.borrow_mut().push((ptr, op)));
+                    defer_set_op(&s, op);
                     Ok(Object::None)
                 }
             }
