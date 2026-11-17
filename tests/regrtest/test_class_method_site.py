@@ -4,7 +4,8 @@ Compiled code remembers a class's plain function, static method or class
 method at the site while the class's and its metaclass's versions hold;
 reassigning the attribute, swapping a static method for a class method,
 another class at the site, a metaclass that reads attributes itself or
-defines the name, and a descriptor with its own `__get__` all behave as
+defines the name (as a data descriptor or a method the class's entry
+overrides), and a descriptor with its own `__get__` all behave as
 in CPython. Run it past the compile threshold.
 """
 
@@ -107,4 +108,24 @@ assert via(M, N_)[-1] == ("meta", N_ - 1)
 assert via(N, N_)[-1] == ("shadow", N_ - 1)
 r = via(D, N_)
 assert r[-1] == ("desc", N_, N_ - 1) and Desc.calls == N_
+
+
+# A metaclass method of the same name: the class's own entry wins until
+# it goes, and then the metaclass's answers, bound to the class.
+class MetaFn(type):
+    def s(cls, x):
+        return ("metafn", cls.__name__, x)
+
+
+class Q(metaclass=MetaFn):
+    @staticmethod
+    def s(x):
+        return ("q", x)
+
+
+assert via(Q, N_)[-1] == ("q", N_ - 1)
+del Q.s
+assert via(Q, 5)[-1] == ("metafn", "Q", 4)
+Q.s = staticmethod(lambda x: ("again", x))
+assert via(Q, 5)[-1] == ("again", 4)
 print("ok")

@@ -8117,9 +8117,11 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
 /// `s`'s code is live.
 /// Whether the user class at `ptr` (the site's receiver) yields its
 /// method at the site as a function of its attributes and its
-/// metaclass's: its metaclass reads attributes as `type` does and doesn't
-/// define the name, and the class's own value is a plain function (no
-/// self bound), a `staticmethod`, or a `classmethod` (`binds`).
+/// metaclass's: its metaclass reads attributes as `type` does and defines
+/// the name, if at all, as a non-data descriptor (`EnumType.__new__`,
+/// which the class's own entry overrides), and the class's own value is a
+/// plain function (no self bound), a `staticmethod`, or a `classmethod`
+/// (`binds`).
 ///
 /// # Safety
 ///
@@ -8148,7 +8150,17 @@ unsafe fn class_method_plain(s: &MethodSite, ptr: usize, binds: bool) -> bool {
             (Some(a), Some(b)) => a.is_same(&b),
             _ => false,
         };
-        if !same_getattr || meta.lookup(name).is_some() {
+        let non_data = match meta.lookup(name) {
+            None => true,
+            Some(
+                Object::Function(_)
+                | Object::StaticMethod(_)
+                | Object::ClassMethod(_)
+                | Object::Builtin(_),
+            ) => true,
+            Some(_) => false,
+        };
+        if !same_getattr || !non_data {
             return false;
         }
     }
