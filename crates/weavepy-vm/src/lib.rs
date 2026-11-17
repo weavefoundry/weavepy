@@ -46434,6 +46434,11 @@ impl Interpreter {
         if let Some(items) = crate::object::collect_small_int_range(v) {
             return items;
         }
+        if let Object::LazyIter(l) = v {
+            if let Some(items) = crate::seqiter::islice_collect(l) {
+                return Ok(items);
+            }
+        }
         // `list(reversed(xs))`: the rest of the reversed list at once,
         // the iterator left exhausted and detached as its last step leaves
         // it (what that releases drops once the iterator is free again).

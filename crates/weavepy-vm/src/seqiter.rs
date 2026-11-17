@@ -1281,6 +1281,67 @@ fn cursors_next(iters: &[Object]) -> Option<[Object; CURSORS_MAX]> {
     Some(items)
 }
 
+/// `list(islice(seq, ...))` and its kin: the rest of an `islice` over a
+/// tuple or list cursor only it holds, taken at once in CPython's
+/// `islice_next` order (the skipped items first, then the stop bound),
+/// the adapter left finished with its source released. `None`, nothing
+/// consumed, for any other `islice` or iterator.
+pub(crate) fn islice_collect(l: &PyLazyIter) -> Option<Vec<Object>> {
+    // SAFETY: nothing below runs code until the source's release, after
+    // the views end.
+    let st = unsafe { l.state.peek_mut() }?;
+    let LazyIterKind::Islice {
+        source,
+        next_idx,
+        pos,
+        stop,
+        step,
+        done,
+    } = st
+    else {
+        return None;
+    };
+    let Object::Iter(c) = source else {
+        return None;
+    };
+    if *done || Rc::strong_count(c) != 1 || *step == 0 {
+        return None;
+    }
+    // SAFETY: the source's own cell, viewed alone.
+    let (xs, idx) = unsafe { c.peek_mut() }.and_then(seq_cursor)?;
+    let len = xs.len();
+    let mut i = *idx;
+    let mut out = Vec::new();
+    loop {
+        if *pos < *next_idx {
+            let skip = *next_idx - *pos;
+            let left = len.saturating_sub(i) as u64;
+            if skip > left {
+                *pos += left;
+                break;
+            }
+            i += skip as usize;
+            *pos += skip;
+        }
+        if stop.is_some_and(|s| *pos >= s) || i >= len {
+            break;
+        }
+        out.push(xs[i].clone());
+        i += 1;
+        *pos += 1;
+        *next_idx = next_idx.saturating_add(*step);
+        if let Some(s) = *stop {
+            *next_idx = (*next_idx).min(s);
+        }
+    }
+    *idx = i;
+    *done = true;
+    // (CPython clears `lz->it`: the source and what only it holds go.)
+    let released = std::mem::replace(source, Object::None);
+    drop(released);
+    Some(out)
+}
+
 /// Whether a `zip` stops now with nothing consumed (its first source, a
 /// tuple or list cursor, is at its end) and releasing it, when this is
 /// the last reference, frees nothing that could hold a finalizer: the
