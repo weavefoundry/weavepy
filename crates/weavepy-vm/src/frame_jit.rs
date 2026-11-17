@@ -6093,6 +6093,34 @@ unsafe fn store_subscr_fast(
                 }
                 old
             }
+            // A unit-step slice of a list assigned an exact list's or
+            // tuple's items (`xs[:] = xs[n:]`): spliced in place, the
+            // displaced items released after.
+            (Object::List(xs), Object::Slice(sl)) if matches!(sl.step, Object::None) => {
+                let items: Vec<Object> = match &*val {
+                    Object::List(ys) => match ys.peek() {
+                        Some(ys) => ys.clone(),
+                        None => return 1,
+                    },
+                    Object::Tuple(t) => t.to_vec(),
+                    _ => return 1,
+                };
+                let Some(v) = xs.peek_mut() else {
+                    return 1;
+                };
+                let Some((lo, hi)) = Interpreter::slice_bounds(sl, v.len()) else {
+                    return 1;
+                };
+                if !v[lo..hi.max(lo)].iter().all(displaced_ok) {
+                    return 1;
+                }
+                let removed: Vec<Object> = v.splice(lo..hi.max(lo), items).collect();
+                if owned & 1 != 0 {
+                    crate::drop_hot_at(val);
+                }
+                drop(removed);
+                Object::None
+            }
             _ => return 1,
         };
         if owned & 4 != 0 {

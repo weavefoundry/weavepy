@@ -21316,7 +21316,7 @@ impl Interpreter {
     /// A unit-step slice's clamped `[lo, hi)` over `n` items, its bounds
     /// plain ints or omitted (`None` otherwise).
     #[inline]
-    fn slice_bounds(sl: &crate::object::PySlice, n: usize) -> Option<(usize, usize)> {
+    pub(crate) fn slice_bounds(sl: &crate::object::PySlice, n: usize) -> Option<(usize, usize)> {
         let n = n as i64;
         let at = |v: &Object, dflt: i64| -> Option<usize> {
             let i = match v {
