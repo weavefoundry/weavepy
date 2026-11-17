@@ -11571,6 +11571,12 @@ fn str_split(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Run
 /// text are born knowing their counts.
 fn str_split_sep(s: &str, ascii: bool, sep: &str, maxsplit: i64) -> Vec<Object> {
     let piece = |text: &str| {
+        // (A one-character field is the shared string.)
+        if let [c] = text.as_bytes() {
+            if c.is_ascii() {
+                return str_piece(text);
+            }
+        }
         Object::Str(if ascii {
             SharedStr::from_ascii(text)
         } else {
@@ -11581,6 +11587,20 @@ fn str_split_sep(s: &str, ascii: bool, sep: &str, maxsplit: i64) -> Vec<Object> 
     if let [byte] = *sep.as_bytes() {
         let mut out = Vec::new();
         let mut start = 0;
+        // (A short line by byte: `memchr`'s vector setup costs more there.)
+        if s.len() <= 32 {
+            for (at, &b) in s.as_bytes().iter().enumerate() {
+                if b == byte {
+                    if out.len() == limit {
+                        break;
+                    }
+                    out.push(piece(&s[start..at]));
+                    start = at + 1;
+                }
+            }
+            out.push(piece(&s[start..]));
+            return out;
+        }
         for at in memchr::memchr_iter(byte, s.as_bytes()) {
             if out.len() == limit {
                 break;
@@ -12477,6 +12497,25 @@ fn str_rsplit(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
                 .ok_or_else(|| type_error("must be str or None, not other"))?;
             if sep.is_empty() {
                 return Err(value_error("empty separator"));
+            }
+            // A one-byte separator from the right, by byte (no overlaps
+            // to tell apart), each field built in place.
+            if let [byte] = *sep.as_bytes() {
+                let b = s.as_bytes();
+                let limit = usize::try_from(maxsplit).unwrap_or(usize::MAX);
+                let mut out: Vec<Object> = Vec::new();
+                let mut end = b.len();
+                let mut at = b.len();
+                while at > 0 && out.len() < limit {
+                    at -= 1;
+                    if b[at] == byte {
+                        out.push(str_piece(&s[at + 1..end]));
+                        end = at;
+                    }
+                }
+                out.push(str_piece(&s[..end]));
+                out.reverse();
+                return Ok(new_str_split_list(wrap(out)));
             }
             // Always scan right-to-left: with overlapping separators the
             // match positions differ from a left scan ('aaa'.rsplit('aa')

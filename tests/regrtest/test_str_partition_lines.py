@@ -1,4 +1,4 @@
-"""`str.partition`, `str.rpartition` and `str.splitlines` on exact strings.
+"""`str.partition`, `rpartition`, `split`, `rsplit` and `splitlines` on exact strings.
 
 The pieces, the separator object returned as the middle item, the string
 itself when the separator isn't found, every line boundary (`\\r\\n`
@@ -9,6 +9,26 @@ together, the ASCII controls, and the non-ASCII ones), `keepends`, and a
 
 class S(str):
     pass
+
+
+def list_split(text, m):
+    out, start, i = [], 0, 0
+    while i < len(text):
+        if text[i] == "," and (m < 0 or len(out) < m):
+            out.append(text[start:i])
+            start = i + 1
+        i += 1
+    return out + [text[start:]]
+
+
+def list_rsplit(text, m):
+    out, end, i = [], len(text), len(text)
+    while i > 0:
+        i -= 1
+        if text[i] == "," and (m < 0 or len(out) < m):
+            out.append(text[i + 1:end])
+            end = i
+    return [text[:end]] + out[::-1]
 
 
 def run(n):
@@ -35,6 +55,11 @@ def run(n):
         assert "".splitlines() == [] and "\n".splitlines() == [""]
         assert "é z\x85w".splitlines() == ["é", "z", "w"]
         assert S("p\nq").splitlines() == ["p", "q"]
+        for text in ("a,b,,c,", ",x", "é,ü,,ß", "k," * 20 + "end"):
+            for m in (-1, 0, 1, 2, 30):
+                assert text.split(",", m) == list_split(text, m)
+                assert text.rsplit(",", m) == list_rsplit(text, m)
+        assert "aaa".rsplit("aa") == ["a", ""] and "aaa".split("aa") == ["", "a"]
 
 
 run(2000)
