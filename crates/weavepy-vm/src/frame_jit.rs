@@ -4875,6 +4875,17 @@ const FOR_RAISED: u32 = 5;
 unsafe extern "C" fn h_list_append(list: *const Object, value: *const Object) -> u32 {
     // SAFETY: the code passes two initialized stack slots; growing the
     // list runs no code, so nothing reaches it while it is peeked at.
+    unsafe { h_list_append_ref(list, value, 1) }
+}
+
+/// [`h_list_append`] of a value read in place: moved from its stack slot
+/// (`owned` nonzero) or copied from a local or constant.
+unsafe extern "C" fn h_list_append_ref(
+    list: *const Object,
+    value: *const Object,
+    owned: u32,
+) -> u32 {
+    // SAFETY: as `h_list_append`'s; a borrowed value outlives the call.
     unsafe {
         let Object::List(l) = &*list else {
             return 1;
@@ -4882,7 +4893,12 @@ unsafe extern "C" fn h_list_append(list: *const Object, value: *const Object) ->
         let Some(items) = l.peek_mut() else {
             return 1;
         };
-        crate::push_fast(items, value.read());
+        let v = if owned != 0 {
+            value.read()
+        } else {
+            crate::clone_hot(&*value)
+        };
+        crate::push_fast(items, v);
         0
     }
 }
@@ -4896,10 +4912,20 @@ unsafe extern "C" fn h_map_add(
     dict: *const Object,
     key: *const Object,
     value: *const Object,
+    owned: u32,
 ) -> u32 {
-    // SAFETY: the code passes three initialized stack slots; the probe and
-    // the insert run no code, so nothing reaches the dict meanwhile.
+    // SAFETY: the code passes three initialized values (the key in its
+    // stack slot when bit 0 of `owned` is set and the value when bit 1 is,
+    // else a local or constant that outlives the call); the probe and the
+    // insert run no code, so nothing reaches the dict meanwhile.
     unsafe {
+        let take = |p: *const Object, bit: u32| {
+            if owned & bit != 0 {
+                p.read()
+            } else {
+                crate::clone_hot(&*p)
+            }
+        };
         let Object::Dict(cell) = &*dict else {
             return 1;
         };
@@ -4925,15 +4951,17 @@ unsafe extern "C" fn h_map_add(
                     return 1;
                 }
                 // (The key the dict holds stays; the new one leaves.)
-                *slot = value.read();
-                crate::drop_hot_at(key);
+                *slot = take(value, 2);
+                if owned & 1 != 0 {
+                    crate::drop_hot_at(key);
+                }
                 false
             }
             crate::dictmap::ProbeEntry::Vacant(e) => {
                 if !probe.miss_is_exact() {
                     return 1;
                 }
-                e.insert(crate::object::DictKey(key.read()), value.read());
+                e.insert(crate::object::DictKey(take(key, 1)), take(value, 2));
                 true
             }
         };
@@ -4948,9 +4976,11 @@ unsafe extern "C" fn h_map_add(
 /// `SET_ADD` (a set comprehension's store) into the exact set at `set` of
 /// the value at `value`: `0` the value moved in (or, a scalar or string
 /// equal to an element, released), anything else declined untouched.
-unsafe extern "C" fn h_set_add(set: *const Object, value: *const Object) -> u32 {
-    // SAFETY: the code passes two initialized stack slots; the probe and
-    // the insert run no code, so nothing reaches the set meanwhile.
+unsafe extern "C" fn h_set_add(set: *const Object, value: *const Object, owned: u32) -> u32 {
+    // SAFETY: the code passes two initialized values (the value in its
+    // stack slot when `owned` is nonzero, else a local or constant that
+    // outlives the call); the probe and the insert run no code, so nothing
+    // reaches the set meanwhile.
     unsafe {
         let Object::Set(cell) = &*set else {
             return 1;
@@ -4961,10 +4991,17 @@ unsafe extern "C" fn h_set_add(set: *const Object, value: *const Object) -> u32 
         let Some(s) = cell.peek_mut() else {
             return 1;
         };
+        let take = || {
+            if owned != 0 {
+                value.read()
+            } else {
+                crate::clone_hot(&*value)
+            }
+        };
         match s.insert_probe_if(
             &probe,
             |p| p.miss_is_exact(),
-            || crate::object::DictKey(value.read()),
+            || crate::object::DictKey(take()),
         ) {
             Some(true) => 0,
             Some(false)
@@ -4973,7 +5010,9 @@ unsafe extern "C" fn h_set_add(set: *const Object, value: *const Object) -> u32 
                     Object::Int(_) | Object::Str(_) | Object::Bool(_) | Object::None
                 ) =>
             {
-                crate::drop_hot_at(value);
+                if owned != 0 {
+                    crate::drop_hot_at(value);
+                }
                 0
             }
             _ => 1,
@@ -21864,6 +21903,27 @@ impl<'a> Lower<'a> {
     /// `LIST_APPEND` through [`h_list_append`] (the value leaves the stack
     /// into the list `arg` below it).
     fn list_append(&mut self, pc: usize, arg: usize) -> bool {
+        // A local's or constant's value is read in place (no copy to the
+        // stack first) when the list is on the frame's stack.
+        if self.slot_on_stack(self.depth - 1 - arg) && !self.inlining() {
+            let list = self.slot_addr(self.depth - 1 - arg);
+            let vi = self.pop();
+            let slot = self.depth;
+            let (value, own) = self.ref_or_own(vi, slot);
+            let owned = self.b.ins().iconst(types::I32, i64::from(own));
+            let r = self
+                .call(
+                    h_list_append_ref as *const () as usize,
+                    &[list, value, owned],
+                    true,
+                )
+                .expect("returns");
+            let restore = if own { Item::Mem(slot) } else { vi };
+            let out = self.exit_with(pc, &[restore], INTERP);
+            self.branch_out(r, out);
+            self.set_last(pc);
+            return true;
+        }
         self.flush();
         let list = self.slot_addr(self.depth - 1 - arg);
         let value = self.slot_addr(self.depth - 1);
@@ -21877,18 +21937,30 @@ impl<'a> Lower<'a> {
         true
     }
 
+    /// Whether stack slot `s` holds its value on the frame's stack (not a
+    /// virtual item waiting to be written there).
+    fn slot_on_stack(&self, s: usize) -> bool {
+        let base = self.depth - self.vs.len();
+        s < base || matches!(self.vs.get(s - base), Some(Item::Mem(m)) if *m == s)
+    }
+
     /// `SET_ADD` through [`h_set_add`], or out to the core loop with the
     /// operands as they were.
     fn set_add(&mut self, pc: usize, arg: usize) -> bool {
-        self.flush();
+        if !self.slot_on_stack(self.depth - 1 - arg) || self.inlining() {
+            self.flush();
+        }
         let set = self.slot_addr(self.depth - 1 - arg);
-        let value = self.slot_addr(self.depth - 1);
+        let vi = self.pop();
+        let slot = self.depth;
+        let (value, own) = self.ref_or_own(vi, slot);
+        let owned = self.b.ins().iconst(types::I32, i64::from(own));
         let r = self
-            .call(h_set_add as *const () as usize, &[set, value], true)
+            .call(h_set_add as *const () as usize, &[set, value, owned], true)
             .expect("returns");
-        let out = self.exit_with(pc, &[], INTERP);
+        let restore = if own { Item::Mem(slot) } else { vi };
+        let out = self.exit_with(pc, &[restore], INTERP);
         self.branch_out(r, out);
-        self.depth -= 1;
         self.set_last(pc);
         true
     }
@@ -21896,16 +21968,30 @@ impl<'a> Lower<'a> {
     /// `MAP_ADD` through [`h_map_add`], or out to the core loop with the
     /// operands as they were.
     fn map_add(&mut self, pc: usize, arg: usize) -> bool {
-        self.flush();
+        if !self.slot_on_stack(self.depth - 2 - arg) || self.inlining() {
+            self.flush();
+        }
         let dict = self.slot_addr(self.depth - 2 - arg);
-        let key = self.slot_addr(self.depth - 2);
-        let value = self.slot_addr(self.depth - 1);
+        let vi = self.pop();
+        let ki = self.pop();
+        let slot = self.depth;
+        let (key, own_k) = self.ref_or_own(ki, slot);
+        let (value, own_v) = self.ref_or_own(vi, slot + 1);
+        let owned = self.b.ins().iconst(
+            types::I32,
+            i64::from(u8::from(own_k) | u8::from(own_v) << 1),
+        );
         let r = self
-            .call(h_map_add as *const () as usize, &[dict, key, value], true)
+            .call(
+                h_map_add as *const () as usize,
+                &[dict, key, value, owned],
+                true,
+            )
             .expect("returns");
-        let out = self.exit_with(pc, &[], INTERP);
+        let rk = if own_k { Item::Mem(slot) } else { ki };
+        let rv = if own_v { Item::Mem(slot + 1) } else { vi };
+        let out = self.exit_with(pc, &[rk, rv], INTERP);
         self.branch_out(r, out);
-        self.depth -= 2;
         self.set_last(pc);
         true
     }
