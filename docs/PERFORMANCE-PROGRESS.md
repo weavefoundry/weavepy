@@ -582,6 +582,15 @@ branch and pull request.
     still does, but handing tier 2's code with such loops to it cost
     `pyaes` 2.6 times its instructions, `deque_ops` 1.6 and `richards` 1.5:
     their int work wins back more than the iterator steps cost.
+  - Container methods. A frozenset of atomic values isn't registered with
+    the collector (it can't change, so it can never close a cycle;
+    `gc.is_tracked` registers it on asking): `frozenset((1, 2, 3))` 2,181
+    to 1,446 (1,432). `dict.update` from a plain dict whose keys run no
+    code, `dict.copy`, and `set.add` and `set.update` of natively hashed
+    values have leaf halves, which call sites run in place instead of
+    through the general call (`set.update` also cloned the whole set as a
+    snapshot on every call): `x = {}; x.update(sd)` 2,237 to 1,771 (1,500),
+    `x = set(); x.update(t)` 3,598 to 1,978 (1,700).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
