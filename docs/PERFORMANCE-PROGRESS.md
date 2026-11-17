@@ -612,6 +612,21 @@ branch and pull request.
     4% for it). A `**kwargs` dict that its code only ever feeds to a `**`
     spread (a decorator's wrapper) can't outlive its call and skips the
     registration; one that may escape pays about 170 instructions.
+  - Builtin subclasses and getters. A compiled call site settled on a
+    container's or string's method declined an instance of a subclass (a
+    `Counter`, an `OrderedDict`, a `class L(list)`) and sent it through
+    the general call, which found the method's receiver shim, checked the
+    receiver and unwrapped it. The site now runs its kernel on the
+    instance's native payload (a dict view keeps the instance), and
+    `len()` and `in` read the payload when the class keeps the base's own
+    `__len__` or `__contains__`: `d.get(k)` 1,990 to 432 (CPython 671), a
+    list subclass's `append` and `pop` 3,521 to 652 (767), `len(d)` 2,014
+    to 400 (359), `k in d` 1,666 to 319 (573), `d.items()` 1,801 to 861
+    (880). A site settled on `itemgetter`'s or `attrgetter`'s native
+    `__call__` takes the instance itself, which it had passed to the
+    general call to rewrite: `ig(t)` 737 to 477 (484). A differential
+    sweep against CPython found `round(True)` returning `True` and
+    `float.hex` and `int.bit_length` accepting an argument.
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

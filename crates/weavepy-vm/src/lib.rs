@@ -31207,6 +31207,14 @@ impl Interpreter {
             // pure leaf with a scalar answer (anything else is the full
             // path's, which runs it again: nothing observed the first).
             Object::Instance(inst) => {
+                // A builtin subclass's own `__contains__`: its payload's.
+                if let Some(native) = Self::native_payload_for(
+                    inst,
+                    crate::types::vm_key::NATIVE_CONTAINS,
+                    "__contains__",
+                ) {
+                    return Self::leaf_contains(native, item);
+                }
                 let f = Self::instance_dunder_function(
                     inst,
                     crate::types::AttrKey::vm(crate::types::vm_key::CONTAINS),
@@ -31662,6 +31670,23 @@ impl Interpreter {
         }
     }
 
+    /// Whether `type(inst).__call__` is the native call `f` that takes the
+    /// instance first (see [`Self::instance_call_native`]), by its cached
+    /// entry alone: `false` until a call has filled it.
+    #[inline]
+    pub(crate) fn instance_calls_native(
+        inst: &PyInstance,
+        f: *const crate::object::BuiltinFn,
+    ) -> bool {
+        use crate::types::LeafAttrKind as K;
+        let cls = inst.cls_raw();
+        let key = crate::types::AttrKey::vm(crate::types::vm_key::CALL_NATIVE);
+        matches!(
+            cls.leaf_attrs.get(key, cls.attr_version.get()),
+            Some(K::BuiltinMethod(b)) if std::ptr::eq(Rc::as_ptr(b), f)
+        )
+    }
+
     /// `type(inst).__call__` when it is a plain Python function, cached
     /// on the class under its attribute version.
     #[inline(never)]
@@ -31900,6 +31925,26 @@ impl Interpreter {
         cls.leaf_attrs
             .set(key, ver, fast.map_or(K::Other, K::LeafFast));
         fast
+    }
+
+    /// `inst`'s native payload (a `Counter`'s dict, a list subclass's list)
+    /// when the class resolves the special method `name` to a built-in
+    /// base's own, cached under `key`: the payload answers for it.
+    #[inline]
+    pub(crate) fn native_payload_for<'a>(
+        inst: &'a PyInstance,
+        key: u32,
+        name: &str,
+    ) -> Option<&'a Object> {
+        use crate::types::LeafAttrKind as K;
+        let native = inst.native.get()?;
+        let cls = inst.cls_raw();
+        let key = crate::types::AttrKey::vm(key);
+        match cls.leaf_attrs.get(key, cls.attr_version.get()) {
+            Some(K::BuiltinMethod(_)) => Some(native),
+            Some(_) => None,
+            None => Self::instance_native_dunder(inst, key, name, true).map(|_| native),
+        }
     }
 
     /// Whether `inst`'s `__getitem__` is a built-in base's own over its

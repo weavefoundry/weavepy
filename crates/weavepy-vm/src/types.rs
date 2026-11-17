@@ -808,6 +808,10 @@ pub(crate) mod vm_key {
     pub(crate) const BINOP: u32 = 48;
     pub(crate) const RBINOP: u32 = 64;
     pub(crate) const IBINOP: u32 = 80;
+    /// Whether `__len__` / `__contains__` is a built-in base's own over the
+    /// instance's native payload.
+    pub(crate) const NATIVE_LEN: u32 = 96;
+    pub(crate) const NATIVE_CONTAINS: u32 = 97;
 }
 
 /// The cached answer (see [`LeafAttrCache`]).

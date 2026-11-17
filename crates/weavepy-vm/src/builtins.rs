@@ -2919,6 +2919,21 @@ fn slot_getstate(args: &[Object]) -> Result<Object, RuntimeError> {
 
 // ---------- free builtins ----------
 
+/// The receiver of a method that takes no arguments (`float.hex()`),
+/// rejecting any extra argument as CPython does.
+fn self_only<'a>(args: &'a [Object], qual: &str) -> Result<&'a Object, RuntimeError> {
+    match args {
+        [v] => Ok(v),
+        [] => Err(type_error(format!(
+            "unbound method {qual}() needs an argument"
+        ))),
+        _ => Err(type_error(format!(
+            "{qual}() takes no arguments ({} given)",
+            args.len() - 1
+        ))),
+    }
+}
+
 fn one<'a>(args: &'a [Object], name: &str) -> Result<&'a Object, RuntimeError> {
     args.first()
         .ok_or_else(|| type_error(format!("{name}() takes 1 argument (0 given)")))
@@ -5775,7 +5790,7 @@ fn parse_int_string(
 // ---------- int methods (RFC 0019) ----------
 
 fn int_bit_length(args: &[Object]) -> Result<Object, RuntimeError> {
-    let v = one(args, "bit_length")?;
+    let v = self_only(args, "int.bit_length")?;
     match v {
         Object::Int(i) => {
             return Ok(Object::Int(i64::from(
@@ -5796,7 +5811,7 @@ fn int_bit_length(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn int_bit_count(args: &[Object]) -> Result<Object, RuntimeError> {
-    let v = one(args, "bit_count")?;
+    let v = self_only(args, "int.bit_count")?;
     match v {
         Object::Int(i) => return Ok(Object::Int(i64::from(i.unsigned_abs().count_ones()))),
         Object::Bool(b) => return Ok(Object::Int(i64::from(*b))),
@@ -5816,17 +5831,17 @@ fn int_bit_count(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn int_conjugate(args: &[Object]) -> Result<Object, RuntimeError> {
-    let v = one(args, "conjugate")?;
+    let v = self_only(args, "int.conjugate")?;
     Ok(v.clone())
 }
 
 fn int_is_integer(args: &[Object]) -> Result<Object, RuntimeError> {
-    let _ = one(args, "is_integer")?;
+    let _ = self_only(args, "int.is_integer")?;
     Ok(Object::Bool(true))
 }
 
 fn int_as_integer_ratio(args: &[Object]) -> Result<Object, RuntimeError> {
-    let v = one(args, "as_integer_ratio")?;
+    let v = self_only(args, "int.as_integer_ratio")?;
     // The numerator is a *plain* int even when self is a bool or an int
     // subclass (CPython's long_as_integer_ratio calls _PyLong_Copy;
     // test_long asserts `type(True.as_integer_ratio()[0]) is int`).
@@ -6124,7 +6139,7 @@ fn float_receiver(v: &Object) -> Option<f64> {
 }
 
 fn float_is_integer(args: &[Object]) -> Result<Object, RuntimeError> {
-    let v = one(args, "is_integer")?;
+    let v = self_only(args, "float.is_integer")?;
     match float_receiver(v) {
         Some(f) => Ok(Object::Bool(f.is_finite() && f.fract() == 0.0)),
         None => Err(type_error("is_integer: float expected")),
@@ -6132,7 +6147,7 @@ fn float_is_integer(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn float_hex(args: &[Object]) -> Result<Object, RuntimeError> {
-    let v = one(args, "hex")?;
+    let v = self_only(args, "float.hex")?;
     match float_receiver(v) {
         Some(f) => Ok(Object::from_str(format_float_hex(f))),
         None => Err(type_error("hex: float expected")),
@@ -6177,7 +6192,7 @@ fn float_fromhex_wrap(cls: Option<&Object>, x: f64) -> Result<Object, RuntimeErr
 }
 
 fn float_as_integer_ratio(args: &[Object]) -> Result<Object, RuntimeError> {
-    let v = one(args, "as_integer_ratio")?;
+    let v = self_only(args, "float.as_integer_ratio")?;
     let Some(f) = float_receiver(v) else {
         return Err(type_error("as_integer_ratio: float expected"));
     };
@@ -6251,7 +6266,7 @@ fn float_as_integer_ratio(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn float_conjugate(args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(one(args, "conjugate")?.clone())
+    Ok(self_only(args, "float.conjugate")?.clone())
 }
 
 fn float_trunc(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -11112,8 +11127,13 @@ fn float_to_int_obj(r: f64) -> Object {
 /// unchanged; negative `ndigits` round to a power of ten (ties-to-even).
 fn round_int(value: &Object, ndigits: Option<i64>) -> Result<Object, RuntimeError> {
     let n = match ndigits {
-        None => return Ok(value.clone()),
-        Some(n) if n >= 0 => return Ok(value.clone()),
+        // `bool.__round__` is `int.__round__`: the result is a plain `int`.
+        None | Some(0..) => {
+            return Ok(match value {
+                Object::Bool(b) => Object::Int(i64::from(*b)),
+                _ => value.clone(),
+            });
+        }
         Some(n) => n,
     };
     // Negative ndigits: round to 10^(-n) via BigInt to stay exact.

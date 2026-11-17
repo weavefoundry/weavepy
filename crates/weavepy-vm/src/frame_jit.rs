@@ -14423,6 +14423,18 @@ fn len_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
             [Object::Bytes(b)] => b.len(),
             // A dict's keys, values or items view: the dict's size.
             [Object::DictView(v)] => v.dict.peek()?.len(),
+            // A builtin subclass's own `__len__`: its payload's.
+            [Object::Instance(inst)] => {
+                let native = Interpreter::native_payload_for(
+                    inst,
+                    crate::types::vm_key::NATIVE_LEN,
+                    "__len__",
+                )?;
+                if matches!(native, Object::Instance(_)) {
+                    return None;
+                }
+                return len_fast(std::slice::from_ref(native));
+            }
             _ => return None,
         }
     };
@@ -14498,7 +14510,23 @@ unsafe fn call_kernel_in_place(s: &mut State, site: &BuiltinSite, lenu: usize) -
             _ => std::ptr::null(),
         };
         if let (false, Some(kernel), false) = (recv.is_null(), site.kernel, s.sw.is_null()) {
-            if (*recv).tag() == site.recv_tag {
+            // A builtin subclass's instance (a `Counter`'s `get`, a list
+            // subclass's `append`): the kernel on the native value backing
+            // it, as the method's receiver unwrapping runs the body. A dict
+            // view keeps the instance (its body unwraps it); an opaque body
+            // isn't run on one.
+            use crate::LeafKind as K;
+            let (recv, tag) = match &*recv {
+                Object::Instance(inst) => match (inst.native.get(), site.kind) {
+                    (None, _) | (_, Some(K::Opaque) | None) => (recv, (*recv).tag()),
+                    (Some(native), Some(K::DictKeys | K::DictValues | K::DictItems)) => {
+                        (recv, native.tag())
+                    }
+                    (Some(native), _) => (std::ptr::from_ref(native), native.tag()),
+                },
+                r => (recv, r.tag()),
+            };
+            if tag == site.recv_tag {
                 let arg = |k: usize| {
                     if k <= site.argc {
                         base.add(start + 1 + k).cast_const()
@@ -14591,6 +14619,20 @@ unsafe fn call_leaf_in_place(
             {
                 let slots = bound.as_mut_ptr();
                 slots.write((&raw const bm.receiver).read());
+                std::ptr::copy_nonoverlapping(base.add(start + 2), slots.add(1), site.argc);
+                Some(std::slice::from_raw_parts(
+                    slots.cast_const(),
+                    site.argc + 1,
+                ))
+            }
+            // An instance whose class's native `__call__` is the builtin
+            // (`key(elem)` of an `itemgetter(1)`): the instance first, as
+            // the call's rewrite in `h_call` would pass it.
+            (Object::Instance(inst), Object::Unbound)
+                if site.argc < bound.len() && Interpreter::instance_calls_native(inst, site.f) =>
+            {
+                let slots = bound.as_mut_ptr();
+                slots.write(base.add(start).read());
                 std::ptr::copy_nonoverlapping(base.add(start + 2), slots.add(1), site.argc);
                 Some(std::slice::from_raw_parts(
                     slots.cast_const(),
