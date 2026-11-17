@@ -20403,6 +20403,45 @@ impl Interpreter {
             return self.core_new_user(sw, pc, argc, &ty, &plan, &new_f);
         }
         let Some((init, code)) = plan.lean_init.as_ref() else {
+            // `C(x)` for a subclass of an immutable built-in that keeps the
+            // base's `__new__` and `object.__init__`, of an argument of the
+            // base's own type: the base's constructor returns the argument
+            // itself, so it is the payload (`configparser._Line`'s `str`).
+            if argc == 1
+                && plan.user_new.is_none()
+                && plan.init_from_object
+                && ty.native_kind.get() == 0
+            {
+                if let crate::types::NativeKind::Value {
+                    base,
+                    mutable: false,
+                } = &plan.native
+                {
+                    let fits = base.flags.is_builtin
+                        && matches!(
+                            (base.name.as_str(), &frame.stack[self_slot + 1]),
+                            ("str", Object::Str(_))
+                                | ("int", Object::Int(_))
+                                | ("float", Object::Float(_))
+                                | ("tuple", Object::Tuple(_))
+                                | ("bytes", Object::Bytes(_))
+                                | ("frozenset", Object::FrozenSet(_))
+                        );
+                    if fits {
+                        let payload = frame.stack.pop().expect("the argument");
+                        let inst =
+                            Object::Instance(Rc::new(PyInstance::with_native(ty.clone(), payload)));
+                        gc_trace::track(&inst);
+                        frame.stack.truncate(callee_slot);
+                        frame.stack.push(inst);
+                        frame.pc = pc as u32 + 1;
+                        if gc_trace::maybe_auto_collect() {
+                            self.run_pending_finalizers();
+                        }
+                        return true;
+                    }
+                }
+            }
             // `E(*args)` for an exception class that keeps
             // `BaseException`'s allocator and `__init__`: the allocation,
             // and that `__init__`'s `args` (and a `StopIteration`'s
