@@ -639,6 +639,29 @@ impl Interpreter {
             Object::Type(t) => Rc::ptr_eq(t, &builtin_types().bool_),
             _ => false,
         };
+        // A plain sequence cursor's items whose truth is plain data, stepped
+        // in place: anything else (an item whose `__bool__` could run code,
+        // the end) is the general step's, from where this one stopped.
+        if check_true {
+            if let Object::Iter(it) = source {
+                // SAFETY: nothing below runs code while the view lives (a
+                // falsy item dropped here is a scalar or a `str`).
+                if let Some(cursor) = unsafe { it.peek_mut() } {
+                    while let Some(item) = cursor.pure_peek() {
+                        match scalar_truth(&item) {
+                            Some(true) => {
+                                cursor.pure_skip();
+                                return Ok(Some(item));
+                            }
+                            Some(false) => {
+                                cursor.pure_skip();
+                            }
+                            None => break,
+                        }
+                    }
+                }
+            }
+        }
         loop {
             let Some(item) = self.seq_step_source(source, globals)? else {
                 return Ok(None);
