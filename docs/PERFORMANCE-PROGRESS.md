@@ -476,6 +476,57 @@ branch and pull request.
 
 ## Done
 
+- **Container operators, iteration adapters, and class method sites**
+  (PR #112, November 17). Ratios are instructions, WeavePy's over
+  CPython's; cycles where noted.
+  - A `BINARY_OP` that built a heap value on the generic path didn't mark
+    its site, so compiled code took the numbers' helper and left at the
+    next instruction (`d1 | d2`, `k & s`, `b * 3`). The site is marked
+    now, and compiled code serves dict union, `bytes` repetition and
+    `bytes % args` natively. `plain_compare` answers two exact dicts' `==`
+    (1,135 cycles to 215, CPython 160), two sets' comparisons (1,444 to
+    710, against 400) and a keys view against a set (1,083 to 753,
+    against 542) when no key or value can run Python.
+  - `zip` replaced its result tuple whenever it built one, so `for t in
+    zip(xs, ys)`, which still holds the last tuple, never reused one; it
+    keeps the tuple before as a spare now, indexes tuple and list cursors
+    directly, and stops in compiled code when its release frees nothing
+    that could finalize: a ten-item `for t in zip(t, t)` 3,878 cycles to
+    2,460 (1,770), three sources unpacked 5,366 to 3,788 (1,917).
+    `list(islice(lst, 10))` takes the slice at once (7,879 instructions to
+    4,620, against 3,679), a collecting consumer takes a `yield from` over
+    a sequence in one run (12,506 to 8,171, against 5,490), and
+    `dict(zip(ks, gen))` takes its pairs straight from the sources
+    (16,066 to 11,355, against 6,247).
+  - A method load on a user class receiver resolved `C.s(x)` and
+    `C.make()` through the type lanes every time: the site remembers a
+    class's plain function, static or class method now, keyed by the
+    class's and its metaclass's versions, a metaclass method of the same
+    name being a non-data descriptor the class overrides (`C.s(1)` 919 to
+    297, against 678; `Color(1)` 5,491 to 3,917, against 2,672).
+    `object.__setattr__` stores into a plain instance natively, which a
+    frozen dataclass's `__init__` calls per field (`Key(i, "x")` 5,135 to
+    3,956, against 3,392), and the current interpreter, which 248 builtin
+    sites look up, is one thread-local load.
+  - A frameless call of a pure leaf with keyword-only parameters cached no
+    call shape, so the frame JIT never knew the callee: `fkw(i)` for `def
+    fkw(a, b=2, *, c=3)` 901 to 356 (677). `None` and `bool` keys take the
+    native dict probe (argparse's `registry[None] = cls`), a list's
+    unit-step slice assignment splices in place, the type cache compares
+    names up to 32 bytes in line (17-byte dunders went to `memcmp`), and
+    tier 2 stops analyzing code from its back edges once it has handed the
+    code to the frame JIT (argparse's `_parse_known_args` was analyzed
+    ten times, twice each).
+  - What's left. Battery geomean 1.197 instructions. The worst cases are
+    flat profiles of interpreted library code: argparse's per-iteration
+    cost is 2.3 times CPython's with both JITs off or on, since it runs
+    mostly cold code, where the core loop's call and return cost about
+    700 instructions to CPython's 200. Exceptions (a raise caught in the
+    caller 2.1, same frame 1.7) spread over about 40 helpers, creating the
+    instance alone about 680 instructions to 250; a generator resume's
+    trampoline is 291 instructions of checks and setup, `FOR_ITER`'s
+    dispatch to it 80 more.
+
 - **Generator drains, a warm-up gate, and email's token tree** (PR #112,
   November 16, evening). Ratios are instructions, WeavePy's over
   CPython's.
