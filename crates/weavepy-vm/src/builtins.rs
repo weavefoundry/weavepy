@@ -514,6 +514,12 @@ fn lookup_method_memo(obj: &Object, name: &str, tag: u8) -> Option<Object> {
             _ => {}
         }
     }
+    // A dict's `update` from another plain dict whose keys run no code.
+    if let (Object::Dict(_), Some(Object::Builtin(b))) = (obj, &found) {
+        if name == "update" {
+            crate::leaf_builtins::register_fast(b, dict_update_fast);
+        }
+    }
     let mut memo = memo.borrow_mut();
     if memo.len() <= usize::from(tag) {
         memo.resize_with(usize::from(tag) + 1, Default::default);
@@ -14654,6 +14660,19 @@ fn dict_pop(args: &[Object]) -> Result<Object, RuntimeError> {
     } else {
         Err(key_error_object(key.clone()))
     }
+}
+
+/// `d.update(other)`'s leaf half: a plain dict merged from another whose
+/// keys' hashing and equality run no code (see
+/// `Interpreter::dict_merge_plain`), `None` for anything else.
+fn dict_update_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Dict(d), Object::Dict(src)] = args else {
+        return None;
+    };
+    if Rc::ptr_eq(d, src) || crate::capi_watchers::dicts_active() {
+        return None;
+    }
+    crate::Interpreter::dict_merge_plain(d, src).then_some(Ok(Object::None))
 }
 
 fn dict_update(args: &[Object]) -> Result<Object, RuntimeError> {

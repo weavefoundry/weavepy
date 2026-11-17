@@ -47916,7 +47916,10 @@ impl Interpreter {
     /// (distinct dicts) when no key on either side can run Python code to
     /// hash or compare (see [`crate::object::dict_key_is_reentrant`]), with
     /// the same effects as one insert per key. `false` touches nothing.
-    fn dict_merge_plain(&self, dst: &Rc<RefCell<DictData>>, src: &Rc<RefCell<DictData>>) -> bool {
+    pub(crate) fn dict_merge_plain(
+        dst: &Rc<RefCell<DictData>>,
+        src: &Rc<RefCell<DictData>>,
+    ) -> bool {
         // A destination this large is merged key by key: checking its keys
         // could cost more than the merge saves.
         const DST_CHECK_CAP: usize = 32;
@@ -47973,7 +47976,7 @@ impl Interpreter {
         if let (Object::Dict(dd), Object::Dict(src)) = (dst, other) {
             if !Rc::ptr_eq(dd, src)
                 && !crate::capi_watchers::dicts_active()
-                && self.dict_merge_plain(dd, src)
+                && Self::dict_merge_plain(dd, src)
             {
                 return Ok(());
             }
