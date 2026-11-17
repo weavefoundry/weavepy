@@ -10462,6 +10462,9 @@ unsafe extern "C" fn wpjit_build_map(frame: *mut JitFrame, n: i64) -> i64 {
     }
     let n = n as usize;
     let mut d = DictData::with_capacity_and_hasher(n, crate::fasthash::FxBuildHasher);
+    // (Keys whose hashes differ from every earlier key's go in without the
+    // probe for an equal one; a repeated key replaces, as the literal's.)
+    let mut seen = [0i64; 8];
     for p in 0..n {
         // SAFETY: per the function contract, `2n` marshaled entries
         // and tags are live.
@@ -10470,18 +10473,29 @@ unsafe extern "C" fn wpjit_build_map(frame: *mut JitFrame, n: i64) -> i64 {
         let Some(k) = boxed_element(ctx, kbits, ktag) else {
             return -1;
         };
-        if !matches!(k, Object::Str(_) | Object::Int(_)) {
-            return -1;
-        }
+        let h = match &k {
+            Object::Str(s) => crate::shared_value::SharedStr::hash_cached(s),
+            Object::Int(i) => crate::object::py_hash_long_i64(*i),
+            _ => return -1,
+        };
         let Some(v) = boxed_element(ctx, vbits, vtag) else {
             return -1;
         };
-        d.insert(DictKey(k), v);
+        if p < seen.len() && !seen[..p].contains(&h) {
+            seen[p] = h;
+            d.insert_unique_hashed(h, DictKey(k), v);
+        } else {
+            if p < seen.len() {
+                seen[p] = h;
+            }
+            d.insert(DictKey(k), v);
+        }
     }
     let obj = Object::Dict(Rc::new(GilRefCell::new(d)));
-    // The interpreter tracks every dict it builds; a natively built
-    // dict is no different.
-    crate::gc_trace::track(&obj);
+    // The interpreter tracks every dict it builds; a natively built one
+    // is deferred as a built dict is, a collection promoting it once it
+    // can anchor a cycle.
+    crate::gc_trace::track_built(&obj);
     let idx = ctx.pins.len() as i64;
     ctx.pins.push(Pin::Obj(obj));
     idx

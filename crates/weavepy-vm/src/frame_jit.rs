@@ -10911,13 +10911,34 @@ unsafe extern "C" fn h_build_map(at: *mut Object, n: u64) -> u32 {
         }
         let mut d =
             crate::object::DictData::with_capacity_and_hasher(n, crate::fasthash::FxBuildHasher);
+        // `str` and `int` keys whose hashes differ from every earlier key's
+        // go in without the probe for an equal one (a repeated key, or a
+        // `bool` or `None` among them, takes it: `True` equals `1`).
+        let mut seen = [0i64; 8];
+        let plain = n <= seen.len()
+            && (0..n).all(|j| matches!(&*at.add(2 * j), Object::Str(_) | Object::Int(_)));
         for j in 0..n {
             let k = at.add(2 * j).read();
             let v = at.add(2 * j + 1).read();
+            if plain {
+                let h = match &k {
+                    Object::Str(s) => crate::shared_value::SharedStr::hash_cached(s),
+                    Object::Int(i) => crate::object::py_hash_long_i64(*i),
+                    _ => unreachable!("checked above"),
+                };
+                let fresh = !seen[..j].contains(&h);
+                seen[j] = h;
+                if fresh {
+                    d.insert_unique_hashed(h, crate::object::DictKey(k), v);
+                    continue;
+                }
+            }
             d.insert(crate::object::DictKey(k), v);
         }
         let obj = Object::Dict(Rc::new(crate::sync::RefCell::new(d)));
-        crate::gc_trace::track(&obj);
+        // (Deferred as a built dict is, a collection promoting it once it
+        // can anchor a cycle.)
+        crate::gc_trace::track_built(&obj);
         at.write(obj);
     }
     0
