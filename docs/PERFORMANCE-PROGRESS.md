@@ -591,6 +591,20 @@ branch and pull request.
     through the general call (`set.update` also cloned the whole set as a
     snapshot on every call): `x = {}; x.update(sd)` 2,237 to 1,771 (1,500),
     `x = set(); x.update(t)` 3,598 to 1,978 (1,700).
+  - Strings and collection. `str.partition` and `rpartition` return the
+    separator and an unsplit string themselves, as CPython does, and build
+    their pieces from slices; `splitlines` and `split` scan short ASCII
+    strings by byte; one-character pieces are the shared strings
+    (`partition` 1,266 to 838, against 987; `splitlines` 1,574 to 1,215,
+    against 997). `list(enumerate(xs))` over a list or tuple builds its
+    pairs at once (6,843 to 4,853, against 4,521).
+  - Leaks found on the way. A cycle through a list or dict that a builtin
+    built was never collected when the builtin didn't register it: list
+    slices and starred targets in the core loop, `list.copy()`, `dir()`,
+    `json.loads`, `re.findall`, `dict.fromkeys`, the generic `dict | dict`,
+    `+` and `*` of lists, and every binder's `**kwargs` dict. They now
+    defer their tracking as other built containers do (a `**kwargs` call
+    pays about 170 instructions for it, `json_bench` 4%).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
