@@ -21343,7 +21343,11 @@ impl Interpreter {
         match c {
             Object::List(items) => {
                 let items = items.try_borrow().ok()?;
-                Some(Object::new_list(slice_seq(&items, sl).ok()?))
+                let out = Object::new_list(slice_seq(&items, sl).ok()?);
+                // (Deferred without scanning: a cycle through it is still
+                // the collector's to find.)
+                gc_trace::track_built(&out);
+                Some(out)
             }
             Object::Tuple(items) => {
                 // A contiguous slice clones its range straight into the new
@@ -22768,6 +22772,7 @@ impl Interpreter {
                         };
                         let mid_end = items.len() - after;
                         let mid = Object::new_list(items[before..mid_end].to_vec());
+                        gc_trace::track_built(&mid);
                         let mut k = len - 1;
                         for x in items[mid_end..].iter().rev() {
                             base.add(k).write(clone_hot(x));
@@ -30138,7 +30143,9 @@ impl Interpreter {
                     for x in items[mid_end..].iter().rev() {
                         stack.push(x.clone());
                     }
-                    stack.push(Object::new_list(items[before..mid_end].to_vec()));
+                    let mid = Object::new_list(items[before..mid_end].to_vec());
+                    gc_trace::track_built(&mid);
+                    stack.push(mid);
                     for x in items[..before].iter().rev() {
                         stack.push(x.clone());
                     }
