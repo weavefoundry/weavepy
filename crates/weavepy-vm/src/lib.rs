@@ -24540,12 +24540,22 @@ impl Interpreter {
         let missing = match hit {
             Some((missing, slot_self)) if slot_self == has_self => missing,
             Some(_) => return None,
-            // A positional call caches no shape for keyword-only
-            // parameters (the defaults bind them below): its count of
-            // positional defaults, directly.
+            // A callee with keyword-only parameters (the defaults bind
+            // them below): its count of positional defaults, cached as the
+            // site's shape, which the framed call binds and compiled code
+            // lowers in line from.
             None if code_rc.kwonly_count != 0 => {
                 let given = ops.len() - 2 + usize::from(has_self);
-                u32::try_from(Self::missing_defaults(f, code_rc, given)?).ok()?
+                let missing = u32::try_from(Self::missing_defaults(f, code_rc, given)?).ok()?;
+                if let Some(slot) = code_call_slot(code, pc) {
+                    slot.set(CallShape {
+                        func: Rc::downgrade(f),
+                        code: Rc::downgrade(code_rc),
+                        missing,
+                        has_self,
+                    });
+                }
+                missing
             }
             None => return None,
         };
