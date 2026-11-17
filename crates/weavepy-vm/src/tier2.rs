@@ -13967,6 +13967,47 @@ unsafe extern "C" fn wpjit_iter_next_pair(
     let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
     // SAFETY: the `&mut Interpreter` is dormant while the helper runs.
     let interp = unsafe { &mut *ctx.interp };
+    // A list's or tuple's next element that is a pair whose halves pack
+    // into the two lanes (`for a, b in pairs`): read where it sits, the
+    // cursor advanced once both packed. (The views are guard-free: nothing
+    // below runs code, and packing touches only the pin table.)
+    let at: Option<(*const Object, *mut usize)> = match ctx.pins.get(pin as usize) {
+        // SAFETY: as above.
+        Some(Pin::Obj(Object::Iter(cell))) => match unsafe { cell.peek_mut() } {
+            Some(PyIterator::List {
+                items,
+                index,
+                owner: None,
+            }) => unsafe { items.peek() }
+                .and_then(|xs| xs.get(*index))
+                .map(|v| (std::ptr::from_ref(v), std::ptr::from_mut(index))),
+            Some(PyIterator::Tuple { items, index }) => items
+                .get(*index)
+                .map(|v| (std::ptr::from_ref(v), std::ptr::from_mut(index))),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some((v, index)) = at {
+        // SAFETY: the element and the cursor live in the source's and the
+        // iterator's own allocations, which the pinned iterator keeps, and
+        // packing pushes only onto the pin table.
+        if let Object::Tuple(t) = unsafe { &*v } {
+            if let [a, b] = &t[..] {
+                let packed1 = pack_iter_elem(a, tag1, &mut ctx.pins, &mut ctx.pin_memo);
+                let packed2 =
+                    packed1.and_then(|_| pack_iter_elem(b, tag2, &mut ctx.pins, &mut ctx.pin_memo));
+                if let (Some(b1), Some(b2)) = (packed1, packed2) {
+                    // SAFETY: as above.
+                    unsafe { *index += 1 };
+                    jf.ret_bits = b1;
+                    // SAFETY: the marshal buffer is at least one slot wide.
+                    unsafe { *jf.call_args = b2 };
+                    return 0;
+                }
+            }
+        }
+    }
     // `enumerate` over bytes or tuples into typed lanes first: one peek
     // tells any other iterator apart, where the list, tuple and
     // `dict.items()` steps below would each borrow and inspect it (an
