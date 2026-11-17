@@ -31793,6 +31793,45 @@ impl Interpreter {
         }
     }
 
+    /// The leaf half (see `leaf_builtins::register_fast`) of `inst`'s
+    /// `__setitem__` when the class resolves it to a built-in base's own
+    /// (an `OrderedDict`'s), cached on the class under its attribute
+    /// version. A store it settles runs no Python code.
+    #[inline]
+    pub(crate) fn instance_setitem_leaf(inst: &PyInstance) -> Option<leaf_builtins::Fast> {
+        use crate::types::LeafAttrKind as K;
+        let cls = inst.cls_raw();
+        let ver = cls.attr_version.get();
+        let key = crate::types::AttrKey::vm(crate::types::vm_key::SETITEM_LEAF);
+        match cls.leaf_attrs.get(key, ver) {
+            Some(K::LeafFast(f)) => Some(*f),
+            Some(_) => None,
+            None => Self::instance_setitem_leaf_slow(cls, key, ver),
+        }
+    }
+
+    #[inline(never)]
+    fn instance_setitem_leaf_slow(
+        cls: &crate::types::TypeObject,
+        key: crate::types::AttrKey,
+        ver: u64,
+    ) -> Option<leaf_builtins::Fast> {
+        use crate::types::LeafAttrKind as K;
+        if crate::object::exotic_str_keys_possible() {
+            return None;
+        }
+        let fast = match cls.lookup("__setitem__") {
+            Some(Object::Builtin(b)) if b.binds_instance => match leaf_builtins::lookup(&b) {
+                Some((_, leaf_builtins::Entry::Fast(f))) => Some(f),
+                _ => None,
+            },
+            _ => None,
+        };
+        cls.leaf_attrs
+            .set(key, ver, fast.map_or(K::Other, K::LeafFast));
+        fast
+    }
+
     /// Whether `inst`'s `__getitem__` is a built-in base's own over its
     /// native payload (a `defaultdict`'s): the native subscript serves it.
     fn native_payload_getitem(inst: &PyInstance) -> bool {
@@ -34277,7 +34316,7 @@ impl Interpreter {
                 K::ValueModule(w) => Some(LeafAttr::Value(Object::Module(w.upgrade()?))),
                 K::Property(w) => Some(LeafAttr::Property(w.upgrade()?)),
                 K::TupleField(ix) => Some(LeafAttr::TupleField(*ix)),
-                K::DataDescr { .. } | K::Other => None,
+                K::DataDescr { .. } | K::LeafFast(_) | K::Other => None,
             };
         }
         if crate::object::exotic_str_keys_possible() {
@@ -34373,7 +34412,7 @@ impl Interpreter {
             K::ValueModule(w) => w.upgrade().map(|m| LeafAttr::Value(Object::Module(m))),
             K::Property(w) => w.upgrade().map(LeafAttr::Property),
             K::TupleField(ix) => Some(LeafAttr::TupleField(*ix)),
-            K::DataDescr { .. } | K::Other => None,
+            K::DataDescr { .. } | K::LeafFast(_) | K::Other => None,
         };
         cls.leaf_attrs.set(name_key, ver, kind);
         out
@@ -85408,6 +85447,47 @@ pub(crate) unsafe extern "C" fn h_inst_dict_set<const OWNED: u32>(
         rk.run();
         rc.run();
         crate::drop_hot(old);
+        0
+    }
+}
+
+/// `STORE_SUBSCR` into an instance whose class resolves `__setitem__` to a
+/// built-in base's own with a leaf half (an `OrderedDict`'s; see
+/// [`Interpreter::instance_setitem_leaf`]): as [`h_inst_dict_set`], with the
+/// owned operands flagged in `owned`, the half storing it. The half only
+/// borrows its arguments and runs no code, so it is handed bitwise copies.
+pub(crate) unsafe fn inst_leaf_set(
+    val: *const Object,
+    cont: *const Object,
+    key: *const Object,
+    owned: u32,
+) -> u32 {
+    // SAFETY: as `h_dict_set`'s; the copies are never dropped, and the
+    // originals outlive the call (no code runs to release them).
+    unsafe {
+        let (c, k) = (&*cont, &*key);
+        let Object::Instance(inst) = c else {
+            return 1;
+        };
+        let Some(fast) = Interpreter::instance_setitem_leaf(inst) else {
+            return 1;
+        };
+        let (Some(rc), Some(rk)) = (
+            PlainRelease::of(c, owned & 2 != 0),
+            PlainRelease::of(k, owned & 4 != 0),
+        ) else {
+            return 1;
+        };
+        let args = std::mem::ManuallyDrop::new([cont.read(), key.read(), val.read()]);
+        // (A half that fails is left to the full path, which reports it.)
+        let Some(Ok(_)) = fast(&args[..]) else {
+            return 1;
+        };
+        if owned & 1 != 0 {
+            crate::drop_hot(val.read());
+        }
+        rk.run();
+        rc.run();
         0
     }
 }

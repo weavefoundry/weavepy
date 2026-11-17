@@ -13391,6 +13391,31 @@ unsafe extern "C" fn wpjit_dyn_setitem(frame: *mut JitFrame, _arg: i64, _unused:
         unpack_pins(*jf.call_args.add(k), *jf.call_tags.add(k), &ctx.pins)
     });
     ctx.dirty = true;
+    // A built-in base's own `__setitem__` with a leaf half (an
+    // `OrderedDict`'s): the half stores it, running no code, so no guard can
+    // have broken.
+    if let Object::Instance(inst) = &container {
+        if let Some(fast) = super::Interpreter::instance_setitem_leaf(inst) {
+            let args = [container, index, value];
+            match fast(&args) {
+                Some(Ok(_)) => {
+                    if finalizer_queued() {
+                        ctx.parked = None;
+                        return 2;
+                    }
+                    return 0;
+                }
+                Some(Err(err)) => {
+                    ctx.raised = Some(err);
+                    return 1;
+                }
+                None => {
+                    let [c, i, v] = args;
+                    return dyn_setitem_full(interp, ctx, &c, &i, v);
+                }
+            }
+        }
+    }
     // A `dict` subclass's instance that keeps `dict.__setitem__`, by a key
     // that compares natively: stored as compiled code's `h_inst_dict_set`
     // stores it (the store runs no code, so no guard can have broken).
@@ -13408,7 +13433,18 @@ unsafe extern "C" fn wpjit_dyn_setitem(frame: *mut JitFrame, _arg: i64, _unused:
             return 0;
         }
     }
-    match interp.subscr_set_public(&container, &index, value) {
+    dyn_setitem_full(interp, ctx, &container, &index, value)
+}
+
+/// [`wpjit_dyn_setitem`]'s general store.
+fn dyn_setitem_full(
+    interp: &mut super::Interpreter,
+    ctx: &mut CallCtx,
+    container: &Object,
+    index: &Object,
+    value: Object,
+) -> i64 {
+    match interp.subscr_set_public(container, index, value) {
         Err(err) => {
             ctx.raised = Some(err);
             1

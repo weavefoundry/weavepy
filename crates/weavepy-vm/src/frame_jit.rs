@@ -6150,6 +6150,11 @@ unsafe fn store_subscr_fast(
         // A `dict` subclass's instance that keeps `dict.__setitem__` (see
         // `subscr_fast`).
         if let (Object::Instance(_), Object::Str(_) | Object::Int(_)) = (c, k) {
+            // A built-in base's own `__setitem__` with a leaf half (an
+            // `OrderedDict`'s).
+            if crate::inst_leaf_set(val, cont, key, owned & 7) == 0 {
+                return 0;
+            }
             return match owned & 7 {
                 0 => crate::h_inst_dict_set::<0>(val, cont, key),
                 1 => crate::h_inst_dict_set::<1>(val, cont, key),

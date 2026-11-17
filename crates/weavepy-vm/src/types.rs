@@ -800,6 +800,7 @@ pub(crate) mod vm_key {
     pub(crate) const ITER_FN: u32 = 27;
     pub(crate) const FLOAT_FN: u32 = 28;
     pub(crate) const INT_FN: u32 = 29;
+    pub(crate) const SETITEM_LEAF: u32 = 30;
     /// Per comparison (eight).
     pub(crate) const CMP: u32 = 32;
     /// Per binary operator (sixteen each): its method, and whether the
@@ -855,6 +856,10 @@ pub enum LeafAttrKind {
         get: crate::sync::Weak<crate::object::PyFunction>,
         dver: u64,
     },
+    /// A built-in base's own special method with a registered leaf half
+    /// (see `leaf_builtins::register_fast`): the half, which runs no Python
+    /// code.
+    LeafFast(crate::leaf_builtins::Fast),
     /// Anything else: the full path decides.
     Other,
 }
