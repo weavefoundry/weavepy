@@ -16045,7 +16045,26 @@ pub fn buffer_exported_view(obj: &Object, flags: i64) -> Option<Rc<crate::object
     }
 }
 
+/// The lowercase hex digits of `data`, two a byte.
+fn hex_ascii(data: &[u8]) -> SharedStr {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let len = data.len() * 2;
+    // SAFETY: hex digits are ASCII, one code point a byte, `len` in all.
+    unsafe {
+        SharedStr::build_unchecked(len, Some(len), |w| {
+            for &b in data {
+                w.push(&[HEX[usize::from(b >> 4)], HEX[usize::from(b & 15)]]);
+            }
+        })
+    }
+}
+
 fn bytes_hex_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    // `b.hex()` of bytes without a separator: the digits straight into the
+    // string's own allocation.
+    if let ([Object::Bytes(b)], []) = (args, kwargs) {
+        return Ok(Object::Str(hex_ascii(b)));
+    }
     let data = match args.first() {
         Some(Object::MemoryView(mv)) => mv.to_bytes(),
         _ => bytes_data(args)?.into_owned(),
@@ -16599,7 +16618,56 @@ fn bytes_split_args(
     Ok((data.into_owned(), sep, maxsplit))
 }
 
+/// `b.split()` or `b.split(sep)` of bytes by bytes, no `maxsplit`: each
+/// piece made from its slice once.
+fn bytes_split_plain(data: &[u8], sep: Option<&[u8]>) -> Object {
+    let piece = |p: &[u8]| {
+        if p.is_empty() {
+            Object::new_bytes(Vec::new())
+        } else {
+            Object::Bytes(SharedSlice::from(p))
+        }
+    };
+    let mut parts = Vec::new();
+    match sep {
+        None => {
+            let mut i = 0;
+            while i < data.len() {
+                while i < data.len() && byte_is_pyspace(data[i]) {
+                    i += 1;
+                }
+                if i >= data.len() {
+                    break;
+                }
+                let start = i;
+                while i < data.len() && !byte_is_pyspace(data[i]) {
+                    i += 1;
+                }
+                parts.push(piece(&data[start..i]));
+            }
+        }
+        Some(sep) => {
+            let mut start = 0;
+            while let Some(rel) = bytes_search(&data[start..], sep) {
+                parts.push(piece(&data[start..start + rel]));
+                start += rel + sep.len();
+            }
+            parts.push(piece(&data[start..]));
+        }
+    }
+    Object::new_list(parts)
+}
+
 fn bytes_split_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    match (args, kwargs) {
+        ([Object::Bytes(b)], []) | ([Object::Bytes(b), Object::None], []) => {
+            return Ok(bytes_split_plain(b, None));
+        }
+        ([Object::Bytes(b), Object::Bytes(sep)], []) if !sep.is_empty() => {
+            return Ok(bytes_split_plain(b, Some(sep)));
+        }
+        _ => {}
+    }
     let (data, sep, maxsplit) = bytes_split_args(args, kwargs, "split")?;
     let mut parts: Vec<Vec<u8>> = Vec::new();
     match sep {
