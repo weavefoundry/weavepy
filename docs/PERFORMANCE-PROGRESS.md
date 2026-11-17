@@ -534,7 +534,13 @@ branch and pull request.
     its elements (a collection promotes the deferred ones that can anchor
     a cycle first): `{'a': i, 'b': 2}` 1,331 to 1,119 (937). `bytes.strip`
     tests membership through a table, and `dict(zip(ks, gen))` takes its
-    pairs straight from the sources.
+    pairs straight from the sources. Tier 2 gives up OSR entries that
+    average fewer than 16 iterations (the floor was 8): `difflib`'s
+    `find_longest_match` entered its inner loop about nine times a pass,
+    paying a hand-off and a frame rebuild each time while the frame JIT,
+    which had left the code to tier 2, kept its outer loop interpreted;
+    `SequenceMatcher(...).ratio()` ran 10,265,084 instructions to
+    4,195,398 (CPython 4,487,196).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
