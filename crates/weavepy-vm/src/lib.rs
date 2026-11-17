@@ -78946,7 +78946,7 @@ fn freeze_set_result(o: Object) -> Object {
 /// [`crate::object::dict_key_is_reentrant`]), and a comparison with a
 /// stored key that would run Python defers instead. `None` (nothing
 /// observable done) sends the operation to the snapshot path.
-fn set_algebra_fast(a: &Object, b: &Object, op: BinOpKind) -> Option<Object> {
+pub(crate) fn set_algebra_fast(a: &Object, b: &Object, op: BinOpKind) -> Option<Object> {
     // Whether every key of `o` hashes and compares natively.
     fn plain(o: &Object) -> bool {
         let check = |s: &crate::object::SetData| {

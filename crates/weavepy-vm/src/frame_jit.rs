@@ -6367,6 +6367,20 @@ unsafe extern "C" fn h_binop(at: *mut Object, kind: u32) -> u32 {
             {
                 Interpreter::core_seq_repeat(a, b)
             }
+            // Two sets' union, intersection, difference or symmetric
+            // difference whose keys hash and compare natively (the core
+            // loop's set lane; an in-place one mutates, and is its own).
+            (Object::Set(_) | Object::FrozenSet(_), Object::Set(_) | Object::FrozenSet(_))
+                if !inplace
+                    && matches!(
+                        kind,
+                        BinOpKind::BitOr | BinOpKind::BitAnd | BinOpKind::Sub | BinOpKind::BitXor
+                    )
+                    && droppable(a)
+                    && droppable(b) =>
+            {
+                crate::set_algebra_fast(a, b, kind)
+            }
             // Two `bytes`' concatenation (`_ALWAYS_SAFE_BYTES + safe`;
             // immutable, so `+=` is the same).
             (Object::Bytes(x), Object::Bytes(y))
