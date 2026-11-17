@@ -80538,7 +80538,9 @@ fn percent_render_spec(out: &mut String, bytes: &[u8], mut k: usize, v: &Object)
             if !x.is_finite() {
                 return None;
             }
-            let _ = write!(num, "{:.*}", prec.unwrap_or(6), x.abs());
+            // (In integer arithmetic for the common shapes, as the `f`
+            // format spec renders it.)
+            num.push_str(&fixed_core(x.abs(), prec.unwrap_or(6)));
             (
                 if x.is_sign_negative() { "-" } else { "" },
                 num.as_str(),
