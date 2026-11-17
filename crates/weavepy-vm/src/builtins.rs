@@ -514,6 +514,14 @@ fn lookup_method_memo(obj: &Object, name: &str, tag: u8) -> Option<Object> {
             _ => {}
         }
     }
+    // A set's `add` and `update` of values that hash and compare natively.
+    if let (Object::Set(_), Some(Object::Builtin(b))) = (obj, &found) {
+        match name {
+            "add" => crate::leaf_builtins::register_fast(b, set_add_fast),
+            "update" => crate::leaf_builtins::register_fast(b, set_update_fast),
+            _ => {}
+        }
+    }
     // A dict's `update` from another plain dict whose keys run no code.
     if let (Object::Dict(_), Some(Object::Builtin(b))) = (obj, &found) {
         match name {
@@ -15313,12 +15321,108 @@ fn set_copy(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
+/// A value a set hashes and compares without running code.
+#[inline]
+fn set_value_native(v: &Object) -> bool {
+    matches!(
+        v,
+        Object::Int(_)
+            | Object::Str(_)
+            | Object::Float(_)
+            | Object::Bool(_)
+            | Object::None
+            | Object::Bytes(_)
+    )
+}
+
+/// Whether a re-entrant mutation of some set waits to be replayed (see
+/// `SET_DEFERRED_OPS`): the full method replays it first.
+#[inline]
+fn set_ops_pending() -> bool {
+    SET_DEFERRED_OPS.with(|q| q.try_borrow().map_or(true, |q| !q.is_empty()))
+}
+
+/// `s.add(x)`'s leaf half: a plain set, a value that hashes and compares
+/// natively. `None` for anything else.
+fn set_add_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Set(s), v] = args else {
+        return None;
+    };
+    if !set_value_native(v) || set_ops_pending() {
+        return None;
+    }
+    s.try_borrow_mut().ok()?.insert(DictKey(v.clone()));
+    Some(Ok(Object::None))
+}
+
+/// `s.update(*others)`'s leaf half: a plain set from tuples, lists, sets
+/// and frozensets of values that hash and compare natively, inserted in
+/// place (no code runs, so no snapshot is needed). `None`, touching
+/// nothing, for anything else.
+fn set_update_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Set(s), rest @ ..] = args else {
+        return None;
+    };
+    if set_ops_pending() {
+        return None;
+    }
+    // SAFETY: guard-free views of the sources, each ended before anything
+    // could borrow it (nothing below runs code).
+    let fits = |o: &Object| unsafe {
+        match o {
+            Object::Tuple(t) => t.iter().all(set_value_native),
+            Object::List(l) => l.peek().is_some_and(|l| l.iter().all(set_value_native)),
+            Object::Set(o) => {
+                !Rc::ptr_eq(o, s)
+                    && o.peek()
+                        .is_some_and(|o| o.iter().all(|k| set_value_native(&k.0)))
+            }
+            Object::FrozenSet(o) => o.iter().all(|k| set_value_native(&k.0)),
+            _ => false,
+        }
+    };
+    if !rest.iter().all(fits) {
+        return None;
+    }
+    let mut b = s.try_borrow_mut().ok()?;
+    for o in rest {
+        // SAFETY: as above.
+        unsafe {
+            match o {
+                Object::Tuple(t) => t.iter().for_each(|v| {
+                    b.insert(DictKey(v.clone()));
+                }),
+                Object::List(l) => l.peek()?.iter().for_each(|v| {
+                    b.insert(DictKey(v.clone()));
+                }),
+                Object::Set(o) => o.peek()?.iter().for_each(|k| {
+                    b.insert(k.clone());
+                }),
+                Object::FrozenSet(o) => o.iter().for_each(|k| {
+                    b.insert(k.clone());
+                }),
+                _ => {}
+            }
+        }
+    }
+    Some(Ok(Object::None))
+}
+
 fn set_update(args: &[Object]) -> Result<Object, RuntimeError> {
     let receiver = set_self(args)?;
     if let Object::FrozenSet(_) = receiver {
         return Err(type_error("frozenset is immutable"));
     }
     if let Object::Set(s) = &receiver {
+        // Mutations deferred while another operation held the set came
+        // first (see `SET_DEFERRED_OPS`).
+        let pending = take_deferred_set_ops(s);
+        if !pending.is_empty() {
+            let mut b = s.borrow_mut();
+            for op in pending {
+                apply_set_inplace_op(&mut b, op);
+            }
+        }
         // Build on a snapshot so an element `__hash__` that re-enters and
         // mutates `s` can't fire while we hold `s.borrow_mut()` (bpo-46615).
         let mut acc: crate::object::SetData = s.borrow().clone();
