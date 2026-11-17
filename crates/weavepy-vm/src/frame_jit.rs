@@ -8690,6 +8690,15 @@ unsafe fn attr_miss_quick(
                         return Some(v);
                     }
                 }
+                // (A tuple's field first: it has no dict to probe.)
+                if matches!(inst.native.get(), Some(Object::Tuple(_))) {
+                    if let Some(v) = (*site.ext)
+                        .stamp_slot(site.pc as usize)
+                        .and_then(|s| crate::tuple_field_hit(s, inst))
+                    {
+                        return Some(v);
+                    }
+                }
                 if let Some(d) = inst_dict_read(site, inst) {
                     return Some(d);
                 }
@@ -9363,6 +9372,15 @@ unsafe extern "C" fn attr_local_slow(st: *mut State, site: *const AttrSite) -> u
             }
             // (A class attribute the site has read before.)
             Object::Instance(inst) => {
+                // A named tuple's field (a data descriptor: no instance
+                // shadows it), as the site's stamp remembers it.
+                if let Some(v) = (*site.ext)
+                    .stamp_slot(site.pc as usize)
+                    .and_then(|s| crate::tuple_field_hit(s, inst))
+                {
+                    (*st).stack.add(slot).write(v);
+                    return 0;
+                }
                 if site_property_leaf(&mut *st, site, at, true) {
                     return 0;
                 }
