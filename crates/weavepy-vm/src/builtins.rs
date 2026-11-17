@@ -516,8 +516,10 @@ fn lookup_method_memo(obj: &Object, name: &str, tag: u8) -> Option<Object> {
     }
     // A dict's `update` from another plain dict whose keys run no code.
     if let (Object::Dict(_), Some(Object::Builtin(b))) = (obj, &found) {
-        if name == "update" {
-            crate::leaf_builtins::register_fast(b, dict_update_fast);
+        match name {
+            "update" => crate::leaf_builtins::register_fast(b, dict_update_fast),
+            "copy" => crate::leaf_builtins::register_fast(b, dict_copy_fast),
+            _ => {}
         }
     }
     let mut memo = memo.borrow_mut();
@@ -14857,6 +14859,14 @@ pub(crate) fn dict_setdefault(args: &[Object]) -> Result<Object, RuntimeError> {
         }
     }
     Ok(value)
+}
+
+/// `d.copy()`'s leaf half: a plain dict's copy runs no code.
+fn dict_copy_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Dict(_)] = args else {
+        return None;
+    };
+    Some(dict_copy(args))
 }
 
 fn dict_copy(args: &[Object]) -> Result<Object, RuntimeError> {

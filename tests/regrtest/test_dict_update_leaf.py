@@ -1,4 +1,4 @@
-"""`d.update(other)` of plain dicts in compiled code.
+"""`d.update(other)` and `d.copy()` of plain dicts in compiled code.
 
 A merge from another plain dict whose keys run no code takes the
 source's entries in place: an existing key keeps its key object and takes
@@ -41,6 +41,9 @@ for i in range(N):
     assert len(kd) == 2 and kd[K(1)] == 2
     same = {"s": 1}
     assert merge(same, same) == {"s": 1}
+    c = base.copy()
+    c["a"] = i
+    assert base == {"a": 1, "b": 2} and list(c) == ["a", "b"] and c["a"] == i
 d = {"a": 1}
 d.update({"b": 2}, c=3)
 assert d == {"a": 1, "b": 2, "c": 3}
