@@ -521,12 +521,15 @@ fn object_is_tracked(target: &Object) -> bool {
         // A list/dict/set born holding only scalars has its tracking
         // deferred; CPython tracks it from birth, so answer as CPython
         // does and hand it to the collector from here on.
-        Object::List(_) | Object::Dict(_) | Object::Set(_) => gc_trace::with_state(|s| {
-            if !s.is_tracked_instance(target) {
-                s.track_now(target);
-            }
-            s.is_tracked_instance(target)
-        }),
+        // (So is a frozenset of atomic values, which is never registered.)
+        Object::List(_) | Object::Dict(_) | Object::Set(_) | Object::FrozenSet(_) => {
+            gc_trace::with_state(|s| {
+                if !s.is_tracked_instance(target) {
+                    s.track_now(target);
+                }
+                s.is_tracked_instance(target)
+            })
+        }
         other => gc_trace::with_state(|s| s.is_tracked_obj(other)),
     }
 }

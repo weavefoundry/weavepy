@@ -3973,6 +3973,15 @@ pub fn track(obj: &Object) {
             return;
         }
     }
+    // A frozenset of atomic values (`frozenset((1, 2, 3))`) can never be
+    // part of a cycle, whatever happens later: it can't change. It isn't
+    // registered (`gc.is_tracked` registers it on asking, as CPython tracks
+    // every frozenset).
+    if let Object::FrozenSet(fs) = obj {
+        if fs.len() <= 64 && fs.iter().all(|k| is_atomic(&k.0)) {
+            return;
+        }
+    }
     if let Object::Instance(inst) = obj {
         // The instance may have been born with deferred tracking; its
         // `__dict__` no longer needs to guard it.
