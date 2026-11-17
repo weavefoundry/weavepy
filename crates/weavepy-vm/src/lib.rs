@@ -32609,6 +32609,12 @@ impl Interpreter {
                 [Object::Int(n)] => Some(Object::from_str(itoa::Buffer::new().format(*n))),
                 [Object::Bool(b)] => Some(Object::from_static(if *b { "True" } else { "False" })),
                 [Object::None] => Some(Object::from_static("None")),
+                // An exact `decimal.Decimal` (see `stdlib::decimal_native`).
+                [Object::Instance(inst)]
+                    if crate::stdlib::decimal_native::is_decimal_instance(inst) =>
+                {
+                    crate::stdlib::decimal_native::leaf_str(inst)
+                }
                 // A plain instance whose class's `__str__` is a Python
                 // function that evaluates as a pure leaf, answering a `str`.
                 [recv @ Object::Instance(inst)] if inst.native.get().is_none() => {
