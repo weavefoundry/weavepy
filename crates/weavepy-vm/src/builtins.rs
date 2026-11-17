@@ -10212,15 +10212,38 @@ impl DirNames {
     }
 }
 
+/// `hex`/`oct`/`bin` of a machine int: the prefix (`0x`, `0o`, `0b`, after a
+/// sign) and the digits of the magnitude in base `1 << shift`, built in a
+/// stack buffer as an ASCII string.
+fn radix_str(i: i64, letter: u8, shift: u32) -> Object {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut buf = [0u8; 67];
+    let mut at = buf.len();
+    let mut m = i.unsigned_abs();
+    let mask = (1u64 << shift) - 1;
+    loop {
+        at -= 1;
+        buf[at] = DIGITS[(m & mask) as usize];
+        m >>= shift;
+        if m == 0 {
+            break;
+        }
+    }
+    at -= 2;
+    buf[at] = b'0';
+    buf[at + 1] = letter;
+    if i < 0 {
+        at -= 1;
+        buf[at] = b'-';
+    }
+    // SAFETY: only ASCII digits, letters and signs were written.
+    let text = unsafe { std::str::from_utf8_unchecked(&buf[at..]) };
+    Object::Str(SharedStr::from_ascii(text))
+}
+
 fn b_hex(args: &[Object]) -> Result<Object, RuntimeError> {
     match one(args, "hex")? {
-        Object::Int(i) => {
-            if *i < 0 {
-                Ok(Object::from_str(format!("-0x{:x}", (i.unsigned_abs()))))
-            } else {
-                Ok(Object::from_str(format!("0x{i:x}")))
-            }
-        }
+        Object::Int(i) => Ok(radix_str(*i, b'x', 4)),
         Object::Long(b) => {
             let inner = (**b).clone();
             if inner.is_negative() {
@@ -10238,13 +10261,7 @@ fn b_hex(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn b_oct(args: &[Object]) -> Result<Object, RuntimeError> {
     match one(args, "oct")? {
-        Object::Int(i) => {
-            if *i < 0 {
-                Ok(Object::from_str(format!("-0o{:o}", i.unsigned_abs())))
-            } else {
-                Ok(Object::from_str(format!("0o{i:o}")))
-            }
-        }
+        Object::Int(i) => Ok(radix_str(*i, b'o', 3)),
         Object::Long(b) => {
             let inner = (**b).clone();
             if inner.is_negative() {
@@ -10261,13 +10278,7 @@ fn b_oct(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn b_bin(args: &[Object]) -> Result<Object, RuntimeError> {
     match one(args, "bin")? {
-        Object::Int(i) => {
-            if *i < 0 {
-                Ok(Object::from_str(format!("-0b{:b}", i.unsigned_abs())))
-            } else {
-                Ok(Object::from_str(format!("0b{i:b}")))
-            }
-        }
+        Object::Int(i) => Ok(radix_str(*i, b'b', 1)),
         Object::Long(b) => {
             let inner = (**b).clone();
             if inner.is_negative() {
