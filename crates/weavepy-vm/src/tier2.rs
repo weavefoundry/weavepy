@@ -13967,6 +13967,27 @@ unsafe extern "C" fn wpjit_iter_next_pair(
     let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
     // SAFETY: the `&mut Interpreter` is dormant while the helper runs.
     let interp = unsafe { &mut *ctx.interp };
+    // `enumerate` over bytes into two int lanes first (a byte loop's
+    // every step): one peek tells any other iterator apart, where the list, tuple and
+    // `dict.items()` steps below would each borrow and inspect it (an
+    // `enumerate(bytes)` step cost a third more behind them).
+    if tag1 == SlotTag::Int as i64 && tag2 == SlotTag::Int as i64 {
+        let pair = match ctx.pins.get(pin as usize) {
+            Some(Pin::Obj(it)) => next_enumerated_byte(it),
+            _ => NativeBytePair::Unsupported,
+        };
+        match pair {
+            NativeBytePair::Value(index, byte) => {
+                jf.ret_bits = index as u64;
+                // SAFETY: the marshal buffer has at least one slot,
+                // as required by this helper's live-buffer contract.
+                unsafe { *jf.call_args = u64::from(byte) };
+                return 0;
+            }
+            NativeBytePair::Exhausted => return 1,
+            NativeBytePair::Unsupported => {}
+        }
+    }
     // A list's or tuple's next element that is a pair whose halves pack
     // into the two lanes (`for a, b in pairs`): read where it sits, the
     // cursor advanced once both packed. (The views are guard-free: nothing
@@ -14006,27 +14027,6 @@ unsafe extern "C" fn wpjit_iter_next_pair(
                     return 0;
                 }
             }
-        }
-    }
-    // `enumerate` over bytes or tuples into typed lanes first: one peek
-    // tells any other iterator apart, where the list, tuple and
-    // `dict.items()` steps below would each borrow and inspect it (an
-    // `enumerate(bytes)` step cost a third more behind them).
-    if tag1 == SlotTag::Int as i64 && tag2 == SlotTag::Int as i64 {
-        let pair = match ctx.pins.get(pin as usize) {
-            Some(Pin::Obj(it)) => next_enumerated_byte(it),
-            _ => NativeBytePair::Unsupported,
-        };
-        match pair {
-            NativeBytePair::Value(index, byte) => {
-                jf.ret_bits = index as u64;
-                // SAFETY: the marshal buffer has at least one slot,
-                // as required by this helper's live-buffer contract.
-                unsafe { *jf.call_args = u64::from(byte) };
-                return 0;
-            }
-            NativeBytePair::Exhausted => return 1,
-            NativeBytePair::Unsupported => {}
         }
     }
     // `enumerate` over a list or tuple into an int lane and a scalar one.
