@@ -1740,6 +1740,14 @@ impl JitState {
         if res.is_err() {
             if let Some(e) = self.cache.get_mut(&key) {
                 e.failed_compiles = e.failed_compiles.saturating_add(1);
+                // Handed over (see `gave_up_often`): its back edges stop
+                // asking, so the loops each failing in turn don't analyze
+                // it again and again; the frame JIT takes them.
+                if e.failed_compiles >= FAILED_COMPILES_HANDOVER
+                    && !matches!(e.tier, Tier::Compiled(_))
+                {
+                    code.jit_hint.set_backedge_quiet();
+                }
             }
         }
         if matches!(
