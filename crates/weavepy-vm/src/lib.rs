@@ -21398,7 +21398,7 @@ impl Interpreter {
                 items.extend(x.iter().cloned());
                 items.extend(y.iter().cloned());
                 let obj = Object::new_list(items);
-                gc_trace::track(&obj);
+                gc_trace::track_built(&obj);
                 Some(obj)
             }
             _ => None,
@@ -21450,7 +21450,7 @@ impl Interpreter {
                 }
                 drop(x);
                 let obj = Object::new_list(out);
-                gc_trace::track(&obj);
+                gc_trace::track_built(&obj);
                 Some(obj)
             }
             _ => None,
@@ -32760,7 +32760,7 @@ impl Interpreter {
                 _ => return None,
             };
             let obj = Object::new_list(items);
-            gc_trace::track(&obj);
+            gc_trace::track_built(&obj);
             return Some(obj);
         }
         if ty.flags.is_builtin {
@@ -46336,7 +46336,7 @@ impl Interpreter {
             // literal and `b_list` paths, or a cycle closed through the
             // result (`x = list(...); x[0].back = x`) is never collected.
             let obj = Object::new_list(collected);
-            gc_trace::track(&obj);
+            gc_trace::track_built(&obj);
             Ok(obj)
         } else {
             Ok(Object::new_tuple(collected))
@@ -47752,7 +47752,7 @@ impl Interpreter {
             .find_map(|(k, v)| (k == "key").then(|| v.clone()));
         self.sort_with_key(&mut items, key_fn.as_ref(), reverse, globals)?;
         let obj = Object::new_list(items);
-        gc_trace::track(&obj);
+        gc_trace::track_built(&obj);
         Ok(obj)
     }
 
@@ -61256,7 +61256,7 @@ impl Interpreter {
         }
         // CPython tracks every set (as `b_set` does).
         let obj = Object::Set(Rc::new(RefCell::new(out)));
-        gc_trace::track(&obj);
+        gc_trace::track_built(&obj);
         Ok(obj)
     }
 
@@ -64464,7 +64464,7 @@ impl Interpreter {
                         }
                     }
                     let out = Object::Dict(Rc::new(RefCell::new(d)));
-                    crate::gc_trace::track(&out);
+                    crate::gc_trace::track_built(&out);
                     return Ok(out);
                 }
             }
@@ -64511,7 +64511,7 @@ impl Interpreter {
                     })?;
                 }
                 let out = Object::Dict(Rc::new(RefCell::new(d)));
-                crate::gc_trace::track(&out);
+                crate::gc_trace::track_built(&out);
                 return Ok(out);
             }
             // `int(x)` / `float(x)` honour the user's `__int__` /
