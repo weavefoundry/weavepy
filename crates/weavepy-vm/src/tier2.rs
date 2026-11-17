@@ -14938,10 +14938,13 @@ const OSR_VERDICT_ENTRIES: u32 = 16;
 
 /// The fewest loop iterations an OSR entry's runs must average: an entry
 /// and its exit (the frame rebuilt for the interpreter) cost several
-/// interpreted iterations, though a float kernel's iteration gains enough
-/// natively for a short loop to pay (`scimark`'s `lu` runs 16 a pass in
-/// its last rows).
-const OSR_MIN_TRIPS: u64 = 8;
+/// interpreted iterations, and a loop given up goes to the frame JIT,
+/// which runs it and the loops around it with no hand-off at all
+/// (`difflib`'s `find_longest_match` entered its inner loop about nine
+/// times a pass, its outer loop interpreted: `ratio()` ran 2.4 times
+/// slower). A float kernel's iteration gains enough natively for a short
+/// loop to pay (`scimark`'s `lu` runs 16 a pass in its last rows).
+const OSR_MIN_TRIPS: u64 = 16;
 
 /// [`OSR_MIN_TRIPS`] for compiled code of `stmts` statements. Small code
 /// gains little an iteration over the frame JIT's loop, while the
