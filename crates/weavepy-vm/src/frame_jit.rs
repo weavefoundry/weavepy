@@ -2785,6 +2785,20 @@ unsafe extern "C" fn h_for_iter_view(
                             return 1;
                         }
                     }
+                    // Exhausted, held by the stack alone, over a list that
+                    // lives on: it leaves the stack, as the core loop's end
+                    // retires it (its release frees nothing).
+                    PyIterator::Reversed {
+                        items,
+                        index,
+                        owner: None,
+                    } if *index < 0
+                        && Rc::strong_count(rc) == 1
+                        && crate::sync::Rc::strong_count(items) > 1 =>
+                    {
+                        drop(it.read());
+                        return 2;
+                    }
                     view @ PyIterator::DictKeys { .. } => {
                         match Interpreter::core_dict_next(view, false, false) {
                             crate::DictStep::Item(Object::Int(i), _) => {
