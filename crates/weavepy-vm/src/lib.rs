@@ -65073,8 +65073,13 @@ impl Interpreter {
         if let Some(ctor) = crate::builtins::builtin_type_constructor(&cls.name) {
             return Some(ctor);
         }
-        let key = DictKey(Object::from_str(&cls.name));
-        match self.builtins.borrow().get(&key).cloned() {
+        // (Probed by the name itself: no string built for the key.)
+        match self
+            .builtins
+            .borrow()
+            .get(&crate::object::StrKey(&cls.name))
+            .cloned()
+        {
             Some(Object::Builtin(b)) => Some(b),
             _ => None,
         }
