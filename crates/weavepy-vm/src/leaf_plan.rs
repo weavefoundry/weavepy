@@ -1792,6 +1792,18 @@ impl Interpreter {
                     .and_then(|s| crate::class_attr_hit(s, cls))
                 {
                     Some(v) => owned.own(v),
+                    // An attribute of a class under a Python metaclass the
+                    // site found before (an enum's `_member_map_`): its
+                    // stamp is filled only past the checks below.
+                    None if !Self::plain_metaclass(cls) => {
+                        match crate::meta_entry_hit(code, cls, pc as usize) {
+                            Some(v) => owned.own(v),
+                            None => {
+                                let v = Self::leaf_load_type_attr(code, cls, pc, name)?;
+                                owned.own(v)
+                            }
+                        }
+                    }
                     None => {
                         let v = Self::leaf_load_type_attr(code, cls, pc, name)?;
                         // A scalar is a plain class value (see

@@ -85846,7 +85846,11 @@ const META_CLASS_ENTRY: u64 = 0x5ca1_a770_0000_000b;
 /// The metaclass-class attribute the `LOAD_ATTR` site at `pc` remembers
 /// for `cls` (see [`META_CLASS_ENTRY`]), while both versions stand.
 #[inline]
-fn meta_entry_hit(code: &CodeObject, cls: &crate::types::TypeObject, pc: usize) -> Option<Object> {
+pub(crate) fn meta_entry_hit(
+    code: &CodeObject,
+    cls: &crate::types::TypeObject,
+    pc: usize,
+) -> Option<Object> {
     let slot = code_stamp_slot(code, pc as u32)?;
     let [ver, tag, bits] = slot.get();
     if tag != META_CLASS_ENTRY || ver != cls.attr_version.get() {
