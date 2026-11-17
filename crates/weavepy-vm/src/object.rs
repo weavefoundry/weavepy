@@ -3873,6 +3873,9 @@ impl<'a> LeafProbe<'a> {
             // (`re`'s `(LITERAL, 97)` and `(RANGE, (48, 57))`): the same.
             Object::Tuple(t) if t.iter().all(|x| leaf_tuple_item(x, 0)) => py_hash_value(key)?,
             Object::Bytes(_) => py_hash_value(key)?,
+            // `None` and the `bool`s (a key of another kind with an equal
+            // hash, `1` against `True`, marks the probe foreign).
+            Object::None | Object::Bool(_) => py_hash_value(key)?,
             // Kinds that hash and compare by identity alone.
             Object::Function(_)
             | Object::Generator(_)
@@ -4088,6 +4091,8 @@ impl LeafProbe<'_> {
             | (Object::AsyncGenerator(a), Object::AsyncGenerator(b)) => Rc::ptr_eq(a, b),
             (Object::Module(a), Object::Module(b)) => Rc::ptr_eq(a, b),
             (Object::Bytes(a), Object::Bytes(b)) => a[..] == b[..],
+            (Object::None, Object::None) => true,
+            (Object::Bool(a), Object::Bool(b)) => a == b,
             // Item by item; any item pairing other than int-int or str-str
             // (an equal `True` or `1.0`, say) may need Python's equality.
             (Object::Tuple(a), Object::Tuple(b)) if a.len() == b.len() => {
