@@ -511,8 +511,9 @@ pub(crate) mod type_cache {
         }
     }
 
-    /// `a == b` for attribute names, in line for the short ones (most
-    /// dunders and identifiers fit in sixteen bytes).
+    /// `a == b` for attribute names, in line up to 32 bytes (identifiers
+    /// and dunders, `__subclasscheck__` and `__init_subclass__` among
+    /// them, with overlapping word loads).
     #[inline]
     pub(crate) fn name_eq(a: &str, b: &str) -> bool {
         let (a, b) = (a.as_bytes(), b.as_bytes());
@@ -520,10 +521,16 @@ pub(crate) mod type_cache {
         if n != b.len() {
             return false;
         }
-        if n > 16 {
+        if n > 32 {
             return a == b;
         }
         let w = |s: &[u8], at: usize| u64::from_le_bytes(s[at..at + 8].try_into().expect("8"));
+        if n > 16 {
+            return w(a, 0) == w(b, 0)
+                && w(a, 8) == w(b, 8)
+                && w(a, n - 16) == w(b, n - 16)
+                && w(a, n - 8) == w(b, n - 8);
+        }
         if n >= 8 {
             return w(a, 0) == w(b, 0) && w(a, n - 8) == w(b, n - 8);
         }
@@ -2596,7 +2603,7 @@ impl TypeObject {
                 if let Some(owner) = mro.get(mro_idx as usize) {
                     let d = owner.dict.borrow();
                     if let Some((k, v)) = d.get_index(dict_idx as usize) {
-                        if matches!(&k.0, Object::Str(s) if s.as_ref() == name) {
+                        if matches!(&k.0, Object::Str(s) if type_cache::name_eq(s, name)) {
                             return Some((v.clone(), mro_idx as usize));
                         }
                     }
