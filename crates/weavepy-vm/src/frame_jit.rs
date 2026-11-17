@@ -4945,6 +4945,42 @@ unsafe extern "C" fn h_map_add(
     }
 }
 
+/// `SET_ADD` (a set comprehension's store) into the exact set at `set` of
+/// the value at `value`: `0` the value moved in (or, a scalar or string
+/// equal to an element, released), anything else declined untouched.
+unsafe extern "C" fn h_set_add(set: *const Object, value: *const Object) -> u32 {
+    // SAFETY: the code passes two initialized stack slots; the probe and
+    // the insert run no code, so nothing reaches the set meanwhile.
+    unsafe {
+        let Object::Set(cell) = &*set else {
+            return 1;
+        };
+        let Some(probe) = crate::object::LeafProbe::new(&*value) else {
+            return 1;
+        };
+        let Some(s) = cell.peek_mut() else {
+            return 1;
+        };
+        match s.insert_probe_if(
+            &probe,
+            |p| p.miss_is_exact(),
+            || crate::object::DictKey(value.read()),
+        ) {
+            Some(true) => 0,
+            Some(false)
+                if matches!(
+                    &*value,
+                    Object::Int(_) | Object::Str(_) | Object::Bool(_) | Object::None
+                ) =>
+            {
+                crate::drop_hot_at(value);
+                0
+            }
+            _ => 1,
+        }
+    }
+}
+
 /// A method kernel: `recv.m(a, b)` for an exact `list`, `dict`, `set` or
 /// `str` receiver (its tag checked by the caller), with the arguments the
 /// site passes (null past them) read in place, and the method's builtin
@@ -19411,6 +19447,9 @@ impl<'a> Lower<'a> {
             OpCode::MapAdd if ins.arg != 0 && (ins.arg as usize) + 2 <= self.depth => {
                 return self.map_add(pc, ins.arg as usize)
             }
+            OpCode::SetAdd if ins.arg != 0 && (ins.arg as usize) < self.depth => {
+                return self.set_add(pc, ins.arg as usize)
+            }
             OpCode::ListAppend
             | OpCode::ListExtend
             | OpCode::SetAdd
@@ -21830,6 +21869,22 @@ impl<'a> Lower<'a> {
         let value = self.slot_addr(self.depth - 1);
         let r = self
             .call(h_list_append as *const () as usize, &[list, value], true)
+            .expect("returns");
+        let out = self.exit_with(pc, &[], INTERP);
+        self.branch_out(r, out);
+        self.depth -= 1;
+        self.set_last(pc);
+        true
+    }
+
+    /// `SET_ADD` through [`h_set_add`], or out to the core loop with the
+    /// operands as they were.
+    fn set_add(&mut self, pc: usize, arg: usize) -> bool {
+        self.flush();
+        let set = self.slot_addr(self.depth - 1 - arg);
+        let value = self.slot_addr(self.depth - 1);
+        let r = self
+            .call(h_set_add as *const () as usize, &[set, value], true)
             .expect("returns");
         let out = self.exit_with(pc, &[], INTERP);
         self.branch_out(r, out);
