@@ -48400,9 +48400,17 @@ impl Interpreter {
             });
             let fast_key = match leaf_key {
                 Some(r) => Some(r?),
-                None => call_fast.and_then(|fast| match fast(&[f.clone(), item.clone()]) {
-                    Some(Ok(k)) => Some(k),
-                    _ => None,
+                None => call_fast.and_then(|fast| {
+                    // SAFETY: bitwise views of the live key function and
+                    // item, never dropped (the fast half clones what it
+                    // keeps).
+                    let views = std::mem::ManuallyDrop::new(unsafe {
+                        [std::ptr::read(f), std::ptr::read(item)]
+                    });
+                    match fast(&views[..]) {
+                        Some(Ok(k)) => Some(k),
+                        _ => None,
+                    }
                 }),
             };
             let k = if let Some(k) = fast_key {
@@ -48442,15 +48450,25 @@ impl Interpreter {
         // CPython decrefs the keys inside `list.sort` while the list is
         // still detached, so a key `__del__` that mutates the list is caught
         // by the caller's mutation check (test_sort.test_key_with_mutating_del).
-        let mut dead_keys: Vec<Object> = Vec::with_capacity(decorated.len());
-        *items = decorated
-            .into_iter()
-            .map(|(k, v)| {
-                dead_keys.push(k);
-                v
-            })
-            .collect();
-        drop(dead_keys);
+        // (Each item goes back to its place in the detached vector, which
+        // still holds the items in their old order; the keys and those old
+        // references leave together after.)
+        if items.len() == decorated.len() {
+            for (slot, pair) in items.iter_mut().zip(decorated.iter_mut()) {
+                std::mem::swap(slot, &mut pair.1);
+            }
+            drop(decorated);
+        } else {
+            let mut dead_keys: Vec<Object> = Vec::with_capacity(decorated.len());
+            *items = decorated
+                .into_iter()
+                .map(|(k, v)| {
+                    dead_keys.push(k);
+                    v
+                })
+                .collect();
+            drop(dead_keys);
+        }
         self.run_pending_finalizers();
         result
     }
