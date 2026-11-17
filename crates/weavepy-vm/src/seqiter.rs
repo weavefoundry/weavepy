@@ -526,6 +526,41 @@ impl Interpreter {
         })
     }
 
+    /// The pairs of a non-strict two-source `zip` (`dict(zip(ks, vs))`),
+    /// stepped as the zip steps them: the first source, then the second,
+    /// until either ends (an item the first gave is dropped when the second
+    /// has none, as the zip drops it). `None`, nothing stepped, for any
+    /// other iterable.
+    pub(crate) fn zip2_pairs(
+        &mut self,
+        it: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Option<Result<Vec<(Object, Object)>, RuntimeError>> {
+        let Object::LazyIter(l) = it else {
+            return None;
+        };
+        let (a, b) = match &*l.state.try_borrow().ok()? {
+            LazyIterKind::Zip {
+                iters,
+                strict: false,
+                held,
+                ..
+            } if held.is_empty() && iters.len() == 2 => (iters[0].clone(), iters[1].clone()),
+            _ => return None,
+        };
+        let mut out = Vec::new();
+        Some((|| loop {
+            let Some(x) = self.seq_step_source(&a, globals)? else {
+                return Ok(out);
+            };
+            let Some(y) = self.seq_step_source(&b, globals)? else {
+                self.release(x);
+                return Ok(out);
+            };
+            out.push((x, y));
+        })())
+    }
+
     /// The `(index, value)` pair for `v`, advancing a lazy enumerate's
     /// counter (CPython counts only produced items).
     fn enumerate_advance(l: &PyLazyIter, v: Object) -> Object {

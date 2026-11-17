@@ -64391,27 +64391,43 @@ impl Interpreter {
                 }
                 if cls.name == "dict" {
                     let global_dummy = Rc::new(RefCell::new(DictData::default()));
-                    let items = self.collect_iterable(&args[0], &global_dummy)?;
+                    // `dict(zip(ks, vs))`: the pairs straight from the two
+                    // sources, in the order the zip would step them, with
+                    // no tuple between.
+                    let pairs: Vec<(Object, Object)> = match self
+                        .zip2_pairs(&args[0], &global_dummy)
+                    {
+                        Some(pairs) => pairs?,
+                        None => {
+                            let items = self.collect_iterable(&args[0], &global_dummy)?;
+                            let mut pairs = Vec::with_capacity(items.len());
+                            for (i, pair) in items.into_iter().enumerate() {
+                                // A 2-tuple is its own pair.
+                                pairs.push(match &pair {
+                                        Object::Tuple(t) if t.len() == 2 => {
+                                            (t[0].clone(), t[1].clone())
+                                        }
+                                        _ => {
+                                            let kv = self.collect_iterable(&pair, &global_dummy)?;
+                                            if kv.len() != 2 {
+                                                return Err(value_error(format!(
+                                                    "dictionary update sequence element #{i} has length {}; 2 is required",
+                                                    kv.len()
+                                                )));
+                                            }
+                                            let mut kv = kv.into_iter();
+                                            (kv.next().expect("two"), kv.next().expect("two"))
+                                        }
+                                    });
+                            }
+                            pairs
+                        }
+                    };
                     let mut d = DictData::default();
                     // While every key compares natively (as all so far
                     // have), an insert runs no Python comparison to catch.
                     let mut native = true;
-                    for (i, pair) in items.into_iter().enumerate() {
-                        // A 2-tuple (`dict(zip(ks, vs))`) is its own pair.
-                        let (key, value) = match &pair {
-                            Object::Tuple(t) if t.len() == 2 => (t[0].clone(), t[1].clone()),
-                            _ => {
-                                let kv = self.collect_iterable(&pair, &global_dummy)?;
-                                if kv.len() != 2 {
-                                    return Err(value_error(format!(
-                                        "dictionary update sequence element #{i} has length {}; 2 is required",
-                                        kv.len()
-                                    )));
-                                }
-                                let mut kv = kv.into_iter();
-                                (kv.next().expect("two"), kv.next().expect("two"))
-                            }
-                        };
+                    for (key, value) in pairs {
                         crate::builtins::ensure_dict_key(&key)?;
                         native &= matches!(
                             key,
