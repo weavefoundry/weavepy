@@ -95,6 +95,29 @@ thread_local! {
     /// dropped at thread exit: the interpreter may be gone by then.
     static CURRENT: std::mem::ManuallyDrop<std::cell::RefCell<Object>> =
         const { std::mem::ManuallyDrop::new(std::cell::RefCell::new(Object::None)) };
+    /// Advanced whenever the current context changes or a context's
+    /// mapping is written (see [`generation`]).
+    static GENERATION: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+}
+
+/// The last [`GENERATION`] handed out, on any thread: every stamp is
+/// unique to its thread and moment.
+static GENERATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Note a change of the current context or of a mapping.
+#[inline]
+fn bump() {
+    let next = GENERATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let _ = GENERATION.try_with(|g| g.set(next));
+}
+
+/// A stamp that stays the same while the thread's current context and
+/// every context's mapping do, unique across threads (`0` for none): what
+/// a reader of the current context's values (`decimal`'s `getcontext`) may
+/// cache against.
+#[inline]
+pub(crate) fn generation() -> u64 {
+    GENERATION.try_with(std::cell::Cell::get).unwrap_or(0)
 }
 
 thread_local! {
@@ -201,8 +224,12 @@ fn current(st: &State) -> Object {
     CURRENT.with(|c| {
         let mut c = c.borrow_mut();
         match &*c {
-            Object::None => *c = new_context(st, new_dict()),
+            Object::None => {
+                bump();
+                *c = new_context(st, new_dict());
+            }
             Object::Dict(d) => {
+                bump();
                 let from = Rc::as_ptr(d) as usize;
                 let data = std::mem::replace(&mut *c, Object::None);
                 *c = new_entered_context(st, data);
@@ -244,7 +271,10 @@ fn current_built() -> Object {
 /// greenlet switches: the slot is emptied.
 pub(crate) fn take_current() -> Object {
     let _ = current_built();
-    CURRENT.with(|c| std::mem::replace(&mut *c.borrow_mut(), Object::None))
+    CURRENT.with(|c| {
+        bump();
+        std::mem::replace(&mut *c.borrow_mut(), Object::None)
+    })
 }
 
 /// The thread's current context without creating one (`None` if none).
@@ -264,7 +294,10 @@ pub(crate) fn peek_current_data() -> Option<Rc<RefCell<DictData>>> {
 
 /// Make `ctx` (a context or `None`) the thread's current one.
 pub(crate) fn set_current(ctx: Object) {
-    let old = CURRENT.with(|c| std::mem::replace(&mut *c.borrow_mut(), ctx));
+    let old = CURRENT.with(|c| {
+        bump();
+        std::mem::replace(&mut *c.borrow_mut(), ctx)
+    });
     drop(old);
 }
 
@@ -328,7 +361,10 @@ pub(crate) fn run_in_snapshot(
     let Object::Dict(_) = ctx else {
         return (run_in_context(ctx, f, args), None);
     };
-    let prev = CURRENT.with(|c| std::mem::replace(&mut *c.borrow_mut(), ctx.clone()));
+    let prev = CURRENT.with(|c| {
+        bump();
+        std::mem::replace(&mut *c.borrow_mut(), ctx.clone())
+    });
     let hooked = HOOK_SET.load(Ordering::Relaxed);
     let mut result = if hooked {
         // The hook is handed the context: build it.
@@ -340,7 +376,10 @@ pub(crate) fn run_in_snapshot(
     } else {
         call(f, args, &[])
     };
-    let me = CURRENT.with(|c| std::mem::replace(&mut *c.borrow_mut(), prev.clone()));
+    let me = CURRENT.with(|c| {
+        bump();
+        std::mem::replace(&mut *c.borrow_mut(), prev.clone())
+    });
     let made = match me {
         Object::Instance(i) => {
             if let Some(slot) = i.slots.borrow_mut().get_hinted_mut(CTX_ENTERED, "_entered") {
@@ -475,6 +514,7 @@ fn var_get(args: &[Object]) -> Result<Object, RuntimeError> {
 /// Write `var = value` into `ctx`'s mapping, copying it first if another
 /// context shares it. Returns the previous value (or `missing`).
 fn ctx_store(ctx: &PyInstance, var: &Object, value: Option<Object>, missing: &Object) -> Object {
+    bump();
     let mut slots = ctx.slots.borrow_mut();
     let Some(slot) = slots.get_hinted_mut(CTX_DATA, "_data") else {
         return missing.clone();
@@ -641,7 +681,10 @@ fn enter(ctx_obj: &Object, ctx: &PyInstance) -> Result<Object, RuntimeError> {
             }
         }
     }
-    Ok(CURRENT.with(|c| std::mem::replace(&mut *c.borrow_mut(), ctx_obj.clone())))
+    Ok(CURRENT.with(|c| {
+        bump();
+        std::mem::replace(&mut *c.borrow_mut(), ctx_obj.clone())
+    }))
 }
 
 /// Undo [`enter`]: restore `prev` as the current context.
@@ -653,7 +696,10 @@ fn exit(ctx: &PyInstance, prev: Object) {
     {
         *slot = Object::Bool(false);
     }
-    let me = CURRENT.with(|c| std::mem::replace(&mut *c.borrow_mut(), prev));
+    let me = CURRENT.with(|c| {
+        bump();
+        std::mem::replace(&mut *c.borrow_mut(), prev)
+    });
     drop(me);
 }
 
