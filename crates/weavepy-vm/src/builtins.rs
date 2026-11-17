@@ -10592,20 +10592,42 @@ fn pow_simple(base: &Object, exp: &Object) -> Result<Object, RuntimeError> {
 }
 
 fn pow_modular(base: &Object, exp: &Object, m: &Object) -> Result<Object, RuntimeError> {
+    // (Borrowed where they're already big: no copy of a long operand.)
     let (b, e, mm) = (
-        bigint_from(base, "pow")?,
-        bigint_from(exp, "pow")?,
-        bigint_from(m, "pow")?,
+        bigint_ref(base, "pow")?,
+        bigint_ref(exp, "pow")?,
+        bigint_ref(m, "pow")?,
     );
+    let (b, e, mm): (&BigInt, &BigInt, &BigInt) = (&b, &e, &mm);
     if mm.is_zero() {
         return Err(value_error("pow() 3rd argument cannot be 0"));
     }
     use num_bigint::BigInt;
     use num_traits::One;
+    // A non-negative exponent: a word-size modulus works in machine
+    // integers, any other through num-bigint's `modpow` (Montgomery
+    // reduction for an odd modulus), the result taking `m`'s sign below.
+    if !e.is_negative() {
+        let result: BigInt = match u64::try_from(mm.magnitude()) {
+            Ok(m) => BigInt::from(pow_mod_word(&b, &e, m)),
+            Err(_) => {
+                let m_abs = mm.magnitude();
+                let mut base = b.magnitude() % m_abs;
+                if b.is_negative() && !base.is_zero() {
+                    base = m_abs - base;
+                }
+                BigInt::from(base.modpow(e.magnitude(), m_abs))
+            }
+        };
+        if mm.is_negative() && !result.is_zero() {
+            return Ok(Object::int_from_bigint(result + mm));
+        }
+        return Ok(Object::int_from_bigint(result));
+    }
     // Work modulo |m|; CPython gives the result the *sign* of `m` at the end.
     let m_abs: BigInt = mm.abs();
     // Reduce the base into [0, |m|).
-    let mut base_mod: BigInt = ((&b % &m_abs) + &m_abs) % &m_abs;
+    let mut base_mod: BigInt = ((b % &m_abs) + &m_abs) % &m_abs;
     let mut exp_val: BigInt = e.clone();
     // A negative exponent means `pow(base, -e, m) == pow(base**-1, e, m)`,
     // where `base**-1` is the modular inverse (CPython 3.8+). The inverse only
@@ -10633,9 +10655,44 @@ fn pow_modular(base: &Object, exp: &Object, m: &Object) -> Result<Object, Runtim
     // `result` is in [0, |m|); shift into (m, 0] when the modulus is negative
     // so the sign matches CPython's `int.__mod__` convention.
     if mm.is_negative() && !result.is_zero() {
-        result += &mm;
+        result += mm;
     }
     Ok(Object::int_from_bigint(result))
+}
+
+/// `b ** e % m` in `[0, m)` for a non-negative `e` and a word-size
+/// modulus `m > 0`, by square and multiply in 128-bit integers: the base
+/// reduced limb by limb (`2**64` folded in as a shift), then the
+/// exponent's bits from the lowest.
+fn pow_mod_word(b: &num_bigint::BigInt, e: &num_bigint::BigInt, m: u64) -> u64 {
+    let m128 = u128::from(m);
+    let mut base: u64 = 0;
+    for d in b.magnitude().iter_u64_digits().rev() {
+        base = (((u128::from(base)) << 64 | u128::from(d)) % m128) as u64;
+    }
+    if b.is_negative() && base != 0 {
+        base = m - base;
+    }
+    let mut result: u64 = (1 % m128) as u64;
+    let mut sq = base;
+    let digits: Vec<u64> = e.magnitude().iter_u64_digits().collect();
+    for (i, &d) in digits.iter().enumerate() {
+        let mut d = d;
+        // (The top digit stops at its highest set bit.)
+        let bits = if i + 1 == digits.len() {
+            64 - d.leading_zeros()
+        } else {
+            64
+        };
+        for _ in 0..bits {
+            if d & 1 == 1 {
+                result = (u128::from(result) * u128::from(sq) % m128) as u64;
+            }
+            d >>= 1;
+            sq = (u128::from(sq) * u128::from(sq) % m128) as u64;
+        }
+    }
+    result
 }
 
 /// Modular inverse of `a` (already reduced into `[0, m)`) modulo `m > 0`, via
@@ -10657,6 +10714,17 @@ fn mod_inverse(a: &num_bigint::BigInt, m: &num_bigint::BigInt) -> Option<num_big
         return None;
     }
     Some(((old_s % m) + m) % m)
+}
+
+/// [`bigint_from`] borrowing a long operand instead of copying it.
+fn bigint_ref<'a>(
+    o: &'a Object,
+    fn_name: &str,
+) -> Result<std::borrow::Cow<'a, BigInt>, RuntimeError> {
+    match o {
+        Object::Long(b) => Ok(std::borrow::Cow::Borrowed(&**b)),
+        other => bigint_from(other, fn_name).map(std::borrow::Cow::Owned),
+    }
 }
 
 fn bigint_from(o: &Object, fn_name: &str) -> Result<BigInt, RuntimeError> {

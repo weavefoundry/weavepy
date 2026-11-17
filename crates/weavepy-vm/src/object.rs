@@ -13210,7 +13210,7 @@ impl Object {
             Object::Unbound => "<unbound>".to_owned(),
             Object::Bool(b) => if *b { "True" } else { "False" }.to_owned(),
             Object::Int(i) => i.to_string(),
-            Object::Long(b) => b.to_string(),
+            Object::Long(b) => bigint_decimal(b),
             Object::Complex(c) => complex_repr(c.real, c.imag),
             Object::Float(f) => float_repr(*f),
             Object::Str(s) => {
@@ -14536,10 +14536,81 @@ pub(crate) fn py_hash_long_i64(n: i64) -> i64 {
 
 /// CPython `long_hash` for a big int. `BigInt %` is truncating, so it
 /// already carries the dividend's sign with magnitude `|n| mod P`.
+/// `str(n)` of a big integer: its magnitude's 32-bit limbs folded, most
+/// significant first, into base `10**9` digits, as CPython's
+/// `long_to_decimal_string` does (a division by the constant `10**9`
+/// compiles to a multiply, where num-bigint divides by `10**19` with the
+/// 128-by-64-bit hardware division: 7,500 cycles to 2,900 for a 634-bit
+/// value). The quadratic fold is kept to values of at most 8,192 bits;
+/// larger ones take num-bigint's conversion.
+pub(crate) fn bigint_decimal(b: &BigInt) -> String {
+    const BASE: u64 = 1_000_000_000;
+    let mag = b.magnitude();
+    if mag.bits() > 8192 {
+        return b.to_string();
+    }
+    let limbs: Vec<u32> = mag.iter_u32_digits().collect();
+    // (Each 32-bit limb adds at most 1.07 base-10**9 digits.)
+    let mut out: Vec<u32> = Vec::with_capacity(limbs.len() + limbs.len() / 8 + 2);
+    for &d in limbs.iter().rev() {
+        let mut carry = u64::from(d);
+        for o in &mut out {
+            let z = (u64::from(*o) << 32) + carry;
+            *o = (z % BASE) as u32;
+            carry = z / BASE;
+        }
+        while carry != 0 {
+            out.push((carry % BASE) as u32);
+            carry /= BASE;
+        }
+    }
+    let mut s = String::with_capacity(out.len() * 9 + 1);
+    if b.sign() == num_bigint::Sign::Minus {
+        s.push('-');
+    }
+    let Some((&top, rest)) = out.split_last() else {
+        s.push('0');
+        return s;
+    };
+    use std::fmt::Write as _;
+    let _ = write!(s, "{top}");
+    let mut buf = [b'0'; 9];
+    for &d in rest.iter().rev() {
+        let mut v = d;
+        for slot in buf.iter_mut().rev() {
+            *slot = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+        // SAFETY: ASCII digits.
+        s.push_str(unsafe { std::str::from_utf8_unchecked(&buf) });
+    }
+    s
+}
+
 pub(crate) fn py_hash_long_bigint(value: &BigInt) -> i64 {
-    let modulus = BigInt::from((1u64 << PY_HASH_BITS) - 1);
-    let rem = value % &modulus;
-    let mut x = rem.to_i64().unwrap_or(0);
+    // `|value| mod P` (P = 2**61 - 1) folded over the magnitude's 64-bit
+    // limbs, most significant first, with shifts and adds instead of a
+    // big division: 2**64 is 8 (mod P), and a word's residue is its low
+    // 61 bits plus its top 3. The sign then applies as CPython's
+    // `long_hash` applies it.
+    const P: u64 = (1u64 << PY_HASH_BITS) - 1;
+    #[inline(always)]
+    fn reduce(v: u64) -> u64 {
+        let r = (v & P) + (v >> PY_HASH_BITS);
+        if r >= P {
+            r - P
+        } else {
+            r
+        }
+    }
+    let mut x: u64 = 0;
+    for d in value.magnitude().iter_u64_digits().rev() {
+        x = reduce(reduce(x << 3) + reduce(d));
+    }
+    let mut x = x as i64;
+    if value.sign() == num_bigint::Sign::Minus {
+        x = -x;
+    }
     if x == -1 {
         x = -2;
     }
