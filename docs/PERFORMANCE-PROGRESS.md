@@ -541,6 +541,26 @@ branch and pull request.
     which had left the code to tier 2, kept its outer loop interpreted;
     `SequenceMatcher(...).ratio()` ran 10,265,084 instructions to
     4,195,398 (CPython 4,487,196).
+  - That evening. Compiled code stores into an `OrderedDict` through the
+    leaf half of its own `__setitem__`, which the class caches under its
+    attribute version, instead of the general store: `od[k] = v` in a
+    tier-2 loop 1,325 to 897 (701), in a called function 1,178 to 947
+    (996). The frame JIT's direct call of a built-in subclass instance's
+    native method takes small int arguments (`od.move_to_end(5)` 786 to
+    492, against 434). A method site remembers a callable an instance holds
+    in a materialized dict, by position and name, as it did for a split one:
+    a `threading.Condition` over a lock with `_release_save` assigns its
+    names out of the class's order, so `self._is_owned()` took the full
+    method load (`notify()` 2,427 to 1,751, against 1,057). Reading a native
+    method off such an instance (`self._lock.__exit__`, to call with
+    `*args`) answers from the site's cached builtin before three slow
+    paths, and the leaf registry remembers its last hit: `with cond:` 4,312
+    to 3,124 (2,415), a `Queue` put and get 16,368 to 14,016 (11,764).
+    `test_set` failed about once in 40 runs: a set mutated from an
+    element's `__eq__` while another operation held it queued the mutation
+    by address alone, so a later set at the same address replayed a stale
+    `clear()` on its next `add`. The queue now holds a weak handle and drops
+    a dead set's ops.
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
