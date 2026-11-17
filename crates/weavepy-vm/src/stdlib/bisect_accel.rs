@@ -201,6 +201,39 @@ fn less(interp: &mut crate::Interpreter, a: &Object, b: &Object) -> Result<bool,
     }
 }
 
+/// The bisection steps over an exact list whose comparisons with `item`
+/// are plain scalar ones (`int`, `float`, `str`), under one guard-free
+/// view (no comparison runs code): the bounds narrowed as far as such
+/// steps go, for the general loop to finish from (an item it can't compare
+/// natively, a list it can't view). `right` picks `bisect_right`'s side of
+/// equal items.
+fn native_steps(a: &Object, item: &Object, mut lo: i64, mut hi: i64, right: bool) -> (i64, i64) {
+    let Object::List(l) = a else {
+        return (lo, hi);
+    };
+    // SAFETY: nothing below runs code while the view lives.
+    let Some(items) = (unsafe { l.peek() }) else {
+        return (lo, hi);
+    };
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let Some(litem) = usize::try_from(mid).ok().and_then(|m| items.get(m)) else {
+            break;
+        };
+        let go_left = if right {
+            crate::native_scalar_compare(item, litem, CompareKind::Lt)
+        } else {
+            crate::native_scalar_compare(litem, item, CompareKind::Lt).map(|lt| !lt)
+        };
+        match go_left {
+            Some(true) => hi = mid,
+            Some(false) => lo = mid + 1,
+            None => break,
+        }
+    }
+    (lo, hi)
+}
+
 /// `internal_bisect_right`: leftmost index where `item` could be inserted to
 /// keep `a` sorted, with everything `<= item` to its left.
 fn internal_bisect_right(
@@ -211,6 +244,9 @@ fn internal_bisect_right(
     mut hi: i64,
     key: Option<&Object>,
 ) -> Result<i64, RuntimeError> {
+    if key.is_none() {
+        (lo, hi) = native_steps(a, item, lo, hi, true);
+    }
     while lo < hi {
         // `lo + (hi - lo) / 2` rather than `(lo + hi) / 2`: identical result
         // for `0 <= lo <= hi`, but can't overflow when `hi` is near
@@ -241,6 +277,9 @@ fn internal_bisect_left(
     mut hi: i64,
     key: Option<&Object>,
 ) -> Result<i64, RuntimeError> {
+    if key.is_none() {
+        (lo, hi) = native_steps(a, item, lo, hi, false);
+    }
     while lo < hi {
         // See `internal_bisect_right`: overflow-safe midpoint for huge `hi`.
         let mid = lo + (hi - lo) / 2;
