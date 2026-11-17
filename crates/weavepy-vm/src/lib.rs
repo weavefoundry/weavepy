@@ -48321,15 +48321,50 @@ impl Interpreter {
         } else {
             None
         };
+        // A leaf builtin key (`key=abs`): its body directly (see
+        // `do_min_max_call`).
+        let leaf = match f {
+            Object::Builtin(b) if !len_key && !b.binds_instance => {
+                self.leaf_call_kind(b).map(|k| (b.clone(), k))
+            }
+            _ => None,
+        };
         for item in items.iter() {
-            let fast_key = call_fast.and_then(|fast| match fast(&[f.clone(), item.clone()]) {
-                Some(Ok(k)) => Some(k),
-                _ => None,
+            let leaf_key = leaf.as_ref().and_then(|(b, kind)| {
+                let arg = std::slice::from_ref(item);
+                match kind {
+                    LeafKind::Fast(fast) => fast(arg),
+                    LeafKind::Opaque => Some((b.call)(arg)),
+                    LeafKind::Scalar
+                        if matches!(item, Object::Int(_) | Object::Float(_) | Object::Bool(_)) =>
+                    {
+                        Some((b.call)(arg))
+                    }
+                    _ => None,
+                }
             });
+            let fast_key = match leaf_key {
+                Some(r) => Some(r?),
+                None => call_fast.and_then(|fast| match fast(&[f.clone(), item.clone()]) {
+                    Some(Ok(k)) => Some(k),
+                    _ => None,
+                }),
+            };
             let k = if let Some(k) = fast_key {
                 k
             } else if len_key {
-                self.do_len_call(item, globals)?
+                // (A built-in container's or string's length natively; an
+                // instance's `__len__` through the full call.)
+                match item {
+                    Object::Str(_)
+                    | Object::List(_)
+                    | Object::Tuple(_)
+                    | Object::Dict(_)
+                    | Object::Set(_)
+                    | Object::FrozenSet(_)
+                    | Object::Bytes(_) => Object::Int(item.len()? as i64),
+                    _ => self.do_len_call(item, globals)?,
+                }
             } else if let Some(k) = pure
                 .then(|| self.pure_callback(f, std::slice::from_ref(item), true))
                 .flatten()
