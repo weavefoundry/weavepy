@@ -4887,6 +4887,64 @@ unsafe extern "C" fn h_list_append(list: *const Object, value: *const Object) ->
     }
 }
 
+/// `MAP_ADD` (a dict comprehension's store) into the exact dict at `dict`
+/// of the key at `key` and the value at `value`: `0` both moved in, a new
+/// key the native probe settles (no stored key could equal it) or a scalar
+/// value replaced (its release runs nothing); anything else declined
+/// untouched.
+unsafe extern "C" fn h_map_add(
+    dict: *const Object,
+    key: *const Object,
+    value: *const Object,
+) -> u32 {
+    // SAFETY: the code passes three initialized stack slots; the probe and
+    // the insert run no code, so nothing reaches the dict meanwhile.
+    unsafe {
+        let Object::Dict(cell) = &*dict else {
+            return 1;
+        };
+        if crate::capi_watchers::dicts_active() {
+            return 1;
+        }
+        let Some(probe) = crate::object::LeafProbe::new(&*key) else {
+            return 1;
+        };
+        let Some(d) = cell.peek_mut() else {
+            return 1;
+        };
+        let added = match d.probe_entry(&probe) {
+            crate::dictmap::ProbeEntry::Occupied(e) => {
+                let slot = e.into_mut();
+                if !matches!(
+                    slot,
+                    Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
+                ) || !matches!(
+                    &*key,
+                    Object::Int(_) | Object::Str(_) | Object::Bool(_) | Object::None
+                ) {
+                    return 1;
+                }
+                // (The key the dict holds stays; the new one leaves.)
+                *slot = value.read();
+                crate::drop_hot_at(key);
+                false
+            }
+            crate::dictmap::ProbeEntry::Vacant(e) => {
+                if !probe.miss_is_exact() {
+                    return 1;
+                }
+                e.insert(crate::object::DictKey(key.read()), value.read());
+                true
+            }
+        };
+        if added {
+            crate::object::dict_watch_bump(cell);
+        }
+        crate::object::dict_mutation_event(cell);
+        0
+    }
+}
+
 /// A method kernel: `recv.m(a, b)` for an exact `list`, `dict`, `set` or
 /// `str` receiver (its tag checked by the caller), with the arguments the
 /// site passes (null past them) read in place, and the method's builtin
@@ -19350,6 +19408,9 @@ impl<'a> Lower<'a> {
             OpCode::ListAppend if ins.arg != 0 && (ins.arg as usize) < self.depth => {
                 return self.list_append(pc, ins.arg as usize)
             }
+            OpCode::MapAdd if ins.arg != 0 && (ins.arg as usize) + 2 <= self.depth => {
+                return self.map_add(pc, ins.arg as usize)
+            }
             OpCode::ListAppend
             | OpCode::ListExtend
             | OpCode::SetAdd
@@ -21773,6 +21834,23 @@ impl<'a> Lower<'a> {
         let out = self.exit_with(pc, &[], INTERP);
         self.branch_out(r, out);
         self.depth -= 1;
+        self.set_last(pc);
+        true
+    }
+
+    /// `MAP_ADD` through [`h_map_add`], or out to the core loop with the
+    /// operands as they were.
+    fn map_add(&mut self, pc: usize, arg: usize) -> bool {
+        self.flush();
+        let dict = self.slot_addr(self.depth - 2 - arg);
+        let key = self.slot_addr(self.depth - 2);
+        let value = self.slot_addr(self.depth - 1);
+        let r = self
+            .call(h_map_add as *const () as usize, &[dict, key, value], true)
+            .expect("returns");
+        let out = self.exit_with(pc, &[], INTERP);
+        self.branch_out(r, out);
+        self.depth -= 2;
         self.set_last(pc);
         true
     }
