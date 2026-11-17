@@ -2867,6 +2867,57 @@ pub(crate) fn all_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> 
     any_all_fast(args, false)
 }
 
+/// `list(enumerate(xs))` over a list or tuple iterator: the pairs of the
+/// rest of the source at once, both cursors advanced past them and the
+/// source detached as its end leaves it. `None`, nothing stepped, for any
+/// other iterator or a count that would overflow.
+pub(crate) fn enumerate_seq_collect(it: &Object) -> Option<Vec<Object>> {
+    let Object::Iter(c) = it else {
+        return None;
+    };
+    let mut e = c.try_borrow_mut().ok()?;
+    let PyIterator::Enumerate {
+        inner,
+        count,
+        count_big: None,
+    } = &mut *e
+    else {
+        return None;
+    };
+    let mut src = inner.try_borrow_mut().ok()?;
+    let rest: Vec<Object> = match &*src {
+        PyIterator::List {
+            items,
+            index,
+            owner: None,
+        } => items
+            .try_borrow()
+            .ok()?
+            .get(*index..)
+            .unwrap_or(&[])
+            .to_vec(),
+        PyIterator::Tuple { items, index } => items.get(*index..).unwrap_or(&[]).to_vec(),
+        _ => return None,
+    };
+    let start = *count;
+    *count = count.checked_add(i64::try_from(rest.len()).ok()?)?;
+    match &mut *src {
+        PyIterator::List { index, .. } | PyIterator::Tuple { index, .. } => *index += rest.len(),
+        _ => unreachable!("checked above"),
+    }
+    // (The step past the end detaches the source, as the last one does.)
+    let detached = src.next_value();
+    drop(src);
+    drop(e);
+    drop(detached);
+    Some(
+        rest.into_iter()
+            .zip(start..)
+            .map(|(x, k)| Object::new_tuple_array([Object::Int(k), x]))
+            .collect(),
+    )
+}
+
 /// The `(index, item)` step of an `enumerate` over a native iterator
 /// whose step runs no code, without the tuple (a loop that unpacks it):
 /// `None` for any other iterator or step.

@@ -46600,6 +46600,9 @@ impl Interpreter {
                 return Ok(items);
             }
         }
+        if let Some(items) = crate::seqiter::enumerate_seq_collect(v) {
+            return Ok(items);
+        }
         // `list(reversed(xs))`: the rest of the reversed list at once,
         // the iterator left exhausted and detached as its last step leaves
         // it (what that releases drops once the iterator is free again).
