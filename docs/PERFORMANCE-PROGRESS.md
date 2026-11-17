@@ -517,7 +517,26 @@ branch and pull request.
     tier 2 stops analyzing code from its back edges once it has handed the
     code to the frame JIT (argparse's `_parse_known_args` was analyzed
     ten times, twice each).
-  - What's left. Battery geomean 1.197 instructions. The worst cases are
+  - Later the same day. `decimal` keeps the context it found last under a
+    `contextvars` generation, which every change of the current context
+    and every mapping write moves (unique across threads): `D1 * D2` 1,466
+    to 1,306 (1,028), and `decimal_telco` in the suite 1.17 to 1.07.
+    Exited threads leave their type cache and literal-string cache to the
+    next threads instead of zeroing and dropping them (a thread's start
+    and join 728,556 to 523,657, against 182,851). A named tuple's field
+    read off a local answers from its site's stamp first (two reads 1,076
+    to 382, against 821). `MAP_ADD` and `SET_ADD` have their own helpers,
+    as `LIST_APPEND` had, and the three read a local's value in place
+    (`{x: x for x in t}` 6,803 to 5,994; `{x for x in t}` 5,842 to
+    4,659). Keyword dicts and dict literals insert keys whose hashes
+    differ pairwise without probing, and every container compiled code or
+    the core loop builds defers its collector tracking without scanning
+    its elements (a collection promotes the deferred ones that can anchor
+    a cycle first): `{'a': i, 'b': 2}` 1,331 to 1,119 (937). `bytes.strip`
+    tests membership through a table, and `dict(zip(ks, gen))` takes its
+    pairs straight from the sources.
+  - What's left. Battery geomean 1.178 instructions and 1.052 cycles
+    (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
     cost is 2.3 times CPython's with both JITs off or on, since it runs
     mostly cold code, where the core loop's call and return cost about
