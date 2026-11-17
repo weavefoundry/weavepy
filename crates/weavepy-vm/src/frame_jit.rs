@@ -10833,7 +10833,9 @@ unsafe extern "C" fn h_build(st: *mut State, at: *mut Object, n: u64, list: u32)
             }
             let items: Vec<Object> = (0..n).map(|j| at.add(j).read()).collect();
             let obj = Object::new_list(items);
-            crate::gc_trace::track(&obj);
+            // (Deferred as a built list is, a collection promoting it once
+            // it can anchor a cycle.)
+            crate::gc_trace::track_built(&obj);
             at.write(obj);
             return 0;
         }
@@ -10887,7 +10889,7 @@ unsafe extern "C" fn h_build_set(at: *mut Object, n: u64) -> u32 {
             let _ = crate::object::key_cmp_scope(|| data.insert(item));
         }
         let obj = Object::Set(Rc::new(crate::sync::RefCell::new(data)));
-        crate::gc_trace::track(&obj);
+        crate::gc_trace::track_built(&obj);
         at.write(obj);
     }
     0

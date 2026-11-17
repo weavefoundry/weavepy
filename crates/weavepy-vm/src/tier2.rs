@@ -10273,8 +10273,10 @@ unsafe extern "C" fn wpjit_build_list(
     // RFC 0073 WS1 — the interpreter tracks *every* list it builds
     // (`gc.is_tracked([])` is True and any list can close a cycle by
     // later mutation); a natively built list is no different, and a
-    // comprehension accumulator in particular always escapes.
-    crate::gc_trace::track(&Object::List(list.clone()));
+    // comprehension accumulator in particular always escapes. (Deferred
+    // as a built list is, a collection promoting it once it can anchor a
+    // cycle.)
+    crate::gc_trace::track_built(&Object::List(list.clone()));
     let idx = ctx.pins.len() as i64;
     ctx.pins.push(Pin::List(list, elem));
     idx
