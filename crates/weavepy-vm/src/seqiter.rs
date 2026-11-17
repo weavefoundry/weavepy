@@ -160,11 +160,20 @@ impl Interpreter {
             self.release(v);
             return Ok(r);
         }
+        // (The arguments' vector comes from the scratch pool, which the
+        // bound call returns it to.)
         match func {
-            Object::Function(f) => return self.call_python_owned(f, vec![v], Vec::new()),
+            Object::Function(f) => {
+                let mut args = self.pooled_scratch();
+                args.push(v);
+                return self.call_python_owned(f, args, Vec::new());
+            }
             Object::BoundMethod(bm) if !bm.redispatch_descriptor => {
                 if let Object::Function(f) = &bm.function {
-                    return self.call_python_owned(f, vec![bm.receiver.clone(), v], Vec::new());
+                    let mut args = self.pooled_scratch();
+                    args.push(bm.receiver.clone());
+                    args.push(v);
+                    return self.call_python_owned(f, args, Vec::new());
                 }
             }
             // A placeholder-free `functools.partial` with no stored
