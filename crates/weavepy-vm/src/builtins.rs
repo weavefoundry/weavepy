@@ -16133,19 +16133,41 @@ fn bytes_upper(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(bytes_like_result(args, out))
 }
 
+/// The bytes `bytes.strip` and its kin remove (ASCII whitespace by
+/// default), as a membership table: one lookup a byte, whatever the set's
+/// size (`quote_from_bytes` strips 66 of them).
+fn bytes_strip_set(args: &[Object]) -> Result<[bool; 256], RuntimeError> {
+    let mut table = [false; 256];
+    match args.get(1) {
+        None | Some(Object::None) => {
+            for &b in b" \t\n\r\x0b\x0c" {
+                table[usize::from(b)] = true;
+            }
+        }
+        Some(Object::Bytes(set)) => {
+            for &b in set.iter() {
+                table[usize::from(b)] = true;
+            }
+        }
+        Some(other) => {
+            for b in bytes_argview(other)? {
+                table[usize::from(b)] = true;
+            }
+        }
+    }
+    Ok(table)
+}
+
 fn bytes_strip(args: &[Object]) -> Result<Object, RuntimeError> {
     let data = bytes_data(args)?;
-    let trim_set: Vec<u8> = match args.get(1) {
-        None | Some(Object::None) => b" \t\n\r\x0b\x0c".to_vec(),
-        Some(other) => bytes_argview(other)?,
-    };
+    let trim_set = bytes_strip_set(args)?;
     let start = data
         .iter()
-        .position(|b| !trim_set.contains(b))
+        .position(|b| !trim_set[usize::from(*b)])
         .unwrap_or(data.len());
     let end = data
         .iter()
-        .rposition(|b| !trim_set.contains(b))
+        .rposition(|b| !trim_set[usize::from(*b)])
         .map_or(start, |i| i + 1);
     if let Some(same) = bytes_unchanged_self(args, end - start == data.len()) {
         return Ok(same);
@@ -16167,13 +16189,10 @@ fn bytes_unchanged_self(args: &[Object], unchanged: bool) -> Option<Object> {
 
 fn bytes_lstrip(args: &[Object]) -> Result<Object, RuntimeError> {
     let data = bytes_data(args)?;
-    let trim_set: Vec<u8> = match args.get(1) {
-        None | Some(Object::None) => b" \t\n\r\x0b\x0c".to_vec(),
-        Some(other) => bytes_argview(other)?,
-    };
+    let trim_set = bytes_strip_set(args)?;
     let start = data
         .iter()
-        .position(|b| !trim_set.contains(b))
+        .position(|b| !trim_set[usize::from(*b)])
         .unwrap_or(data.len());
     if let Some(same) = bytes_unchanged_self(args, start == 0) {
         return Ok(same);
@@ -16183,13 +16202,10 @@ fn bytes_lstrip(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn bytes_rstrip(args: &[Object]) -> Result<Object, RuntimeError> {
     let data = bytes_data(args)?;
-    let trim_set: Vec<u8> = match args.get(1) {
-        None | Some(Object::None) => b" \t\n\r\x0b\x0c".to_vec(),
-        Some(other) => bytes_argview(other)?,
-    };
+    let trim_set = bytes_strip_set(args)?;
     let end = data
         .iter()
-        .rposition(|b| !trim_set.contains(b))
+        .rposition(|b| !trim_set[usize::from(*b)])
         .map_or(0, |i| i + 1);
     if let Some(same) = bytes_unchanged_self(args, end == data.len()) {
         return Ok(same);
