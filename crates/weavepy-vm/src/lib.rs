@@ -27877,11 +27877,30 @@ impl Interpreter {
             return None;
         }
         let mut d = DictData::with_capacity_and_hasher(names.len(), crate::fasthash::FxBuildHasher);
-        for (name, v) in names.iter().zip(values) {
-            d.insert(DictKey(name.clone()), v.clone());
+        // Names whose hashes differ pairwise differ too: each goes in
+        // without the probe for an equal key (a call's keyword names are
+        // distinct, but a hand-built code object's might not be).
+        let mut hashes = [0i64; 8];
+        let distinct = names.len() <= hashes.len()
+            && names.iter().enumerate().all(|(k, n)| {
+                let Object::Str(s) = n else {
+                    return false;
+                };
+                let h = SharedStr::hash_cached(s);
+                hashes[k] = h;
+                !hashes[..k].contains(&h)
+            });
+        for (k, (name, v)) in names.iter().zip(values).enumerate() {
+            if distinct {
+                d.insert_unique_hashed(hashes[k], DictKey(name.clone()), v.clone());
+            } else {
+                d.insert(DictKey(name.clone()), v.clone());
+            }
         }
         let obj = Object::Dict(Rc::new(RefCell::new(d)));
-        gc_trace::track(&obj);
+        // (Born full: deferred like a built dict, promoted by a collection
+        // once it can anchor a cycle.)
+        gc_trace::track_built(&obj);
         Some(obj)
     }
 
