@@ -1554,7 +1554,7 @@ fn encoder_call(cfg: &EncoderCfg, args: &[Object]) -> Result<Object, RuntimeErro
     };
     with_interp(|interp| {
         let mut out = JsonWriter::default();
-        let mut cycle: HashSet<usize> = HashSet::new();
+        let mut cycle: crate::fasthash::FxHashSet<usize> = crate::fasthash::FxHashSet::default();
         let track = !matches!(cfg.markers, Object::None);
         encode_value(
             interp,
@@ -1790,7 +1790,7 @@ fn encode_value(
     level: usize,
     out: &mut JsonWriter,
     track: bool,
-    cycle: &mut HashSet<usize>,
+    cycle: &mut crate::fasthash::FxHashSet<usize>,
 ) -> Result<(), RuntimeError> {
     let _depth_guard = match crate::recursion::enter() {
         crate::recursion::Enter::Ok(g) => g,
@@ -1816,7 +1816,7 @@ fn encode_value_impl(
     level: usize,
     out: &mut JsonWriter,
     track: bool,
-    cycle: &mut HashSet<usize>,
+    cycle: &mut crate::fasthash::FxHashSet<usize>,
 ) -> Result<(), RuntimeError> {
     match json_kind(o) {
         Kind::Str => write_encoded_string(interp, cfg, o, out)?,
@@ -1880,7 +1880,7 @@ fn encode_list(
     level: usize,
     out: &mut JsonWriter,
     track: bool,
-    cycle: &mut HashSet<usize>,
+    cycle: &mut crate::fasthash::FxHashSet<usize>,
 ) -> Result<(), RuntimeError> {
     // A native `list` is indexed *live* each iteration (re-reading its
     // current length), exactly like `_json.c`'s `PyList_GET_SIZE` loop, so a
@@ -1956,7 +1956,7 @@ fn encode_dict(
     level: usize,
     out: &mut JsonWriter,
     track: bool,
-    cycle: &mut HashSet<usize>,
+    cycle: &mut crate::fasthash::FxHashSet<usize>,
 ) -> Result<(), RuntimeError> {
     if items.is_empty() {
         out.push_str("{}");
