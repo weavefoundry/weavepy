@@ -597,7 +597,12 @@ branch and pull request.
     strings by byte; one-character pieces are the shared strings
     (`partition` 1,266 to 838, against 987; `splitlines` 1,574 to 1,215,
     against 997). `list(enumerate(xs))` over a list or tuple builds its
-    pairs at once (6,843 to 4,853, against 4,521).
+    pairs at once (6,843 to 4,853, against 4,521). `min`, `max`, `sorted`
+    and `list.sort` call a leaf builtin key's body directly and read a
+    built-in value's length natively for `key=len` (`min(l, key=abs)` 5,515
+    to 3,587, against 3,573; `sorted(w, key=len)` 6,715 to 5,767, against
+    4,510), and `hex`, `oct` and `bin` of a machine int format in a stack
+    buffer (1,354 to 793, against 786).
   - Leaks found on the way. A cycle through a list or dict that a builtin
     built was never collected when the builtin didn't register it: list
     slices and starred targets in the core loop, `list.copy()`, `dir()`,
