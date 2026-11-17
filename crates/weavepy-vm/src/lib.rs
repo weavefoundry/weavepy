@@ -32579,6 +32579,27 @@ impl Interpreter {
             }
             return Some(self.build_exception_instance(ty.clone(), args));
         }
+        // `float(x)` and `int(x)` of a plain instance whose class's
+        // `__float__` or `__int__` is a Python function that evaluates as a
+        // pure leaf, answering an exact `float` or `int` (anything else,
+        // `__index__` among it, is the full call's), as `str(x)` below.
+        if let [recv @ Object::Instance(inst)] = args {
+            let bt = builtin_types();
+            let is_float = Rc::ptr_eq(ty, &bt.float_);
+            if (is_float || Rc::ptr_eq(ty, &bt.int_)) && inst.native.get().is_none() {
+                let (key, name) = if is_float {
+                    (crate::types::vm_key::FLOAT_FN, "__float__")
+                } else {
+                    (crate::types::vm_key::INT_FN, "__int__")
+                };
+                let f = Self::instance_dunder_function(inst, crate::types::AttrKey::vm(key), name)?;
+                return match self.call_pure_leaf_with(&f, Some(recv), &[])? {
+                    v @ Object::Float(_) if is_float => Some(v),
+                    v @ (Object::Int(_) | Object::Long(_)) if !is_float => Some(v),
+                    _ => None,
+                };
+            }
+        }
         let fns = self.leaf_fns();
         if Rc::ptr_eq(ty, &fns.str_ty) {
             // `str(x)` of a native scalar is its text: no `__str__`
@@ -45893,7 +45914,19 @@ impl Interpreter {
                 // CPython's `PyNumber_Float`: try `__float__` (which must
                 // return a float; a strict subclass is accepted with a
                 // DeprecationWarning), then `__index__` (an int, converted with
-                // an overflow check).
+                // an overflow check). A plain Python `__float__`
+                // (`Fraction`'s) is called with the instance, no bound method
+                // built for it.
+                if let Object::Instance(inst) = other {
+                    if let Some(f) = Self::instance_dunder_function(
+                        inst,
+                        crate::types::AttrKey::vm(crate::types::vm_key::FLOAT_FN),
+                        "__float__",
+                    ) {
+                        let r = self.call_dunder_function(f, std::slice::from_ref(other))?;
+                        return self.check_float_result(other, r);
+                    }
+                }
                 if let Some(method) = instance_method(other, "__float__") {
                     let r = self.call(&method, &[], &[], globals)?;
                     return self.check_float_result(other, r);

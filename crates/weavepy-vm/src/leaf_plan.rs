@@ -1486,6 +1486,16 @@ pub(crate) fn unary(v: V, kind: u8) -> Option<V> {
 #[inline(always)]
 pub(crate) fn binary(a: V, b: V, kind: u8) -> Option<V> {
     Some(match (a, b) {
+        // `int / int` of operands a double holds exactly (at most `2**53`
+        // in magnitude): their quotient is correctly rounded, as CPython's
+        // `long_true_divide` gives it (`Fraction.__float__`).
+        (V::I(a), V::I(b)) if kind == BinOpKind::Div as u8 => {
+            const EXACT: i64 = 1 << 53;
+            if b == 0 || !(-EXACT..=EXACT).contains(&a) || !(-EXACT..=EXACT).contains(&b) {
+                return None;
+            }
+            V::F(a as f64 / b as f64)
+        }
         (V::I(a), V::I(b)) => V::I(match kind {
             k if k == BinOpKind::Add as u8 => a.checked_add(b)?,
             k if k == BinOpKind::Sub as u8 => a.checked_sub(b)?,
