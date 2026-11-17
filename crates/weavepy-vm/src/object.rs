@@ -10520,13 +10520,14 @@ impl PyLazyIter {
             LazyIterKind::Zip {
                 iters,
                 result,
+                spare,
                 held,
                 ..
             } => {
                 for it in iters.iter().chain(held.iter()) {
                     visit(it);
                 }
-                if let Some(t) = result {
+                for t in result.iter().chain(spare.iter()) {
                     for v in t.iter() {
                         visit(v);
                     }
@@ -10754,6 +10755,11 @@ pub enum LazyIterKind {
         iters: Vec<Object>,
         strict: bool,
         result: Option<SharedTuple>,
+        /// The result before `result`, kept to refill once its holder
+        /// lets go: a loop that binds each tuple (`for t in zip(xs, ys)`)
+        /// still holds `result` when it asks for the next, so the two
+        /// take turns and no step allocates.
+        spare: Option<SharedTuple>,
         held: Vec<Object>,
     },
     /// The builtin `enumerate(iterable, start)` over a source only the

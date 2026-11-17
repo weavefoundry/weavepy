@@ -327,6 +327,7 @@ impl Interpreter {
                     iters,
                     strict: false,
                     result: None,
+                    spare: None,
                     held: Vec::new(),
                 })
             }
@@ -416,6 +417,7 @@ impl Interpreter {
                     iters,
                     strict,
                     result: None,
+                    spare: None,
                     held: Vec::new(),
                 }))
             }
@@ -1041,6 +1043,7 @@ pub(crate) fn lazy_pure_next(l: &PyLazyIter) -> Option<Option<Object>> {
         iters,
         strict: false,
         result,
+        spare,
         held,
     } = st
     else {
@@ -1050,14 +1053,11 @@ pub(crate) fn lazy_pure_next(l: &PyLazyIter) -> Option<Option<Object>> {
     if !held.is_empty() {
         return None;
     }
+    let n = iters.len();
     // Two plain sequence cursors (`zip(xs, ys)`), the commonest shape.
     if let [a, b] = iters.as_slice() {
         if let Some((x, y)) = cursor_pair(a, b) {
-            if let Some(slots) = result
-                .as_mut()
-                .and_then(crate::shared_value::ThinArc::get_mut)
-                .filter(|slots| slots.len() == 2)
-            {
+            if let Some(slots) = reusable_result(result, spare, 2) {
                 let old = (
                     std::mem::replace(&mut slots[0], x),
                     std::mem::replace(&mut slots[1], y),
@@ -1065,21 +1065,29 @@ pub(crate) fn lazy_pure_next(l: &PyLazyIter) -> Option<Option<Object>> {
                 drop(old);
                 return Some(Some(Object::Tuple(result.clone()?)));
             }
-            let t = crate::object::TupleStorage::from_array([x, y]);
-            *result = Some(t.clone());
-            return Some(Some(Object::Tuple(t)));
+            return Some(Some(fresh_result(
+                result,
+                spare,
+                crate::object::TupleStorage::from_array([x, y]),
+            )));
         }
     }
     // Up to eight plain sequence cursors (`zip(xs, ys, zs)`): their items,
     // into the previous result when this adapter holds it alone.
-    if (3..=CURSORS_MAX).contains(&iters.len()) {
+    if (3..=CURSORS_MAX).contains(&n) {
+        // (Tuple and list cursors, straight into the result's slots.)
+        if seq_cursors_ready(iters) {
+            if let Some(slots) = reusable_result(result, spare, n) {
+                seq_cursors_take(iters, slots);
+                return Some(Some(Object::Tuple(result.clone()?)));
+            }
+            let mut items = vec![Object::None; n];
+            seq_cursors_take(iters, &mut items);
+            let t = crate::object::TupleStorage::from_vec(items);
+            return Some(Some(fresh_result(result, spare, t)));
+        }
         if let Some(mut items) = cursors_next(iters) {
-            let n = iters.len();
-            if let Some(slots) = result
-                .as_mut()
-                .and_then(crate::shared_value::ThinArc::get_mut)
-                .filter(|slots| slots.len() == n)
-            {
+            if let Some(slots) = reusable_result(result, spare, n) {
                 // (The old items leave in `items`, released below.)
                 for (slot, x) in slots.iter_mut().zip(items.iter_mut()) {
                     std::mem::swap(slot, x);
@@ -1088,8 +1096,7 @@ pub(crate) fn lazy_pure_next(l: &PyLazyIter) -> Option<Option<Object>> {
                 return Some(Some(Object::Tuple(result.clone()?)));
             }
             let t = crate::object::TupleStorage::from_vec(items[..n].to_vec());
-            *result = Some(t.clone());
-            return Some(Some(Object::Tuple(t)));
+            return Some(Some(fresh_result(result, spare, t)));
         }
     }
     if !srcs_ready(iters) {
@@ -1099,16 +1106,11 @@ pub(crate) fn lazy_pure_next(l: &PyLazyIter) -> Option<Option<Object>> {
         return Some(None);
     }
     // The previous result, refilled when this adapter holds it alone.
-    if let Some(slots) = result
-        .as_mut()
-        .and_then(crate::shared_value::ThinArc::get_mut)
-    {
-        if slots.len() == iters.len() {
-            for (slot, it) in slots.iter_mut().zip(iters.iter()) {
-                *slot = src_step(it)?;
-            }
-            return Some(Some(Object::Tuple(result.clone()?)));
+    if let Some(slots) = reusable_result(result, spare, n) {
+        for (slot, it) in slots.iter_mut().zip(iters.iter()) {
+            *slot = src_step(it)?;
         }
+        return Some(Some(Object::Tuple(result.clone()?)));
     }
     let t = match iters.as_slice() {
         [a, b] => crate::object::TupleStorage::from_array([src_step(a)?, src_step(b)?]),
@@ -1116,8 +1118,43 @@ pub(crate) fn lazy_pure_next(l: &PyLazyIter) -> Option<Option<Object>> {
             iters.iter().map(src_step).collect::<Option<Vec<_>>>()?,
         ),
     };
-    *result = Some(t.clone());
-    Some(Some(Object::Tuple(t)))
+    Some(Some(fresh_result(result, spare, t)))
+}
+
+/// The slots of a `zip`'s result tuple of `n` items that only the adapter
+/// holds: `result`'s, or else its spare's (which then becomes `result`).
+#[inline]
+fn reusable_result<'a>(
+    result: &'a mut Option<crate::object::SharedTuple>,
+    spare: &mut Option<crate::object::SharedTuple>,
+    n: usize,
+) -> Option<&'a mut [Object]> {
+    let alone = |t: &mut Option<crate::object::SharedTuple>| {
+        t.as_mut()
+            .and_then(crate::shared_value::ThinArc::get_mut)
+            .is_some_and(|slots| slots.len() == n)
+    };
+    if !alone(result) {
+        if !alone(spare) {
+            return None;
+        }
+        std::mem::swap(result, spare);
+    }
+    result
+        .as_mut()
+        .and_then(crate::shared_value::ThinArc::get_mut)
+        .map(|slots| &mut slots[..])
+}
+
+/// A `zip`'s new result `t`, kept as `result` (the old one as the spare).
+#[inline]
+fn fresh_result(
+    result: &mut Option<crate::object::SharedTuple>,
+    spare: &mut Option<crate::object::SharedTuple>,
+    t: crate::object::SharedTuple,
+) -> Object {
+    *spare = result.replace(t.clone());
+    Object::Tuple(t)
 }
 
 /// [`lazy_pure_next`] for a two-source `zip` whose pair is unpacked at
@@ -1175,6 +1212,44 @@ pub(crate) fn next_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>>
 /// The most sources [`cursors_next`] steps at once.
 const CURSORS_MAX: usize = 8;
 
+/// Whether every one of `iters` is a distinct tuple or list cursor with an
+/// item left (see [`seq_cursors_take`]).
+fn seq_cursors_ready(iters: &[Object]) -> bool {
+    iters.iter().enumerate().all(|(k, it)| {
+        let Object::Iter(c) = it else {
+            return false;
+        };
+        if iters[..k]
+            .iter()
+            .any(|d| matches!(d, Object::Iter(d) if Rc::ptr_eq(c, d)))
+        {
+            return false;
+        }
+        // SAFETY: a view that runs no code and ends here.
+        unsafe { c.peek_mut() }
+            .and_then(seq_cursor)
+            .is_some_and(|(xs, i)| *i < xs.len())
+    })
+}
+
+/// Each of the cursors [`seq_cursors_ready`] admitted steps, its item
+/// written over the matching slot of `out` (the old one released).
+fn seq_cursors_take(iters: &[Object], out: &mut [Object]) {
+    for (slot, it) in out.iter_mut().zip(iters) {
+        let Object::Iter(c) = it else {
+            continue;
+        };
+        // SAFETY: distinct cells, one viewed at a time; an item's release
+        // only queues work for the next safe point.
+        if let Some((xs, i)) = unsafe { c.peek_mut() }.and_then(seq_cursor) {
+            if let Some(x) = xs.get(*i) {
+                *slot = x.clone();
+                *i += 1;
+            }
+        }
+    }
+}
+
 /// [`cursor_pair`] for up to [`CURSORS_MAX`] distinct plain sequence
 /// cursors: every one's next item, all taken, in the first `iters.len()`
 /// slots of the result; `None` (none taken) unless each has one.
@@ -1206,6 +1281,106 @@ fn cursors_next(iters: &[Object]) -> Option<[Object; CURSORS_MAX]> {
     Some(items)
 }
 
+/// Whether a `zip` stops now with nothing consumed (its first source, a
+/// tuple or list cursor, is at its end) and releasing it, when this is
+/// the last reference, frees nothing that could hold a finalizer: the
+/// core loop's `FOR_ITER` end, in place.
+pub(crate) fn zip_stops_quietly(l: &Rc<PyLazyIter>) -> bool {
+    use crate::object::PyIterator;
+    // SAFETY: reads that run no code, ending with this call.
+    let Some(st) = (unsafe { l.state.peek() }) else {
+        return false;
+    };
+    let LazyIterKind::Zip {
+        iters,
+        strict: false,
+        result,
+        spare,
+        held,
+    } = st
+    else {
+        return false;
+    };
+    let Some(Object::Iter(first)) = iters.first() else {
+        return false;
+    };
+    // SAFETY: as above.
+    let at_end = match unsafe { first.peek() } {
+        Some(PyIterator::Tuple { items, index }) => *index >= items.len(),
+        Some(PyIterator::List {
+            items,
+            index,
+            owner: None,
+        }) => unsafe { items.peek() }.is_some_and(|v| *index >= v.len()),
+        _ => false,
+    };
+    if !held.is_empty() || !at_end {
+        return false;
+    }
+    if Rc::strong_count(l) > 1 {
+        return true;
+    }
+    // A scalar dies quietly.
+    fn plain(v: &Object) -> bool {
+        matches!(
+            v,
+            Object::Int(_)
+                | Object::Float(_)
+                | Object::Bool(_)
+                | Object::None
+                | Object::Str(_)
+                | Object::Bytes(_)
+        )
+    }
+    // A source whose sequence another owner keeps (or that holds only
+    // scalars) releases quietly.
+    let quiet_source = |o: &Object| {
+        let Object::Iter(rc) = o else {
+            return false;
+        };
+        if Rc::strong_count(rc) > 1 {
+            return true;
+        }
+        // SAFETY: as above.
+        match unsafe { rc.peek() } {
+            Some(PyIterator::Tuple { items, .. }) => {
+                crate::shared_value::ThinArc::strong_count(items) > 1 || items.iter().all(plain)
+            }
+            Some(PyIterator::List { items, .. }) => {
+                Rc::strong_count(items) > 1
+                    || unsafe { items.peek() }.is_some_and(|v| v.iter().all(plain))
+            }
+            Some(PyIterator::Range { .. }) => true,
+            _ => false,
+        }
+    };
+    let quiet_result = |t: &Option<crate::object::SharedTuple>| {
+        t.as_ref().is_none_or(|t| {
+            crate::shared_value::ThinArc::strong_count(t) > 1 || t.iter().all(plain)
+        })
+    };
+    iters.iter().all(quiet_source) && quiet_result(result) && quiet_result(spare)
+}
+
+/// A tuple's or an unowned list's cursor: the items, and the position.
+#[inline(always)]
+fn seq_cursor(it: &mut crate::object::PyIterator) -> Option<(&[Object], &mut usize)> {
+    use crate::object::PyIterator;
+    match it {
+        PyIterator::Tuple { items, index } => Some((&items[..], index)),
+        PyIterator::List {
+            items,
+            index,
+            owner: None,
+        } => {
+            // SAFETY: a read that runs no code, ending before anything does.
+            let v = unsafe { items.peek() }?;
+            Some((&v[..], index))
+        }
+        _ => None,
+    }
+}
+
 /// The next items of two distinct plain sequence cursors, both taken; `None`
 /// (neither taken) unless both have one.
 #[inline]
@@ -1219,6 +1394,13 @@ fn cursor_pair(a: &Object, b: &Object) -> Option<(Object, Object)> {
     // SAFETY: two distinct cells; nothing below runs code, and the views
     // end with this call.
     let (ia, ib) = unsafe { (ca.peek_mut()?, cb.peek_mut()?) };
+    // Two tuple or list cursors (the commonest), indexed directly.
+    if let (Some((xs, i)), Some((ys, j))) = (seq_cursor(ia), seq_cursor(ib)) {
+        let pair = (xs.get(*i)?.clone(), ys.get(*j)?.clone());
+        *i += 1;
+        *j += 1;
+        return Some(pair);
+    }
     let x = ia.pure_peek()?;
     let y = ib.pure_peek()?;
     // (`pure_skip` steps past exactly what `pure_peek` found.)
