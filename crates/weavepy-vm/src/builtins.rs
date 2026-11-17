@@ -14773,10 +14773,10 @@ fn dict_copy(args: &[Object]) -> Result<Object, RuntimeError> {
     dict_view_no_args(args, "copy")?;
     let cloned = d.borrow().clone();
     let out = Object::Dict(Rc::new(RefCell::new(cloned)));
-    // Tracked by its contents, as any new dict is: a copy of scalars stays
-    // deferred, and one that could close a cycle is registered.
+    // Deferred without scanning its values: every collection promotes the
+    // deferred containers that could close a cycle before it marks.
     // (`gc.is_tracked` answers for a dict as CPython does either way.)
-    crate::gc_trace::track(&out);
+    crate::gc_trace::track_built(&out);
     Ok(out)
 }
 
