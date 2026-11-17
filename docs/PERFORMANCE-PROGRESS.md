@@ -608,8 +608,10 @@ branch and pull request.
     slices and starred targets in the core loop, `list.copy()`, `dir()`,
     `json.loads`, `re.findall`, `dict.fromkeys`, the generic `dict | dict`,
     `+` and `*` of lists, and every binder's `**kwargs` dict. They now
-    defer their tracking as other built containers do (a `**kwargs` call
-    pays about 170 instructions for it, `json_bench` 4%).
+    defer their tracking as other built containers do (`json_bench` pays
+    4% for it). A `**kwargs` dict that its code only ever feeds to a `**`
+    spread (a decorator's wrapper) can't outlive its call and skips the
+    registration; one that may escape pays about 170 instructions.
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
