@@ -9877,6 +9877,13 @@ const CODE_ATTR_NAMES: &[&str] = &[
 /// this loose because runtime helpers (typing, dataclasses, abc)
 /// only need it to enumerate user attributes.
 pub fn b_dir(args: &[Object]) -> Result<Object, RuntimeError> {
+    // (The list is the caller's to fill and keep: a tracked one.)
+    let out = b_dir_names(args)?;
+    crate::gc_trace::track_built(&out);
+    Ok(out)
+}
+
+fn b_dir_names(args: &[Object]) -> Result<Object, RuntimeError> {
     let mut names = DirNames(Vec::new());
     let obj = one(args, "dir")?;
     // Set when `getattr(obj, '__class__')` would fail — an *unset*
@@ -14042,7 +14049,9 @@ fn list_copy(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let l = list_self(args)?;
     let v = l.borrow().clone();
-    Ok(Object::new_list(v))
+    let out = Object::new_list(v);
+    crate::gc_trace::track_built(&out);
+    Ok(out)
 }
 
 // ---------- dict methods ----------
@@ -15052,7 +15061,9 @@ fn dict_fromkeys(args: &[Object]) -> Result<Object, RuntimeError> {
                 dict_insert(&d, k, value.clone())?;
             }
         }
-        return Ok(Object::Dict(d));
+        let out = Object::Dict(d);
+        crate::gc_trace::track_built(&out);
+        return Ok(out);
     }
     // A dict subclass: CPython's `dict_fromkeys` calls `cls()` — running
     // `__new__`/`__init__`, either of which may raise or return a foreign

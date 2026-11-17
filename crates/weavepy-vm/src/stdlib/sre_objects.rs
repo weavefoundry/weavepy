@@ -658,7 +658,9 @@ fn pattern_findall(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
             must_advance = s == en;
             p = en;
         }
-        Ok(Object::new_list(out))
+        let out = Object::new_list(out);
+        crate::gc_trace::track_built(&out);
+        Ok(out)
     })
 }
 

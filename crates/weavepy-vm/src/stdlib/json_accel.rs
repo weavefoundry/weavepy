@@ -1136,11 +1136,14 @@ fn finish_object(
                 .map(|(k, v)| Object::new_tuple_array([k, v]))
                 .collect();
             let arg = Object::new_list(pair_objs);
+            crate::gc_trace::track_built(&arg);
             return interp.call_object(cfg.object_pairs_hook.clone(), &[arg], &[]);
         }
         DecodedObject::Dict(dict) => dict,
     };
     let dict_obj = Object::Dict(Rc::new(RefCell::new(d)));
+    // (Deferred without scanning, as every built container's.)
+    crate::gc_trace::track_built(&dict_obj);
     if is_set(&cfg.object_hook) {
         return interp.call_object(cfg.object_hook.clone(), &[dict_obj], &[]);
     }
@@ -1170,7 +1173,7 @@ fn parse_array<C: JsonChar>(
     }
     if nextchar == Some(0x5d) {
         // ']'
-        return Ok((Object::new_list(values), end + 1));
+        return Ok((built_list(values), end + 1));
     }
     loop {
         let (value, new_end) = match scan_once(interp, cfg, doc, cps, end, memo) {
@@ -1233,7 +1236,14 @@ fn parse_array<C: JsonChar>(
             )));
         }
     }
-    Ok((Object::new_list(values), end))
+    Ok((built_list(values), end))
+}
+
+/// A decoded array: a new list, its tracking deferred without a scan.
+fn built_list(values: Vec<Object>) -> Object {
+    let list = Object::new_list(values);
+    crate::gc_trace::track_built(&list);
+    list
 }
 
 // ---------------------------------------------------------------------------

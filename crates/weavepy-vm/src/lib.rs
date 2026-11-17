@@ -9758,7 +9758,9 @@ impl Interpreter {
             });
         }
         if code.has_varkeywords {
-            v.push(Object::Dict(Rc::new(RefCell::new(DictData::default()))));
+            let d = Object::Dict(Rc::new(RefCell::new(DictData::default())));
+            gc_trace::track_built(&d);
+            v.push(d);
         }
     }
 
@@ -9993,7 +9995,9 @@ impl Interpreter {
         }
         v.extend(star);
         if code.has_varkeywords {
-            v.push(Object::Dict(Rc::new(RefCell::new(DictData::default()))));
+            let d = Object::Dict(Rc::new(RefCell::new(DictData::default())));
+            gc_trace::track_built(&d);
+            v.push(d);
         }
     }
 
@@ -10233,7 +10237,9 @@ impl Interpreter {
             drop(run);
         }
         if let Some(d) = varkw {
-            locals[total + usize::from(code.has_varargs)] = Object::Dict(Rc::new(RefCell::new(d)));
+            let d = Object::Dict(Rc::new(RefCell::new(d)));
+            gc_trace::track_built(&d);
+            locals[total + usize::from(code.has_varargs)] = d;
         }
         #[allow(clippy::needless_range_loop)]
         for slot in direct..total {
@@ -19883,9 +19889,9 @@ impl Interpreter {
             });
         }
         if code.has_varkeywords {
-            out.push(Object::Dict(Rc::new(RefCell::new(
-                varkw.unwrap_or_default(),
-            ))));
+            let d = Object::Dict(Rc::new(RefCell::new(varkw.unwrap_or_default())));
+            gc_trace::track_built(&d);
+            out.push(d);
         }
         Some(())
     }
@@ -24926,6 +24932,7 @@ impl Interpreter {
         let dict;
         if code_rc.has_varkeywords {
             dict = Object::Dict(Rc::new(RefCell::new(varkw.unwrap_or_default())));
+            gc_trace::track_built(&dict);
             args[total] = &raw const dict;
         }
         self.pure_leaf_eval::<false, false>(code_rc, f, &args[..arity])
@@ -60030,9 +60037,10 @@ impl Interpreter {
                             }
                         }
                         names.sort();
-                        return Ok(Object::new_list(
-                            names.into_iter().map(Object::from_str).collect(),
-                        ));
+                        let out =
+                            Object::new_list(names.into_iter().map(Object::from_str).collect());
+                        gc_trace::track_built(&out);
+                        return Ok(out);
                     }
                     if b.name == "breakpoint" {
                         return self.do_breakpoint_call(args, kwargs, outer_globals);
@@ -65632,7 +65640,10 @@ impl Interpreter {
             return Err(type_error(msg));
         }
         if let Some(slot) = kwargs_slot {
-            positional[slot] = Object::Dict(Rc::new(RefCell::new(extra_kwargs)));
+            // (The function may keep it: tracked, as CPython's dicts are.)
+            let d = Object::Dict(Rc::new(RefCell::new(extra_kwargs)));
+            gc_trace::track_built(&d);
+            positional[slot] = d;
             filled[slot] = true;
         }
         // Defaults plug remaining holes among positional args. CPython
@@ -89042,13 +89053,18 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             for (k, v) in y.borrow().iter() {
                 out.insert(k.clone(), v.clone());
             }
-            Ok(Object::Dict(Rc::new(RefCell::new(out))))
+            // (New containers: deferred, as every built one is.)
+            let out = Object::Dict(Rc::new(RefCell::new(out)));
+            gc_trace::track_built(&out);
+            Ok(out)
         }
 
         (O::List(x), O::List(y), B::Add) => {
             let mut out = x.borrow().clone();
             out.extend(y.borrow().iter().cloned());
-            Ok(Object::new_list(out))
+            let out = Object::new_list(out);
+            gc_trace::track_built(&out);
+            Ok(out)
         }
         (O::List(x), O::Int(n), B::Mult) | (O::Int(n), O::List(x), B::Mult) => {
             let body = x.borrow().clone();
@@ -89057,7 +89073,9 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             for _ in 0..times {
                 out.extend(body.iter().cloned());
             }
-            Ok(Object::new_list(out))
+            let out = Object::new_list(out);
+            gc_trace::track_built(&out);
+            Ok(out)
         }
         (O::Tuple(x), O::Tuple(y), B::Add) => {
             let mut out: Vec<Object> = x.iter().cloned().collect();
