@@ -46975,7 +46975,32 @@ impl Interpreter {
             return default
                 .ok_or_else(|| value_error(format!("{name}() iterable argument is empty")));
         }
+        // A leaf builtin key (`key=abs`, `key=len`): its body called
+        // directly, as a call site runs it (the general call otherwise).
+        let leaf = match &key_fn {
+            Some(Object::Builtin(b)) if !b.binds_instance => {
+                self.leaf_call_kind(b).map(|k| (b.clone(), k))
+            }
+            _ => None,
+        };
         let key_of = |slf: &mut Self, item: &Object| -> Result<Object, RuntimeError> {
+            if let Some((b, kind)) = &leaf {
+                let arg = std::slice::from_ref(item);
+                match kind {
+                    LeafKind::Fast(f) => {
+                        if let Some(r) = f(arg) {
+                            return r;
+                        }
+                    }
+                    LeafKind::Opaque => return (b.call)(arg),
+                    LeafKind::Scalar
+                        if matches!(item, Object::Int(_) | Object::Float(_) | Object::Bool(_)) =>
+                    {
+                        return (b.call)(arg);
+                    }
+                    _ => {}
+                }
+            }
             if let Some(f) = &key_fn {
                 slf.call(f, std::slice::from_ref(item), &[], globals)
             } else {
