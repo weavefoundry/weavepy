@@ -15958,9 +15958,23 @@ impl Object {
     pub fn from_static(s: &'static str) -> Self {
         const SLOTS: usize = 1024;
         type Slot = Option<((usize, usize), SharedStr)>;
+        /// A thread's table, which an exiting thread leaves to the next
+        /// (a literal's address and text are the process's, so an entry
+        /// holds on any thread) instead of building and dropping its own.
+        struct Statics(Option<Box<[Slot]>>);
+        static POOL: std::sync::Mutex<Vec<Box<[Slot]>>> = std::sync::Mutex::new(Vec::new());
+        impl Drop for Statics {
+            fn drop(&mut self) {
+                if let (Some(t), Ok(mut pool)) = (self.0.take(), POOL.lock()) {
+                    if pool.len() < 4 {
+                        pool.push(t);
+                    }
+                }
+            }
+        }
         thread_local! {
-            static STATICS: std::cell::RefCell<Option<Box<[Slot]>>> =
-                const { std::cell::RefCell::new(None) };
+            static STATICS: std::cell::RefCell<Statics> =
+                const { std::cell::RefCell::new(Statics(None)) };
         }
         if s.len() <= 2 {
             return Object::Str(SharedStr::from(s));
@@ -15971,7 +15985,12 @@ impl Object {
             let Ok(mut t) = t.try_borrow_mut() else {
                 return SharedStr::from(s);
             };
-            let table = t.get_or_insert_with(|| (0..SLOTS).map(|_| None).collect());
+            let table = t.0.get_or_insert_with(|| {
+                POOL.lock()
+                    .ok()
+                    .and_then(|mut p| p.pop())
+                    .unwrap_or_else(|| (0..SLOTS).map(|_| None).collect())
+            });
             match &table[ix] {
                 Some((k, v)) if *k == key => v.clone(),
                 _ => {
