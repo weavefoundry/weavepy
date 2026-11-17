@@ -3126,14 +3126,75 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
             call_kw: None,
         })),
     );
+    /// `object.__setattr__(obj, name, value)`'s leaf half (see
+    /// `leaf_builtins::register_fast`), for the stores the default
+    /// `__setattr__` makes without running any code: a plain instance's
+    /// own attribute in its split dict (where the class holds nothing that
+    /// would intercept the name) or a writable `__slots__` member. What a
+    /// frozen dataclass's `__init__` pays per field. `None` leaves the
+    /// rest to the full store.
+    fn object_setattr_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+        let [Object::Instance(inst), Object::Str(name), value] = args else {
+            return None;
+        };
+        let n: &str = name;
+        let cls = inst.cls_raw();
+        // (Dunders and `args` have stores of their own; a bound method
+        // value is tracked first.)
+        if n.starts_with("__")
+            || n == "args"
+            || inst.native.get().is_some()
+            || inst.c_body.get() != 0
+            || cls.native_kind.get() != 0
+            || cls.is_super_proxy_type()
+            || matches!(value, Object::BoundMethod(_))
+            || crate::object::exotic_str_keys_possible()
+            || crate::capi_watchers::dicts_active()
+        {
+            return None;
+        }
+        match cls.lookup(n) {
+            Some(Object::SlotDescriptor(sd)) if sd.name == n && !sd.readonly => {
+                inst.note_slot_store(value);
+                let old = inst
+                    .slots
+                    .try_borrow_mut()
+                    .ok()?
+                    .insert_shared(name, value.clone());
+                drop(old);
+                Some(Ok(Object::None))
+            }
+            None
+            | Some(
+                Object::Function(_)
+                | Object::Int(_)
+                | Object::Float(_)
+                | Object::Bool(_)
+                | Object::None
+                | Object::Str(_),
+            ) if !cls.forbids_dict => {
+                let key = crate::stdlib::sys::intern_shared_memo(name);
+                match inst.split_store(&key, value.clone()) {
+                    Ok(old) => {
+                        drop(old);
+                        Some(Ok(Object::None))
+                    }
+                    Err(_) => None,
+                }
+            }
+            _ => None,
+        }
+    }
+    let setattr = Rc::new(BuiltinFn {
+        name: "__setattr__",
+        binds_instance: true,
+        call: Box::new(object_setattr),
+        call_kw: None,
+    });
+    crate::leaf_builtins::register_fast(&setattr, object_setattr_fast);
     dict.insert(
         DictKey(Object::from_static("__setattr__")),
-        Object::Builtin(Rc::new(BuiltinFn {
-            name: "__setattr__",
-            binds_instance: true,
-            call: Box::new(object_setattr),
-            call_kw: None,
-        })),
+        Object::Builtin(setattr),
     );
     dict.insert(
         DictKey(Object::from_static("__delattr__")),
