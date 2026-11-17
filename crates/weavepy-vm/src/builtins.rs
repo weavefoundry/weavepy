@@ -10609,7 +10609,7 @@ fn pow_modular(base: &Object, exp: &Object, m: &Object) -> Result<Object, Runtim
     // reduction for an odd modulus), the result taking `m`'s sign below.
     if !e.is_negative() {
         let result: BigInt = match u64::try_from(mm.magnitude()) {
-            Ok(m) => BigInt::from(pow_mod_word(&b, &e, m)),
+            Ok(m) => BigInt::from(pow_mod_word(b, e, m)),
             Err(_) => {
                 let m_abs = mm.magnitude();
                 let mut base = b.magnitude() % m_abs;
