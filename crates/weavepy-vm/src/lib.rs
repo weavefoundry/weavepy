@@ -7476,6 +7476,15 @@ impl Interpreter {
             // ops on mutables return the same object; the registry
             // keyed by identity just overwrites, which is harmless.
             self.record_alloc(&r);
+            // A heap result (`d1 | d2`, `k & s`, `b * 3`): compiled code
+            // takes the helper that keeps one, not the numbers' (which
+            // leaves for the core loop on anything else).
+            if !matches!(
+                r,
+                Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
+            ) {
+                Self::heap_result_note(frame, cache_pc as usize);
+            }
             frame.push(r);
             // Mirror of the BINARY_SUBSCR retirement: CPython decrefs
             // both operands as BINARY_OP retires them, so a chained
@@ -7490,6 +7499,17 @@ impl Interpreter {
             self.retire_operand(b);
         }
         Ok(())
+    }
+
+    /// Note that the `BINARY_OP` at `pc` built a heap value (see
+    /// [`heap_site`]).
+    #[cold]
+    fn heap_result_note(frame: &Frame, pc: usize) {
+        if let Some(ext) = code_vm_ext_existing(&frame.code) {
+            if !heap_site(ext, pc) {
+                heap_site_note(ext, frame.code.instructions.len(), pc);
+            }
+        }
     }
 
     /// Operand retirement for `BINARY_OP` / `COMPARE_OP`: an instance
@@ -53323,6 +53343,40 @@ impl Interpreter {
         ) {
             let a_elems = dict_view_set_elems(a);
             let b_elems = dict_view_set_elems(b);
+            if op == BinOpKind::BitAnd && (a_elems.is_some() || b_elems.is_some()) {
+                // CPython's `_PyDictView_Intersect` keeps the elements of
+                // the operand it walks: the view's when the other is a
+                // `set` at least as long (`set.intersection(view)`) or a
+                // longer view, else the other's.
+                let (view_elems, other, other_elems) = match a_elems {
+                    Some(e) => (e, b, b_elems),
+                    None => (b_elems.expect("one is a view"), a, None),
+                };
+                let (keep_view, other_elems) = match other_elems {
+                    Some(e) => (e.len() > view_elems.len(), e),
+                    None => {
+                        let set_len = match other {
+                            Object::Set(s) => Some(s.borrow().len()),
+                            _ => None,
+                        };
+                        let e = self.collect_iterable(other, globals)?;
+                        (set_len.is_some_and(|n| view_elems.len() <= n), e)
+                    }
+                };
+                let (walk, probe) = if keep_view {
+                    (view_elems, other_elems)
+                } else {
+                    (other_elems, view_elems)
+                };
+                let probe = Object::new_set_from(probe);
+                let mut kept = Vec::new();
+                for x in walk {
+                    if probe.contains(&x)? {
+                        kept.push(x);
+                    }
+                }
+                return Ok(Object::new_set_from(kept));
+            }
             if a_elems.is_some() || b_elems.is_some() {
                 let left = match a_elems {
                     Some(e) => Object::new_set_from(e),
@@ -78946,6 +79000,71 @@ fn freeze_set_result(o: Object) -> Object {
 /// [`crate::object::dict_key_is_reentrant`]), and a comparison with a
 /// stored key that would run Python defers instead. `None` (nothing
 /// observable done) sends the operation to the snapshot path.
+/// `a | b` of two exact dicts whose keys hash and compare natively: a copy
+/// of `a`'s table with `b`'s entries put over it, as `dict.__or__` merges
+/// them. `None` (nothing done) for any other case: a key a Python
+/// `__eq__`/`__hash__` could answer, an active dict watcher, a cell in use.
+pub(crate) fn dict_union_plain(a: &Object, b: &Object) -> Option<Object> {
+    let (Object::Dict(x), Object::Dict(y)) = (a, b) else {
+        return None;
+    };
+    if crate::capi_watchers::dicts_active() {
+        return None;
+    }
+    let (Ok(x), Ok(y)) = (x.try_borrow(), y.try_borrow()) else {
+        return None;
+    };
+    let reentrant = |d: &DictData| d.keys().any(|k| crate::object::dict_key_is_reentrant(&k.0));
+    if reentrant(&y) || (!y.is_empty() && reentrant(&x)) {
+        return None;
+    }
+    let mut map = x.clone_with_room(y.len());
+    for (k, v) in y.iter() {
+        map.insert(k.clone(), v.clone());
+    }
+    drop((x, y));
+    let out = Object::Dict(Rc::new(RefCell::new(DictData::from(map))));
+    gc_trace::track_built(&out);
+    Some(out)
+}
+
+/// `keys_view <op> s` for a dict's keys view and an exact set or frozenset
+/// (CPython's `dictviews_or`, `_and`, `_sub` and `_xor`), whose keys hash
+/// and compare natively: a `set`. An intersection keeps the smaller
+/// operand's elements, the view's on a tie (`set.intersection(view)`), so
+/// it is taken only against a `set`.
+pub(crate) fn keys_view_algebra(a: &Object, b: &Object, op: BinOpKind) -> Option<Object> {
+    let Object::DictView(v) = a else {
+        return None;
+    };
+    if v.kind != crate::object::DictViewKind::Keys
+        || !matches!(b, Object::Set(_) | Object::FrozenSet(_))
+        || (op == BinOpKind::BitAnd && !matches!(b, Object::Set(_)))
+    {
+        return None;
+    }
+    let keys = {
+        let d = v.dict.try_borrow().ok()?;
+        let entries = d.as_entries();
+        if entries
+            .iter()
+            .any(|e| crate::object::dict_key_is_reentrant(&e.key.0))
+        {
+            return None;
+        }
+        let mut keys = crate::object::SetData::with_capacity(entries.len());
+        for e in entries {
+            keys.insert_hashed(e.hash, e.key.clone());
+        }
+        keys
+    };
+    let keys = Object::Set(Rc::new(RefCell::new(keys)));
+    match op {
+        BinOpKind::BitAnd => set_algebra_fast(b, &keys, op),
+        _ => set_algebra_fast(&keys, b, op),
+    }
+}
+
 pub(crate) fn set_algebra_fast(a: &Object, b: &Object, op: BinOpKind) -> Option<Object> {
     // Whether every key of `o` hashes and compares natively.
     fn plain(o: &Object) -> bool {
@@ -90405,7 +90524,31 @@ pub(crate) unsafe fn core_plain_compare(at: *mut Object, op: CompareKind) -> Opt
             Some(w) => {
                 matches!(o, Object::Str(_) | Object::Bytes(_) | Object::Long(_))
                     || unsafe { &*w }.load(std::sync::atomic::Ordering::Relaxed) > 1
+                    || scalar_set(o)
             }
+        }
+    }
+    // A small set of strings and numbers (a literal built for the
+    // comparison) frees only them.
+    fn scalar_set(o: &Object) -> bool {
+        let all = |d: &crate::object::SetData| {
+            d.len() <= 16
+                && d.iter().all(|k| {
+                    matches!(
+                        k.0,
+                        Object::Int(_)
+                            | Object::Float(_)
+                            | Object::Str(_)
+                            | Object::Bytes(_)
+                            | Object::Bool(_)
+                            | Object::None
+                    )
+                })
+        };
+        match o {
+            Object::Set(s) => s.try_borrow().is_ok_and(|d| all(&d)),
+            Object::FrozenSet(s) => all(s),
+            _ => false,
         }
     }
     if !Interpreter::core_drops_plain()
@@ -90540,6 +90683,14 @@ pub(crate) fn plain_compare(a: &Object, b: &Object, op: CompareKind) -> Option<b
         (Object::Int(x), Object::Long(y)) => {
             return Some(by_ord(Some(long_cmp_int(y, *x).reverse())));
         }
+        (Object::Dict(_), Object::Dict(_))
+            if matches!(op, CompareKind::Eq | CompareKind::NotEq) =>
+        {
+            return native_dict_eq(a, b, 0).map(|eq| eq == (op == CompareKind::Eq));
+        }
+        (Object::Set(_) | Object::FrozenSet(_), Object::Set(_) | Object::FrozenSet(_)) => {
+            return native_set_compare(a, b, op);
+        }
         _ => {}
     }
     if !matches!(op, CompareKind::Eq | CompareKind::NotEq) {
@@ -90564,6 +90715,75 @@ pub(crate) fn plain_compare(a: &Object, b: &Object, op: CompareKind) -> Option<b
         _ => return None,
     };
     Some(same == matches!(op, CompareKind::Eq))
+}
+
+/// `a == b` for two exact dicts whose keys hash and compare natively and
+/// whose values compare without Python code (as [`plain_compare`]
+/// decides, a nested dict to a small depth): CPython's `dict_equal`, the
+/// lengths, then each of `a`'s keys looked up in `b` and its values
+/// compared, identity first. `None` for anything that might run Python.
+fn native_dict_eq(a: &Object, b: &Object, depth: u32) -> Option<bool> {
+    let (Object::Dict(x), Object::Dict(y)) = (a, b) else {
+        return None;
+    };
+    if depth > 8 {
+        return None;
+    }
+    let (x, y) = (x.try_borrow().ok()?, y.try_borrow().ok()?);
+    if x.len() != y.len() {
+        return Some(false);
+    }
+    let reentrant = |d: &DictData| d.keys().any(|k| crate::object::dict_key_is_reentrant(&k.0));
+    if reentrant(&x) || reentrant(&y) {
+        return None;
+    }
+    let (r, deferred) = crate::object::with_key_eq_deferred(|| {
+        for (k, v) in x.iter() {
+            let Some(w) = y.get(k) else {
+                return Some(false);
+            };
+            if v.is_same(w) {
+                continue;
+            }
+            let eq = match (v, w) {
+                (Object::Dict(_), Object::Dict(_)) => native_dict_eq(v, w, depth + 1)?,
+                _ => plain_compare(v, w, CompareKind::Eq)?,
+            };
+            if !eq {
+                return Some(false);
+            }
+        }
+        Some(true)
+    });
+    if deferred {
+        None
+    } else {
+        r
+    }
+}
+
+/// `a <op> b` for two exact sets or frozensets whose elements hash and
+/// compare natively: equality, subset and superset tests. `None` when an
+/// element might run Python.
+fn native_set_compare(a: &Object, b: &Object, op: CompareKind) -> Option<bool> {
+    use crate::object::SetData;
+    fn with<R>(o: &Object, f: impl FnOnce(&SetData) -> Option<R>) -> Option<R> {
+        match o {
+            Object::Set(s) => f(&*s.try_borrow().ok()?),
+            Object::FrozenSet(s) => f(s),
+            _ => None,
+        }
+    }
+    let reentrant = |d: &SetData| d.iter().any(|k| crate::object::dict_key_is_reentrant(&k.0));
+    with(a, |x| {
+        with(b, |y| {
+            if reentrant(x) || reentrant(y) {
+                return None;
+            }
+            let (r, deferred) = crate::object::with_key_eq_deferred(|| compare_sets(x, y, op));
+            (!deferred).then_some(r)
+        })
+    })
 }
 
 /// How the big int `x` orders against the machine int `y`, allocating

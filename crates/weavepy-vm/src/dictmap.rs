@@ -333,6 +333,20 @@ impl<V: Clone> Clone for Table<V> {
     }
 }
 
+impl<V: Clone> Table<V> {
+    /// A copy whose entry list has room for `extra` more entries (a
+    /// union's), allocated once.
+    pub fn clone_with_room(&self, extra: usize) -> Self {
+        let mut entries = Vec::with_capacity(self.entries.len() + extra);
+        entries.extend_from_slice(&self.entries);
+        Self {
+            entries,
+            slots: self.slots.clone(),
+            shift: self.shift,
+        }
+    }
+}
+
 impl<V: fmt::Debug> fmt::Debug for Table<V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_map()

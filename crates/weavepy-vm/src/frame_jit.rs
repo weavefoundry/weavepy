@@ -6367,6 +6367,13 @@ unsafe extern "C" fn h_binop(at: *mut Object, kind: u32) -> u32 {
             {
                 Interpreter::core_seq_repeat(a, b)
             }
+            // Two dicts' union (`dict.__or__`) whose keys hash and compare
+            // natively.
+            (Object::Dict(_), Object::Dict(_))
+                if !inplace && kind == BinOpKind::BitOr && droppable(a) && droppable(b) =>
+            {
+                crate::dict_union_plain(a, b)
+            }
             // Two sets' union, intersection, difference or symmetric
             // difference whose keys hash and compare natively (the core
             // loop's set lane; an in-place one mutates, and is its own).
@@ -6380,6 +6387,34 @@ unsafe extern "C" fn h_binop(at: *mut Object, kind: u32) -> u32 {
                     && droppable(b) =>
             {
                 crate::set_algebra_fast(a, b, kind)
+            }
+            // A dict's keys view against a set (`d.keys() & s`): a set.
+            (Object::DictView(_), Object::Set(_) | Object::FrozenSet(_))
+                if !inplace
+                    && matches!(
+                        kind,
+                        BinOpKind::BitOr | BinOpKind::BitAnd | BinOpKind::Sub | BinOpKind::BitXor
+                    )
+                    && droppable(a)
+                    && droppable(b) =>
+            {
+                crate::keys_view_algebra(a, b, kind)
+            }
+            // `bytes % args` with plain conversions over ints and bytes
+            // (on success, everything released is one of those).
+            (Object::Bytes(t), Object::Int(_) | Object::Bytes(_) | Object::Tuple(_))
+                if kind == BinOpKind::Mod && droppable(a) && droppable(b) =>
+            {
+                crate::bytes_percent_simple(t, b).map(Object::new_bytes)
+            }
+            // A short `bytes`' repetition.
+            (Object::Bytes(x), Object::Int(n)) | (Object::Int(n), Object::Bytes(x))
+                if kind == BinOpKind::Mult
+                    && x.len().saturating_mul((*n).max(0) as usize) <= 1 << 20
+                    && droppable(a)
+                    && droppable(b) =>
+            {
+                Some(Object::new_bytes(x.repeat((*n).max(0) as usize)))
             }
             // Two `bytes`' concatenation (`_ALWAYS_SAFE_BYTES + safe`;
             // immutable, so `+=` is the same).
@@ -20308,9 +20343,10 @@ impl<'a> Lower<'a> {
         if native {
             return self.binary_helper(pc, kind, ai, bi);
         }
+        // (A small int operand, `b * 3`, is boxed onto the stack.)
         if crate::heap_site(self.ext, pc)
-            && matches!(ai, Item::Local(_) | Item::Const(_))
-            && matches!(bi, Item::Local(_) | Item::Const(_))
+            && !matches!(ai, Item::Mem(_))
+            && !matches!(bi, Item::Mem(_))
         {
             return self.binary_helper(pc, kind, ai, bi);
         }
