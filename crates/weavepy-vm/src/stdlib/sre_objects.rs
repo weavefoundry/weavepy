@@ -1682,6 +1682,20 @@ fn compile_cached_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> 
     let [Object::Dict(cache), _, Object::Type(flag_type)] = &front[..] else {
         return None;
     };
+    // A compiled pattern with no flags (`re.match(SECTCRE, key)`): `_compile`
+    // finds it in neither cache (they key only strings and bytes), raising
+    // and catching a `KeyError` on the way, and returns it as is.
+    if let Object::Instance(inst) = pattern {
+        let no_flags = match flags {
+            Object::Int(0) | Object::Bool(false) => true,
+            Object::Instance(i) if Rc::ptr_eq(&i.cls(), flag_type) => {
+                matches!(i.native.get(), Some(Object::Int(0)))
+            }
+            _ => false,
+        };
+        let compiled = with_state(inst, |st| pattern_code(st, inst).is_some()) == Some(true);
+        return (no_flags && compiled).then(|| Ok(pattern.clone()));
+    }
     let bt = crate::builtin_types::builtin_types();
     let ty = match pattern {
         Object::Str(_) => bt.str_.clone(),
