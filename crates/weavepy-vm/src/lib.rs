@@ -21299,7 +21299,26 @@ impl Interpreter {
                 let items = items.try_borrow().ok()?;
                 Some(Object::new_list(slice_seq(&items, sl).ok()?))
             }
-            Object::Tuple(items) => Some(Object::new_tuple(slice_seq(&items[..], sl).ok()?)),
+            Object::Tuple(items) => {
+                // A contiguous slice clones its range straight into the new
+                // tuple (the whole tuple is itself, as CPython's).
+                if matches!(sl.step, Object::None | Object::Int(1)) {
+                    let (lo, hi) = Self::slice_bounds(sl, items.len())?;
+                    let hi = hi.max(lo);
+                    if lo == 0 && hi == items.len() {
+                        return Some(c.clone());
+                    }
+                    if lo == hi {
+                        return Some(Object::new_tuple(Vec::new()));
+                    }
+                    return Some(Object::Tuple(
+                        crate::tuple_storage::TupleStorage::from_exact_iter(
+                            items[lo..hi].iter().cloned(),
+                        ),
+                    ));
+                }
+                Some(Object::new_tuple(slice_seq(&items[..], sl).ok()?))
+            }
             Object::Str(st) => str_subscript_slice(st, sl).ok(),
             Object::Bytes(b) => {
                 // (A contiguous slice copies its range once.)
