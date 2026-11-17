@@ -1,5 +1,5 @@
-"""Dict union and equality, set comparisons, keys-view algebra, and bytes
-repetition and formatting in compiled code.
+"""Dict union and equality, set and keys-view comparisons, keys-view
+algebra, and bytes repetition and formatting in compiled code.
 
 Plain keys and values take the native paths; a key or value with a
 Python `__eq__` takes the full path, which runs it. Results that are heap
@@ -75,6 +75,21 @@ def views(n):
         assert {E(1): 0}.keys() & {E(1)} == {E(1)} and E.eqs >= 1
 
 
+def keys_compare(n):
+    d = {"a": 1, "b": 2}
+    k = d.keys()
+    e = {"x": 1}.keys()
+    for _ in range(n):
+        assert k == {"a", "b"} and k != {"a"} and {"a", "b"} == k and k == frozenset("ab")
+        assert k <= {"a", "b", "c"} and k < {"a", "b", "c"} and not k < {"a", "b"}
+        assert k >= {"a"} and k > {"a"} and not k > {"a", "b"} and {"a"} < k
+        assert {"a", "b", "c"} > k and k == {"b": 0, "a": 0}.keys() and k != e and not k <= e
+        assert d.items() == {("a", 1), ("b", 2)} and d.values() != {1, 2}
+        assert {1: 0}.keys() == {1.0} and {1: 0}.keys() == {True}
+        E.eqs = 0
+        assert {E(1): 0}.keys() == {E(1)} and E.eqs >= 1
+
+
 def byte_ops(n):
     bs = b"ab"
     for i in range(n):
@@ -97,7 +112,7 @@ def byte_ops(n):
             raise AssertionError("too few arguments")
 
 
-for f in (dicts, sets, views, byte_ops):
+for f in (dicts, sets, views, keys_compare, byte_ops):
     f(1500)
 
 # Self-referential dicts compare by identity first, and two distinct

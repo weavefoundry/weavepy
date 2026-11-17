@@ -90691,6 +90691,10 @@ pub(crate) fn plain_compare(a: &Object, b: &Object, op: CompareKind) -> Option<b
         (Object::Set(_) | Object::FrozenSet(_), Object::Set(_) | Object::FrozenSet(_)) => {
             return native_set_compare(a, b, op);
         }
+        (Object::DictView(_), Object::Set(_) | Object::FrozenSet(_) | Object::DictView(_))
+        | (Object::Set(_) | Object::FrozenSet(_), Object::DictView(_)) => {
+            return native_keys_compare(a, b, op);
+        }
         _ => {}
     }
     if !matches!(op, CompareKind::Eq | CompareKind::NotEq) {
@@ -90783,6 +90787,81 @@ fn native_set_compare(a: &Object, b: &Object, op: CompareKind) -> Option<bool> {
             let (r, deferred) = crate::object::with_key_eq_deferred(|| compare_sets(x, y, op));
             (!deferred).then_some(r)
         })
+    })
+}
+
+/// `a <op> b` for a dict's keys view against a set, a frozenset or another
+/// keys view (CPython's `dictview_richcompare`: the lengths, then whether
+/// one side's elements are all in the other), when every key hashes and
+/// compares natively. `None` for an items or values view, or a key that
+/// might run Python.
+fn native_keys_compare(a: &Object, b: &Object, op: CompareKind) -> Option<bool> {
+    use crate::object::{DictKey, SetData};
+    enum Side<'a> {
+        Keys(crate::sync::Ref<'a, DictData>),
+        Set(crate::sync::Ref<'a, SetData>),
+        Frozen(&'a SetData),
+    }
+    impl Side<'_> {
+        fn len(&self) -> usize {
+            match self {
+                Side::Keys(d) => d.len(),
+                Side::Set(s) => s.len(),
+                Side::Frozen(s) => s.len(),
+            }
+        }
+        fn has(&self, k: &DictKey) -> bool {
+            match self {
+                Side::Keys(d) => d.contains_key(k),
+                Side::Set(s) => s.contains(k),
+                Side::Frozen(s) => s.contains(k),
+            }
+        }
+        fn any(&self, mut f: impl FnMut(&DictKey) -> bool) -> bool {
+            match self {
+                Side::Keys(d) => d.keys().any(f),
+                Side::Set(s) => s.iter().any(&mut f),
+                Side::Frozen(s) => s.iter().any(f),
+            }
+        }
+    }
+    fn side(o: &Object) -> Option<Side<'_>> {
+        Some(match o {
+            Object::DictView(v) if v.kind == crate::object::DictViewKind::Keys => {
+                Side::Keys(v.dict.try_borrow().ok()?)
+            }
+            Object::Set(s) => Side::Set(s.try_borrow().ok()?),
+            Object::FrozenSet(s) => Side::Frozen(s),
+            _ => return None,
+        })
+    }
+    let (x, y) = (side(a)?, side(b)?);
+    let reentrant = |k: &DictKey| crate::object::dict_key_is_reentrant(&k.0);
+    if x.any(reentrant) || y.any(reentrant) {
+        return None;
+    }
+    let (m, n) = (x.len(), y.len());
+    let len_ok = match op {
+        CompareKind::Eq | CompareKind::NotEq => m == n,
+        CompareKind::Lt => m < n,
+        CompareKind::LtE => m <= n,
+        CompareKind::Gt => m > n,
+        CompareKind::GtE => m >= n,
+    };
+    // (`>` and `>=` test that `b`'s elements are all in `a`.)
+    let (inner, outer) = match op {
+        CompareKind::Gt | CompareKind::GtE => (&y, &x),
+        _ => (&x, &y),
+    };
+    let (contained, deferred) =
+        crate::object::with_key_eq_deferred(|| len_ok && !inner.any(|k| !outer.has(k)));
+    if deferred {
+        return None;
+    }
+    Some(if op == CompareKind::NotEq {
+        !contained
+    } else {
+        contained
     })
 }
 
