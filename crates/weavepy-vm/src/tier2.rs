@@ -10588,9 +10588,13 @@ unsafe extern "C" fn wpjit_list_repeat(frame: *mut JitFrame, pin: i64, count: i6
         out.extend(items.iter().cloned());
     }
     drop(items);
-    let fresh = Rc::new(crate::sync::RefCell::new(out));
-    // See `wpjit_build_list`: every built list is GC-tracked.
-    crate::gc_trace::track(&Object::List(fresh.clone()));
+    let fresh = Object::List(Rc::new(crate::sync::RefCell::new(out)));
+    // See `wpjit_build_list`: deferred without scanning its elements (each
+    // collection promotes the deferred lists that could close a cycle).
+    crate::gc_trace::track_built(&fresh);
+    let Object::List(fresh) = fresh else {
+        unreachable!("built above")
+    };
     let idx = ctx.pins.len() as i64;
     ctx.pins.push(Pin::List(fresh, elem));
     idx
@@ -10682,9 +10686,13 @@ unsafe extern "C" fn wpjit_list_slice(
         Vec::new()
     };
     drop(items);
-    let fresh = Rc::new(crate::sync::RefCell::new(out));
-    // See `wpjit_build_list`: every built list is GC-tracked.
-    crate::gc_trace::track(&Object::List(fresh.clone()));
+    let fresh = Object::List(Rc::new(crate::sync::RefCell::new(out)));
+    // See `wpjit_build_list`: deferred without scanning its elements (each
+    // collection promotes the deferred lists that could close a cycle).
+    crate::gc_trace::track_built(&fresh);
+    let Object::List(fresh) = fresh else {
+        unreachable!("built above")
+    };
     let idx = ctx.pins.len() as i64;
     ctx.pins.push(Pin::List(fresh, elem));
     idx
