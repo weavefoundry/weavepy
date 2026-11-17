@@ -4631,6 +4631,7 @@ fn key_eq_defer_active() -> bool {
 /// exactly once per operation (`test_setdefault_atomic`). Builtin-owned
 /// overrides (`weakref` comparing by referent) stay on the fast path: they
 /// cannot re-enter user code.
+#[inline]
 pub(crate) fn dict_key_is_reentrant(key: &Object) -> bool {
     match key {
         Object::Instance(inst) => {

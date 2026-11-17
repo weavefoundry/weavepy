@@ -47737,11 +47737,14 @@ impl Interpreter {
         let (Ok(s), Ok(mut d)) = (src.try_borrow(), dst.try_borrow_mut()) else {
             return false;
         };
-        if s.keys().any(|k| crate::object::dict_key_is_reentrant(&k.0)) {
-            return false;
-        }
         let was = d.len();
-        if was > DST_CHECK_CAP || d.keys().any(|k| crate::object::dict_key_is_reentrant(&k.0)) {
+        // (An empty destination takes the source's table, hashes and all:
+        // no key is hashed or compared, so none needs checking.)
+        if was != 0
+            && (s.keys().any(|k| crate::object::dict_key_is_reentrant(&k.0))
+                || was > DST_CHECK_CAP
+                || d.keys().any(|k| crate::object::dict_key_is_reentrant(&k.0)))
+        {
             return false;
         }
         let mut changed = false;
