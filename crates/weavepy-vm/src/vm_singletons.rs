@@ -737,8 +737,24 @@ thread_local! {
     /// Stored as a raw pointer because the VM owns the storage —
     /// the guard pops on drop so the pointer never outlives the
     /// owning `&mut Interpreter` borrow.
-    static CURRENT_INTERPRETER_PTR: RefCell<Vec<*mut crate::Interpreter>> =
-        const { RefCell::new(Vec::new()) };
+    static CURRENT_INTERPRETER_PTR: RefCell<InterpStack> =
+        const { RefCell::new(InterpStack(Vec::new())) };
+    /// The top of [`CURRENT_INTERPRETER_PTR`] (null when it is empty), so a
+    /// lookup is one thread-local load: a constant-initialized cell with no
+    /// destructor, readable through thread teardown.
+    static CURRENT_INTERPRETER_TOP: std::cell::Cell<*mut crate::Interpreter> =
+        const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// The published interpreters (see [`CURRENT_INTERPRETER_PTR`]); its
+/// destruction with the thread clears the top's mirror, so a lookup past
+/// it finds none.
+struct InterpStack(Vec<*mut crate::Interpreter>);
+
+impl Drop for InterpStack {
+    fn drop(&mut self) {
+        let _ = CURRENT_INTERPRETER_TOP.try_with(|t| t.set(std::ptr::null_mut()));
+    }
 }
 
 /// RAII guard that pushes `interp` onto [`CURRENT_INTERPRETER_PTR`]
@@ -753,9 +769,14 @@ impl Drop for InterpreterGuard {
     fn drop(&mut self) {
         // `try_with`: guards can unwind during thread teardown after the
         // TLS slot is gone; the stack died with it, so popping is moot.
-        let _ = CURRENT_INTERPRETER_PTR.try_with(|cell| {
-            let _ = cell.borrow_mut().pop();
-        });
+        let top = CURRENT_INTERPRETER_PTR
+            .try_with(|cell| {
+                let mut stack = cell.borrow_mut();
+                let _ = stack.0.pop();
+                stack.0.last().copied().unwrap_or(std::ptr::null_mut())
+            })
+            .unwrap_or(std::ptr::null_mut());
+        let _ = CURRENT_INTERPRETER_TOP.try_with(|t| t.set(top));
     }
 }
 
@@ -1422,7 +1443,8 @@ pub fn warn_default_encoding() -> bool {
 /// the returned guard. Re-entrant calls produce a stack so the
 /// most recent guard wins on `current_interpreter_ptr` lookups.
 pub fn publish_interpreter_ptr(interp: *mut crate::Interpreter) -> InterpreterGuard {
-    CURRENT_INTERPRETER_PTR.with(|cell| cell.borrow_mut().push(interp));
+    CURRENT_INTERPRETER_PTR.with(|cell| cell.borrow_mut().0.push(interp));
+    CURRENT_INTERPRETER_TOP.with(|t| t.set(interp));
     InterpreterGuard { _private: () }
 }
 
@@ -1434,10 +1456,12 @@ pub fn publish_interpreter_ptr(interp: *mut crate::Interpreter) -> InterpreterGu
 /// shm-manager child) probe `Py_IsInitialized` after this thread's
 /// TLS has been destroyed — report "no interpreter" rather than
 /// aborting the process (RFC 0076 WS5).
+#[inline]
 pub fn current_interpreter_ptr() -> Option<*mut crate::Interpreter> {
-    CURRENT_INTERPRETER_PTR
-        .try_with(|cell| cell.borrow().last().copied())
-        .unwrap_or(None)
+    let top = CURRENT_INTERPRETER_TOP
+        .try_with(std::cell::Cell::get)
+        .unwrap_or(std::ptr::null_mut());
+    (!top.is_null()).then_some(top)
 }
 
 /// `quit` and `exit` — interactive sentinels that raise `SystemExit`.
