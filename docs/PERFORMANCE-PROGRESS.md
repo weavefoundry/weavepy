@@ -569,6 +569,19 @@ branch and pull request.
     of `str`, `int`, `float`, `tuple`, `bytes` or `frozenset` that keeps its
     base's `__new__` wraps an argument of the base's exact type directly
     (4,995 to 2,254, against 1,409).
+  - Loops over opaque iterators. Tier 2 stepped a set through its fully
+    general iterator step and dict keys after that step's setup; it now
+    steps list, tuple, range, set and dict iterators in place for any lane
+    (10 set items 6,691 to 3,188, against 1,978; 10 keys 5,498 to 4,553,
+    against 1,976). `for a, b in pairs` reads each pair where it sits (4,821
+    to 3,069, against 1,657), `enumerate` over a list or tuple reads its
+    pairs in place in both JITs (a tier-2 `i * x` sum 7,565 to 4,293,
+    against 6,342), and an exhausted `reversed(xs)` leaves compiled code's
+    loop in place instead of through the interpreter (3,891 to 2,192,
+    against 2,230). The frame JIT runs these loops for less than tier 2
+    still does, but handing tier 2's code with such loops to it cost
+    `pyaes` 2.6 times its instructions, `deque_ops` 1.6 and `richards` 1.5:
+    their int work wins back more than the iterator steps cost.
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
