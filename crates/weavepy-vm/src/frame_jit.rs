@@ -7859,11 +7859,12 @@ pub(crate) struct MethodSite {
     desc: Option<(u64, bool, Object)>,
     /// The class version whose attribute the site found isn't one.
     desc_miss: u64,
-    /// A builtin type receiver the site loaded an attribute of
-    /// (`object.__setattr__(self, ...)`, `dict.fromkeys(...)`): the type,
-    /// its version, the attribute, and whether the type itself goes in the
-    /// self slot (a class method) or it stays empty.
-    type_attr: Option<(usize, u64, Object, bool)>,
+    /// A class receiver the site loaded an attribute of
+    /// (`object.__setattr__(self, ...)`, `dict.fromkeys(...)`, a user
+    /// class's static or class method): the class, its version, its
+    /// metaclass's, the attribute, and whether the class itself goes in
+    /// the self slot (a class method) or it stays empty.
+    type_attr: Option<(usize, u64, u64, Object, bool)>,
 }
 
 /// `LOAD_ATTR` with the method flag at `site`: the method in the
@@ -7956,13 +7957,18 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
                 }
             }
         }
-        // A builtin type's attribute the site loaded last, while the type's
-        // version holds: it and an empty self slot, the type released.
+        // A class's attribute the site loaded last, while the class's and
+        // its metaclass's versions hold: it and an empty self slot (or the
+        // class, for a class method), the receiver released.
         let type_recv = match &*top {
-            Object::Type(t) if t.flags.is_builtin => {
-                let (ptr, ver) = (Rc::as_ptr(t) as usize, t.attr_version.get());
-                if let Some((p, v, attr, binds)) = &s.type_attr {
-                    if *p == ptr && *v == ver {
+            Object::Type(t) if t.flags.is_builtin || t.attr_version.get() != 0 => {
+                let (ptr, ver, meta) = (
+                    Rc::as_ptr(t) as usize,
+                    t.attr_version.get(),
+                    meta_version(t),
+                );
+                if let Some((p, v, m, attr, binds)) = &s.type_attr {
+                    if *p == ptr && *v == ver && *m == meta {
                         let attr = crate::clone_hot(attr);
                         let recv = std::mem::replace(&mut *top, attr);
                         if *binds {
@@ -7974,7 +7980,7 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
                         return 0;
                     }
                 }
-                Some((ptr, ver))
+                Some((ptr, ver, meta, t.flags.is_builtin))
             }
             _ => None,
         };
@@ -8041,8 +8047,10 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
         if r != 0 {
             return left(st, s.pc, s.last, s.len as usize);
         }
-        // A builtin type's unbound function or builtin: for the next time.
-        if let Some((ptr, ver)) = type_recv {
+        // A builtin type's unbound function or builtin, or a user class's
+        // plain, static or class method that the class's attributes alone
+        // decide: for the next time.
+        if let Some((ptr, ver, meta, builtin)) = type_recv {
             let callable = &*(*st).stack.add(s.len as usize - 1);
             let binds = match &*(*st).stack.add(s.len as usize) {
                 Object::Unbound => Some(false),
@@ -8050,7 +8058,9 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
                 _ => None,
             };
             if let (Some(binds), Object::Builtin(_) | Object::Function(_)) = (binds, callable) {
-                s.type_attr = Some((ptr, ver, callable.clone(), binds));
+                if builtin || class_method_plain(s, ptr, binds) {
+                    s.type_attr = Some((ptr, ver, meta, callable.clone(), binds));
+                }
             }
         }
         // A `staticmethod`'s or `classmethod`'s function: the descriptor, for
@@ -8105,6 +8115,50 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
 /// # Safety
 ///
 /// `s`'s code is live.
+/// Whether the user class at `ptr` (the site's receiver) yields its
+/// method at the site as a function of its attributes and its
+/// metaclass's: its metaclass reads attributes as `type` does and doesn't
+/// define the name, and the class's own value is a plain function (no
+/// self bound), a `staticmethod`, or a `classmethod` (`binds`).
+///
+/// # Safety
+///
+/// `ptr` is the receiver class, alive on the stack.
+unsafe fn class_method_plain(s: &MethodSite, ptr: usize, binds: bool) -> bool {
+    // SAFETY: the caller's contract.
+    let cls = unsafe { &*(ptr as *const crate::types::TypeObject) };
+    if crate::object::exotic_str_keys_possible() {
+        return false;
+    }
+    // SAFETY: the site's code is live.
+    let code = unsafe { &*s.code };
+    let Some(name) = code
+        .names
+        .get(code.instructions[s.pc as usize].arg as usize)
+    else {
+        return false;
+    };
+    if !cls.metaclass_is_type() {
+        let meta = cls.metaclass_or_type();
+        let ty = &crate::builtin_types::builtin_types().type_;
+        let same_getattr = match (
+            meta.lookup("__getattribute__"),
+            ty.lookup("__getattribute__"),
+        ) {
+            (Some(a), Some(b)) => a.is_same(&b),
+            _ => false,
+        };
+        if !same_getattr || meta.lookup(name).is_some() {
+            return false;
+        }
+    }
+    matches!(
+        (cls.lookup(name), binds),
+        (Some(Object::Function(_) | Object::StaticMethod(_)), false)
+            | (Some(Object::ClassMethod(_)), true)
+    )
+}
+
 unsafe fn note_method_desc(
     s: &mut MethodSite,
     inst: &Rc<crate::types::PyInstance>,
