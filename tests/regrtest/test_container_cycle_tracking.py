@@ -4,7 +4,10 @@ Each maker's container is given an object that refers back to it; the
 collector must find every such cycle. `list.copy()`, `dir()`,
 `json.loads`, `re.findall`, `dict.fromkeys`, `dict | dict`, a list's `+`
 and `*`, and a function's `**kwargs` built their containers without
-registering them, so these cycles were never collected.
+registering them, so these cycles were never collected. A `**kwargs` dict
+that only ever feeds a `**` spread can't escape its call and isn't
+registered; one that leaves through another local, a closure or
+`locals()` is.
 """
 
 import copy
@@ -20,6 +23,23 @@ class Node:
 
 def kwargs(**k):
     return k
+
+
+def kwargs_via_local(**k):
+    other = k
+    return other
+
+
+def kwargs_via_closure(**k):
+    return (lambda: k)()
+
+
+def kwargs_via_locals(**k):
+    return locals()["k"]
+
+
+def merged(*a, **k):
+    return dict(**k)
 
 
 LISTS = {
@@ -44,6 +64,10 @@ DICTS = {
     "json": lambda: json.loads('{"a": 1}'),
     "kwargs": lambda: kwargs(a=1),
     "kwargs_empty": lambda: kwargs(),
+    "kwargs_via_local": lambda: kwargs_via_local(a=1),
+    "kwargs_via_closure": lambda: kwargs_via_closure(),
+    "kwargs_via_locals": lambda: kwargs_via_locals(),
+    "merged": lambda: merged(a=1),
 }
 
 

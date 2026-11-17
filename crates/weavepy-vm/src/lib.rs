@@ -9759,7 +9759,9 @@ impl Interpreter {
         }
         if code.has_varkeywords {
             let d = Object::Dict(Rc::new(RefCell::new(DictData::default())));
-            gc_trace::track_built(&d);
+            if !varkw_stays_local(code) {
+                gc_trace::track_built(&d);
+            }
             v.push(d);
         }
     }
@@ -9996,7 +9998,9 @@ impl Interpreter {
         v.extend(star);
         if code.has_varkeywords {
             let d = Object::Dict(Rc::new(RefCell::new(DictData::default())));
-            gc_trace::track_built(&d);
+            if !varkw_stays_local(code) {
+                gc_trace::track_built(&d);
+            }
             v.push(d);
         }
     }
@@ -10238,7 +10242,9 @@ impl Interpreter {
         }
         if let Some(d) = varkw {
             let d = Object::Dict(Rc::new(RefCell::new(d)));
-            gc_trace::track_built(&d);
+            if !varkw_stays_local(code) {
+                gc_trace::track_built(&d);
+            }
             locals[total + usize::from(code.has_varargs)] = d;
         }
         #[allow(clippy::needless_range_loop)]
@@ -19890,7 +19896,9 @@ impl Interpreter {
         }
         if code.has_varkeywords {
             let d = Object::Dict(Rc::new(RefCell::new(varkw.unwrap_or_default())));
-            gc_trace::track_built(&d);
+            if !varkw_stays_local(code) {
+                gc_trace::track_built(&d);
+            }
             out.push(d);
         }
         Some(())
@@ -24932,7 +24940,9 @@ impl Interpreter {
         let dict;
         if code_rc.has_varkeywords {
             dict = Object::Dict(Rc::new(RefCell::new(varkw.unwrap_or_default())));
-            gc_trace::track_built(&dict);
+            if !varkw_stays_local(code_rc) {
+                gc_trace::track_built(&dict);
+            }
             args[total] = &raw const dict;
         }
         self.pure_leaf_eval::<false, false>(code_rc, f, &args[..arity])
@@ -65702,7 +65712,9 @@ impl Interpreter {
         if let Some(slot) = kwargs_slot {
             // (The function may keep it: tracked, as CPython's dicts are.)
             let d = Object::Dict(Rc::new(RefCell::new(extra_kwargs)));
-            gc_trace::track_built(&d);
+            if !varkw_stays_local(code) {
+                gc_trace::track_built(&d);
+            }
             positional[slot] = d;
             filled[slot] = true;
         }
@@ -76752,6 +76764,59 @@ thread_local! {
 
 /// An empty `**kwargs` dictionary with room for `n` keys: the spare one,
 /// if any, else a fresh one.
+/// Whether `code`'s `**kwargs` dict can only be read in its call: every use
+/// of its slot loads it straight into a `DICT_MERGE` or `DICT_UPDATE`
+/// (`fn(*a, **k)`), which copy it, no closure captures it, and nothing can
+/// read the frame's locals (`locals()`, `vars()`, `eval`, `exec`, a frame).
+/// Such a dict can't close a cycle that outlives the call, so its binder
+/// needn't register it with the collector. Cached in the code's extension
+/// table.
+fn varkw_stays_local(code: &CodeObject) -> bool {
+    use std::sync::atomic::Ordering;
+    let Some(ext) = code_vm_ext(code) else {
+        return false;
+    };
+    match ext.varkw_local.load(Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
+    }
+    let slot = code.arg_count as usize + code.kwonly_count as usize + usize::from(code.has_varargs);
+    let captured = code
+        .varnames
+        .get(slot)
+        .is_none_or(|n| code.cellvars.iter().any(|c| c == n));
+    let introspects = code.names.iter().any(|n| {
+        matches!(
+            n.as_str(),
+            "locals" | "vars" | "eval" | "exec" | "_getframe" | "f_locals" | "currentframe"
+        )
+    });
+    let ins = &code.instructions;
+    let local = !captured
+        && !introspects
+        && ins.iter().enumerate().all(|(pc, i)| match i.op {
+            OpCode::LoadFast | OpCode::LoadFastBorrow | OpCode::LoadFastCheck
+                if i.arg as usize == slot =>
+            {
+                ins.get(pc + 1).is_some_and(|n| n.op == OpCode::DictUpdate)
+            }
+            OpCode::LoadFastAndClear | OpCode::StoreFast | OpCode::DeleteFast => {
+                i.arg as usize != slot
+            }
+            OpCode::LoadFastLoadFast
+            | OpCode::LoadFastBorrowLoadFastBorrow
+            | OpCode::StoreFastLoadFast
+            | OpCode::StoreFastStoreFast => {
+                (i.arg >> 4) as usize != slot && (i.arg & 15) as usize != slot
+            }
+            _ => true,
+        });
+    ext.varkw_local
+        .store(if local { 1 } else { 2 }, Ordering::Relaxed);
+    local
+}
+
 fn spare_kw_dict(n: usize) -> Rc<RefCell<DictData>> {
     SPARE_KW_DICT
         .try_with(std::cell::Cell::take)
@@ -83592,6 +83657,9 @@ struct CodeConstObjects {
     /// Whether the code is a generator body fast steps run (see
     /// `gen_fast`): 0 not yet scanned, 1 no, 2 yes.
     gen_fast: std::sync::atomic::AtomicU8,
+    /// Whether the code's `**kwargs` dict can outlive its call (see
+    /// [`varkw_stays_local`]): 0 not yet scanned, 1 it can't, 2 it can.
+    varkw_local: std::sync::atomic::AtomicU8,
     /// The `RETURN_GENERATOR` a generator-family call of the code starts
     /// past (see `Interpreter::generator_start`): `0` not yet scanned,
     /// `u32::MAX` none (the prologue holds something else), else its pc
@@ -87941,6 +88009,7 @@ fn code_vm_ext_build(code: &CodeObject) -> &CodeConstObjects {
             dunders: std::sync::OnceLock::new(),
             fast_pairs: std::sync::OnceLock::new(),
             gen_fast: std::sync::atomic::AtomicU8::new(0),
+            varkw_local: std::sync::atomic::AtomicU8::new(0),
             gen_start: std::sync::atomic::AtomicU32::new(0),
             field_slots: SiteSlots::new(),
             native_sites: std::sync::OnceLock::new(),
