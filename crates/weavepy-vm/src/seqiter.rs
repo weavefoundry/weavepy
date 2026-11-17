@@ -2886,6 +2886,26 @@ pub(crate) fn enumerate_pure_pair(it: &Object) -> Option<(Object, Object)> {
     let next = count.checked_add(1)?;
     // SAFETY: as above; `inner` is a cell of its own.
     let src = unsafe { inner.peek_mut() }?;
+    // A list's or tuple's next item, read in place (their end goes through
+    // `next_value`, which detaches the source).
+    let item = match src {
+        PyIterator::List {
+            items,
+            index,
+            owner: None,
+        } => unsafe { items.peek() }
+            .and_then(|xs| xs.get(*index))
+            .map(crate::clone_hot),
+        PyIterator::Tuple { items, index } => items.get(*index).map(crate::clone_hot),
+        _ => None,
+    };
+    if let Some(v) = item {
+        if let PyIterator::List { index, .. } | PyIterator::Tuple { index, .. } = src {
+            *index += 1;
+        }
+        let i = std::mem::replace(count, next);
+        return Some((Object::Int(i), v));
+    }
     if !src.pure_ready() {
         return None;
     }

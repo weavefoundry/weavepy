@@ -13725,6 +13725,48 @@ enum NativeBytePair {
     Value(i64, u8),
 }
 
+/// `enumerate` over a list or tuple iterator whose next item packs into the
+/// scalar lane `lane` (`for i, x in enumerate(xs)` over a list of ints): the
+/// count and the item's bits, both cursors advanced. `None` consumes
+/// nothing: any other shape, an item outside the lane, the source's end
+/// (the general step reports it), or a counter that would overflow.
+#[inline]
+fn next_enumerated_scalar(it: &Object, lane: JitType) -> Option<(i64, u64)> {
+    let Object::Iter(it) = it else {
+        return None;
+    };
+    // SAFETY: the views end before anything that could borrow either cell
+    // runs (reading an item and packing its bits run no code).
+    let state = unsafe { it.peek_mut()? };
+    let PyIterator::Enumerate {
+        inner,
+        count,
+        count_big: None,
+    } = state
+    else {
+        return None;
+    };
+    let next_count = count.checked_add(1)?;
+    // SAFETY: as above (the source is a cell of its own).
+    let bits = match unsafe { inner.peek_mut()? } {
+        PyIterator::Tuple { items, index } => {
+            let bits = pack(items.get(*index)?, lane)?;
+            *index += 1;
+            bits
+        }
+        PyIterator::List { items, index, .. } => {
+            // SAFETY: as above.
+            let bits = pack(unsafe { items.peek()? }.get(*index)?, lane)?;
+            *index += 1;
+            bits
+        }
+        _ => return None,
+    };
+    let current = *count;
+    *count = next_count;
+    Some((current, bits))
+}
+
 /// Read exact native byte enumeration without constructing a Python tuple.
 /// Keep both shared cursors current so an interpreter continuation sees the
 /// same state. Unsupported shapes and counter overflow consume nothing.
@@ -13896,7 +13938,25 @@ unsafe extern "C" fn wpjit_iter_next_pair(
             NativeBytePair::Exhausted => return 1,
             NativeBytePair::Unsupported => {}
         }
-    } else if tag1 == SlotTag::Int as i64 && tag2 == SlotTag::ObjPin as i64 {
+    }
+    // `enumerate` over a list or tuple into an int lane and a scalar one.
+    if tag1 == SlotTag::Int as i64 {
+        let lane = match u32::try_from(tag2).ok().map(SlotTag::from_raw) {
+            Some(SlotTag::Int) => Some(JitType::Int),
+            Some(SlotTag::Float) => Some(JitType::Float),
+            Some(SlotTag::Bool) => Some(JitType::Bool),
+            _ => None,
+        };
+        if let (Some(lane), Some(Pin::Obj(it))) = (lane, ctx.pins.get(pin as usize)) {
+            if let Some((index, bits)) = next_enumerated_scalar(it, lane) {
+                jf.ret_bits = index as u64;
+                // SAFETY: the marshal buffer has at least one slot.
+                unsafe { *jf.call_args = bits };
+                return 0;
+            }
+        }
+    }
+    if tag1 == SlotTag::Int as i64 && tag2 == SlotTag::ObjPin as i64 {
         let pair = match ctx.pins.get(pin as usize) {
             Some(Pin::Obj(it)) => next_enumerated_tuple(it, ctx.pins.len() < RUNTIME_PIN_CAP),
             _ => NativeObjectPair::Unsupported,
