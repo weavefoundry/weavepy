@@ -12522,6 +12522,31 @@ fn str_splitlines(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object
     };
     let mut out: Vec<Object> = Vec::new();
     let mut start = 0;
+    // An exact ASCII string's lines, by byte, each piece built in place.
+    if matches!(args.first(), Some(Object::Str(_)))
+        && !args.iter().any(|o| matches!(o, Object::WStr(_)))
+        && s.is_ascii()
+    {
+        let b = s.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if matches!(b[i], b'\n' | b'\r' | 0x0b | 0x0c | 0x1c | 0x1d | 0x1e) {
+                let mut end = i + 1;
+                if b[i] == b'\r' && b.get(i + 1) == Some(&b'\n') {
+                    end = i + 2;
+                }
+                out.push(str_piece(&s[start..if keepends { end } else { i }]));
+                start = end;
+                i = end;
+            } else {
+                i += 1;
+            }
+        }
+        if start < s.len() {
+            out.push(str_piece(&s[start..]));
+        }
+        return Ok(new_str_split_list(out));
+    }
     let mut iter = s.char_indices().peekable();
     while let Some((i, c)) = iter.next() {
         if is_break(c) {
@@ -12633,7 +12658,60 @@ fn str_count(args: &[Object]) -> Result<Object, RuntimeError> {
     ))
 }
 
+/// A piece of a `str` method's result: the shared one-character string for
+/// an ASCII character, else a new string of `t`.
+#[inline]
+fn str_piece(t: &str) -> Object {
+    match t.as_bytes() {
+        [] => Object::from_static(""),
+        [c] if c.is_ascii() => crate::shared_value::SharedStr::ascii_char_built(*c).map_or_else(
+            || Object::Str(crate::shared_value::SharedStr::from(t)),
+            Object::Str,
+        ),
+        _ => Object::Str(crate::shared_value::SharedStr::from(t)),
+    }
+}
+
+/// `s.partition(sep)` and `s.rpartition(sep)` of an exact `str` by an
+/// exact `str`, as CPython builds them: the separator object itself, and
+/// the string itself when the separator isn't found. `None` for anything
+/// else.
+fn str_partition_exact(args: &[Object], from_right: bool) -> Option<Object> {
+    let [Object::Str(recv), sep_obj @ Object::Str(sep)] = args else {
+        return None;
+    };
+    let (s, sep) = (&**recv, &**sep);
+    if sep.is_empty() {
+        return None;
+    }
+    let found = if from_right {
+        s.rfind(sep)
+    } else {
+        substr_find(s, sep)
+    };
+    Some(match found {
+        Some(i) => Object::new_tuple_array([
+            str_piece(&s[..i]),
+            sep_obj.clone(),
+            str_piece(&s[i + sep.len()..]),
+        ]),
+        None if from_right => Object::new_tuple_array([
+            Object::from_static(""),
+            Object::from_static(""),
+            args[0].clone(),
+        ]),
+        None => Object::new_tuple_array([
+            args[0].clone(),
+            Object::from_static(""),
+            Object::from_static(""),
+        ]),
+    })
+}
+
 fn str_partition(args: &[Object]) -> Result<Object, RuntimeError> {
+    if let Some(r) = str_partition_exact(args, false) {
+        return Ok(r);
+    }
     let s = str_self(args)?;
     let s = s.as_ref();
     let sep = match args.get(1).and_then(str_arg_bridged) {
@@ -12661,6 +12739,9 @@ fn str_partition(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn str_rpartition(args: &[Object]) -> Result<Object, RuntimeError> {
+    if let Some(r) = str_partition_exact(args, true) {
+        return Ok(r);
+    }
     let s = str_self(args)?;
     let s = s.as_ref();
     let sep = match args.get(1).and_then(str_arg_bridged) {
