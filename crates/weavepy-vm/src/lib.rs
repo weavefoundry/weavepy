@@ -14205,6 +14205,22 @@ impl Interpreter {
                                 unsafe { &*base.add(len - 2) },
                                 unsafe { &*base.add(len - 1) },
                             ) {
+                                // A collecting consumer drains this frame and
+                                // its next instruction is the yield that would
+                                // fold each item: the items go to its sink at
+                                // once, and the step below finds the end.
+                                if let Some((ff, FoldSink::Collect(out))) = self.sum_fold {
+                                    // SAFETY: `pc + 1` is checked first; see
+                                    // `CoreSwitch`; the sink is the consumer's
+                                    // local, alive while the resume runs.
+                                    if ff == sw.cur as usize
+                                        && pc + 1 < ninstrs
+                                        && unsafe { (*instrs.add(pc + 1)).op } == OpCode::YieldValue
+                                        && unsafe { (*sw.inl).is_empty() }
+                                    {
+                                        gen_fast::send_iter_drain(it, unsafe { &mut *out });
+                                    }
+                                }
                                 if let Some(item) = gen_fast::send_iter_step(it) {
                                     let exit = item.is_none();
                                     // SAFETY: the sent `None`'s slot (no drop

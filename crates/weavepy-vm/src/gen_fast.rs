@@ -423,6 +423,55 @@ pub(crate) fn send_iter_step(it: &Rc<crate::sync::RefCell<PyIterator>>) -> Optio
     }
 }
 
+/// [`send_iter_step`] for a whole run: the remaining items of a range,
+/// tuple or list iterator (up to a bound) appended to `out`, the cursor
+/// left past them, for a `yield from` whose every yield a collecting
+/// consumer would take. `false`, nothing taken, for any other iterator.
+pub(crate) fn send_iter_drain(
+    it: &Rc<crate::sync::RefCell<PyIterator>>,
+    out: &mut Vec<Object>,
+) -> bool {
+    const MAX: usize = 1 << 16;
+    let Ok(mut it) = it.try_borrow_mut() else {
+        return false;
+    };
+    match &mut *it {
+        PyIterator::Tuple { items, index } => {
+            let rest = items.get(*index..).unwrap_or(&[]);
+            let rest = &rest[..rest.len().min(MAX)];
+            out.extend_from_slice(rest);
+            *index += rest.len();
+        }
+        PyIterator::List {
+            items,
+            index,
+            owner: None,
+        } => {
+            let Ok(v) = items.try_borrow() else {
+                return false;
+            };
+            let rest = v.get(*index..).unwrap_or(&[]);
+            let rest = &rest[..rest.len().min(MAX)];
+            out.extend_from_slice(rest);
+            *index += rest.len();
+        }
+        PyIterator::Range {
+            current,
+            stop,
+            step,
+        } if *step > 0 => {
+            let mut n = 0;
+            while *current < *stop && n < MAX {
+                out.push(Object::Int(*current));
+                *current = current.wrapping_add(*step);
+                n += 1;
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
 /// How deep a chain of `yield from` delegations steps directly (see
 /// `Interpreter::gen_chain_step`).
 #[cfg(feature = "jit")]
