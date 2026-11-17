@@ -499,8 +499,11 @@ fn lock_enter(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn lock_exit(args: &[Object]) -> Result<Object, RuntimeError> {
-    let _ = lock_of(args, "__exit__")?.release();
-    Ok(Object::Bool(false))
+    // As CPython's: `release()`, an unheld lock's error included, and `None`.
+    lock_of(args, "__exit__")?
+        .release()
+        .map_err(runtime_error)?;
+    Ok(Object::None)
 }
 
 fn lock_at_fork_reinit(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -698,8 +701,9 @@ fn rlock_enter(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn rlock_exit(args: &[Object]) -> Result<Object, RuntimeError> {
     let lock = rlock_of(args, "__exit__")?;
-    let _ = lock.release(crate::gil::current_thread_id());
-    Ok(Object::Bool(false))
+    lock.release(crate::gil::current_thread_id())
+        .map_err(runtime_error)?;
+    Ok(Object::None)
 }
 
 fn rlock_at_fork_reinit(args: &[Object]) -> Result<Object, RuntimeError> {

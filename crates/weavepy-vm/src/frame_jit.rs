@@ -7988,8 +7988,9 @@ pub(crate) struct MethodSite {
     builtin_recv: u8,
     builtin: [u64; 2],
     /// A value of the receiver's own (`self.fn(...)` of a function an
-    /// instance holds): its class's version, its values' shared names and
-    /// the value's position among them (`0` versions: none yet).
+    /// instance holds): its class's version, its values' shared names (or
+    /// [`OWN_PUBLISHED`] for a materialized dict) and the value's position
+    /// among them (`0` versions: none yet).
     own: (u64, u64, u32),
     /// A `staticmethod` or `classmethod` of the receiver's class the site
     /// loaded last: the class's version, whether it binds the class, and
@@ -8063,6 +8064,11 @@ unsafe extern "C" fn h_method(st: *mut State, site: *mut MethodSite) -> u32 {
     }
 }
 
+/// [`MethodSite::own`]'s names for a value in an instance's materialized
+/// dict, which the site finds by position and name (no shared-names table
+/// sits at this address).
+const OWN_PUBLISHED: u64 = 1;
+
 /// [`h_method`] for a receiver the site's first cache doesn't know.
 #[inline(never)]
 unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
@@ -8129,16 +8135,27 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
         let recv = match &*top {
             Object::Instance(inst) => {
                 let (ver, keys, idx) = s.own;
-                if ver != 0
-                    && ver == inst.cls_raw().attr_version.get()
-                    && inst.dict.published().is_none()
-                    && droppable(&*top)
-                {
-                    if let Some(v) = inst
-                        .dict
-                        .split_peek()
-                        .and_then(|split| split.get_over(keys as *const _, idx as usize))
-                    {
+                if ver != 0 && ver == inst.cls_raw().attr_version.get() && droppable(&*top) {
+                    let v = if keys == OWN_PUBLISHED {
+                        // (Its entry at the position, by the site's name.)
+                        let code = &*s.code;
+                        inst.attr_peek_index(idx as usize)
+                            .filter(|(k, _)| {
+                                crate::slot_name_matches(
+                                    code,
+                                    code.instructions[s.pc as usize].arg,
+                                    k,
+                                )
+                            })
+                            .map(|(_, v)| v)
+                    } else if inst.dict.published().is_none() {
+                        inst.dict
+                            .split_peek()
+                            .and_then(|split| split.get_over(keys as *const _, idx as usize))
+                    } else {
+                        None
+                    };
+                    if let Some(v) = v {
                         if !matches!(v, Object::Unbound) {
                             let v = crate::clone_hot(v);
                             crate::drop_hot(std::mem::replace(&mut *top, v));
@@ -8225,15 +8242,24 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
             let name = code
                 .names
                 .get(code.instructions[s.pc as usize].arg as usize);
-            if let (Some(name), None, Some(split)) =
-                (name, inst.dict.published(), inst.dict.split_peek())
-            {
+            let found = &*(*st).stack.add(s.len as usize - 1);
+            let same =
+                |v: &Object| v.strong_word().is_some() && v.strong_word() == found.strong_word();
+            if inst.dict.published().is_some() {
+                // A materialized dict's entry (an instance that assigned
+                // its names out of the class's order): where it sits.
+                let arg = code.instructions[s.pc as usize].arg;
+                if let Some((crate::LeafAttr::Value(v), Some(ix))) =
+                    Interpreter::leaf_resolve_instance_attr_ix(code, &inst, arg)
+                {
+                    if same(&v) {
+                        s.own = (inst.cls_raw().attr_version.get(), OWN_PUBLISHED, ix);
+                    }
+                }
+            } else if let (Some(name), Some(split)) = (name, inst.dict.split_peek()) {
                 let (keys, _) = split.keys_and_len();
                 if let Some(idx) = split.position_str(name) {
-                    let found = &*(*st).stack.add(s.len as usize - 1);
-                    if split.get_over(keys as *const _, idx).is_some_and(|v| {
-                        v.strong_word().is_some() && v.strong_word() == found.strong_word()
-                    }) {
+                    if split.get_over(keys as *const _, idx).is_some_and(same) {
                         s.own = (inst.cls_raw().attr_version.get(), keys as u64, idx as u32);
                     }
                 }
@@ -9487,6 +9513,32 @@ unsafe extern "C" fn h_attr_local(st: *mut State, site: *const AttrSite) -> u32 
     }
 }
 
+/// A native method of the instance's class that the site last bound (an
+/// `RLock`'s `__exit__`, read to be called with `*args`; see
+/// `Interpreter::leaf_attr_resolve_site`), which the instance doesn't
+/// shadow: bound to the receiver `recv`.
+///
+/// # Safety
+///
+/// The site's code and extension are live.
+unsafe fn inst_builtin_bound(
+    site: &AttrSite,
+    inst: &crate::types::PyInstance,
+    recv: &Object,
+) -> Option<Object> {
+    // SAFETY: the caller's contract.
+    let (code, ext) = unsafe { (&*site.code, &*site.ext) };
+    let b = ext
+        .method_slot(site.pc as usize)?
+        .get_inst_builtin(inst.cls_raw().attr_version.get())?;
+    if crate::inst_may_shadow(inst, code, code.instructions[site.pc as usize].arg) {
+        return None;
+    }
+    Some(Object::BoundMethod(Rc::new(
+        crate::object::BoundMethod::new(recv.clone(), Object::Builtin(b)),
+    )))
+}
+
 /// [`h_attr_local`] past its commonest shape.
 #[inline(never)]
 unsafe extern "C" fn attr_local_slow(st: *mut State, site: *const AttrSite) -> u32 {
@@ -9515,6 +9567,7 @@ unsafe extern "C" fn attr_local_slow(st: *mut State, site: *const AttrSite) -> u
                 if let Some(v) = (*site.ext)
                     .stamp_slot(site.pc as usize)
                     .and_then(|s| crate::tuple_field_hit(s, inst))
+                    .or_else(|| inst_builtin_bound(site, inst, &*at))
                 {
                     (*st).stack.add(slot).write(v);
                     return 0;
@@ -10314,6 +10367,13 @@ unsafe extern "C" fn attr_stack_slow(st: *mut State, site: *const AttrSite) -> u
             }
             // (A class attribute the site has read before.)
             Object::Instance(inst) => {
+                if let Some(v) = inst_builtin_bound(site, inst, &*at) {
+                    if plain_release(&*at) {
+                        at.write(v);
+                        return 0;
+                    }
+                    drop(v);
+                }
                 if site_property_leaf(&mut *st, site, at, false) {
                     return 0;
                 }
