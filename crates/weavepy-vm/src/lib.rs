@@ -13232,7 +13232,7 @@ impl Interpreter {
                             .collect();
                         len -= n;
                         let obj = Object::new_list(items);
-                        gc_trace::track(&obj);
+                        gc_trace::track_built(&obj);
                         // SAFETY: `len < cap` (the operands' slots were freed).
                         unsafe { base.add(len).write(obj) };
                         len += 1;
@@ -30119,7 +30119,7 @@ impl Interpreter {
                     }
                     let items = stack.split_off(stack.len() - n);
                     let obj = Object::new_list(items);
-                    gc_trace::track(&obj);
+                    gc_trace::track_built(&obj);
                     stack.push(obj);
                     last = pc;
                     pc += 1;
@@ -30134,7 +30134,7 @@ impl Interpreter {
                         break;
                     }
                     let obj = Object::Set(Rc::new(RefCell::new(crate::object::SetData::default())));
-                    gc_trace::track(&obj);
+                    gc_trace::track_built(&obj);
                     stack.push(obj);
                     last = pc;
                     pc += 1;
@@ -30171,7 +30171,7 @@ impl Interpreter {
                     }
                     stack.truncate(split);
                     let obj = Object::Dict(Rc::new(RefCell::new(d)));
-                    gc_trace::track(&obj);
+                    gc_trace::track_built(&obj);
                     stack.push(obj);
                     last = pc;
                     pc += 1;
