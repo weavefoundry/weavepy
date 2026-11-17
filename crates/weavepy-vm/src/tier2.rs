@@ -9905,17 +9905,28 @@ unsafe extern "C" fn wpjit_get_iter(frame: *mut JitFrame, pin: i64) -> i64 {
 #[inline]
 fn builtin_seq_step(cell: &Rc<GilRefCell<crate::object::PyIterator>>) -> Option<Option<Object>> {
     use crate::object::PyIterator;
-    let mut it = cell.try_borrow_mut().ok()?;
-    match &*it {
+    // SAFETY: the view ends with the step, which runs no code.
+    let it = unsafe { cell.peek_mut() }?;
+    match it {
         PyIterator::List { .. } | PyIterator::Tuple { .. } | PyIterator::Range { .. } => {
             Some(it.next_value())
         }
-        PyIterator::DictKeys { .. } => {
-            match super::Interpreter::core_dict_next(&mut it, false, false) {
-                crate::DictStep::Item(v, _) => Some(Some(v)),
-                crate::DictStep::Exhausted | crate::DictStep::Decline => None,
+        // A set's next element while it keeps its size (a change, and the
+        // end, are the general step's to report).
+        PyIterator::Set { set, len, index } => {
+            // SAFETY: a read of a distinct cell, ended before anything runs.
+            let items = unsafe { set.peek() }?;
+            if items.len() != *len {
+                return None;
             }
+            let v = crate::clone_hot(&items.get_index(*index)?.0);
+            *index += 1;
+            Some(Some(v))
         }
+        PyIterator::DictKeys { .. } => match super::Interpreter::core_dict_next(it, false, false) {
+            crate::DictStep::Item(v, _) => Some(Some(v)),
+            crate::DictStep::Exhausted | crate::DictStep::Decline => None,
+        },
         _ => None,
     }
 }
@@ -9979,6 +9990,44 @@ unsafe extern "C" fn wpjit_iter_next(frame: *mut JitFrame, pin: i64, elem_tag: i
             jf.ret_bits = bits;
             return 0;
         }
+    }
+    // A list, tuple, range, set or dict iterator's next element for any
+    // lane it packs into (a dict's keys, a set's strings): stepped in place,
+    // no Python run. Its end, and an element outside the lane, take the
+    // general step.
+    let step = match ctx.pins.get(pin as usize) {
+        Some(Pin::Obj(Object::Iter(cell))) => builtin_seq_step(cell),
+        _ => None,
+    };
+    if let Some(Some(v)) = step {
+        #[allow(clippy::cast_ptr_alignment)]
+        let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
+        // (A string for the `str` lane is pinned itself, with room checked
+        // first.)
+        if elem_tag == weavepy_jit::ITER_ELEM_STR
+            && matches!(v, Object::Str(_))
+            && ctx.pins.len() < RUNTIME_PIN_CAP
+        {
+            ctx.pins.push(Pin::Obj(v));
+            jf.ret_bits = (ctx.pins.len() - 1) as u64;
+            return 0;
+        }
+        if let Some(bits) = pack_iter_elem(&v, elem_tag, &mut ctx.pins, &mut ctx.pin_memo) {
+            jf.ret_bits = bits;
+            return 0;
+        }
+        // Consumed but outside the lane: pinned raw (`None` rides the
+        // nullable `-1`), resumed interpreted at the fused store.
+        jf.ret_bits = if matches!(v, Object::None) {
+            u64::MAX
+        } else {
+            ctx.pins.push(Pin::Obj(v));
+            (ctx.pins.len() - 1) as u64
+        };
+        return 3;
+    }
+    if let Some(None) = step {
+        return 1;
     }
     // SAFETY: the caller's contract.
     unsafe { iter_next_general(frame, pin, elem_tag) }
