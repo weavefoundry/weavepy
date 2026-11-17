@@ -378,17 +378,46 @@ pub(crate) mod type_cache {
             // (`TABLE` and `HASH_MEMO` have no destructor, so they are
             // still readable here.)
             let table = TABLE.with(|t| t.replace(std::ptr::null_mut()));
-            if !table.is_null() {
+            if !table.is_null() && !park(&TABLES, table as usize) {
                 // SAFETY: allocated by `alloc_table` as a boxed slice of
                 // `SIZE` entries, and no longer reachable through `TABLE`.
                 drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(table, SIZE)) });
             }
             let memo = HASH_MEMO.with(|t| t.replace(std::ptr::null_mut()));
-            if !memo.is_null() {
+            if !memo.is_null() && !park(&MEMOS, memo as usize) {
                 // SAFETY: as above, `HASHES` entries from `alloc_memo`.
                 drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(memo, HASHES)) });
             }
         }
+    }
+
+    /// Tables (and name-hash memos) of threads that have exited, for the
+    /// next threads to start with instead of zeroing and later dropping
+    /// their own (a thread's start and join paid both). An entry stays
+    /// valid on any thread: it names its class by the class's version,
+    /// which is unique for the process, and its name is its own. Each
+    /// pointer is one exited thread's, owned by the pool until taken.
+    static TABLES: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+    static MEMOS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+    /// How many of each the pool keeps.
+    const POOLED: usize = 4;
+
+    /// Give an exited thread's table to the pool: `false` when it is full.
+    fn park(pool: &std::sync::Mutex<Vec<usize>>, p: usize) -> bool {
+        let Ok(mut v) = pool.lock() else {
+            return false;
+        };
+        if v.len() >= POOLED {
+            return false;
+        }
+        v.push(p);
+        true
+    }
+
+    /// A table an exited thread left in the pool, if any.
+    fn unpark(pool: &std::sync::Mutex<Vec<usize>>) -> Option<usize> {
+        pool.lock().ok()?.pop()
     }
 
     /// Entries of a thread's name-hash memo.
@@ -405,7 +434,10 @@ pub(crate) mod type_cache {
     #[cold]
     #[inline(never)]
     fn alloc_memo() -> *mut NameHash {
-        let memo = zeroed_slice::<NameHash>(HASHES);
+        let memo = match unpark(&MEMOS) {
+            Some(p) => p as *mut NameHash,
+            None => zeroed_slice::<NameHash>(HASHES),
+        };
         HASH_MEMO.with(|t| t.set(memo));
         let _ = OWNER.try_with(|_| ());
         memo
@@ -456,7 +488,10 @@ pub(crate) mod type_cache {
     #[cold]
     #[inline(never)]
     fn alloc_table() -> *mut Entry {
-        let table = zeroed_slice::<Entry>(SIZE);
+        let table = match unpark(&TABLES) {
+            Some(p) => p as *mut Entry,
+            None => zeroed_slice::<Entry>(SIZE),
+        };
         TABLE.with(|t| t.set(table));
         // (Registers the owner's destructor; a thread already past its
         // destructors keeps the table until the process exits.)
