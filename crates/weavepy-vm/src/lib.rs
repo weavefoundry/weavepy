@@ -81981,7 +81981,7 @@ fn apply_format_spec_inner(
                     }
                 }
             }
-            apply_alignment(&s, &sp, numeric_default)
+            apply_alignment(s, &sp, numeric_default)
         }
         Some('c') => match value {
             Object::Int(_) | Object::Bool(_) | Object::Long(_) => {
@@ -81991,7 +81991,7 @@ fn apply_format_spec_inner(
                     .ok_or_else(|| overflow_error("%c arg not in range(0x110000)"))?;
                 let c = char::from_u32(cp as u32)
                     .ok_or_else(|| value_error("integer is not a valid unicode codepoint"))?;
-                apply_alignment(&c.to_string(), &parsed, false)
+                apply_alignment(c.to_string(), &parsed, false)
             }
             // `format(1.5, 'c')`: the float/complex formatter has no `c`
             // (`Unknown format code 'c' for object of type 'float'`).
@@ -82213,6 +82213,13 @@ fn obj_as_float(v: &Object, code: char) -> Result<f64, RuntimeError> {
         Object::Float(f) => Ok(*f),
         Object::Int(i) => Ok(*i as f64),
         Object::Bool(b) => Ok(if *b { 1.0 } else { 0.0 }),
+        // A big int converts as `float(n)` does (`format(10**20, '.2f')`).
+        Object::Long(b) => {
+            use num_traits::ToPrimitive;
+            b.to_f64()
+                .filter(|f| f.is_finite())
+                .ok_or_else(|| crate::error::overflow_error("int too large to convert to float"))
+        }
         // `str.__format__` rejects a numeric code itself, with the same
         // wording as the integer codes above (CPython
         // `unicode__format__`); the printf engine's own message for a
@@ -82280,7 +82287,7 @@ fn format_int(i: i64, p: &ParsedSpec) -> String {
     let core = group_int_digits(mag.to_string(), p, 3, int_decor_len(i < 0, p, false));
     let core = int_precision_apply(core, p);
     let body = with_sign(i < 0, &core, p);
-    apply_alignment(&body, p, true)
+    apply_alignment(body, p, true)
 }
 
 fn format_int_base(i: i64, base: u32, p: &ParsedSpec) -> String {
@@ -82305,7 +82312,7 @@ fn format_int_base(i: i64, base: u32, p: &ParsedSpec) -> String {
         core
     };
     body = with_sign(i < 0, &body, p);
-    apply_alignment(&body, p, true)
+    apply_alignment(body, p, true)
 }
 
 fn format_int_hex(i: i64, upper: bool, p: &ParsedSpec) -> String {
@@ -82324,7 +82331,7 @@ fn format_int_hex(i: i64, upper: bool, p: &ParsedSpec) -> String {
         body_core
     };
     body = with_sign(i < 0, &body, p);
-    apply_alignment(&body, p, true)
+    apply_alignment(body, p, true)
 }
 
 /// Group an already-rendered magnitude string into fixed-size runs from
@@ -82356,7 +82363,7 @@ fn format_bigint(b: &num_bigint::BigInt, p: &ParsedSpec) -> String {
     let core = group_int_digits(mag, p, 3, int_decor_len(neg, p, false));
     let core = int_precision_apply(core, p);
     let body = with_sign(neg, &core, p);
-    apply_alignment(&body, p, true)
+    apply_alignment(body, p, true)
 }
 
 fn format_bigint_base(b: &num_bigint::BigInt, base: u32, p: &ParsedSpec) -> String {
@@ -82381,7 +82388,7 @@ fn format_bigint_base(b: &num_bigint::BigInt, base: u32, p: &ParsedSpec) -> Stri
         core
     };
     body = with_sign(neg, &body, p);
-    apply_alignment(&body, p, true)
+    apply_alignment(body, p, true)
 }
 
 fn format_bigint_hex(b: &num_bigint::BigInt, upper: bool, p: &ParsedSpec) -> String {
@@ -82401,7 +82408,7 @@ fn format_bigint_hex(b: &num_bigint::BigInt, upper: bool, p: &ParsedSpec) -> Str
         core
     };
     body = with_sign(neg, &body, p);
-    apply_alignment(&body, p, true)
+    apply_alignment(body, p, true)
 }
 
 /// Unsigned fixed-point magnitude digits (no sign, no padding). A finite
@@ -82523,7 +82530,7 @@ fn finish_float(neg: bool, core: String, p: &ParsedSpec) -> String {
             return zero_pad_grouped(neg, &core, sep, width, p);
         }
     }
-    apply_alignment(&body, p, true)
+    apply_alignment(body, p, true)
 }
 
 /// Grow the integer-digit run with leading zeros until its *grouped*
@@ -82607,7 +82614,7 @@ fn group_float_frac(core: &str, sep: char) -> String {
 /// matching CPython's `format_float_short` special-value branch.
 fn finish_special(neg: bool, core: &str, p: &ParsedSpec) -> String {
     let body = with_sign(neg, core, p);
-    apply_alignment(&body, p, true)
+    apply_alignment(body, p, true)
 }
 
 fn format_float_fixed(f: f64, prec: usize, upper: bool, p: &ParsedSpec) -> String {
@@ -82834,7 +82841,7 @@ fn format_complex(re: f64, im: f64, parsed: &ParsedSpec) -> Result<String, Runti
     } else {
         body
     };
-    Ok(apply_alignment(&body, parsed, true))
+    Ok(apply_alignment(body, parsed, true))
 }
 
 /// Strip trailing fractional zeros (and a bare decimal point) from a
@@ -82865,13 +82872,20 @@ fn with_sign(neg: bool, body: &str, p: &ParsedSpec) -> String {
     }
 }
 
-fn apply_alignment(body: &str, p: &ParsedSpec, default_right: bool) -> String {
+fn apply_alignment(owned: String, p: &ParsedSpec, default_right: bool) -> String {
     let width = p.width.unwrap_or(0);
-    if body.chars().count() >= width {
-        return body.to_owned();
+    // (The common unpadded result is the body itself, not a copy.)
+    let n = if owned.is_ascii() {
+        owned.len()
+    } else {
+        owned.chars().count()
+    };
+    if n >= width {
+        return owned;
     }
+    let body: &str = &owned;
     let fill = p.fill.unwrap_or(' ');
-    let pad = width - body.chars().count();
+    let pad = width - n;
     let align = p.align.unwrap_or(if default_right { '>' } else { '<' });
     match align {
         '<' => {
@@ -82928,7 +82942,7 @@ fn apply_alignment(body: &str, p: &ParsedSpec, default_right: bool) -> String {
             s.push_str(rest);
             s
         }
-        _ => body.to_owned(),
+        _ => owned,
     }
 }
 
