@@ -560,7 +560,15 @@ branch and pull request.
     element's `__eq__` while another operation held it queued the mutation
     by address alone, so a later set at the same address replayed a stale
     `clear()` on its next `add`. The queue now holds a weak handle and drops
-    a dead set's ops.
+    a dead set's ops. `re.match(compiled, s)` went through `re._compile`,
+    which raises and catches a `KeyError` before handing a compiled pattern
+    back; the native cache front now returns it (16,572 to 1,703, against
+    7,626; `ConfigParser.write` 3.46 M to 1.60 M, against 1.94 M). A method
+    site keeps a native stream's method for its kind (three `StringIO`
+    writes and a `getvalue()` 8,450 to 7,737, against 4,663), and a subclass
+    of `str`, `int`, `float`, `tuple`, `bytes` or `frozenset` that keeps its
+    base's `__new__` wraps an argument of the base's exact type directly
+    (4,995 to 2,254, against 1,409).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
