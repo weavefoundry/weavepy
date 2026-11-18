@@ -52,5 +52,23 @@ class ReversedJoinTests(unittest.TestCase):
         self.assertEqual(str(cm.exception), "sequence item 1: expected str instance, int found")
 
 
+class MinMaxKeyTests(unittest.TestCase):
+    def test_leaf_keys(self):
+        words = "the quick brown fox jumps over the lazy dog".split()
+        for _ in range(N):
+            r = (min(words, key=len), max(words, key=len), min([[1, 2], [3]], key=len),
+                 max(words, key=str.upper), min([3, 1, 2]), max([1.5, 2, 2.0]),
+                 min(words, key=lambda w: -len(w)), max([2, 1, 2], key=abs))
+        self.assertEqual(r, ("the", "quick", [3], "the", 1, 2, "quick", 2))
+
+        class Sized:
+            def __len__(self):
+                return 5
+
+        self.assertEqual(min([Sized(), "ab"], key=len), "ab")
+        with self.assertRaises(TypeError):
+            min([1], key=len)
+
+
 if __name__ == "__main__":
     unittest.main()

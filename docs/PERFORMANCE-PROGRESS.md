@@ -805,6 +805,10 @@ branch and pull request.
     after (about 200 instructions a loop); the first eight watched dicts
     now sit in a vector scanned in place, the map holding any beyond
     (`[k for k in d]` of three keys 2,541 to 2,410 under callgrind).
+    `min(xs, key=len)` ran `len` through the general call for each item,
+    the key path taking only some of the leaf builtins' kinds; it takes
+    every kind now, and compares machine-int keys directly (5,756 to
+    3,929, against 3,864).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

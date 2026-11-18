@@ -47310,7 +47310,12 @@ impl Interpreter {
                     {
                         return (b.call)(arg);
                     }
-                    _ => {}
+                    // (`key=len` and the other leaf kinds' bodies.)
+                    kind => {
+                        if let Some(r) = slf.leaf_builtin_call(*kind, b, arg) {
+                            return r;
+                        }
+                    }
                 }
             }
             if let Some(f) = &key_fn {
@@ -47328,10 +47333,17 @@ impl Interpreter {
             // `__gt__` — `Fraction`, `Decimal`, any rich-comparable type —
             // drives selection (`test_statistics` `approx_equal`). Strict
             // comparison keeps the *first* extremum on ties, as CPython does.
-            let take = if want_max {
-                self.op_compare(&candidate_key, &best_key, CompareKind::Gt)?
-            } else {
-                self.op_compare(&candidate_key, &best_key, CompareKind::Lt)?
+            let take = match (&candidate_key, &best_key) {
+                // (Two machine ints compare natively.)
+                (Object::Int(c), Object::Int(b)) => {
+                    if want_max {
+                        c > b
+                    } else {
+                        c < b
+                    }
+                }
+                _ if want_max => self.op_compare(&candidate_key, &best_key, CompareKind::Gt)?,
+                _ => self.op_compare(&candidate_key, &best_key, CompareKind::Lt)?,
             };
             if take {
                 best_value = item.clone();
