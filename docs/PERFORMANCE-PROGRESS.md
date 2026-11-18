@@ -997,6 +997,11 @@ branch and pull request.
     on the pending list, its `StopIteration` the loop's end, and compiled
     code takes the lane in place (`Parser().parsestr(msg)` 8% fewer
     instructions).
+  - Tier 2's item store into an exact dict went through the generic
+    store and rechecked every guard afterward, where its item read had a
+    leaf path; a store by a key that hashes and compares natively now
+    goes straight into the dict (`d[k] += 1` in a compiled loop 1,276
+    instructions to 1,024, against 743).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

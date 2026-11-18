@@ -13594,6 +13594,42 @@ unsafe extern "C" fn wpjit_dyn_setitem(frame: *mut JitFrame, _arg: i64, _unused:
             return 0;
         }
     }
+    // An exact dict by a key that hashes and compares natively: stored as
+    // the core loop's `STORE_SUBSCR` arm stores it (no code runs, so no
+    // guard can have broken; a displaced value's release may queue a
+    // finalizer).
+    if let Object::Dict(cell) = &container {
+        if !crate::capi_watchers::dicts_active() {
+            if let Some(probe) = crate::object::LeafProbe::new(&index) {
+                if let Ok(mut d) = cell.try_borrow_mut() {
+                    let stored = match d.probe_entry(&probe) {
+                        crate::dictmap::ProbeEntry::Occupied(e) => {
+                            let slot = e.into_mut();
+                            let old = std::mem::replace(slot, value.clone());
+                            Some((!old.is_same(slot), old))
+                        }
+                        crate::dictmap::ProbeEntry::Vacant(e) if probe.miss_is_exact() => {
+                            e.insert(DictKey(index.clone()), value.clone());
+                            Some((true, Object::None))
+                        }
+                        crate::dictmap::ProbeEntry::Vacant(_) => None,
+                    };
+                    drop(d);
+                    if let Some((changed, old)) = stored {
+                        if changed {
+                            crate::object::dict_mutation_event(cell);
+                        }
+                        drop(old);
+                        if finalizer_queued() {
+                            ctx.parked = None;
+                            return 2;
+                        }
+                        return 0;
+                    }
+                }
+            }
+        }
+    }
     dyn_setitem_full(interp, ctx, &container, &index, value)
 }
 
