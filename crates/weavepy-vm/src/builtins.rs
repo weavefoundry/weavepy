@@ -13854,9 +13854,50 @@ fn list_remove(args: &[Object]) -> Result<Object, RuntimeError> {
     Err(value_error("list.remove(x): x not in list"))
 }
 
+/// The positions of `list` whose items equal `needle` by a comparison
+/// that runs no code (identity first, as `PyObject_RichCompareBool`
+/// compares): `f` sees each match in order and may stop the scan. `None`
+/// when an item needs the full comparison (the caller then discards what
+/// `f` saw and takes the full path, as nothing has run).
+fn list_scan_native(
+    list: &Object,
+    needle: &Object,
+    mut f: impl FnMut(usize) -> bool,
+) -> Option<()> {
+    let Object::List(l) = list else {
+        return None;
+    };
+    let items = l.try_borrow().ok()?;
+    for (i, x) in items.iter().enumerate() {
+        let eq = match (x, needle) {
+            (Object::Int(a), Object::Int(b)) => a == b,
+            (Object::Str(a), Object::Str(b)) => a == b,
+            _ => x.is_same(needle) || crate::Interpreter::leaf_contains_eq(x, needle)?,
+        };
+        if eq && !f(i) {
+            break;
+        }
+    }
+    Some(())
+}
+
 fn list_index(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() < 2 {
         return Err(type_error("list.index() expected at least 1 argument"));
+    }
+    if let [list, needle] = args {
+        let mut found = None;
+        if list_scan_native(list, needle, |i| {
+            found = Some(i);
+            false
+        })
+        .is_some()
+        {
+            return match found {
+                Some(i) => Ok(Object::Int(i as i64)),
+                None => Err(value_error("list.index(x): x not in list")),
+            };
+        }
     }
     // Snapshot strong refs: CPython `list.index` re-reads by index because a
     // user `__eq__` can mutate the list mid-scan; cloning the handles keeps us
@@ -13889,12 +13930,21 @@ fn list_index(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         i += 1;
     }
-    Err(value_error(format!("{} is not in list", args[1].repr())))
+    Err(value_error("list.index(x): x not in list"))
 }
 
 fn list_count(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() != 2 {
         return Err(type_error("list.count() expected 1 argument"));
+    }
+    let mut n = 0i64;
+    if list_scan_native(&args[0], &args[1], |_| {
+        n += 1;
+        true
+    })
+    .is_some()
+    {
+        return Ok(Object::Int(n));
     }
     // Snapshot strong refs (a user `__eq__` may mutate the list mid-scan).
     // CPython compares with `PyObject_RichCompareBool`: identity-first (so

@@ -31362,7 +31362,7 @@ impl Interpreter {
 
     /// [`Self::leaf_member_eq`] for a membership test (`in`), which settles
     /// a few more pairs itself rather than through a native comparison.
-    fn leaf_contains_eq(x: &Object, item: &Object) -> Option<bool> {
+    pub(crate) fn leaf_contains_eq(x: &Object, item: &Object) -> Option<bool> {
         if let Some(eq) = Self::leaf_member_eq(x, item) {
             return Some(eq);
         }
