@@ -854,14 +854,16 @@ pub enum LeafAttrKind {
     /// MRO, reading this index of the instance's tuple (the descriptor's
     /// index is fixed for its life).
     TupleField(u32),
-    /// An instance of a Python data descriptor class (a plain-function
-    /// `__get__`, and `__set__` or `__delete__`) on the MRO: it wins over
-    /// the instance dict, and a read calls its `__get__`. Valid while its
-    /// class's attribute version is `dver`; both held weakly.
+    /// An instance of a Python descriptor class (a plain-function
+    /// `__get__`) on the MRO, whose read calls its `__get__`: a data
+    /// descriptor (`__set__` or `__delete__` too, `data`) wins over the
+    /// instance dict, any other yields to the instance's own entry. Valid
+    /// while its class's attribute version is `dver`; both held weakly.
     DataDescr {
         descr: crate::sync::Weak<PyInstance>,
         get: crate::sync::Weak<crate::object::PyFunction>,
         dver: u64,
+        data: bool,
     },
     /// A built-in base's own special method with a registered leaf half
     /// (see `leaf_builtins::register_fast`): the half, which runs no Python

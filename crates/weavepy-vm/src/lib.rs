@@ -10941,9 +10941,12 @@ impl Interpreter {
         {
             return None;
         }
-        // (A non-data descriptor would yield to the instance's own
-        // attribute; those stay on the full path, as do dunders.)
-        let (descr, get) = Self::leaf_class_data_descr(code, cls, name_idx)?;
+        // (A non-data descriptor yields to the instance's own attribute:
+        // only a certain miss of the instance's reads through it.)
+        let (descr, get, data) = Self::leaf_class_data_descr(code, cls, name_idx)?;
+        if !data && inst_may_shadow(inst, code, name_idx) {
+            return None;
+        }
         // SAFETY: GIL-serialized raw read of the function's code cell.
         let gcode: &CodeObject = unsafe { &*get.code.as_ptr() };
         if gcode.arg_count != 3
@@ -34633,12 +34636,17 @@ impl Interpreter {
                 return None;
             }
         }
-        let on_class = match Self::leaf_class_attr(code, cls, name_idx)? {
-            LeafAttr::InstanceOnly => None,
+        let on_class = match Self::leaf_class_attr(code, cls, name_idx) {
+            Some(LeafAttr::InstanceOnly) => None,
             // A data descriptor: the instance dict never shadows it.
-            prop @ LeafAttr::Property(_) => return Some((prop, None)),
-            field @ LeafAttr::TupleField(_) => return Some((field, None)),
-            other => Some(other),
+            Some(prop @ LeafAttr::Property(_)) => return Some((prop, None)),
+            Some(field @ LeafAttr::TupleField(_)) => return Some((field, None)),
+            Some(other) => Some(other),
+            // A Python non-data descriptor (a `functools.cached_property`
+            // whose value the instance now holds): the instance's own
+            // entry, a miss the full path's (the descriptor's `__get__`).
+            None if Self::leaf_class_non_data_descr(code, cls, name_idx) => None,
+            None => return None,
         };
         match inst.dict.published() {
             Some(dict) => {
@@ -34809,17 +34817,23 @@ impl Interpreter {
     fn data_descr_kind(descr: &Rc<PyInstance>) -> crate::types::LeafAttrKind {
         use crate::types::{Dunder, LeafAttrKind as K};
         let dcls = descr.cls_raw();
-        if !(dcls.dunder(Dunder::Set).present() || dcls.dunder(Dunder::Delete).present()) {
-            return K::Other;
-        }
+        let data = dcls.dunder(Dunder::Set).present() || dcls.dunder(Dunder::Delete).present();
         match dcls.lookup("__get__") {
             Some(Object::Function(get)) => K::DataDescr {
                 descr: Rc::downgrade(descr),
                 get: Rc::downgrade(&get),
                 dver: dcls.attr_version.get(),
+                data,
             },
             _ => K::Other,
         }
+    }
+
+    /// Whether `cls` resolves `co_names[name_idx]` to a Python non-data
+    /// descriptor (see [`crate::types::LeafAttrKind::DataDescr`]), which
+    /// the instance's own entry shadows.
+    fn leaf_class_non_data_descr(code: &CodeObject, cls: &TypeObject, name_idx: u32) -> bool {
+        Self::leaf_class_data_descr(code, cls, name_idx).is_some_and(|(_, _, data)| !data)
     }
 
     /// The Python data descriptor `cls` resolves `co_names[name_idx]` to
@@ -34829,7 +34843,7 @@ impl Interpreter {
         code: &CodeObject,
         cls: &TypeObject,
         name_idx: u32,
-    ) -> Option<(Rc<PyInstance>, Rc<crate::object::PyFunction>)> {
+    ) -> Option<(Rc<PyInstance>, Rc<crate::object::PyFunction>, bool)> {
         use crate::types::LeafAttrKind as K;
         let Some(Object::Str(name_obj)) = code_name_obj(code, name_idx) else {
             return None;
@@ -34840,14 +34854,20 @@ impl Interpreter {
             // (Fills the entry.)
             Self::leaf_class_attr(code, cls, name_idx);
         }
-        let K::DataDescr { descr, get, dver } = cls.leaf_attrs.get(name_key, ver)? else {
+        let K::DataDescr {
+            descr,
+            get,
+            dver,
+            data,
+        } = cls.leaf_attrs.get(name_key, ver)?
+        else {
             return None;
         };
         let descr = descr.upgrade()?;
         if descr.cls_raw().attr_version.get() != *dver {
             return None;
         }
-        Some((descr, get.upgrade()?))
+        Some((descr, get.upgrade()?, *data))
     }
 
     /// `cls.name` for a class with a plain metaclass, when the name is a
