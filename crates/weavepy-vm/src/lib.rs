@@ -12423,6 +12423,8 @@ impl Interpreter {
         let done = match ins.op {
             OpCode::Call => self.leaf_core_call(frame, ins, pc),
             OpCode::LoadSpecial => Self::leaf_load_special(frame, ins.arg, pc),
+            OpCode::ImportName => self.leaf_import_name(frame, ins.arg),
+            OpCode::ImportFrom => Self::leaf_import_from(frame, ins.arg),
             _ => self.leaf_core_attr(frame, ins, pc),
         };
         match done {
@@ -12436,6 +12438,48 @@ impl Interpreter {
             CoreAttr::Decline | CoreAttr::Full => {}
         }
         done
+    }
+
+    /// `import m` of a module already imported (see
+    /// [`Self::cached_import`]): the module in place of the level and
+    /// from-list. Declines anything else, touching nothing.
+    fn leaf_import_name(&self, frame: &mut Frame, arg: u32) -> CoreAttr {
+        let n = frame.stack.len();
+        if n < 2 {
+            return CoreAttr::Decline;
+        }
+        let Some(name) = frame.code.names.get(arg as usize).cloned() else {
+            return CoreAttr::Decline;
+        };
+        let Some(module) =
+            self.cached_import(frame, &name, &frame.stack[n - 2], &frame.stack[n - 1])
+        else {
+            return CoreAttr::Decline;
+        };
+        // (The level is an int; the from-list a constant.)
+        frame.stack.truncate(n - 2);
+        frame.stack.push(module);
+        CoreAttr::Done
+    }
+
+    /// `from m import x` of a name in the module's dict: the value above
+    /// the module. Declines anything else (a submodule, a missing name).
+    fn leaf_import_from(frame: &mut Frame, arg: u32) -> CoreAttr {
+        let (Some(Object::Module(m)), Some(name)) =
+            (frame.stack.last(), frame.code.names.get(arg as usize))
+        else {
+            return CoreAttr::Decline;
+        };
+        let Some(v) = m
+            .dict
+            .try_borrow()
+            .ok()
+            .and_then(|d| d.get(&crate::object::StrKey(name)).cloned())
+        else {
+            return CoreAttr::Decline;
+        };
+        frame.stack.push(v);
+        CoreAttr::Done
     }
 
     /// `LOAD_SPECIAL` at `pc` of an instance whose class resolves the
@@ -17056,6 +17100,9 @@ impl Interpreter {
                     // `{1, 2, 3}`'s update from its folded constant
                     // (`core_set_op`, or else the full handler).
                     OpCode::SetUpdate => break None,
+                    // A function-level `import m` / `from m import x` of an
+                    // imported module (the helper's, as compiled code's).
+                    OpCode::ImportName | OpCode::ImportFrom => offload!(OFFLOAD_HELPER),
                     // An opcode the full leaf arms have no arm for is the quiet
                     // loop's straight away.
                     op if !SLOW_LEAF_OPS[op as u8 as usize] => {

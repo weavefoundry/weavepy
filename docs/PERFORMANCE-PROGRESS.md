@@ -986,7 +986,10 @@ branch and pull request.
     `file_small_open_close` 2%, `os_stat_exists` 12%). `with open(p) as
     f` loaded the file's `__enter__` and `__exit__` through the full step;
     `LOAD_SPECIAL` takes a native file's own methods in place (another
-    1.5% of `file_small_open_close`).
+    1.5% of `file_small_open_close`). A function-level `import m` or
+    `from m import x` of an imported module, in place in compiled code
+    already, is the core loop's helper's too, for interpreted callers
+    (`shlex.__init__`'s imports at every construction).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
