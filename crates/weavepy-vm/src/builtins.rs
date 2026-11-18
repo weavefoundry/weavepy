@@ -4209,7 +4209,10 @@ fn b_callable(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Bool(object_is_callable(v)))
 }
 
-fn b_object(_args: &[Object]) -> Result<Object, RuntimeError> {
+fn b_object(args: &[Object]) -> Result<Object, RuntimeError> {
+    if !args.is_empty() {
+        return Err(type_error("object() takes no arguments"));
+    }
     let cls = crate::builtin_types::builtin_types().object_.clone();
     let inst = crate::types::PyInstance::new(cls);
     Ok(Object::Instance(Rc::new(inst)))

@@ -585,6 +585,8 @@ fn lock_type() -> Rc<TypeObject> {
             },
         )
         .expect("lock type");
+        t.pure_new
+            .set(Some(|_, args| args.is_empty().then(new_lock_object)));
         *cell.borrow_mut() = Some(t.clone());
         t
     })
@@ -791,6 +793,8 @@ fn rlock_type() -> Rc<TypeObject> {
             },
         )
         .expect("rlock type");
+        t.pure_new
+            .set(Some(|_, args| args.is_empty().then(new_rlock_object)));
         *cell.borrow_mut() = Some(t.clone());
         t
     })

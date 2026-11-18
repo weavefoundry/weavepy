@@ -814,6 +814,9 @@ pub(crate) mod vm_key {
     pub(crate) const NATIVE_CONTAINS: u32 = 97;
 }
 
+/// A builtin type's pure constructor (see [`TypeObject::pure_new`]).
+pub type PureNew = fn(&Rc<TypeObject>, &[Object]) -> Option<Object>;
+
 /// The cached answer (see [`LeafAttrCache`]).
 #[derive(Clone, Debug)]
 pub enum LeafAttrKind {
@@ -1262,6 +1265,12 @@ pub struct TypeObject {
     /// native adapter directly (see `stdlib::itertools_mod::native_new`):
     /// the adapter's kind. A subclass has its own (zero) value.
     pub lazy_ctor: Cell<u8>,
+    /// For an exact builtin type whose call, for some arguments, runs no
+    /// Python code and has no effect beyond building the object
+    /// (`io.BytesIO()`, `threading.Lock()`, `object()`): that call, or
+    /// `None` for arguments it leaves to the full constructor (see
+    /// `seqiter::builtin_ctor_pure`). A subclass has its own (empty) one.
+    pub pure_new: Cell<Option<PureNew>>,
     /// Non-zero for an exact `_collections` class the interpreter serves
     /// natively: `_tuplegetter`, whose instances the attribute paths read
     /// as tuple items (`stdlib::collections_native::DESCR_TUPLEGETTER`),
@@ -1726,6 +1735,7 @@ impl TypeObject {
             shared_keys: crate::sync::LazyArc::new(),
             native_kind: Cell::new(0),
             lazy_ctor: Cell::new(0),
+            pure_new: Cell::new(None),
             collections_kind: Cell::new(0),
             native_ext: std::sync::OnceLock::new(),
             abc_state: std::sync::OnceLock::new(),

@@ -219,6 +219,11 @@ impl BuiltinTypes {
             TypeObject::new_exception(name, base).expect("built-in exception must linearise")
         };
         let object_ = mk("object", vec![]);
+        // `object()`: a bare instance (as `b_object` builds it).
+        object_.pure_new.set(Some(|cls, args| {
+            args.is_empty()
+                .then(|| Object::Instance(Rc::new(crate::types::PyInstance::new(cls.clone()))))
+        }));
         // `object()` instances carry no `__dict__` (tp_dictoffset 0 in
         // CPython): attribute writes on a plain object raise
         // AttributeError, and weak references to one are refused.

@@ -1957,9 +1957,12 @@ pub(crate) fn builtin_ctor_pure(cls: &Rc<TypeObject>, args: &[Object]) -> Option
     if let Some(ty) = SeqType::of_exact(cls) {
         return Interpreter::seq_new_pure(ty, args);
     }
-    // `io.BytesIO()` and `io.StringIO()`, empty or of plain data.
-    if let Some(stream) = crate::stdlib::io::memory_stream_new_pure(cls, args) {
-        return Some(stream);
+    // A type with a pure constructor of its own (`io.BytesIO()`,
+    // `threading.Lock()`, `object()`).
+    if let Some(new) = cls.pure_new.get() {
+        if let Some(made) = new(cls, args) {
+            return Some(made);
+        }
     }
     let bt = builtin_types();
     // `float(x)` and `int(x)` of a plain number or a well-formed `str`
