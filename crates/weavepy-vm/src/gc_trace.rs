@@ -1186,35 +1186,50 @@ impl GcState {
     /// garbage can appear, and nothing deferred here can be part of a
     /// cycle. A population that genuinely accumulates is paced by
     /// `DEFERRED_CAP` instead.
+    #[inline]
     fn defer_container(&self, obj: &Object) -> bool {
         let Some(weak) = DeferredContainer::new(obj) else {
             return false;
         };
-        let over = {
-            // SAFETY: nothing below runs code while the list is borrowed
-            // (a dead predecessor's release only frees memory).
-            let mut guard = None;
-            let deferred = match unsafe { self.deferred.peek_mut() } {
-                Some(d) => d,
-                None => match self.deferred.try_borrow_mut() {
-                    Ok(g) => &mut **guard.insert(g),
-                    // A sweep is already walking the list (it upgrades and
-                    // can re-enter through a promotion). Track eagerly
-                    // rather than queue onto a list we cannot touch.
-                    Err(_) => return false,
-                },
-            };
-            // The churn shape — a loop that builds a container and drops
-            // the previous one — leaves its dead predecessors just below
-            // the tail: reclaim them here, so steady churn neither grows
-            // the list nor parks dead allocations until a sweep.
-            let n = deferred.len();
-            for i in (n.saturating_sub(2)..n).rev() {
-                if deferred[i].is_dead() {
-                    deferred.swap_remove(i);
-                }
+        // SAFETY: nothing below runs code while the list is viewed (a dead
+        // predecessor's release only frees memory).
+        let Some(deferred) = (unsafe { self.deferred.peek_mut() }) else {
+            return self.defer_container_slow(weak);
+        };
+        Self::push_deferred(deferred, weak);
+        if deferred.len() >= self.deferred_limit.load(Ordering::Relaxed) {
+            self.sweep_deferred(false);
+        }
+        true
+    }
+
+    /// Queue `weak`, first reclaiming the dead predecessors just below the
+    /// tail: the churn shape (a loop that builds a container and drops the
+    /// previous one) leaves them there, so steady churn neither grows the
+    /// list nor parks dead allocations until a sweep.
+    #[inline(always)]
+    fn push_deferred(deferred: &mut Vec<DeferredContainer>, weak: DeferredContainer) {
+        let n = deferred.len();
+        for i in (n.saturating_sub(2)..n).rev() {
+            if deferred[i].is_dead() {
+                deferred.swap_remove(i);
             }
-            deferred.push(weak);
+        }
+        deferred.push(weak);
+    }
+
+    /// [`Self::defer_container`] when the list is held by a guard: through
+    /// a borrow of its own, or (a sweep is already walking the list, which
+    /// upgrades and can re-enter through a promotion) not at all, the
+    /// container then tracked eagerly.
+    #[cold]
+    #[inline(never)]
+    fn defer_container_slow(&self, weak: DeferredContainer) -> bool {
+        let over = {
+            let Ok(mut deferred) = self.deferred.try_borrow_mut() else {
+                return false;
+            };
+            Self::push_deferred(&mut deferred, weak);
             deferred.len() >= self.deferred_limit.load(Ordering::Relaxed)
         };
         if over {
