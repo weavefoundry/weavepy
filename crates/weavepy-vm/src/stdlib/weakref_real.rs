@@ -532,6 +532,7 @@ fn ref_type() -> Rc<TypeObject> {
         .expect("ref type");
         *cell.borrow_mut() = Some(t.clone());
         REF_TYPE_ADDR.with(|a| a.set(Rc::as_ptr(&t) as usize));
+        t.pure_new.set(Some(crate::seqiter::builtin_ctor_arms));
         t
     })
 }

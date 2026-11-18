@@ -1954,16 +1954,21 @@ pub(crate) fn itertools_pure_next(l: &PyLazyIter) -> Option<Option<Object>> {
 /// empty container, built without running any code (the core loop's
 /// `CALL`): `None` for every shape that might.
 pub(crate) fn builtin_ctor_pure(cls: &Rc<TypeObject>, args: &[Object]) -> Option<Object> {
-    if let Some(ty) = SeqType::of_exact(cls) {
-        return Interpreter::seq_new_pure(ty, args);
-    }
-    // A type with a pure constructor of its own (`io.BytesIO()`,
-    // `threading.Lock()`, `object()`).
-    if let Some(new) = cls.pure_new.get() {
-        if let Some(made) = new(cls, args) {
-            return Some(made);
-        }
-    }
+    // The type's pure constructor (see `TypeObject::pure_new`): one of the
+    // arms below for the builtin types they serve, or one of its own
+    // (`io.BytesIO()`, `threading.Lock()`, `object()`).
+    cls.pure_new.get()?(cls, args)
+}
+
+/// `map(...)`, `filter(...)` and `zip(...)` of the exact adapter types
+/// (see [`Interpreter::seq_new_pure`]).
+pub(crate) fn seq_ctor_pure(cls: &Rc<TypeObject>, args: &[Object]) -> Option<Object> {
+    Interpreter::seq_new_pure(SeqType::of_exact(cls)?, args)
+}
+
+/// [`builtin_ctor_pure`]'s arms for the builtin types `builtin_types`
+/// registers it on.
+pub(crate) fn builtin_ctor_arms(cls: &Rc<TypeObject>, args: &[Object]) -> Option<Object> {
     let bt = builtin_types();
     // `float(x)` and `int(x)` of a plain number or a well-formed `str`
     // (a malformed one raises through the full constructor).

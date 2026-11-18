@@ -987,6 +987,33 @@ impl BuiltinTypes {
             }
         }
 
+        // The builtin types `seqiter::builtin_ctor_arms` builds for some
+        // arguments, and the lazy adapters: their constructors' pure halves
+        // (any other builtin type's call skips them at a load).
+        for ty in [
+            &bool_,
+            &bytearray_,
+            &bytes_,
+            &dict_,
+            &enumerate_,
+            &float_,
+            &frozenset_,
+            &int_,
+            &list_,
+            &method_,
+            &reversed_,
+            &set_,
+            &slice_,
+            &str_,
+            &super_,
+            &tuple_,
+            &type_,
+        ] {
+            ty.pure_new.set(Some(crate::seqiter::builtin_ctor_arms));
+        }
+        for ty in [&map_, &filter_, &zip_] {
+            ty.pure_new.set(Some(crate::seqiter::seq_ctor_pure));
+        }
         let bt = BuiltinTypes {
             object_: object_.clone(),
             type_: type_.clone(),
