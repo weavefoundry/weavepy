@@ -21574,6 +21574,35 @@ impl Interpreter {
                 }
                 Some(Object::new_bytes(slice_seq(&b[..], sl).ok()?))
             }
+            // A contiguous slice of a `bytearray`: a new one over the range.
+            Object::ByteArray(b) if matches!(sl.step, Object::None | Object::Int(1)) => {
+                let b = b.try_borrow().ok()?;
+                let (lo, hi) = Self::slice_bounds(sl, b.len())?;
+                Some(Object::new_bytearray(&b[lo..hi.max(lo)]))
+            }
+            // A `str`, `list` or `tuple` subclass's instance whose class
+            // keeps its base's own `__getitem__` (`email`'s header tokens and
+            // token lists): the base's slice, exact, as CPython's is.
+            Object::Instance(inst) => {
+                let native = inst.native.get()?;
+                let bt = builtin_types();
+                let base = match native {
+                    Object::Str(_) => &bt.str_,
+                    Object::List(_) => &bt.list_,
+                    Object::Tuple(_) => &bt.tuple_,
+                    _ => return None,
+                };
+                let own = base
+                    .dict
+                    .try_borrow()
+                    .ok()?
+                    .get(&crate::object::StrKey("__getitem__"))
+                    .cloned()?;
+                match inst.cls_raw().lookup("__getitem__") {
+                    Some(g) if g.is_same(&own) => Self::core_slice(native, sl),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
@@ -22622,7 +22651,12 @@ impl Interpreter {
                     // full handler's own slicing, out of line (a bad step
                     // declines, and the full handler raises).
                     (
-                        Object::List(_) | Object::Tuple(_) | Object::Str(_) | Object::Bytes(_),
+                        Object::List(_)
+                        | Object::Tuple(_)
+                        | Object::Str(_)
+                        | Object::Bytes(_)
+                        | Object::ByteArray(_)
+                        | Object::Instance(_),
                         Object::Slice(sl),
                     ) if [&sl.start, &sl.stop, &sl.step]
                         .iter()
@@ -22660,7 +22694,12 @@ impl Interpreter {
                 };
                 if !matches!(
                     c,
-                    Object::List(_) | Object::Tuple(_) | Object::Str(_) | Object::Bytes(_)
+                    Object::List(_)
+                        | Object::Tuple(_)
+                        | Object::Str(_)
+                        | Object::Bytes(_)
+                        | Object::ByteArray(_)
+                        | Object::Instance(_)
                 ) || !Self::core_droppable(c)
                     || !matches!(a, Object::None | Object::Int(_))
                     || !matches!(b, Object::None | Object::Int(_))

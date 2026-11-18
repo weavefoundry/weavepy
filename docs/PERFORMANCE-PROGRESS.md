@@ -962,6 +962,12 @@ branch and pull request.
     ends do, detaching from the list where nothing its release frees
     could finalize (`sum(i * v for i, v in enumerate(xs))` of five
     items 8,697 instructions to 6,226 in the container).
+  - The battery's slow-step census (`WEAVEPY_BURST_STATS=1` over every
+    case) showed slices of `bytearray`s and of `str` subclasses (`re`'s
+    `_plain_slice` over `email`'s header tokens) taking the full step at
+    every call. The core loop's slice arms take a `bytearray` (a new
+    one), and a `str`, `list` or `tuple` subclass keeping its base's
+    `__getitem__` (the base's exact slice, as CPython's).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
