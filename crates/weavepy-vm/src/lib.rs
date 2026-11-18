@@ -22588,6 +22588,8 @@ impl Interpreter {
                     return None;
                 }
                 let removed_ok = |v: &Object| scalar(v) || Self::core_droppable(v);
+                // (A slice's run, released with the other removals.)
+                let mut run_items: Vec<Object> = Vec::new();
                 let (removed, key) = match (c, k) {
                     (Object::List(xs), Object::Int(i)) => {
                         // SAFETY: a store between two instructions (the
@@ -22599,6 +22601,30 @@ impl Interpreter {
                             return None;
                         }
                         (xs.remove(i as usize), Object::None)
+                    }
+                    // `del xs[a:b]` of a unit step, by plain bounds, whose
+                    // items release without running code.
+                    (Object::List(xs), Object::Slice(sl))
+                        if matches!(sl.step, Object::None | Object::Int(1))
+                            && matches!(sl.start, Object::None | Object::Int(_))
+                            && matches!(sl.stop, Object::None | Object::Int(_)) =>
+                    {
+                        // SAFETY: as above.
+                        let xs = unsafe { xs.peek_mut() }?;
+                        let n = xs.len() as i64;
+                        let bound = |o: &Object, default: i64| match o {
+                            Object::Int(i) => {
+                                if *i < 0 { i.saturating_add(n) } else { *i }.clamp(0, n)
+                            }
+                            _ => default,
+                        };
+                        let (lo, hi) = (bound(&sl.start, 0), bound(&sl.stop, n));
+                        let run = (lo as usize)..(hi.max(lo) as usize);
+                        if !xs[run.clone()].iter().all(removed_ok) {
+                            return None;
+                        }
+                        run_items = xs.drain(run).collect();
+                        (Object::None, Object::None)
                     }
                     (Object::Dict(cell), Object::Str(_) | Object::Int(_)) => {
                         if crate::capi_watchers::dicts_active() {
@@ -22626,6 +22652,10 @@ impl Interpreter {
                 }
                 drop_hot(removed);
                 drop_hot(key);
+                // (Last first, as `list_ass_slice` releases them.)
+                for v in run_items.into_iter().rev() {
+                    drop_hot(v);
+                }
                 Some(len - 2)
             }
             OpCode::UnpackSequence => {
@@ -74787,6 +74817,24 @@ pub(crate) fn range_slice(
 /// returning them so the caller can prompt-reap (mirrors
 /// [`apply_slice_assignment`]).
 fn apply_slice_deletion(data: &mut Vec<Object>, s: &PySlice) -> Result<Vec<Object>, RuntimeError> {
+    // A unit step's run, from its bounds alone (`del items[-k:]`).
+    if matches!(s.step, Object::None | Object::Int(1)) {
+        let len = data.len() as i64;
+        let bound = |o: &Object, default: i64| match o {
+            Object::None => Some(default),
+            Object::Int(i) => Some(if *i < 0 { i.saturating_add(len) } else { *i }.clamp(0, len)),
+            _ => None,
+        };
+        if let (Some(lo), Some(hi)) = (bound(&s.start, 0), bound(&s.stop, len)) {
+            // (Last first: the order CPython's `list_ass_slice` releases
+            // them in, which finalizers see.)
+            return Ok(if lo < hi {
+                data.drain(lo as usize..hi as usize).rev().collect()
+            } else {
+                Vec::new()
+            });
+        }
+    }
     let mut indices = slice_indices(data.len(), s)?;
     indices.sort_unstable();
     indices.dedup();
