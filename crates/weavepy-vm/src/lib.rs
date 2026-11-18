@@ -34658,6 +34658,17 @@ impl Interpreter {
         name_idx: u32,
     ) -> Option<Object> {
         use weavepy_compiler::InlineCache as IC;
+        // `inst.__class__` where `object`'s descriptor answers (a
+        // dataclass's `__eq__` reads it of both operands): the class.
+        if code
+            .names
+            .get(name_idx as usize)
+            .is_some_and(|n| n.as_str() == "__class__")
+            && inst.c_body.get() == 0
+            && inst.cls_raw().class_read_is_plain()
+        {
+            return Some(Object::Type(inst.cls()));
+        }
         // A scalar class attribute read through an instance that doesn't
         // shadow it (the stamp was filled below, at this class version),
         // or a named tuple field.

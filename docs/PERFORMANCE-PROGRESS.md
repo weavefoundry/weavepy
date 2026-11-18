@@ -944,6 +944,11 @@ branch and pull request.
     `_value2member_map_` (the verdict and the maps remembered under the
     class's and metaclass's versions); anything else is the Python
     call's (`Color(1)` 1,530, `Color(member)` 960 to 2,521).
+  - A dataclass's `__eq__`, evaluated in place, read `other.__class__`
+    and `self.__class__` through the general instance-attribute
+    resolution each time; the in-place read answers `__class__` first
+    where `object`'s descriptor does (`dc == dc2` 2,362 instructions to
+    1,944 in the container).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
