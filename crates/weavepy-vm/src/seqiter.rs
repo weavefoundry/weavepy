@@ -291,6 +291,50 @@ impl Interpreter {
                 }
             }
         }
+        // A leaf method's fast half bound to an instance of a built-in
+        // subclass (`map(_Quoter(safe).__getitem__, bs)` in
+        // `urllib.parse.quote`), resolved once: each item through it, on
+        // views of the receiver and the item; one it declines takes the
+        // full call.
+        let bound_fast = match &func {
+            Object::BoundMethod(bm)
+                if !bm.redispatch_descriptor && matches!(bm.receiver, Object::Instance(_)) =>
+            {
+                match &bm.function {
+                    Object::Builtin(b) if b.binds_instance => match self.leaf_call_kind(b) {
+                        Some(LeafKind::Fast(f)) => Some((f, bm.receiver.clone())),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some((fast, recv)) = bound_fast {
+            loop {
+                let v = match self.seq_step_source(&source, globals) {
+                    Ok(Some(v)) => v,
+                    Ok(None) => return Ok(true),
+                    Err(e) => return stop(e),
+                };
+                // SAFETY: bitwise views of the live receiver and item, never
+                // dropped (the fast half clones what it keeps).
+                let views = std::mem::ManuallyDrop::new(unsafe {
+                    [std::ptr::read(&recv), std::ptr::read(&v)]
+                });
+                let r = match fast(&views[..]) {
+                    Some(Ok(r)) => {
+                        self.release(v);
+                        Ok(r)
+                    }
+                    _ => self.seq_call1(&func, v, globals),
+                };
+                match r {
+                    Ok(r) => out.push(r),
+                    Err(e) => return stop(e),
+                }
+            }
+        }
         loop {
             let v = match self.seq_step_source(&source, globals) {
                 Ok(Some(v)) => v,
