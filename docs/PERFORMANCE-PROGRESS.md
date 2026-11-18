@@ -932,7 +932,9 @@ branch and pull request.
     memo only after a dozen other lanes (properties, class values,
     published dicts) declined; a site that has read the managed dict
     for the instance's class at its version now reads it first (811
-    instructions to 255 in the container).
+    instructions to 255 in the container). `for k in d` over a plain dict
+    steps its keys directly once the iterator's watch is set, without
+    the views' and `OrderedDict`'s checks (20 keys 5,167 to 4,341).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

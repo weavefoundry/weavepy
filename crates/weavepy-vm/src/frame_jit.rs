@@ -2806,6 +2806,34 @@ unsafe extern "C" fn h_for_iter_view(
                         drop(it.read());
                         return 2;
                     }
+                    // A plain dict's next key, the dict unchanged since the
+                    // iterator's first step (its watch set then): as
+                    // `core_dict_next` steps it, without the other shapes'
+                    // checks.
+                    PyIterator::DictKeys {
+                        kind: crate::object::DictViewKind::Keys,
+                        index,
+                        dict: Some(d),
+                        len,
+                        watch: Some(w),
+                        reverse: false,
+                        odict: None,
+                        ..
+                    } if !w.changed() => {
+                        if let Some((k, _)) = d
+                            .peek()
+                            .filter(|data| data.len() == *len)
+                            .and_then(|data| data.get_index(*index))
+                        {
+                            *index += 1;
+                            if let Object::Int(i) = k.0 {
+                                (*st).out = i as u64;
+                                return 0;
+                            }
+                            out.write(crate::clone_hot(&k.0));
+                            return 1;
+                        }
+                    }
                     view @ PyIterator::DictKeys { .. } => {
                         match Interpreter::core_dict_next(view, false, false) {
                             crate::DictStep::Item(Object::Int(i), _) => {
