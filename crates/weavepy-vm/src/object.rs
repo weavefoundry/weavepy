@@ -16491,6 +16491,44 @@ impl Object {
 const _: () = assert!(std::mem::size_of::<Object>() == 16);
 const _: () = assert!(std::mem::size_of::<Option<Object>>() == 16);
 
+/// A container item's repr appended to `out`: an `int`, `bool` or `None`
+/// written in place, anything else through its own [`Object::repr`].
+fn push_item_repr(out: &mut String, x: &Object) {
+    match x {
+        Object::Int(i) => {
+            let mut buf = [0u8; 20];
+            let mut at = buf.len();
+            let mut n = i.unsigned_abs();
+            loop {
+                at -= 1;
+                buf[at] = b'0' + (n % 10) as u8;
+                n /= 10;
+                if n == 0 {
+                    break;
+                }
+            }
+            if *i < 0 {
+                out.push('-');
+            }
+            // SAFETY: the digits are ASCII.
+            out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[at..]) });
+        }
+        Object::Bool(b) => out.push_str(if *b { "True" } else { "False" }),
+        Object::None => out.push_str("None"),
+        // Printable ASCII with no quote or backslash: single-quoted as is.
+        Object::Str(t)
+            if t.as_bytes()
+                .iter()
+                .all(|&c| (0x20..0x7f).contains(&c) && c != b'\'' && c != b'\\') =>
+        {
+            out.push('\'');
+            out.push_str(t);
+            out.push('\'');
+        }
+        _ => out.push_str(&x.repr()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -16743,43 +16781,5 @@ mod tests {
         assert_eq!(b, Some(2));
         assert_eq!(c, Some(3));
         assert!(d.is_none());
-    }
-}
-
-/// A container item's repr appended to `out`: an `int`, `bool` or `None`
-/// written in place, anything else through its own [`Object::repr`].
-fn push_item_repr(out: &mut String, x: &Object) {
-    match x {
-        Object::Int(i) => {
-            let mut buf = [0u8; 20];
-            let mut at = buf.len();
-            let mut n = i.unsigned_abs();
-            loop {
-                at -= 1;
-                buf[at] = b'0' + (n % 10) as u8;
-                n /= 10;
-                if n == 0 {
-                    break;
-                }
-            }
-            if *i < 0 {
-                out.push('-');
-            }
-            // SAFETY: the digits are ASCII.
-            out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[at..]) });
-        }
-        Object::Bool(b) => out.push_str(if *b { "True" } else { "False" }),
-        Object::None => out.push_str("None"),
-        // Printable ASCII with no quote or backslash: single-quoted as is.
-        Object::Str(t)
-            if t.as_bytes()
-                .iter()
-                .all(|&c| (0x20..0x7f).contains(&c) && c != b'\'' && c != b'\\') =>
-        {
-            out.push('\'');
-            out.push_str(t);
-            out.push('\'');
-        }
-        _ => out.push_str(&x.repr()),
     }
 }
