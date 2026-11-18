@@ -1,4 +1,4 @@
-"""`list.count(x)` and `list.index(x)` when every comparison runs no code.
+"""`list.count(x)`, `list.index(x)` and the tuple's when no comparison runs code.
 
 Mixed numbers compare across `int`, `float` and `bool`; `nan` matches
 itself by identity; strings, bytes, `None` and tuples of those compare
@@ -38,6 +38,10 @@ def run(n):
         before = Eq.calls
         assert ys.count("eq") == 2 and Eq.calls == before + 1
         assert ys.index(1) == 2
+        t = tuple(xs)
+        assert t.count(1) == 2 and t.count(nan) == 1 and t.index(2) == 1
+        assert t.index("a") == 3 and t.index(2, 2) == 7
+        assert (Eq(), "eq").count("eq") == 2
 
 
 run(3000)

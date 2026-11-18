@@ -15023,11 +15023,22 @@ fn tuple_count(args: &[Object]) -> Result<Object, RuntimeError> {
     // directions), propagating any exception the comparison raises.
     let mut n: i64 = 0;
     for x in t.iter() {
-        if crate::object::member_eq(x, &args[1])? {
+        if seq_item_eq(x, &args[1])? {
             n += 1;
         }
     }
     Ok(Object::Int(n))
+}
+
+/// `PyObject_RichCompareBool(x, value)` for a sequence scan: ints and
+/// strings compared directly, anything else through [`member_eq`].
+#[inline]
+fn seq_item_eq(x: &Object, value: &Object) -> Result<bool, RuntimeError> {
+    match (x, value) {
+        (Object::Int(a), Object::Int(b)) => Ok(a == b),
+        (Object::Str(a), Object::Str(b)) => Ok(a == b),
+        _ => crate::object::member_eq(x, value),
+    }
 }
 
 fn tuple_index(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -15058,7 +15069,7 @@ fn tuple_index(args: &[Object]) -> Result<Object, RuntimeError> {
     };
     let mut i = start;
     while i < stop {
-        if crate::object::member_eq(&t[i as usize], &args[1])? {
+        if seq_item_eq(&t[i as usize], &args[1])? {
             return Ok(Object::Int(i));
         }
         i += 1;
