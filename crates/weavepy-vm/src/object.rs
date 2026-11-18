@@ -4945,11 +4945,76 @@ pub(crate) fn dict_reentrant_remove(
 // thread-local read, keeping `d[k] = v` hot paths unaffected.
 // ---------------------------------------------------------------------------
 
+/// The live dict watches of a thread (see the section notes): a few in a
+/// vector scanned in place (one or two dict loops running at a time is
+/// the rule, and each registration through a hash map cost about a
+/// hundred instructions), the rest in a map beside it.
+#[derive(Default)]
+struct DictWatches {
+    /// dict address, shared structural version, live watcher count.
+    small: Vec<(usize, Rc<Cell<u64>>, usize)>,
+    big: std::collections::HashMap<usize, (Rc<Cell<u64>>, usize), crate::fasthash::FxBuildHasher>,
+}
+
+/// How many watched dicts the scanned vector holds before the map takes
+/// the rest.
+const SMALL_WATCHES: usize = 8;
+
+impl DictWatches {
+    /// Count one more watcher of `ptr`, its version shared (a fresh one,
+    /// `fresh`'s, when the dict had none).
+    fn enter(&mut self, ptr: usize, fresh: impl FnOnce() -> Rc<Cell<u64>>) -> Rc<Cell<u64>> {
+        if let Some(e) = self.small.iter_mut().find(|e| e.0 == ptr) {
+            e.2 += 1;
+            return e.1.clone();
+        }
+        if let Some(e) = self.big.get_mut(&ptr) {
+            e.1 += 1;
+            return e.0.clone();
+        }
+        let version = fresh();
+        if self.small.len() < SMALL_WATCHES {
+            self.small.push((ptr, version.clone(), 1));
+        } else {
+            self.big.insert(ptr, (version.clone(), 1));
+        }
+        version
+    }
+
+    /// Count one watcher of `ptr` fewer, dropping the entry at none.
+    fn leave(&mut self, ptr: usize) {
+        if let Some(i) = self.small.iter().position(|e| e.0 == ptr) {
+            let e = &mut self.small[i];
+            e.2 = e.2.saturating_sub(1);
+            if e.2 == 0 {
+                self.small.swap_remove(i);
+            }
+            return;
+        }
+        if let Some(e) = self.big.get_mut(&ptr) {
+            e.1 = e.1.saturating_sub(1);
+            if e.1 == 0 {
+                self.big.remove(&ptr);
+            }
+        }
+    }
+
+    fn version(&self, ptr: usize) -> Option<&Rc<Cell<u64>>> {
+        match self.small.iter().find(|e| e.0 == ptr) {
+            Some(e) => Some(&e.1),
+            None if self.big.is_empty() => None,
+            None => self.big.get(&ptr).map(|e| &e.0),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.small.len() + self.big.len()
+    }
+}
+
 thread_local! {
-    /// dict address -> (shared structural version, live watcher count).
-    static DICT_WATCHES: std::cell::RefCell<
-        std::collections::HashMap<usize, (Rc<Cell<u64>>, usize), crate::fasthash::FxBuildHasher>,
-    > = std::cell::RefCell::new(std::collections::HashMap::default());
+    static DICT_WATCHES: std::cell::RefCell<DictWatches> =
+        std::cell::RefCell::new(DictWatches::default());
     /// Number of entries in `DICT_WATCHES` (fast gate for mutators).
     static DICT_WATCH_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -4968,11 +5033,10 @@ impl DictWatch {
         let ptr = std::ptr::from_ref::<RefCell<DictData>>(&**d) as usize;
         let version = DICT_WATCHES.with(|w| {
             let mut w = w.borrow_mut();
-            let entry = w.entry(ptr).or_insert_with(|| (Rc::new(Cell::new(0)), 0));
-            entry.1 += 1;
-            entry.0.clone()
+            let v = w.enter(ptr, || Rc::new(Cell::new(0)));
+            DICT_WATCH_COUNT.with(|c| c.set(w.len()));
+            v
         });
-        DICT_WATCH_COUNT.with(|c| c.set(DICT_WATCHES.with(|w| w.borrow().len())));
         let start = version.get();
         DictWatch {
             ptr,
@@ -4995,12 +5059,9 @@ impl Clone for DictWatch {
         // the watch alive after the original drops).
         DICT_WATCHES.with(|w| {
             let mut w = w.borrow_mut();
-            let entry = w
-                .entry(self.ptr)
-                .or_insert_with(|| (self.version.clone(), 0));
-            entry.1 += 1;
+            w.enter(self.ptr, || self.version.clone());
+            DICT_WATCH_COUNT.with(|c| c.set(w.len()));
         });
-        DICT_WATCH_COUNT.with(|c| c.set(DICT_WATCHES.with(|w| w.borrow().len())));
         DictWatch {
             ptr: self.ptr,
             version: self.version.clone(),
@@ -5013,14 +5074,9 @@ impl Drop for DictWatch {
     fn drop(&mut self) {
         DICT_WATCHES.with(|w| {
             let mut w = w.borrow_mut();
-            if let Some(entry) = w.get_mut(&self.ptr) {
-                entry.1 = entry.1.saturating_sub(1);
-                if entry.1 == 0 {
-                    w.remove(&self.ptr);
-                }
-            }
+            w.leave(self.ptr);
+            DICT_WATCH_COUNT.with(|c| c.set(w.len()));
         });
-        DICT_WATCH_COUNT.with(|c| c.set(DICT_WATCHES.with(|w| w.borrow().len())));
     }
 }
 
@@ -5032,7 +5088,7 @@ pub(crate) fn dict_watch_bump(d: &RefCell<DictData>) {
     }
     let ptr = std::ptr::from_ref::<RefCell<DictData>>(d) as usize;
     DICT_WATCHES.with(|w| {
-        if let Some((version, _)) = w.borrow().get(&ptr) {
+        if let Some(version) = w.borrow().version(ptr) {
             version.set(version.get() + 1);
         }
     });

@@ -800,7 +800,11 @@ branch and pull request.
     list's or tuple's iterator drains at once (8,138 instructions to
     5,073, against 2,736). An `__iter__` that returns a list or another
     non-iterator now raises CPython's `TypeError` on every path; a `for`
-    loop used to iterate it.
+    loop used to iterate it. Each loop over a dict registered its
+    iterator's mutation watch in a thread-local hash map and removed it
+    after (about 200 instructions a loop); the first eight watched dicts
+    now sit in a vector scanned in place, the map holding any beyond
+    (`[k for k in d]` of three keys 2,541 to 2,410 under callgrind).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
