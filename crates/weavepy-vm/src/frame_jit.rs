@@ -14396,6 +14396,15 @@ unsafe extern "C" fn h_call(
                 if slot.get_leaf(b).is_some() {
                     return None;
                 }
+                // A leaf builtin called unbound (`heapreplace(h, x)`): the
+                // site remembers it, as a settled leaf's (the leaf lanes
+                // below take it, without asking each call).
+                if let (Object::Builtin(_), Object::Unbound) = (&ops[0], &ops[1]) {
+                    if let Some(kind) = interp.leaf_call_kind(b) {
+                        slot.set_leaf(b, kind);
+                        return None;
+                    }
+                }
                 let via_call = interp.builtin_lane(b, recv)?;
                 slot.set_native_body(b, via_call);
                 Some(via_call)

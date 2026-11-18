@@ -84080,7 +84080,8 @@ fn builtin_fn_lane_ok_uncached(name: &str) -> bool {
             // time, heapq, bisect
             | "time" | "time_ns" | "perf_counter" | "perf_counter_ns" | "monotonic"
             | "monotonic_ns" | "heappush" | "heappop" | "heapify" | "heapreplace"
-            | "heappushpop" | "bisect" | "bisect_left" | "bisect_right" | "insort"
+            | "heappushpop" | "heappush_max" | "heappop_max" | "heapify_max"
+            | "heapreplace_max" | "heappushpop_max" | "bisect" | "bisect_left" | "bisect_right" | "insort"
             | "insort_left" | "insort_right"
             // sys
             | "_getframe" | "_getframemodulename" | "getrecursionlimit" | "intern" | "exc_info"
