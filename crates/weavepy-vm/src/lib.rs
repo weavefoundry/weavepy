@@ -84095,8 +84095,6 @@ fn builtin_needs_interp_uncached(name: &str) -> bool {
         || matches!(
             name,
             ".format"
-                | "fsdecode"
-                | "fsencode"
                 | "sha256"
                 | "sha1"
                 | "md5"
@@ -84111,7 +84109,6 @@ fn builtin_needs_interp_uncached(name: &str) -> bool {
                 | "_release_lock"
                 | "stat"
                 | "lstat"
-                | "fspath"
                 | "getcwd"
                 | "access"
                 | "listdir"
