@@ -2040,6 +2040,18 @@ pub(crate) fn builtin_ctor_arms(cls: &Rc<TypeObject>, args: &[Object]) -> Option
             // Truncated toward zero, inside the machine range.
             [Object::Float(f)] if f.is_finite() && f.abs() < 9.0e18 => Some(Object::Int(*f as i64)),
             [Object::Str(text)] => decimal_i64(text).map(Object::Int),
+            // `int('ff', 16)`: plain digits of the base, an optional sign
+            // and surrounding ASCII whitespace, inside the machine range
+            // (a prefix, an underscore or anything malformed is the full
+            // constructor's).
+            [Object::Str(text), Object::Int(base)] if (2..=36).contains(base) => {
+                let t = text.trim_matches(|c: char| c.is_ascii_whitespace());
+                let digits = t.strip_prefix(['+', '-']).unwrap_or(t);
+                if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_alphanumeric()) {
+                    return None;
+                }
+                i64::from_str_radix(t, *base as u32).ok().map(Object::Int)
+            }
             _ => None,
         };
     }

@@ -787,7 +787,12 @@ branch and pull request.
     (anything that could run code declines), so a `__contains__` that
     tests its own list evaluates in place: `2 in box` 3,759 to 1,047
     (1,026). `__bool__ = None` now raises CPython's "cannot be interpreted
-    as a boolean".
+    as a boolean". `int(text, base)` of plain digits is the pure
+    constructor's (`int('ff', 16)` 2,503 to 814, against 986), and
+    `"".join(reversed(s))` reads the string's characters into the
+    snapshot directly and joins the rest of it at once (10,403 to 7,664,
+    against 4,362); `str.join`'s error for a non-`str` item now names its
+    index, as CPython's does.
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

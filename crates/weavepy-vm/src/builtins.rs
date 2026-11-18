@@ -8835,11 +8835,17 @@ pub(crate) fn b_reversed(args: &[Object]) -> Result<Object, RuntimeError> {
     // iterator walks it back-to-front. (CPython's `reversed` uses
     // `__reversed__` or `__len__`+`__getitem__`; a forward snapshot
     // reproduces the same sequence for the finite iterables handled here.)
-    let mut it = iterable.make_iter()?;
-    let mut buf = Vec::new();
-    while let Some(v) = it.next_value() {
-        buf.push(v);
-    }
+    let buf: Vec<Object> = if let Object::Str(text) = iterable {
+        // (A `str`'s characters, read directly.)
+        text.chars().map(Object::from_char).collect()
+    } else {
+        let mut it = iterable.make_iter()?;
+        let mut buf = Vec::new();
+        while let Some(v) = it.next_value() {
+            buf.push(v);
+        }
+        buf
+    };
     let index = buf.len() as i64 - 1;
     Ok(Object::Iter(Rc::new(RefCell::new(PyIterator::Reversed {
         items: Rc::new(RefCell::new(buf)),
@@ -11707,6 +11713,45 @@ fn str_join(args: &[Object]) -> Result<Object, RuntimeError> {
         if let Some(joined) = joined {
             return Ok(joined);
         }
+        // `"".join(reversed(xs))`: the rest of the reversed snapshot read
+        // back to front at once, the iterator left exhausted and detached
+        // as its last step leaves it (as `list(reversed(xs))` drains it).
+        if let Object::Iter(it) = &args[1] {
+            if let Ok(mut cursor) = it.try_borrow_mut() {
+                if let PyIterator::Reversed {
+                    items,
+                    index,
+                    owner,
+                } = &mut *cursor
+                {
+                    let rest: Option<Vec<Object>> =
+                        items
+                            .try_borrow()
+                            .ok()
+                            .map(|v| match usize::try_from(*index) {
+                                Ok(i) if i < v.len() => v[..=i].iter().rev().cloned().collect(),
+                                _ => Vec::new(),
+                            });
+                    if let Some(joined) = rest.as_deref().and_then(|r| {
+                        if r.is_empty() {
+                            Some(Object::from_static(""))
+                        } else {
+                            join_exact_strings(r, sep)
+                        }
+                    }) {
+                        let detached = (
+                            std::mem::replace(items, Rc::new(RefCell::new(Vec::new()))),
+                            owner.take(),
+                        );
+                        *index = -1;
+                        drop(cursor);
+                        drop(detached);
+                        drop(rest);
+                        return Ok(joined);
+                    }
+                }
+            }
+        }
     }
     let mut it = args[1].make_iter()?;
     let mut items = Vec::new();
@@ -11721,7 +11766,7 @@ fn str_join(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let mut parts: Vec<Cow<'_, str>> = Vec::with_capacity(items.len());
     let mut saw_surrogate = matches!(args.first(), Some(Object::WStr(_)));
-    for v in &items {
+    for (index, v) in items.iter().enumerate() {
         match v {
             Object::Str(s) => parts.push(Cow::Borrowed(s)),
             Object::WStr(cps) => {
@@ -11739,7 +11784,7 @@ fn str_join(args: &[Object]) -> Result<Object, RuntimeError> {
                 }
                 _ => {
                     return Err(type_error(format!(
-                        "sequence item: expected str instance, {} found",
+                        "sequence item {index}: expected str instance, {} found",
                         other.type_name()
                     )))
                 }
