@@ -320,7 +320,10 @@ impl Interpreter {
                 // SAFETY: bitwise views of the live receiver and item, never
                 // dropped (the fast half clones what it keeps).
                 let views = std::mem::ManuallyDrop::new(unsafe {
-                    [std::ptr::read(&recv), std::ptr::read(&v)]
+                    [
+                        std::ptr::read(&raw const recv),
+                        std::ptr::read(&raw const v),
+                    ]
                 });
                 let r = match fast(&views[..]) {
                     Some(Ok(r)) => {
