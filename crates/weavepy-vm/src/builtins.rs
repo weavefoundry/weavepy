@@ -17876,7 +17876,34 @@ pub(crate) fn file_read(args: &[Object]) -> Result<Object, RuntimeError> {
             f.io_kind.get(),
             crate::object::IoKind::Raw | crate::object::IoKind::BytesIO
         );
-        match f.read_bytes_opt(n)? {
+        // A buffered sized read of a disk file: straight into the result's
+        // storage when one read fills it.
+        #[cfg(unix)]
+        let first = match (buffered, n) {
+            (true, Some(want)) => match f.read_sized_shared(want) {
+                Some(r) => match r? {
+                    Ok(full) => return Ok(full),
+                    Err(partial) => Some(Some(partial)),
+                },
+                None => None,
+            },
+            _ => None,
+        };
+        #[cfg(not(unix))]
+        let first = None;
+        // A read to the end of a regular file: sized by its length, into
+        // the result's storage.
+        #[cfg(unix)]
+        if n.is_none() {
+            if let Some(r) = f.read_all_shared() {
+                return r;
+            }
+        }
+        let first = match first {
+            Some(read) => read,
+            None => f.read_bytes_opt(n)?,
+        };
+        match first {
             Some(mut data) => {
                 // A *buffered* size-`n` read keeps issuing raw reads until it
                 // has `n` bytes or hits EOF/would-block — a raw read cut

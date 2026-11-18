@@ -88853,6 +88853,36 @@ pub fn sequence_concat_native(a: &Object, b: &Object) -> Result<Object, RuntimeE
 
 /// `out` (empty) made `times` copies of `unit`, back to back, by doubling
 /// what it holds (a copy per repeat made `b"\0" * 65536` 65,536 calls).
+/// `unit * times` as a new `bytes`, built in its own allocation (a fill for
+/// one byte, doubling copies otherwise); `None` past a size where the
+/// allocation should fail softly (`MemoryError`) instead.
+pub(crate) fn bytes_repeat(unit: &[u8], times: usize) -> Option<Object> {
+    let total = unit.len().checked_mul(times)?;
+    if total > 1 << 30 {
+        return None;
+    }
+    if total == 0 {
+        return Some(Object::new_bytes(Vec::new()));
+    }
+    // SAFETY: every one of the `total` bytes is written: the first copy of
+    // the unit, then doublings of what's written so far.
+    Some(Object::Bytes(unsafe {
+        crate::shared_value::SharedSlice::build_uninit(total, |dst: *mut u8| {
+            if let [b] = unit {
+                std::ptr::write_bytes(dst, *b, total);
+                return;
+            }
+            std::ptr::copy_nonoverlapping(unit.as_ptr(), dst, unit.len());
+            let mut done = unit.len();
+            while done < total {
+                let n = done.min(total - done);
+                std::ptr::copy_nonoverlapping(dst, dst.add(done), n);
+                done += n;
+            }
+        })
+    }))
+}
+
 fn repeat_into<T: Copy>(out: &mut Vec<T>, unit: &[T], times: usize) {
     let total = unit.len() * times;
     if total == 0 {
@@ -89175,6 +89205,9 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
                 return Ok(Object::Bytes(x.clone()));
             }
             let times = checked_repeat_count(x.len(), *n, "bytes")?;
+            if let Some(r) = bytes_repeat(x, times) {
+                return Ok(r);
+            }
             let mut out = try_alloc_vec(x.len() * times)?;
             repeat_into(&mut out, x, times);
             Ok(Object::new_bytes(out))

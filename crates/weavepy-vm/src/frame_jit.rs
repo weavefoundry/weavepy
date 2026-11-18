@@ -6601,7 +6601,12 @@ unsafe extern "C" fn h_binop(at: *mut Object, kind: u32) -> u32 {
                     && droppable(a)
                     && droppable(b) =>
             {
-                Some(Object::new_bytes(x.repeat((*n).max(0) as usize)))
+                if *n == 1 {
+                    // (`b * 1` is `b` itself, as CPython shares it.)
+                    Some(Object::Bytes(x.clone()))
+                } else {
+                    crate::bytes_repeat(x, (*n).max(0) as usize)
+                }
             }
             // Two `bytes`' concatenation (`_ALWAYS_SAFE_BYTES + safe`;
             // immutable, so `+=` is the same).

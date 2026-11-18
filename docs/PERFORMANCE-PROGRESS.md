@@ -627,6 +627,28 @@ branch and pull request.
     general call to rewrite: `ig(t)` 737 to 477 (484). A differential
     sweep against CPython found `round(True)` returning `True` and
     `float.hex` and `int.bit_length` accepting an argument.
+  - Bytes and binary files. A sized read of a buffered binary file made
+    one `read(2)` per call into a vector, then copied that into the
+    `bytes` object; a read of less than half a buffer is now served from
+    the stream's read-ahead, which one `read(2)` of a buffer's worth fills
+    (CPython's `BufferedReader` does the same, and line reads already
+    shared it), and a larger read lands in the result's own storage. A
+    read to the end of a regular file is sized by `fstat` and read into
+    the result directly instead of through 64 KiB chunks and two copies,
+    a write of at least a buffer's worth with nothing staged goes to the
+    descriptor without passing through the write buffer, and `bytes * n`
+    builds in the result's storage (a fill for one byte). Reading 4 MB in
+    8 KiB chunks went from 5.9 million instructions to 3.6 million
+    (CPython 1.7 million), reading it whole from 12.8 to 4.4 (1.5),
+    writing it from 8.6 to 4.2 (4.2), and `b"x" * 4_000_000` from 9.4 to
+    4.7 (1.0). What's left of the last two is page faults: mimalloc maps
+    blocks over 2 MiB from the OS and unmaps them when freed (see
+    `alloc.rs`), where macOS's allocator keeps a freed large block for
+    reuse, so each round faults its 4 MB in again; with nothing freed, as
+    when the results are kept, CPython pays the same faults and WeavePy
+    retires half its instructions. `bytes.split()` and `bytes.hex()`
+    without options build their pieces and digits directly (5,284 to
+    3,546 against 3,386, and 2,197 to 1,377 against 1,185).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

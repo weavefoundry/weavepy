@@ -3350,6 +3350,19 @@ fn write_drain_fd_intr(
     pending: &mut Vec<u8>,
     lock: &std::sync::Mutex<()>,
 ) -> Result<(), RuntimeError> {
+    let (off, res) = write_slice_fd_intr(fd, pending, lock);
+    pending.drain(..off.min(pending.len()));
+    res
+}
+
+/// [`write_drain_fd_intr`] over a slice: how much of it was written, and how
+/// the writing ended.
+#[cfg(unix)]
+fn write_slice_fd_intr(
+    fd: std::os::unix::io::RawFd,
+    pending: &[u8],
+    lock: &std::sync::Mutex<()>,
+) -> (usize, Result<(), RuntimeError>) {
     let mut off = 0usize;
     let res = loop {
         if off >= pending.len() {
@@ -3396,8 +3409,7 @@ fn write_drain_fd_intr(
             break Err(e);
         }
     };
-    pending.drain(..off.min(pending.len()));
-    res
+    (off, res)
 }
 
 /// EAGAIN value to default to when a `BlockingIOError` lacks an explicit
@@ -9297,6 +9309,209 @@ impl PyFile {
         *self.binary_buffer_cache.borrow_mut() = None;
     }
 
+    /// A sized binary read of a disk file with nothing parked, read straight
+    /// into the `bytes` object's own storage: `Ok(Ok(bytes))` when one
+    /// `read(2)` filled all `want` bytes, `Ok(Err(partial))` with what it
+    /// read otherwise (end of file or a short read, for the caller to carry
+    /// on with). `None` when another path must serve the read (another
+    /// backend, read-ahead waiting, a would-block). The first read of the
+    /// stream sets `PyFile`'s pre-read state as `read_bytes_opt` does.
+    #[cfg(unix)]
+    pub fn read_sized_shared(
+        &self,
+        want: usize,
+    ) -> Option<Result<Result<Object, Vec<u8>>, RuntimeError>> {
+        use std::os::unix::io::AsRawFd;
+        if !(1..=1 << 24).contains(&want) {
+            return None;
+        }
+        let fd = match &*self.backend.borrow() {
+            FileBackend::Disk(f) if self.io_kind.get() != IoKind::Raw => f.as_raw_fd(),
+            _ => return None,
+        };
+        if let Err(e) = self.check_open().and_then(|()| self.flush_write_buf()) {
+            return Some(Err(e));
+        }
+        let lock = &self.fd_syscall_lock;
+        // A read of less than half a buffer is served from the read-ahead,
+        // which one `read(2)` of a buffer's worth fills, as CPython's
+        // `BufferedReader` serves it (line reads share it).
+        let room = self.buf_size.get().clamp(8192, 8192 * 1024);
+        if want * 2 <= room {
+            if self.read_ahead.borrow().pending() == 0 {
+                if fd_is_nonblocking(fd) {
+                    return None;
+                }
+                // (The storage leaves the cell for the read, as in
+                // `fill_read_ahead`.)
+                let mut buf = self.read_ahead.borrow_mut().begin_fill(room);
+                let got = read_fd_into(fd, &mut buf, room, lock);
+                self.read_ahead.borrow_mut().put_back(buf);
+                match got {
+                    Err(e) => return Some(Err(e)),
+                    Ok(0) => return Some(Ok(Err(Vec::new()))),
+                    Ok(_) => {}
+                }
+            }
+            let mut ra = self.read_ahead.borrow_mut();
+            let k = want.min(ra.pending());
+            let out = SharedSlice::from(&ra.rest()[..k]);
+            ra.consume(k);
+            return Some(Ok(if k == want {
+                Ok(Object::Bytes(out))
+            } else {
+                Err(out.to_vec())
+            }));
+        }
+        if self.read_ahead.borrow().pending() != 0 {
+            return None;
+        }
+        // One `read(2)` (retried on a signal): the count, or `usize::MAX`
+        // for a would-block.
+        let read = |dst: *mut u8| -> Result<usize, RuntimeError> {
+            loop {
+                let r = crate::gil::allow_threads_then(|| {
+                    let _serialized = fd_lock(lock);
+                    // SAFETY: `dst` has room for `want` bytes.
+                    unsafe { libc::read(fd, dst.cast(), want) }
+                });
+                if r >= 0 {
+                    return Ok(r as usize);
+                }
+                let err = std::io::Error::last_os_error();
+                match err.raw_os_error() {
+                    Some(libc::EINTR) => service_pending_signals_io()?,
+                    Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => {
+                        return Ok(usize::MAX)
+                    }
+                    _ => return Err(crate::error::io_error_to_py(&err)),
+                }
+            }
+        };
+        let mut got: Result<usize, RuntimeError> = Ok(0);
+        let mut partial = Vec::new();
+        // SAFETY: a full read writes all `want` bytes; after anything less
+        // what came is copied out and the slice zeroed whole before it
+        // drops unread.
+        let full = unsafe {
+            SharedSlice::<u8>::build_uninit(want, |dst| {
+                got = read(dst);
+                match got {
+                    Ok(k) if k == want => {}
+                    Ok(k) => {
+                        if k < want {
+                            partial = std::slice::from_raw_parts(dst, k).to_vec();
+                        }
+                        std::ptr::write_bytes(dst, 0, want);
+                    }
+                    Err(_) => std::ptr::write_bytes(dst, 0, want),
+                }
+            })
+        };
+        match got {
+            Ok(k) if k == want => Some(Ok(Ok(Object::Bytes(full)))),
+            Ok(usize::MAX) => None,
+            Ok(_) => Some(Ok(Err(partial))),
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    /// A binary read to the end of a regular disk file, straight into the
+    /// `bytes` object's own storage, sized by what `fstat` says is left: the
+    /// bytes, or `None` when another path must serve it (another backend or
+    /// kind of file, read-ahead waiting, a non-blocking descriptor, an empty
+    /// or very large remainder). A file that grew or shrank meanwhile is
+    /// read on to its end and copied.
+    #[cfg(unix)]
+    pub fn read_all_shared(&self) -> Option<Result<Object, RuntimeError>> {
+        use std::os::unix::io::AsRawFd;
+        let fd = match &*self.backend.borrow() {
+            FileBackend::Disk(f) => f.as_raw_fd(),
+            _ => return None,
+        };
+        if let Err(e) = self.check_open().and_then(|()| self.flush_write_buf()) {
+            return Some(Err(e));
+        }
+        self.rewind_read_ahead();
+        if self.read_ahead.borrow().pending() != 0 || fd_is_nonblocking(fd) {
+            return None;
+        }
+        // SAFETY: plain queries of our own descriptor.
+        let est = unsafe {
+            let mut st: libc::stat = std::mem::zeroed();
+            if libc::fstat(fd, &raw mut st) != 0 || (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+                return None;
+            }
+            let pos = libc::lseek(fd, 0, libc::SEEK_CUR);
+            if pos < 0 || st.st_size <= pos as libc::off_t {
+                return None;
+            }
+            (st.st_size - pos as libc::off_t) as usize
+        };
+        if est > 1 << 30 {
+            return None;
+        }
+        let lock = &self.fd_syscall_lock;
+        let read = |dst: *mut u8, room: usize| -> Result<usize, RuntimeError> {
+            loop {
+                let r = crate::gil::allow_threads_then(|| {
+                    let _serialized = fd_lock(lock);
+                    // SAFETY: `dst` has room for `room` bytes.
+                    unsafe { libc::read(fd, dst.cast(), room) }
+                });
+                if r >= 0 {
+                    return Ok(r as usize);
+                }
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    service_pending_signals_io()?;
+                    continue;
+                }
+                return Err(crate::error::io_error_to_py(&err));
+            }
+        };
+        let mut done = 0usize;
+        let mut failed: Option<RuntimeError> = None;
+        // SAFETY: the bytes past `done` are zeroed before the slice can be
+        // read; when it's kept, `done` is all of it.
+        let full = unsafe {
+            SharedSlice::<u8>::build_uninit(est, |dst| {
+                while done < est {
+                    match read(dst.add(done), est - done) {
+                        Ok(0) => break,
+                        Ok(k) => done += k,
+                        Err(e) => {
+                            failed = Some(e);
+                            break;
+                        }
+                    }
+                }
+                std::ptr::write_bytes(dst.add(done), 0, est - done);
+            })
+        };
+        if let Some(e) = failed {
+            return Some(Err(e));
+        }
+        // The end of the file, or whatever it has gained since.
+        let mut more = [0u8; 1];
+        let extra = match read(more.as_mut_ptr(), 1) {
+            Ok(k) => k,
+            Err(e) => return Some(Err(e)),
+        };
+        if done == est && extra == 0 {
+            return Some(Ok(Object::Bytes(full)));
+        }
+        let mut out = full[..done].to_vec();
+        if extra > 0 {
+            out.push(more[0]);
+            match read_fd_intr(fd, None, lock) {
+                Ok(rest) => out.extend_from_slice(&rest),
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        Some(Ok(Object::new_bytes(out)))
+    }
+
     /// Read up to `n` bytes from the backend; `None` reads everything.
     /// Returns bytes regardless of mode — the caller decides whether
     /// to wrap them as `str` (text mode) or `bytes` (binary mode).
@@ -9812,6 +10027,37 @@ impl PyFile {
         // raises only here / at close.
         if self.is_write_buffered() {
             let bufsize = self.buf_size.get();
+            // A write of at least a buffer's worth with nothing staged goes
+            // to a blocking descriptor directly, as CPython's
+            // `BufferedWriter` writes it, instead of through the buffer.
+            #[cfg(unix)]
+            if data.len() >= bufsize && self.write_buf.borrow().is_empty() {
+                use std::os::unix::io::AsRawFd;
+                let fd = match &*self.backend.borrow() {
+                    FileBackend::Disk(f) => Some(f.as_raw_fd()),
+                    _ => None,
+                };
+                if let Some(fd) = fd.filter(|&fd| !fd_is_nonblocking(fd)) {
+                    // (Settles a text stream's `.buffer` sibling first.)
+                    self.flush_write_buf()?;
+                    if self.write_buf.borrow().is_empty() {
+                        let (off, res) = write_slice_fd_intr(fd, data, &self.fd_syscall_lock);
+                        if res.is_err() && off < data.len() {
+                            // What a raising signal handler cut short waits
+                            // in the buffer, as a flush leaves it.
+                            self.write_buf.borrow_mut().extend_from_slice(&data[off..]);
+                            let addr = std::ptr::from_ref(self) as usize;
+                            if self.write_listed.get() != addr {
+                                self.unlist_writer();
+                                self.write_listed.set(addr);
+                                pending_writers().push(addr);
+                            }
+                        }
+                        res?;
+                        return Ok(data.len());
+                    }
+                }
+            }
             // Pre-flush if the buffer is already over size (a prior partial
             // non-blocking flush left it full). A `BlockingIOError` here means
             // none of `data` has been accepted yet, so it re-raises with
