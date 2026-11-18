@@ -17012,6 +17012,17 @@ impl Interpreter {
                                 | Object::Str(_)
                         ) || !Self::core_droppable(v)
                         {
+                            // A `list` or `tuple` subclass's instance whose
+                            // class inherits its base's `__iter__`: the base's
+                            // iterator over its payload (an `email` token
+                            // list's loop).
+                            if let Some(it) = Self::core_subclass_iter(v) {
+                                // SAFETY: the iterable is replaced in place.
+                                unsafe { drop_hot(std::mem::replace(&mut *top, it)) };
+                                last = pc;
+                                pc += 1;
+                                continue;
+                            }
                             // (Compiled code calls an instance's Python
                             // `__iter__` directly at a site that has seen one.)
                             if let (Object::Instance(_), Some(e)) = (v, ext) {
@@ -17050,6 +17061,29 @@ impl Interpreter {
             *last_pc = last;
             return stop.unwrap_or(CoreExit::Slow);
         }
+    }
+
+    /// `iter(v)` of a `list` or `tuple` subclass's instance inheriting its
+    /// base's `__iter__`: the base's iterator over the payload, as
+    /// compiled code's `GET_ITER` makes it. `None` for anything else.
+    #[inline(never)]
+    fn core_subclass_iter(v: &Object) -> Option<Object> {
+        let Object::Instance(inst) = v else {
+            return None;
+        };
+        let native @ (Object::List(_) | Object::Tuple(_)) = inst.native.get()? else {
+            return None;
+        };
+        let cls = inst.cls_raw();
+        if cls.native_kind.get() != 0
+            || cls.c_ext_ptr.get() != 0
+            || !cls.dunder(crate::types::Dunder::Iter).builtin_owner()
+            || !Self::core_droppable(v)
+        {
+            return None;
+        }
+        let it = native.make_iter().ok()?;
+        Some(Object::Iter(Rc::new(RefCell::new(it))))
     }
 
     /// [`Self::core_pending_enter`] with its commonest case in line: the

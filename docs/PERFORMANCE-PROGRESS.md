@@ -970,7 +970,10 @@ branch and pull request.
     one), and a `str`, `list` or `tuple` subclass keeping its base's
     `__getitem__` (the base's exact slice, as CPython's). `str.encode`'s
     leaf half reads a `str` subclass's text too (`email.utils`'s
-    `_has_surrogates` over header values).
+    `_has_surrogates` over header values), and the core loop's
+    `GET_ITER` iterates a `list` or `tuple` subclass's payload when its
+    class inherits the base's `__iter__`, as compiled code already did
+    (`email`'s token lists).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
