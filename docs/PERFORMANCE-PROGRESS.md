@@ -900,6 +900,16 @@ branch and pull request.
     and the rest, and a call site remembers a leaf builtin called
     unbound the first time (`heapq.nsmallest(2, xs)` 27,568 instructions
     to 18,258, against 11,260).
+  - A crash fixed on the way, present since before this PR:
+    `test_statistics.TestKDE` segfaulted in most runs outside the gate.
+    `statistics.kde`'s cumulative `cdf` runs `sum(W(...) for x_i in
+    supported)` from compiled callers; the generator's call of `W` put
+    its frame on the pending list before the lazily running callers
+    (`p_expected`, `cdf`) registered theirs above it. When `W` returned
+    the generator's entry wasn't on top and stayed behind, naming an
+    activation gone from the native stack, and a later flush wrote
+    through it (found with memcheck on a system-allocator build). An
+    entry now leaves the list from wherever it sits.
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

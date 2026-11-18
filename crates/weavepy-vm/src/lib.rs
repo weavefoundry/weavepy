@@ -11653,13 +11653,23 @@ impl Interpreter {
             if self.lean_pending.last() == Some(&addr) {
                 self.lean_pending.pop();
             } else {
-                // (Newer entries above it would leave this one behind, its
-                // activation gone: see `State::outer_lazy`.)
-                debug_assert!(
-                    !self.lean_pending.contains(&addr),
-                    "pending entry left behind"
-                );
+                self.lean_pending_exit_cold(addr);
             }
+        }
+    }
+
+    /// [`Self::lean_pending_exit`] of an entry not on top: older
+    /// activations that registered late (a lazily running caller whose
+    /// native body drives a generator, `sum(f(x) for x in xs)` from
+    /// compiled code, registers when the generator's callee first needs
+    /// the spine) sit above it, still running. The entry leaves from
+    /// where it is; left behind, it would name an activation gone from the
+    /// native stack, which the next flush would write through.
+    #[cold]
+    #[inline(never)]
+    fn lean_pending_exit_cold(&mut self, addr: usize) {
+        if let Some(pos) = self.lean_pending.iter().rposition(|a| *a == addr) {
+            self.lean_pending.remove(pos);
         }
     }
 
@@ -86015,6 +86025,26 @@ fn bool_hot(b: bool) -> Object {
     const BOOL_TAG: u64 = 2;
     // SAFETY: `Object::Bool(b)`'s layout: the tag, then the `bool` byte.
     unsafe { std::mem::transmute::<[u64; 2], Object>([BOOL_TAG | (u64::from(b) << 8), 0]) }
+}
+
+#[cfg(test)]
+#[test]
+fn lean_pending_exit_leaves_from_where_it_is() {
+    // Entries stand for activations by address only; nothing reads them.
+    let mut interp = Interpreter::new();
+    interp.lean_pending.clear();
+    interp.lean_pending.extend([0x1000, 0x2000, 0x3000]);
+    // An older activation's entry registered late (0x2000, 0x3000) sits
+    // above the returning one's (0x1000), which leaves without them.
+    interp.lean_pending_exit(Some(0x1000));
+    assert_eq!(interp.lean_pending, [0x2000, 0x3000]);
+    interp.lean_pending_exit(Some(0x3000));
+    assert_eq!(interp.lean_pending, [0x2000]);
+    // A flushed (absent) entry is a no-op.
+    interp.lean_pending_exit(Some(0x9000));
+    interp.lean_pending_exit(None);
+    assert_eq!(interp.lean_pending, [0x2000]);
+    interp.lean_pending.clear();
 }
 
 #[cfg(test)]
