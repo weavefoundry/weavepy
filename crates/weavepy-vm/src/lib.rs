@@ -19223,8 +19223,20 @@ impl Interpreter {
         };
         // A file is its own iterator, and its step (a line read) can run a
         // signal handler: it takes the lane too.
+        // An instance with a Python `__next__` (an iterator class): the
+        // call with the activation waiting, its `StopIteration` the end.
         let source = match frame.stack.last() {
             Some(it @ (Object::LazyIter(_) | Object::File(_))) => it.clone(),
+            Some(it @ Object::Instance(inst))
+                if Self::instance_dunder_function(
+                    inst,
+                    crate::types::AttrKey::vm(crate::types::vm_key::NEXT_FN),
+                    "__next__",
+                )
+                .is_some() =>
+            {
+                it.clone()
+            }
             _ => return false,
         };
         if ins.op != OpCode::ForIter {
@@ -19249,6 +19261,10 @@ impl Interpreter {
         let next = match &source {
             Object::LazyIter(l) => self.lazy_iter_next(l, &globals),
             Object::File(f) => crate::builtins::file_iter_next(f),
+            Object::Instance(_) => match self.iter_step(&source, &globals) {
+                Err(e) if crate::seqiter::is_stop_iteration(&e) => Ok(None),
+                r => r,
+            },
             _ => unreachable!("matched above"),
         };
         self.core_pending_exit(sw, pending);

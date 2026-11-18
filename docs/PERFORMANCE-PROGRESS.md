@@ -990,6 +990,13 @@ branch and pull request.
     `from m import x` of an imported module, in place in compiled code
     already, is the core loop's helper's too, for interpreted callers
     (`shlex.__init__`'s imports at every construction).
+  - A loop over a Python iterator class whose `__next__` isn't a leaf
+    (`email.feedparser`'s `BufferedSubFile`) took the full step for
+    every item, compiled code exiting to the core loop to take it. The
+    `FOR_ITER` lane calls such a `__next__` with the activation waiting
+    on the pending list, its `StopIteration` the loop's end, and compiled
+    code takes the lane in place (`Parser().parsestr(msg)` 8% fewer
+    instructions).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

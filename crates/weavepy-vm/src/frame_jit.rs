@@ -4482,15 +4482,17 @@ unsafe extern "C" fn h_for_iter_rest(
                     st.err = Some(e);
                     FOR_RAISED
                 }
-                // A Python `__next__` that evaluates frameless; its end (a
-                // `raise StopIteration`) is the core loop's.
+                // A Python `__next__` that evaluates frameless; any other
+                // (and the frameless one's end, a `raise StopIteration`)
+                // called through the core loop's lane.
                 None => match interp.leaf_python_next(obj, inst) {
                     Some(v) => {
                         // SAFETY: the slot above the iterator is free.
                         unsafe { out.write(v) };
                         1
                     }
-                    None => 3,
+                    // SAFETY: the caller's contract.
+                    None => unsafe { for_iter_lane(st, it, pc) },
                 },
             };
         }
