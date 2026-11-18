@@ -33024,7 +33024,7 @@ impl Interpreter {
                 &'static str,
                 Vec<(LeafRecv, Rc<crate::object::BuiltinFn>)>,
                 crate::fasthash::FxBuildHasher,
-            > = Default::default();
+            > = std::collections::HashMap::default();
             for (recv, name, f) in &methods {
                 method_names
                     .entry(name)

@@ -1102,7 +1102,9 @@ fn src_ready(it: &Object, leaf: bool) -> bool {
             // source, and the chain's step would exhaust it for that one.
             // (A cursor, never another adapter: a chain may come to step
             // itself.)
-            LazyIterKind::Chain { source, active } => !leaf && chain_pure_ready(source, active),
+            LazyIterKind::Chain { source, active } => {
+                !leaf && chain_pure_ready(source.as_ref(), active.as_ref())
+            }
             _ => false,
         }),
         _ => false,
@@ -1110,7 +1112,7 @@ fn src_ready(it: &Object, leaf: bool) -> bool {
 }
 
 /// Whether [`chain_pure_next`] has an item for `chain`'s state.
-fn chain_pure_ready(source: &Option<Object>, active: &Option<Object>) -> bool {
+fn chain_pure_ready(source: Option<&Object>, active: Option<&Object>) -> bool {
     match active {
         Some(a @ Object::Iter(_)) if src_ready(a, false) => true,
         // (A cursor, never another adapter: a chain may come to step
@@ -1138,7 +1140,7 @@ fn chain_pure_next(source: &mut Option<Object>, active: &mut Option<Object>) -> 
             return None;
         }
     }
-    let (sources, next) = chain_next_source(source)?;
+    let (sources, next) = chain_next_source(source.as_ref())?;
     let it = Rc::new(RefCell::new(next.make_iter().ok()?));
     let v = cursor_peek(&it)?;
     cursor_advance(&it)?;
@@ -1150,7 +1152,7 @@ fn chain_pure_next(source: &mut Option<Object>, active: &mut Option<Object>) -> 
 
 /// The cursor over `chain`'s sources and its next one, where that is an
 /// exact list or tuple with items.
-fn chain_next_source(source: &Option<Object>) -> Option<(&Rc<RefCell<PyIterator>>, Object)> {
+fn chain_next_source(source: Option<&Object>) -> Option<(&Rc<RefCell<PyIterator>>, Object)> {
     let Some(Object::Iter(sources)) = source else {
         return None;
     };
