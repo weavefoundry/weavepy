@@ -84034,6 +84034,20 @@ fn builtin_needs_interp_uncached(name: &str) -> bool {
         || matches!(
             name,
             ".format"
+                | "fsdecode"
+                | "fsencode"
+                | "sha256"
+                | "sha1"
+                | "md5"
+                | "crc32"
+                | "adler32"
+                | "compress"
+                | "decompress"
+                | "audit"
+                | "_remove_dead_weakref"
+                | "make_encoder"
+                | "_acquire_lock"
+                | "_release_lock"
                 | "stat"
                 | "lstat"
                 | "fspath"
@@ -84317,6 +84331,13 @@ fn builtin_fn_lane_ok_uncached(name: &str) -> bool {
             // os, through the interpreter's call (a path-like argument's
             // `__fspath__`), and `locale.setlocale`'s query
             | "stat" | "lstat" | "fspath" | "getcwd" | "access" | "listdir" | "setlocale"
+            | "fsdecode" | "fsencode" | "dir"
+            // hashing and compression, `sys.audit` (whose hooks run through
+            // the call), `weakref`'s dead-entry callback, `json`'s encoder
+            // constructor, and the import system's module locks
+            | "sha256" | "sha1" | "md5" | "crc32" | "adler32" | "compress" | "decompress"
+            | "audit" | "_remove_dead_weakref" | "make_encoder" | "_acquire_lock"
+            | "_release_lock"
             // sys
             | "_getframe" | "_getframemodulename" | "getrecursionlimit" | "intern" | "exc_info"
             // struct

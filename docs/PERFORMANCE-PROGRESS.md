@@ -978,7 +978,12 @@ branch and pull request.
     (through the interpreter's call, for a path-like's `__fspath__`), so
     a call no longer takes the full step and its frame shell
     (`os.path.exists(p)` about 4,000 instructions fewer, 1.34 to 1.12 of
-    CPython's; `locale.getlocale()` 1.24 to 1.05).
+    CPython's; `locale.getlocale()` 1.24 to 1.05). So do `fsdecode`,
+    `fsencode` and `dir`, the hash constructors and `zlib`'s functions,
+    `sys.audit`, `weakref`'s dead-entry callback, `json`'s encoder
+    constructor and the import system's module locks, the rest of the
+    census's builtin calls (`hashlib_zlib` 1% fewer instructions,
+    `file_small_open_close` 2%, `os_stat_exists` 12%).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
