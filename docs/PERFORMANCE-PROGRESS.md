@@ -842,6 +842,16 @@ branch and pull request.
     of ten items 3,279 to 2,738). The core loop's `FOR_ITER` takes the
     same shortcut, so a cold loop over one runs 282 an item instead of
     532.
+  - A native class method read through a class (`dict.fromkeys`,
+    `itertools.chain.from_iterable`, which `itertools` installs over the
+    Python one) resolved through every frame JIT read lane before the
+    general one bound it, about 3,000 instructions a read to CPython's
+    700. The site's class memo now holds the descriptor and binds a fresh
+    method at each read, as `classmethod.__get__` does, and a native
+    static method's function (`str.maketrans`) is memoized as a builtin
+    is (645 instructions, 0.93 of CPython's). `dict.fromkeys` of an ASCII
+    string, a dict, or a set builds in place as a list's keys do (6,821
+    to 1,582, against 2,352).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

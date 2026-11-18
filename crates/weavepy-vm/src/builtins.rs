@@ -14778,6 +14778,20 @@ pub(crate) fn dict_fromkeys_leaf(args: &[Object]) -> Option<Result<Object, Runti
     let keys: Vec<Object> = match keys {
         Object::List(l) => l.try_borrow().ok()?.clone(),
         Object::Tuple(t) => t.to_vec(),
+        // An ASCII string's characters (`dict.fromkeys("abc")`), the
+        // shared one-character strings.
+        Object::Str(s) if s.is_ascii() && s.len() <= 64 => s
+            .bytes()
+            .map(|c| Object::Str(crate::shared_value::SharedStr::ascii_char(c)))
+            .collect(),
+        // Another mapping's or set's keys, in their order.
+        Object::Dict(m) if m.try_borrow().ok()?.len() <= 64 => {
+            m.try_borrow().ok()?.keys().map(|k| k.0.clone()).collect()
+        }
+        Object::Set(m) if m.try_borrow().ok()?.len() <= 64 => {
+            m.try_borrow().ok()?.iter().map(|k| k.0.clone()).collect()
+        }
+        Object::FrozenSet(m) if m.len() <= 64 => m.iter().map(|k| k.0.clone()).collect(),
         _ => return None,
     };
     let mut d = DictData::default();
@@ -14791,7 +14805,11 @@ pub(crate) fn dict_fromkeys_leaf(args: &[Object]) -> Option<Result<Object, Runti
             crate::dictmap::ProbeEntry::Vacant(_) => return None,
         }
     }
-    Some(Ok(Object::Dict(Rc::new(RefCell::new(d)))))
+    // (Registered with the collector, as the full path's: a value may
+    // refer back to it.)
+    let out = Object::Dict(Rc::new(RefCell::new(d)));
+    crate::gc_trace::track_built(&out);
+    Some(Ok(out))
 }
 
 pub(crate) fn int_from_bytes_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {

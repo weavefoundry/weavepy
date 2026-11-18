@@ -10109,9 +10109,21 @@ fn type_attr_memo(site: &AttrSite, cls: &Rc<crate::types::TypeObject>) -> Option
             && m.meta == meta_version(cls)
             && !matches!(*m.val, Object::Unbound) =>
         {
-            Some(crate::clone_hot(&m.val))
+            Some(memo_value(&m.val, cls))
         }
         _ => None,
+    }
+}
+
+/// The read of a class's memoized value: the value itself, or, for a
+/// native class method's descriptor, a method bound to the class.
+#[inline]
+fn memo_value(val: &Object, cls: &Rc<crate::types::TypeObject>) -> Object {
+    match val {
+        Object::ClassMethod(cm) => Object::BoundMethod(Rc::new(
+            crate::object::BoundMethod::py_method(Object::Type(cls.clone()), cm.func()),
+        )),
+        v => crate::clone_hot(v),
     }
 }
 
@@ -10289,7 +10301,7 @@ fn type_attr_read(site: &AttrSite, cls: &Rc<crate::types::TypeObject>) -> Option
         if let Some(m) = memo.as_ref() {
             if m.cls == p && m.ver == ver && ver != 0 && m.meta == meta {
                 // (`Unbound`: a read this path declined under that version.)
-                return (!matches!(*m.val, Object::Unbound)).then(|| crate::clone_hot(&m.val));
+                return (!matches!(*m.val, Object::Unbound)).then(|| memo_value(&m.val, cls));
             }
         }
     }
@@ -10392,6 +10404,34 @@ fn type_attr_resolve(
         }
         return Some(b);
     }
+    // A native class method (`dict.fromkeys`,
+    // `itertools.chain.from_iterable`), which the memo holds as the
+    // descriptor and binds to the class at each read (a fresh bound
+    // method, as `classmethod.__get__` makes), or a native static method's
+    // function (`str.maketrans`). Owned, as a builtin is.
+    let v = match v {
+        Object::ClassMethod(cm) => {
+            if !matches!(cm.func(), Object::Builtin(_)) {
+                return None;
+            }
+            let entry = Object::ClassMethod(cm);
+            let out = memo_value(&entry, cls);
+            if let Ok(mut memo) = site.type_attr.try_borrow_mut() {
+                *memo = Some(TypeMemo::owned(p, ver, entry).under(meta_ver));
+            }
+            return Some(out);
+        }
+        Object::StaticMethod(w) => {
+            let b @ Object::Builtin(_) = w.func() else {
+                return None;
+            };
+            if let Ok(mut memo) = site.type_attr.try_borrow_mut() {
+                *memo = Some(TypeMemo::owned(p, ver, b.clone()).under(meta_ver));
+            }
+            return Some(b);
+        }
+        v => v,
+    };
     let plain = matches!(
         v,
         Object::Int(_)

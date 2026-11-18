@@ -34728,6 +34728,9 @@ impl Interpreter {
                 // class and an instance, never bound.
                 Some(Object::StaticMethod(w)) => match w.func() {
                     Object::Function(f) => K::StaticFn(Rc::downgrade(&f)),
+                    // A native function (`str.maketrans`): the same
+                    // object through a class or an instance, unbound.
+                    Object::Builtin(b) => K::Value(Object::Builtin(b)),
                     _ => K::Other,
                 },
                 Some(Object::ClassMethod(w)) => match w.func() {
@@ -34873,6 +34876,18 @@ impl Interpreter {
                 return Some(Self::clone_operand(v));
             }
         }
+        // A native class method this site last bound (see below), under
+        // a metaclass version no real one has.
+        if let Some(Object::ClassMethod(cm)) =
+            slot.and_then(|s| s.class_value(ver, NATIVE_CLASSMETHOD_META))
+        {
+            if Self::plain_metaclass(cls) && (cls.c_ext_ptr.get() == 0 || cls.flags.is_builtin) {
+                return Some(Object::BoundMethod(Rc::new(BoundMethod::py_method(
+                    Object::Type(cls.clone()),
+                    cm.func(),
+                ))));
+            }
+        }
         // A plain `type` metaclass has nothing that could intercept a
         // non-dunder class attribute (the class cache never answers for
         // dunders).
@@ -34964,32 +34979,38 @@ impl Interpreter {
                 }
             }
         }
-        // A builtin class's native class method (`int.from_bytes`), bound
-        // to the class as `classmethod.__get__` binds it.
+        // A native class method in the class's own dict (`int.from_bytes`,
+        // `itertools.chain.from_iterable`), bound to the class as
+        // `classmethod.__get__` binds it.
         // (Most names are none: the class remembers which, sparing the
         // probe's hashing.)
         let name = code.names.get(name_idx as usize)?;
-        if cls.flags.is_builtin
-            && !cls.memo_verdict(crate::types::Verdict::NoNativeClassMethod, name, || {
-                cls.dict.try_borrow().is_ok_and(|d| {
-                    !matches!(
-                        d.get(&crate::object::StrKey(name)),
-                        Some(Object::ClassMethod(_))
-                    )
-                })
+        if !cls.memo_verdict(crate::types::Verdict::NoNativeClassMethod, name, || {
+            cls.dict.try_borrow().is_ok_and(|d| {
+                !matches!(
+                    d.get(&crate::object::StrKey(name)),
+                    Some(Object::ClassMethod(cm)) if matches!(cm.func(), Object::Builtin(_))
+                )
             })
-        {
+        }) {
             // (Through the type cache: the class's own entry is the one
             // its MRO walk finds first.)
-            if let Some((Object::ClassMethod(cm), owner)) = cls.lookup_with_owner(name) {
-                if Rc::ptr_eq(&owner, cls) {
+            if let Some((entry, owner)) = cls.lookup_with_owner(name) {
+                if let (Object::ClassMethod(cm), true) = (&entry, Rc::ptr_eq(&owner, cls)) {
                     let f = cm.func();
-                    return matches!(f, Object::Builtin(_)).then(|| {
-                        Object::BoundMethod(Rc::new(BoundMethod::py_method(
+                    // (A Python function's is the class attribute lane's,
+                    // below.)
+                    if matches!(f, Object::Builtin(_)) {
+                        // (The site remembers the entry, which the class's
+                        // dict holds while its version stands.)
+                        if let Some(s) = slot {
+                            s.set_class_value(ver, NATIVE_CLASSMETHOD_META, &entry);
+                        }
+                        return Some(Object::BoundMethod(Rc::new(BoundMethod::py_method(
                             Object::Type(cls.clone()),
                             f,
-                        )))
-                    });
+                        ))));
+                    }
                 }
             }
         }
@@ -87557,6 +87578,12 @@ impl MethodSlot {
         unsafe { *self.0.get() = (ver, MethodSlotFn::NativeSubscript { generation, fast }) };
     }
 }
+
+/// The metaclass version under which a `LOAD_ATTR` site's method slot
+/// remembers a class's native class method entry (see
+/// `leaf_load_type_attr`): no real version reaches it, so the plain class
+/// value reads (`core_class_value`) never see the descriptor.
+const NATIVE_CLASSMETHOD_META: u64 = u64::MAX;
 
 /// The method slot for `cache_pc`, allocating the table on first use.
 #[inline]

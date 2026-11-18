@@ -60,6 +60,8 @@ DICTS = {
     "literal": lambda: {"a": 1},
     "copy": lambda: {"a": 1}.copy(),
     "fromkeys": lambda: dict.fromkeys("ab"),
+    "fromkeys_list": lambda: dict.fromkeys(["a", "b"]),
+    "fromkeys_dict": lambda: dict.fromkeys({"a": 1}),
     "union": lambda: {"a": 1} | {"b": 2},
     "json": lambda: json.loads('{"a": 1}'),
     "kwargs": lambda: kwargs(a=1),
