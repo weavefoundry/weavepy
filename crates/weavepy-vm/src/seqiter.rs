@@ -3679,6 +3679,69 @@ impl Interpreter {
                 cursor_advance(c)?;
                 Some(Some(r))
             }
+            // `takewhile(pred, xs)` over a plain cursor: the item while the
+            // predicate holds, the end (stopped) at the first that fails,
+            // as the general step consumes it.
+            LazyIterKind::TakeWhile {
+                func,
+                source: Object::Iter(c),
+                stopped: stopped @ false,
+            } if pure_callback_maybe(func) => {
+                let v = cursor_peek(c)?;
+                let keep =
+                    scalar_truth(&self.pure_callback(func, std::slice::from_ref(&v), false)?)?;
+                cursor_advance(c)?;
+                if keep {
+                    Some(Some(v))
+                } else {
+                    *stopped = true;
+                    Some(None)
+                }
+            }
+            // `dropwhile(pred, xs)` over a plain cursor: the items the
+            // predicate holds for skipped (each a whole step), then the
+            // rest as they are.
+            LazyIterKind::DropWhile {
+                func,
+                source: Object::Iter(c),
+                started,
+            } => loop {
+                let v = cursor_peek(c)?;
+                if !*started {
+                    if !pure_callback_maybe(func) {
+                        return None;
+                    }
+                    let skip = scalar_truth(&self.pure_callback(
+                        func,
+                        std::slice::from_ref(&v),
+                        false,
+                    )?)?;
+                    cursor_advance(c)?;
+                    if skip {
+                        continue;
+                    }
+                    *started = true;
+                    return Some(Some(v));
+                }
+                cursor_advance(c)?;
+                return Some(Some(v));
+            },
+            // `filterfalse(pred, xs)` over a plain cursor, as `filter`'s
+            // step with the verdict inverted.
+            LazyIterKind::FilterFalse {
+                func,
+                source: Object::Iter(c),
+            } if matches!(func, Object::None) || pure_callback_maybe(func) => loop {
+                let v = cursor_peek(c)?;
+                let truthy = match &*func {
+                    Object::None => scalar_truth(&v)?,
+                    f => scalar_truth(&self.pure_callback(f, std::slice::from_ref(&v), false)?)?,
+                };
+                cursor_advance(c)?;
+                if !truthy {
+                    return Some(Some(v));
+                }
+            },
             // `enumerate(map(...))` and the like: the source's own pure step.
             LazyIterKind::Enumerate {
                 source: Object::LazyIter(src),

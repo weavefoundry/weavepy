@@ -949,6 +949,11 @@ branch and pull request.
     resolution each time; the in-place read answers `__class__` first
     where `object`'s descriptor does (`dc == dc2` 2,362 instructions to
     1,944 in the container).
+  - `itertools.takewhile`, `dropwhile` and `filterfalse` had no in-place
+    step; over a list or tuple cursor with a predicate that runs as a
+    pure leaf they step as `filter` does, `takewhile` consuming the item
+    that stops it as CPython's does (`list(takewhile(lambda x: x < 3,
+    xs))` 8,673 instructions to 6,181 in the container).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
