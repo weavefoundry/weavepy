@@ -33618,6 +33618,29 @@ impl Interpreter {
             {
                 return Some(Object::Bool(true));
             }
+            // A string's or container's method (`getattr(s, "upper")`),
+            // bound as the attribute load binds it (every other attribute
+            // of theirs is a dunder).
+            Object::Str(_)
+            | Object::List(_)
+            | Object::Dict(_)
+            | Object::Set(_)
+            | Object::FrozenSet(_)
+            | Object::Tuple(_)
+            | Object::Bytes(_)
+            | Object::ByteArray(_)
+                if !name.starts_with('_') && !probe =>
+            {
+                return match builtins::lookup_method(recv, name)? {
+                    m @ Object::Builtin(_) if matches!(&m, Object::Builtin(b) if b.binds_instance) => {
+                        Some(Object::BoundMethod(Rc::new(BoundMethod::new(
+                            recv.clone(),
+                            m,
+                        ))))
+                    }
+                    _ => None,
+                };
+            }
             // A built-in value's class the full path found has no such
             // attribute (`enum`'s `hasattr(1, "__get__")`).
             _ => {

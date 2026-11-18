@@ -883,6 +883,11 @@ branch and pull request.
     string's `template.format(**d)` likewise formats from that mapping as
     `format_map` does, in place, when its values render plainly (8,523 to
     7,013, against 3,943); every error stays the general call's.
+  - `getattr(obj, name)` with no default declined its in-place lane for
+    every built-in receiver, so `getattr(s, 'upper')()` took the full
+    call (3,013 instructions to CPython's 1,291). A string's or
+    container's method now binds in place as the attribute load binds it
+    (1,589).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
