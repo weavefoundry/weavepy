@@ -879,7 +879,10 @@ branch and pull request.
   - `dict(**d)` copied the keyword mapping the call had just built,
     passing each key through a Rust string on the way. That mapping is
     held by nothing else, so with all its keys exact strings it is now
-    the new dict (5,948 instructions to 2,367, against 2,443).
+    the new dict (5,948 instructions to 2,367, against 2,443). An exact
+    string's `template.format(**d)` likewise formats from that mapping as
+    `format_map` does, in place, when its values render plainly (8,523 to
+    7,013, against 3,943); every error stays the general call's.
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

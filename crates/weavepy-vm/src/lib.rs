@@ -19499,6 +19499,33 @@ impl Interpreter {
                 return Some(Ok(()));
             }
         }
+        // `template.format(**kw)` of an exact string: `format_map` over
+        // the mapping the call built (string keys, as keywords are), which
+        // reads the same values; any error is the general call's to raise.
+        if let (Object::BoundMethod(bm), Object::Tuple(sp), Object::Dict(d)) =
+            (callee, spread, mapping)
+        {
+            if sp.is_empty()
+                && !bm.redispatch_descriptor
+                && matches!(bm.receiver, Object::Str(_))
+                && matches!(&bm.function, Object::Builtin(b) if b.name == ".format")
+                // SAFETY: a read that runs no code.
+                && unsafe { d.peek() }
+                    .is_some_and(|m| m.keys().all(|k| matches!(k.0, Object::Str(_))))
+            {
+                let args = [bm.receiver.clone(), mapping.clone()];
+                if let Some(Ok(v)) = crate::builtins::str_format_map_leaf(&args) {
+                    drop(args);
+                    let ops: Vec<Object> = frame.stack.drain(callee_slot..).collect();
+                    frame.pc = pc as u32 + 1;
+                    frame.stack.push(v);
+                    for o in ops {
+                        self.release(o);
+                    }
+                    return Some(Ok(()));
+                }
+            }
+        }
         // A builtin, or a native method bound to its receiver
         // (`callback(*args, **kwds)` of a saved `log.append`), which takes
         // the receiver first, as a `CALL` of the method passes it.
