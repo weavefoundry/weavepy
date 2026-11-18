@@ -5799,6 +5799,9 @@ pub(crate) struct SuperSite {
     recv: usize,
     ver: u64,
     f: Option<Rc<crate::object::PyFunction>>,
+    /// The getter of the property the name resolved to instead (the
+    /// attribute form; see [`h_super_property`]).
+    getter: Option<Rc<crate::object::PyFunction>>,
 }
 
 /// `LOAD_SUPER_ATTR` `ins` at `pc` over the `len`-deep stack: a hit in
@@ -5834,6 +5837,13 @@ unsafe extern "C" fn h_super_attr(
             }
             _ => None,
         };
+        // A property's site declines at once (its getter is called by
+        // `h_super_property`).
+        if let (Some((cls, recv, ver)), Some(_)) = (key, &site.getter) {
+            if cls == site.cls && recv == site.recv && ver == site.ver {
+                return u64::MAX;
+            }
+        }
         if let (Some((cls, recv, ver)), Some(f)) = (key, &site.f) {
             if cls == site.cls
                 && recv == site.recv
@@ -5860,6 +5870,18 @@ unsafe extern "C" fn h_super_attr(
             }
         }
         let Some(n) = Interpreter::core_super_attr(&*code, ins, pc as usize, base, len) else {
+            if let Some((cls, recv, ver)) = key {
+                let ops = std::slice::from_raw_parts(base.add(len - 3), 3);
+                if let Some(g) = Interpreter::super_property_getter(&*code, ins, ops) {
+                    *site = SuperSite {
+                        cls,
+                        recv,
+                        ver,
+                        f: None,
+                        getter: Some(g),
+                    };
+                }
+            }
             return u64::MAX;
         };
         if let Some((cls, recv, ver)) = key {
@@ -5877,7 +5899,13 @@ unsafe extern "C" fn h_super_attr(
                     _ => None,
                 }
             };
-            *site = SuperSite { cls, recv, ver, f };
+            *site = SuperSite {
+                cls,
+                recv,
+                ver,
+                f,
+                getter: None,
+            };
         }
         n as u64
     }
@@ -12202,6 +12230,73 @@ unsafe extern "C" fn h_slice_dunder(
             };
             at.add(1).write(s.start.clone());
             at.add(2).write(s.stop.clone());
+        }
+        r
+    }
+}
+
+/// `super().name` (the attribute form of the `LOAD_SUPER_ATTR` at `pc` of
+/// `code`) of a property, which `h_super_attr` declined, its three
+/// operands from stack slot `slot` up (nothing virtual below them): the
+/// getter `Interpreter::super_property_getter` finds called on the
+/// receiver as [`dunder_call`] calls a special method, the result at
+/// `slot`. `ssite` is the instruction's [`SuperSite`]. Returns as
+/// `h_slice_dunder` does (a decline leaves the operands as they were).
+unsafe extern "C" fn h_super_property(
+    st: *mut State,
+    code: *const CodeObject,
+    pc: u64,
+    slot: u64,
+    site: *mut DirectSite,
+    ssite: *const SuperSite,
+) -> u32 {
+    // SAFETY: the code passes its live state, its own code and one of its
+    // `LOAD_SUPER_ATTR`s, the operands' slot (nothing virtual below them),
+    // and the site's cache.
+    unsafe {
+        let st = &mut *st;
+        if st.sw.is_null() {
+            return CALL_DECLINED;
+        }
+        let (pc, slot) = (pc as usize, slot as usize);
+        let at = st.stack.add(slot);
+        let code = &*code;
+        // The getter `h_super_attr` cached for the receiver's class, or
+        // the lookup's.
+        let ssite = &*ssite;
+        let cached = match (&*at, &*at.add(1), &*at.add(2), &ssite.getter) {
+            (g, Object::Type(cls), Object::Instance(inst), Some(f))
+                if Rc::as_ptr(cls) as usize == ssite.cls
+                    && std::ptr::from_ref(inst.cls_raw()) as usize == ssite.recv
+                    && inst.cls_raw().attr_version.get() == ssite.ver
+                    && crate::is_super_callable(g)
+                    && Interpreter::lean_getter_ok(f) =>
+            {
+                Some(f.clone())
+            }
+            _ => None,
+        };
+        let Some(f) = cached.or_else(|| {
+            Interpreter::super_property_getter(
+                code,
+                code.instructions[pc],
+                std::slice::from_raw_parts(at, 3),
+            )
+        }) else {
+            return CALL_DECLINED;
+        };
+        // The receiver moves down to the operands' first slot; `super` and
+        // the class are held here until the call settles (each is held
+        // elsewhere too: the builtins, the class cell).
+        let (g, cls) = (at.read(), at.add(1).read());
+        at.write(at.add(2).read());
+        let r = dunder_call(st, pc, slot, 1, f, site, None);
+        if r == CALL_DECLINED {
+            at.add(2).write(at.read());
+            at.write(g);
+            at.add(1).write(cls);
+        } else {
+            drop((g, cls));
         }
         r
     }
@@ -21485,6 +21580,7 @@ impl<'a> Lower<'a> {
             .iconst(self.ptr, std::ptr::from_ref(self.code) as i64);
         let pcv = self.b.ins().iconst(types::I64, pc as i64);
         let len = self.b.ins().iconst(types::I64, self.depth as i64);
+        let mut super_site = None;
         let n = if self.code.instructions[pc].op == OpCode::LoadSuperAttr {
             // `super().name`, through its site's cache.
             let site: Box<SuperSite> = Box::default();
@@ -21492,6 +21588,7 @@ impl<'a> Lower<'a> {
                 .b
                 .ins()
                 .iconst(self.ptr, std::ptr::from_ref::<SuperSite>(&site) as i64);
+            super_site = Some(at);
             self.supers.push(site);
             self.call_typed(
                 h_super_attr as *const () as usize,
@@ -21514,11 +21611,19 @@ impl<'a> Lower<'a> {
         // A slice of an instance whose class's `__getitem__` is a Python
         // function, at a site that has sliced one: the method, called
         // directly (see `h_slice_dunder`).
-        if !self.inlining()
-            && self.code.instructions[pc].op == OpCode::BinarySlice
-            && self.depth >= 3
-            && crate::instance_site(self.ext, pc)
-        {
+        // `super().name` of a property likewise: its getter, called
+        // directly (see `h_super_property`).
+        let ins_at = self.code.instructions[pc];
+        let dunder_helper = match ins_at.op {
+            OpCode::BinarySlice if crate::instance_site(self.ext, pc) => {
+                Some(h_slice_dunder as *const () as usize)
+            }
+            OpCode::LoadSuperAttr if ins_at.arg & 1 == 0 => {
+                Some(h_super_property as *const () as usize)
+            }
+            _ => None,
+        };
+        if let (false, true, Some(helper)) = (self.inlining(), self.depth >= 3, dunder_helper) {
             let dunder = self.b.create_block();
             let fine = self.b.create_block();
             self.b.ins().brif(declined, dunder, &[], fine, &[]);
@@ -21530,13 +21635,9 @@ impl<'a> Lower<'a> {
                 .iconst(self.ptr, std::ptr::from_ref::<DirectSite>(&site) as i64);
             self.direct_sites.push(site);
             let slotv = self.b.ins().iconst(types::I64, self.depth as i64 - 3);
-            let d = self
-                .call(
-                    h_slice_dunder as *const () as usize,
-                    &[self.st, code, pcv, slotv, site_at],
-                    true,
-                )
-                .expect("returns");
+            let mut args = vec![self.st, code, pcv, slotv, site_at];
+            args.extend(super_site);
+            let d = self.call(helper, &args, true).expect("returns");
             let done = self.b.create_block();
             let other = self.b.create_block();
             self.b.ins().brif(d, other, &[], done, &[]);

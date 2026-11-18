@@ -10672,6 +10672,107 @@ impl Interpreter {
         Some(self.inline_bind(frame, shell, pc, act, code, Object::Function(getter), guard))
     }
 
+    /// The getter of the `property` that the attribute form of the
+    /// `LOAD_SUPER_ATTR` `ins` (either form) of `code` reads over its three
+    /// operands `ops` (the `super` global, the class, the receiver): a
+    /// property later in an instance receiver's MRO than the class, whose
+    /// getter is a plain Python function of `self` the lean paths run.
+    /// `None` for anything else.
+    pub(crate) fn super_property_getter(
+        code: &CodeObject,
+        ins: weavepy_compiler::Instruction,
+        ops: &[Object],
+    ) -> Option<Rc<PyFunction>> {
+        let [g, Object::Type(cls), Object::Instance(inst)] = ops else {
+            return None;
+        };
+        if ins.op != OpCode::LoadSuperAttr || ins.arg & 1 != 0 || !is_super_callable(g) {
+            return None;
+        }
+        let name = code.names.get((ins.arg >> 2) as usize)?;
+        let prop = {
+            let mro = inst.cls_raw().mro.try_borrow().ok()?;
+            let start = mro.iter().position(|t| Rc::ptr_eq(t, cls))? + 1;
+            let key = crate::object::StrKey(name.as_str());
+            let mut found = None;
+            for owner in &mro[start..] {
+                if owner.c_ext_ptr.get() != 0 {
+                    return None;
+                }
+                let d = owner.dict.try_borrow().ok()?;
+                if let Some(v) = d.get(&key) {
+                    found = Some(v.clone());
+                    break;
+                }
+            }
+            match found? {
+                Object::Property(p) => p,
+                _ => return None,
+            }
+        };
+        // SAFETY: GIL-serialized raw read of the getter cell; the clone is
+        // taken before anything else runs.
+        let Object::Function(f) = (unsafe { &*prop.fget.as_ptr() }) else {
+            return None;
+        };
+        Self::lean_getter_ok(f).then(|| f.clone())
+    }
+
+    /// Whether `f` is a getter the lean paths call: a plain function of
+    /// one positional parameter, not a generator or coroutine, whose code
+    /// and cells they run.
+    pub(crate) fn lean_getter_ok(f: &PyFunction) -> bool {
+        let code = f.code();
+        code.arg_count == 1
+            && !code.is_generator
+            && !code.is_coroutine
+            && !code.is_async_generator
+            && !code.has_varargs
+            && !code.has_varkeywords
+            && code.kwonly_count == 0
+            && Self::lean_code_ok(&code)
+            && f.lean_cells_ref(&code).is_some()
+    }
+
+    /// `super().name` (the attribute form of the `LOAD_SUPER_ATTR` at `pc`
+    /// of `frame`, either form) of an instance where the name is a
+    /// `property` later in its class's MRO whose getter is a plain Python
+    /// function of `self`: an inline activation of the getter, as
+    /// [`Self::try_inline_property`] makes for `obj.name` (a super proxy's
+    /// read runs the getter alike, with no `__getattr__` fallback). The
+    /// three operands leave the stack; the getter's result takes their
+    /// place.
+    fn try_inline_super_property(
+        &mut self,
+        frame: &mut Frame,
+        shell: &mut QuietShell<'_>,
+        pc: usize,
+    ) -> Option<Box<InlineAct>> {
+        let ins = frame.code.instructions.get(pc)?;
+        let n = frame.stack.len();
+        if n < 3 {
+            return None;
+        }
+        let getter = Self::super_property_getter(&frame.code, *ins, &frame.stack[n - 3..])?;
+        let code = getter.code();
+        // Past the recursion limit the nested lean path raises.
+        let crate::recursion::Enter::Ok(guard) = crate::recursion::enter() else {
+            return None;
+        };
+        // Committed.
+        let receiver = frame.stack.pop()?;
+        let cls_obj = frame.stack.pop();
+        let super_obj = frame.stack.pop();
+        drop((cls_obj, super_obj));
+        let act = self.inline_slot();
+        // SAFETY: a parked slot's locals storage is its own, and empty.
+        let locals = unsafe { act.frame.locals.storage() };
+        locals.push(receiver);
+        fill_unbound(locals, code.varnames.len());
+        frame.pc = pc as u32 + 1;
+        Some(self.inline_bind(frame, shell, pc, act, code, Object::Function(getter), guard))
+    }
+
     /// `obj.name = value` (the `STORE_ATTR` at `pc` of `frame`) for a
     /// `property` whose setter is a plain Python function of `(self,
     /// value)`, as an inline activation of the setter (CPython calls it
@@ -12208,6 +12309,17 @@ impl Interpreter {
                         return None;
                     }
                 }
+            }
+            // `super().name` of a property: its getter's activation (the
+            // core loop's arm takes only plain methods and values).
+            if frame
+                .code
+                .instructions
+                .get(pc)
+                .is_some_and(|i| i.op == OpCode::LoadSuperAttr && i.arg & 1 == 0)
+                && self.core_super_property(sw)
+            {
+                return None;
             }
             // SAFETY: as above (`core_property` declined untouched).
             let (frame, last_pc) = unsafe { (&mut *sw.cur, &mut *sw.last) };
@@ -18677,6 +18789,33 @@ impl Interpreter {
             let (frame, _, shell) = sw.activation(depth, &mut tmp);
             let pc = (*frame).pc as usize;
             self.try_inline_property(&mut *frame, &mut *shell.cast::<QuietShell<'_>>(), pc)
+        };
+        let Some(mut act) = act else {
+            return false;
+        };
+        let callee: *mut Frame = &raw mut *act.frame;
+        // SAFETY: as above.
+        unsafe { push_fast(&mut *sw.inl, act) };
+        sw.cur = callee;
+        sw.scratch = usize::MAX;
+        sw.last = &raw mut sw.scratch;
+        true
+    }
+
+    /// [`Self::core_property`] for `super().name` of a property
+    /// ([`Self::try_inline_super_property`]). `false` touches nothing.
+    #[inline(never)]
+    fn core_super_property(&mut self, sw: &mut CoreSwitch) -> bool {
+        if !self.inline_calls_ok() {
+            return false;
+        }
+        let mut tmp = None;
+        // SAFETY: see `CoreSwitch` (as in `core_call`).
+        let act = unsafe {
+            let depth = (*sw.inl).len();
+            let (frame, _, shell) = sw.activation(depth, &mut tmp);
+            let pc = (*frame).pc as usize;
+            self.try_inline_super_property(&mut *frame, &mut *shell.cast::<QuietShell<'_>>(), pc)
         };
         let Some(mut act) = act else {
             return false;
