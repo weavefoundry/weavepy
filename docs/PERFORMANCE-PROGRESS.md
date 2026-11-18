@@ -961,7 +961,8 @@ branch and pull request.
     tuple cursor now retires the iterator in place as those cursors'
     ends do, detaching from the list where nothing its release frees
     could finalize (`sum(i * v for i, v in enumerate(xs))` of five
-    items 8,697 instructions to 6,226 in the container).
+    items 8,697 instructions to 6,226 in the container). The core loop's
+    `enumerate` arm ends in place the same way (`_strptime`'s loop).
   - The battery's slow-step census (`WEAVEPY_BURST_STATS=1` over every
     case) showed slices of `bytearray`s and of `str` subclasses (`re`'s
     `_plain_slice` over `email`'s header tokens) taking the full step at

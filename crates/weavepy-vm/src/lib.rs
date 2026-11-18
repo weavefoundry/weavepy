@@ -14831,22 +14831,45 @@ impl Interpreter {
                                         *current = current.wrapping_add(*step);
                                         int_hot(v)
                                     }
-                                    crate::object::PyIterator::List { items, index, .. } => {
+                                    crate::object::PyIterator::List {
+                                        items,
+                                        index,
+                                        owner,
+                                    } => {
                                         // SAFETY: as above.
                                         let v = match unsafe { items.peek() } {
                                             Some(xs) => xs.get(*index).map(Self::clone_operand),
                                             None => None,
                                         };
-                                        let Some(v) = v else { break None };
-                                        *index += 1;
-                                        v
+                                        match v {
+                                            Some(v) => {
+                                                *index += 1;
+                                                v
+                                            }
+                                            // The end: the cursor detaches from
+                                            // its list as its own end does, and
+                                            // the loop retires the iterator (a
+                                            // finalizer its release queues runs
+                                            // before the next instruction).
+                                            None if owner.is_none() => {
+                                                *items = Rc::new(RefCell::new(Vec::new()));
+                                                retire = true;
+                                                Object::None
+                                            }
+                                            None => break None,
+                                        }
                                     }
                                     crate::object::PyIterator::Tuple { items, index } => {
-                                        let Some(v) = items.get(*index).cloned() else {
-                                            break None;
-                                        };
-                                        *index += 1;
-                                        v
+                                        match items.get(*index).cloned() {
+                                            Some(v) => {
+                                                *index += 1;
+                                                v
+                                            }
+                                            None => {
+                                                retire = true;
+                                                Object::None
+                                            }
+                                        }
                                     }
                                     crate::object::PyIterator::Bytes { data, index } => {
                                         let Some(&b) = data.get(*index) else {
@@ -14877,10 +14900,13 @@ impl Interpreter {
                                     _ => break None,
                                 };
                                 let i = *count;
-                                *count = next_count;
-                                if !fuse {
+                                if retire {
+                                    Object::None
+                                } else if !fuse {
+                                    *count = next_count;
                                     Object::new_tuple_array([Object::Int(i), x])
                                 } else {
+                                    *count = next_count;
                                     // `UNPACK_SEQUENCE` leaves the first item on
                                     // top. SAFETY: `len + 2 <= cap`.
                                     unsafe { base.add(len).write(x) };
