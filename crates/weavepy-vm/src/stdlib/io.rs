@@ -1792,6 +1792,43 @@ pub(crate) fn build_iobase_family() -> IoFamily {
     fam
 }
 
+/// The addresses of the `BytesIO` and `StringIO` types the family built
+/// (the first one stored wins, as for the family; zero until then).
+static MEMORY_STREAM_TYPES: [std::sync::atomic::AtomicUsize; 2] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 2];
+
+/// `io.BytesIO()` / `io.BytesIO(b)` and `io.StringIO()` / `io.StringIO(s)`
+/// of the exact types, with plain `bytes` or `str`: the stream as their
+/// `__new__` builds it, which their `__init__` would leave as it is.
+/// `None` for anything else (a subclass, other arguments), for the full
+/// constructor.
+pub(crate) fn memory_stream_new_pure(
+    cls: &Rc<crate::types::TypeObject>,
+    args: &[Object],
+) -> Option<Object> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let at = Rc::as_ptr(cls) as usize;
+    let bytes = at == MEMORY_STREAM_TYPES[0].load(Relaxed);
+    if !bytes && at != MEMORY_STREAM_TYPES[1].load(Relaxed) {
+        return None;
+    }
+    let call = [
+        Object::Type(cls.clone()),
+        args.first().cloned().unwrap_or(Object::None),
+    ];
+    let call = match (bytes, args) {
+        (_, []) => &call[..1],
+        (true, [Object::Bytes(_)]) | (false, [Object::Str(_)]) => &call[..],
+        _ => return None,
+    };
+    let made = if bytes {
+        bytesio_new(call, &[])
+    } else {
+        stringio_new(call, &[])
+    };
+    made.ok()
+}
+
 /// Whether a native [`PyFile`] should be considered an instance of one of the
 /// `io` ABCs (`info` is the candidate class). `None` means "not an io ABC"
 /// (the caller falls back to ordinary MRO matching). A native binary stream is
@@ -1954,6 +1991,14 @@ fn build_iobase_family_inner() -> IoFamily {
     ] {
         set_type_module(conc, "_io");
     }
+    MEMORY_STREAM_TYPES[0].store(
+        Rc::as_ptr(&bytes_io) as usize,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    MEMORY_STREAM_TYPES[1].store(
+        Rc::as_ptr(&string_io) as usize,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     IoFamily {
         iobase,
         raw,
