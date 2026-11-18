@@ -32151,9 +32151,13 @@ impl Interpreter {
         if inst.native.get().is_some() || crate::object::exotic_str_keys_possible() {
             return None;
         }
-        let Some(Object::Function(f)) = inst.cls_raw().lookup("__hash__") else {
-            return None;
-        };
+        // (The function memoized for the class's version, as the full
+        // hash reads it.)
+        let f = Self::instance_dunder_function(
+            inst,
+            crate::types::AttrKey::vm(crate::types::vm_key::HASH),
+            "__hash__",
+        )?;
         let code = f.code();
         if !code_is_pure_leaf(&code)
             || !pure_leaf_warm(&code)
@@ -32983,7 +32987,12 @@ impl Interpreter {
             let bt = builtin_types();
             // `bool(x)`: the instance's truth, as the truth test reads it
             // in place (`__bool__` or `__len__` as a pure leaf, or none).
+            // (An argument the call holds the last reference to dies with
+            // it: the full call runs its finalizer promptly.)
             if Rc::ptr_eq(ty, &bt.bool_) {
+                if Rc::strong_count(inst) <= 1 {
+                    return None;
+                }
                 return self.leaf_instance_truth(recv).map(Object::Bool);
             }
             let is_float = Rc::ptr_eq(ty, &bt.float_);

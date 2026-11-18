@@ -14868,6 +14868,11 @@ unsafe extern "C" fn h_call_type(
                 crate::release_operands(interp, base.add(start), lenu - start);
                 base.add(start).write(v);
                 s.len = start + 1;
+                // A dying argument's finalizer runs before the next
+                // instruction, as after the full call (`bool(Dying())`).
+                if (*s.maybe_dead).get() {
+                    return left_marked(st, pc as u32, start + 1);
+                }
                 return 0;
             }
         }
