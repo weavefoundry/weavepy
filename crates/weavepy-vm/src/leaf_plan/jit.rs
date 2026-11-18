@@ -776,6 +776,26 @@ unsafe extern "C" fn h_slice(
 }
 
 /// `a[b]` (see [`subscr`]).
+/// `Op::Contains`: `0` the answer put, `1` declined.
+unsafe extern "C" fn h_contains(
+    ctx: *mut Ctx<'static>,
+    ta: u64,
+    pa: u64,
+    tb: u64,
+    pb: u64,
+    invert: u32,
+) -> u32 {
+    // SAFETY: called by native code with its context.
+    let c = unsafe { cx(ctx) };
+    match super::contains(value(ta, pa), value(tb, pb)) {
+        Some(found) => {
+            c.put(V::B(found != (invert != 0)));
+            0
+        }
+        None => 1,
+    }
+}
+
 unsafe extern "C" fn h_subscr(ctx: *mut Ctx<'static>, ta: u64, pa: u64, tb: u64, pb: u64) -> u32 {
     // SAFETY: called by native code with its context.
     let c = unsafe { cx(ctx) };
@@ -2304,6 +2324,22 @@ impl Lower<'_> {
             Op::New { dst, dict } => {
                 let d = self.u32c(u32::from(dict));
                 let st = self.call(h_new as *const () as usize, &[self.ctx, d]);
+                self.check(st);
+                self.set_out(fl, dst, 0);
+            }
+            Op::Contains {
+                dst,
+                item,
+                cont,
+                invert,
+            } => {
+                let (ta, pa) = self.get(fl, item);
+                let (tb, pb) = self.get(fl, cont);
+                let inv = self.u32c(u32::from(invert));
+                let st = self.call(
+                    h_contains as *const () as usize,
+                    &[self.ctx, ta, pa, tb, pb, inv],
+                );
                 self.check(st);
                 self.set_out(fl, dst, 0);
             }

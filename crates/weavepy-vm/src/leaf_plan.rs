@@ -179,6 +179,14 @@ enum Op {
         b: u8,
         kind: u8,
     },
+    /// `regs[dst] = (regs[item] in regs[cont]) != invert` (see
+    /// [`contains`]).
+    Contains {
+        dst: u8,
+        item: u8,
+        cont: u8,
+        invert: bool,
+    },
     /// `regs[dst] = regs[a][regs[b]]` (see [`subscr`]).
     Subscr {
         dst: u8,
@@ -504,6 +512,18 @@ impl Builder<'_> {
                     return None;
                 }
                 self.ops.push(Op::Compare { dst, a, b, kind });
+            }
+            // (`x in self.items`, a `__contains__`'s body.)
+            OpCode::ContainsOp => {
+                let cont = self.pop()?;
+                let item = self.pop()?;
+                let dst = self.push_new()?;
+                self.ops.push(Op::Contains {
+                    dst,
+                    item,
+                    cont,
+                    invert: arg == 1,
+                });
             }
             OpCode::IsOp => {
                 let b = self.pop()?;
@@ -1197,6 +1217,12 @@ impl Interpreter {
                 Op::Truth { dst, src } => set!(dst, V::B(truth(get!(src))?)),
                 Op::Unary { dst, src, kind } => set!(dst, unary(get!(src), kind)?),
                 Op::Binary { dst, a, b, kind } => set!(dst, binary(get!(a), get!(b), kind)?),
+                Op::Contains {
+                    dst,
+                    item,
+                    cont,
+                    invert,
+                } => set!(dst, V::B(contains(get!(item), get!(cont))? != invert)),
                 Op::Subscr { dst, a, b } => set!(dst, subscr(&mut owned, get!(a), get!(b))?),
                 Op::Tuple { dst, a, b, c, n } => {
                     set!(dst, new_tuple(&mut owned, [get!(a), get!(b), get!(c)], n)?)
@@ -1535,6 +1561,37 @@ pub(crate) fn binary(a: V, b: V, kind: u8) -> Option<V> {
 /// key type), or an ASCII string's character (held by `owned`). Anything
 /// else, a miss included, declines.
 #[inline]
+/// `item in cont` when the test runs no code (see
+/// `Interpreter::leaf_contains`): a native container, never an instance,
+/// whose own `__contains__` could reach this evaluation again. `None`
+/// declines.
+pub(super) fn contains(item: V, cont: V) -> Option<bool> {
+    let V::R(c) = cont else {
+        return None;
+    };
+    // SAFETY: as `norm`.
+    let c = unsafe { &*c };
+    if matches!(c, Object::Instance(_)) {
+        return None;
+    }
+    let scalar;
+    let item: &Object = match item {
+        // SAFETY: as above.
+        V::R(p) => unsafe { &*p },
+        V::I(i) => {
+            scalar = Object::Int(i);
+            &scalar
+        }
+        V::B(b) => {
+            scalar = Object::Bool(b);
+            &scalar
+        }
+        V::N => &Object::None,
+        V::F(_) | V::Fn(_) | V::Bi(_) | V::Null => return None,
+    };
+    Interpreter::leaf_contains(c, item)
+}
+
 fn subscr(owned: &mut Owned, a: V, b: V) -> Option<V> {
     let V::R(c) = a else {
         return None;

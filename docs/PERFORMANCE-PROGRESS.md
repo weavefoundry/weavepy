@@ -774,6 +774,20 @@ branch and pull request.
     they line up with the parameters, as positional calls already did.
     `P("a", 1, default=i)` with two keyword-only parameters 3,294
     instructions to 2,838 (CPython 3,365).
+  - User-class protocols, from a third sweep of 83 statements. `bool(x)`
+    of an instance took the type call's dispatch and several method
+    lookups (a plain instance 3,933 instructions to CPython's 422): it is
+    the truth test now, the in-place `__bool__`/`__len__` evaluation
+    first and `PyObject_IsTrue`'s protocol after (465; through a Python
+    `__len__` 4,534 to 1,398). A missing attribute that a pure-leaf
+    `__getattr__` answers ran it as an activation behind a cascade of
+    lanes that each missed; compiled code and the core loop now evaluate
+    it frameless first (3,869 to 1,319, against 1,010). Frameless
+    evaluation also runs `x in c` and `not in` over a native container
+    (anything that could run code declines), so a `__contains__` that
+    tests its own list evaluates in place: `2 in box` 3,759 to 1,047
+    (1,026). `__bool__ = None` now raises CPython's "cannot be interpreted
+    as a boolean".
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

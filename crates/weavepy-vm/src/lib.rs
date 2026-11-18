@@ -11072,6 +11072,76 @@ impl Interpreter {
         Some(self.inline_bind(frame, shell, pc, act, code, Object::Function(hook), guard))
     }
 
+    /// `recv.name` (`name` the `name_idx`th name of `code`) by the class's
+    /// `__getattr__` when the default lookup misses it and that hook is a
+    /// warm pure leaf of `(self, name)`, evaluated in place; `None` for
+    /// everything else, having run nothing.
+    pub(crate) fn leaf_getattr_hook(
+        &self,
+        recv: &Object,
+        name: &str,
+        code: &CodeObject,
+        name_idx: u32,
+    ) -> Option<Object> {
+        let Object::Instance(inst) = recv else {
+            return None;
+        };
+        let cls = inst.cls_raw();
+        if crate::object::exotic_str_keys_possible()
+            || !Self::default_getattribute(cls)
+            || !default_lookup_misses(recv, name, true)
+        {
+            return None;
+        }
+        let Some(Object::Function(hook)) = cls.lookup("__getattr__") else {
+            return None;
+        };
+        let hcode = hook.code();
+        if hcode.arg_count != 2
+            || !code_is_pure_leaf(&hcode)
+            || !pure_leaf_warm(&hcode)
+            || crate::recursion::current_depth() >= crate::recursion::recursion_limit()
+        {
+            return None;
+        }
+        let name = code_name_str(code, name_idx, name);
+        let args = [std::ptr::from_ref(recv), std::ptr::from_ref(&name)];
+        self.pure_leaf_eval::<false, false>(&hcode, &hook, &args)
+    }
+
+    /// `obj.name` at `frame.pc` for an instance the default lookup misses
+    /// whose class's `__getattr__` is a warm pure leaf of `(self, name)`:
+    /// its result replaces the receiver, as the inline activation
+    /// [`Self::try_inline_attr_hook`] would leave it. `false` touches
+    /// nothing.
+    fn try_leaf_attr_hook(&mut self, frame: &mut Frame) -> bool {
+        use crate::types::Dunder;
+        let pc = frame.pc as usize;
+        let Some(ins) = frame.code.instructions.get(pc) else {
+            return false;
+        };
+        if ins.op != OpCode::LoadAttr || crate::object::exotic_str_keys_possible() {
+            return false;
+        }
+        let Some(recv @ Object::Instance(inst)) = frame.stack.last() else {
+            return false;
+        };
+        let cls = inst.cls_raw();
+        let Some(name) = frame.code.names.get(ins.arg as usize) else {
+            return false;
+        };
+        if !cls.dunder(Dunder::GetAttr).present() {
+            return false;
+        }
+        let Some(r) = self.leaf_getattr_hook(recv, name, &frame.code, ins.arg) else {
+            return false;
+        };
+        let receiver = std::mem::replace(frame.stack.last_mut().expect("checked above"), r);
+        frame.pc = pc as u32 + 1;
+        self.release(receiver);
+        true
+    }
+
     /// `BINARY_SUBSCR` at `pc` of `frame` on an instance whose class's
     /// `__getitem__` is a plain Python function of `(self, key)`, as an
     /// inline activation (CPython's `BINARY_SUBSCR_GETITEM`): the operands
@@ -18543,6 +18613,11 @@ impl Interpreter {
     /// ([`Self::try_inline_attr_hook`]). `false` touches nothing.
     #[inline(never)]
     fn core_attr_hook(&mut self, sw: &mut CoreSwitch) -> bool {
+        // A pure leaf `__getattr__`: evaluated in place, no activation.
+        // SAFETY: see `CoreSwitch`: the running activation is synced.
+        if self.try_leaf_attr_hook(unsafe { &mut *sw.cur }) {
+            return true;
+        }
         if !self.inline_calls_ok() {
             return false;
         }
@@ -32874,6 +32949,11 @@ impl Interpreter {
         // `__index__` among it, is the full call's), as `str(x)` below.
         if let [recv @ Object::Instance(inst)] = args {
             let bt = builtin_types();
+            // `bool(x)`: the instance's truth, as the truth test reads it
+            // in place (`__bool__` or `__len__` as a pure leaf, or none).
+            if Rc::ptr_eq(ty, &bt.bool_) {
+                return self.leaf_instance_truth(recv).map(Object::Bool);
+            }
             let is_float = Rc::ptr_eq(ty, &bt.float_);
             if (is_float || Rc::ptr_eq(ty, &bt.int_)) && inst.native.get().is_none() {
                 let (key, name) = if is_float {
@@ -46003,6 +46083,18 @@ impl Interpreter {
             } else {
                 None
             };
+            // `__bool__ = None` blocks the protocol (CPython's
+            // `slot_nb_bool` finds no callable).
+            if let (None, Some(Object::BoundMethod(bm)), Object::Instance(inst)) =
+                (&native, &method, v)
+            {
+                if matches!(bm.function, Object::None) {
+                    return Err(type_error(format!(
+                        "'{}' cannot be interpreted as a boolean",
+                        inst.cls().name
+                    )));
+                }
+            }
             if native.is_some() || method.is_some() {
                 let r = match (native, method) {
                     (Some(r), _) => r?,
@@ -64454,6 +64546,18 @@ impl Interpreter {
         args: &[Object],
         kwargs: &[(String, Object)],
     ) -> Result<Object, RuntimeError> {
+        // `bool(x)` of an instance is its truth (`PyObject_IsTrue`): the
+        // in-place `__bool__`/`__len__` evaluation the truth test uses,
+        // else the full protocol, without the type call's dispatch.
+        if let ([arg @ Object::Instance(_)], true) = (args, kwargs.is_empty()) {
+            if Rc::ptr_eq(&cls, &builtin_types().bool_) {
+                if let Some(b) = self.leaf_instance_truth(arg) {
+                    return Ok(Object::Bool(b));
+                }
+                let globals = self.builtins.clone();
+                return self.obj_truthy(arg, &globals).map(Object::Bool);
+            }
+        }
         // A natively served class's common constructor shapes.
         if cls.native_kind.get() != 0 {
             if let Some(r) = crate::stdlib::datetime_native::construct(&cls, args, kwargs) {
@@ -87545,6 +87649,9 @@ fn code_pure_leaf_decide(code: &CodeObject, ext: &CodeConstObjects) -> bool {
                 | OpCode::LoadAttr
                 | OpCode::CompareOp
                 | OpCode::IsOp
+                // (A membership test over a native container runs no code;
+                // any other declines the evaluation.)
+                | OpCode::ContainsOp
                 | OpCode::ToBool
                 | OpCode::UnaryOp
                 | OpCode::PopJumpIfFalse

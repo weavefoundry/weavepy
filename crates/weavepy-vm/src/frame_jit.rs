@@ -9142,6 +9142,34 @@ unsafe fn attr_miss(st: *mut State, site: &AttrSite, at: *mut Object, local: boo
             }
             _ => None,
         };
+        // A missing attribute a class's pure leaf `__getattr__` answers,
+        // evaluated in place ahead of the lanes that can't.
+        if let Object::Instance(inst) = &*at {
+            if inst
+                .cls_raw()
+                .dunder(crate::types::Dunder::GetAttr)
+                .present()
+            {
+                let code = &*site.code;
+                let arg = code.instructions[site.pc as usize].arg;
+                if let Some(v) = code
+                    .names
+                    .get(arg as usize)
+                    .and_then(|name| (*(*st).interp).leaf_getattr_hook(&*at, name, code, arg))
+                {
+                    if local {
+                        (*st).stack.add(site.slot as usize).write(v);
+                    } else {
+                        if !droppable(&*at) {
+                            drop(v);
+                            return left(st, site.pc, site.last, site.slot as usize + 1);
+                        }
+                        crate::drop_hot(std::mem::replace(&mut *at, v));
+                    }
+                    return 0;
+                }
+            }
+        }
         // A namespace's own entry (a `typing` union's `__args__`, a
         // `SimpleNamespace`'s field): the full handler's first answer.
         if let Object::SimpleNamespace(d) = &*at {
