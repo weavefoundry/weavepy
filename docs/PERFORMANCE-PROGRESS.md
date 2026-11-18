@@ -973,7 +973,12 @@ branch and pull request.
     `_has_surrogates` over header values), and the core loop's
     `GET_ITER` iterates a `list` or `tuple` subclass's payload when its
     class inherits the base's `__iter__`, as compiled code already did
-    (`email`'s token lists).
+    (`email`'s token lists). `os.stat`, `lstat`, `fspath`, `getcwd`,
+    `access`, `listdir` and `locale.setlocale` join the native-body lane
+    (through the interpreter's call, for a path-like's `__fspath__`), so
+    a call no longer takes the full step and its frame shell
+    (`os.path.exists(p)` about 4,000 instructions fewer, 1.34 to 1.12 of
+    CPython's; `locale.getlocale()` 1.24 to 1.05).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

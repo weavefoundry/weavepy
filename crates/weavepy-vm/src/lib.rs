@@ -84034,6 +84034,13 @@ fn builtin_needs_interp_uncached(name: &str) -> bool {
         || matches!(
             name,
             ".format"
+                | "stat"
+                | "lstat"
+                | "fspath"
+                | "getcwd"
+                | "access"
+                | "listdir"
+                | "setlocale"
                 | ".format_map"
                 | ".gc.collect"
                 | ".gc.get_objects"
@@ -84307,6 +84314,9 @@ fn builtin_fn_lane_ok_uncached(name: &str) -> bool {
             | "heappushpop" | "heappush_max" | "heappop_max" | "heapify_max"
             | "heapreplace_max" | "heappushpop_max" | "bisect" | "bisect_left" | "bisect_right" | "insort"
             | "insort_left" | "insort_right"
+            // os, through the interpreter's call (a path-like argument's
+            // `__fspath__`), and `locale.setlocale`'s query
+            | "stat" | "lstat" | "fspath" | "getcwd" | "access" | "listdir" | "setlocale"
             // sys
             | "_getframe" | "_getframemodulename" | "getrecursionlimit" | "intern" | "exc_info"
             // struct
