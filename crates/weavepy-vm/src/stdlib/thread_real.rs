@@ -1280,15 +1280,7 @@ static UNREAPED_WORKERS: AtomicUsize = AtomicUsize::new(0);
 /// (see [`crate::sync::restore_bias`]): a program that ran threads for a
 /// while runs as fast afterwards as one that never did.
 fn reap_workers(ident: u64) {
-    let registry = thread_registry();
-    let mut handles = Vec::new();
-    for entry in registry.all() {
-        if entry.native_id == ident || !entry.is_alive() {
-            if let Some(h) = entry.take_handle() {
-                handles.push(h);
-            }
-        }
-    }
+    let handles = thread_registry().take_finished_handles(ident);
     if handles.is_empty() {
         return;
     }
