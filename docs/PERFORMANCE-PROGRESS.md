@@ -1015,7 +1015,9 @@ branch and pull request.
     the same hook (2,983 to 1,636, against 1,049), and so does
     `functools.partial(func, *args)` over a callable that isn't itself a
     partial, laid out as its native `__new__` lays it (4,837 to 2,317,
-    against 1,801).
+    against 1,801), and `deque()` and `deque(xs)` of a list or tuple, laid
+    out as its `__init__` lays it (3,713 to 1,960 and 5,694 to 2,326,
+    against 2,283 and 4,228).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

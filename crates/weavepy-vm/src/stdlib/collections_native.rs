@@ -1341,6 +1341,53 @@ fn install_defaultdict(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
+/// `install_deque(deque)`: the class's plain constructions build in place
+/// (see [`deque_pure_new`]).
+fn install_deque(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Type(cls)] = args else {
+        return Err(type_error("install_deque() expects a class"));
+    };
+    cls.pure_new.set(Some(deque_pure_new));
+    Ok(Object::None)
+}
+
+/// `deque()` or `deque(xs)` of a list or tuple, of the exact class while
+/// its `__init__` is `_collections`' own and its slots are laid out as
+/// that `__init__` stores them: the instance over a copy of the items, as
+/// `__init__` (no `maxlen`) leaves it. `None` for any other call.
+fn deque_pure_new(cls: &Rc<crate::types::TypeObject>, args: &[Object]) -> Option<Object> {
+    const SLOTS: [&str; 4] = ["_data", "_head", "_maxlen", "_state"];
+    let items: Vec<Object> = match args {
+        [] => Vec::new(),
+        [Object::List(l)] => l.try_borrow().ok()?.clone(),
+        [Object::Tuple(t)] => t.to_vec(),
+        _ => return None,
+    };
+    match cls.lookup("__init__") {
+        Some(Object::Function(f)) if f.code().qualname == "deque.__init__" => {}
+        _ => return None,
+    }
+    let layout = cls.own_slot_layout()?;
+    if layout.len() != SLOTS.len()
+        || !layout
+            .iter()
+            .zip(SLOTS)
+            .all(|(k, n)| matches!(&k.0, Object::Str(s) if s.as_ref() == n))
+    {
+        return None;
+    }
+    let data = Object::new_list(items);
+    crate::gc_trace::track_built(&data);
+    let values = [data, Object::Int(0), Object::None, Object::Int(0)];
+    let inst = crate::types::PyInstance::with_slots(
+        cls.clone(),
+        crate::types::SlotStorage::from_layout_array(layout.clone(), values),
+    );
+    let obj = Object::Instance(Rc::new(inst));
+    crate::gc_trace::track(&obj);
+    Some(obj)
+}
+
 /// `defaultdict()` or `defaultdict(factory)` of the exact class, with the
 /// factory `None`, a class, a builtin or a function (callable, as
 /// `defdict_init` requires): the instance over an empty dict, its
@@ -1673,6 +1720,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             install_defaultdict,
         );
         reg("dd_missing", "__missing__", dd_missing);
+        reg("install_deque", "install_deque", install_deque);
         reg("count_elements", "count_elements", count_elements);
         reg(
             "namedtuple_register",

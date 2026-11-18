@@ -66,6 +66,7 @@ from _weave_collections import (
     dd_init as _dd_init,
     dd_missing as _dd_missing,
     install_defaultdict as _install_defaultdict,
+    install_deque as _install_deque,
 )
 # The native `OrderedDict` operations (`stdlib/collections_odict.rs`).
 from _weave_collections import (
@@ -534,6 +535,10 @@ class deque:
         finally:
             _repr_running.discard(k)
 
+
+# (`deque()` and `deque(list_or_tuple)` build natively while its
+# `__init__` is this one.)
+_install_deque(deque)
 
 _repr_running = set()
 
