@@ -852,6 +852,14 @@ branch and pull request.
     is (645 instructions, 0.93 of CPython's). `dict.fromkeys` of an ASCII
     string, a dict, or a set builds in place as a list's keys do (6,821
     to 1,582, against 2,352).
+  - `islice` steps its source in place when the source is a plain list
+    or tuple cursor, but a `chain` source always took the general step,
+    about 480 instructions an item through both adapters. A `chain` whose
+    current source is a cursor with an item left, or whose next source is
+    a list or tuple with items (the spent cursor's release freeing
+    nothing), now steps in place for one-source adapters, so
+    `list(islice(chain(xs, xs), 4))` runs 10,011 instructions instead of
+    13,365 (CPython 4,837).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

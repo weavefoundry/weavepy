@@ -1096,8 +1096,95 @@ fn src_ready(it: &Object, leaf: bool) -> bool {
                 step: Object::Int(b),
             } => a.checked_add(*b).is_some(),
             LazyIterKind::Repeat { times, .. } => times.is_none_or(|t| t > 0),
+            // A `chain` whose current source is a plain cursor with an
+            // item left (`islice(chain(xs, ys), n)`), for one-source
+            // adapters only: a `zip` could hold that cursor as another
+            // source, and the chain's step would exhaust it for that one.
+            // (A cursor, never another adapter: a chain may come to step
+            // itself.)
+            LazyIterKind::Chain { source, active } => !leaf && chain_pure_ready(source, active),
             _ => false,
         }),
+        _ => false,
+    }
+}
+
+/// Whether [`chain_pure_next`] has an item for `chain`'s state.
+fn chain_pure_ready(source: &Option<Object>, active: &Option<Object>) -> bool {
+    match active {
+        Some(a @ Object::Iter(_)) if src_ready(a, false) => true,
+        // (A cursor, never another adapter: a chain may come to step
+        // itself.)
+        Some(a) if !spent_cursor_droppable(a) => false,
+        _ => chain_next_source(source).is_some(),
+    }
+}
+
+/// `chain`'s next item where no code runs: the current source's, a plain
+/// cursor's; or, that one spent (or none begun), the first item of the
+/// next source, an exact list or tuple with items that a plain cursor
+/// over the sources holds next. `None`, touching nothing, otherwise.
+/// (Releasing a spent cursor frees nothing: its sequence is held
+/// elsewhere.)
+fn chain_pure_next(source: &mut Option<Object>, active: &mut Option<Object>) -> Option<Object> {
+    if let Some(a) = active.as_ref() {
+        if let Object::Iter(c) = a {
+            if let Some(v) = cursor_peek(c) {
+                cursor_advance(c)?;
+                return Some(v);
+            }
+        }
+        if !spent_cursor_droppable(a) {
+            return None;
+        }
+    }
+    let (sources, next) = chain_next_source(source)?;
+    let it = Rc::new(RefCell::new(next.make_iter().ok()?));
+    let v = cursor_peek(&it)?;
+    cursor_advance(&it)?;
+    cursor_advance(sources)?;
+    let old = active.replace(Object::Iter(it));
+    drop(old);
+    Some(v)
+}
+
+/// The cursor over `chain`'s sources and its next one, where that is an
+/// exact list or tuple with items.
+fn chain_next_source(source: &Option<Object>) -> Option<(&Rc<RefCell<PyIterator>>, Object)> {
+    let Some(Object::Iter(sources)) = source else {
+        return None;
+    };
+    let next = cursor_peek(sources)?;
+    let nonempty = match &next {
+        // SAFETY: a read that runs no code.
+        Object::List(l) => unsafe { l.peek() }.is_some_and(|v| !v.is_empty()),
+        Object::Tuple(t) => !t.is_empty(),
+        _ => false,
+    };
+    nonempty.then_some((sources, next))
+}
+
+/// Whether `a`, `chain`'s current source, is a spent plain cursor whose
+/// release frees nothing (its sequence, if any, held elsewhere too).
+fn spent_cursor_droppable(a: &Object) -> bool {
+    let Object::Iter(c) = a else {
+        return false;
+    };
+    // SAFETY: a read that runs no code.
+    let Some(cur) = (unsafe { c.peek() }) else {
+        return false;
+    };
+    if cur.pure_ready() {
+        return false;
+    }
+    match cur {
+        PyIterator::List {
+            items, owner: None, ..
+        } => Rc::strong_count(c) > 1 || Rc::strong_count(items) > 1,
+        PyIterator::Tuple { items, .. } => {
+            Rc::strong_count(c) > 1 || crate::object::SharedTuple::strong_count(items) > 1
+        }
+        PyIterator::Range { .. } | PyIterator::Str { .. } => true,
         _ => false,
     }
 }
@@ -2006,10 +2093,7 @@ pub(crate) fn itertools_pure_next(l: &PyLazyIter) -> Option<Option<Object>> {
         return Some(r);
     }
     match st {
-        LazyIterKind::Chain {
-            active: Some(active),
-            ..
-        } => ready_next(active).map(Some),
+        LazyIterKind::Chain { source, active } => chain_pure_next(source, active).map(Some),
         LazyIterKind::Count { current, step } => {
             let (Object::Int(a), Object::Int(b)) = (&*current, &*step) else {
                 return None;
