@@ -13650,14 +13650,15 @@ impl Object {
                         .map(|(k, v)| (k.0.clone(), v.clone()))
                         .collect()
                 };
-                let mut s = String::from("{");
+                let mut s = String::with_capacity(2 + 8 * pairs.len());
+                s.push('{');
                 for (i, (k, v)) in pairs.iter().enumerate() {
                     if i > 0 {
                         s.push_str(", ");
                     }
-                    s.push_str(&k.repr());
+                    push_item_repr(&mut s, k);
                     s.push_str(": ");
-                    s.push_str(&v.repr());
+                    push_item_repr(&mut s, v);
                 }
                 s.push('}');
                 repr_leave();
