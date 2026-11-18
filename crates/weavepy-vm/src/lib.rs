@@ -22842,8 +22842,10 @@ impl Interpreter {
                 // SAFETY: `len >= 2`.
                 let (c, k) = unsafe { (&*base.add(len - 2), &*base.add(len - 1)) };
                 // (An instance goes to the caller's native subscript, which
-                // grades its own release.)
-                if !matches!(
+                // grades its own release, except for a slice: a `str`,
+                // `list` or `tuple` subclass's keeping its base's
+                // `__getitem__` is the base's slice here.)
+                if !(matches!(
                     c,
                     Object::List(_)
                         | Object::Tuple(_)
@@ -22851,7 +22853,10 @@ impl Interpreter {
                         | Object::Str(_)
                         | Object::Bytes(_)
                         | Object::MappingProxy(_)
-                ) || !Self::core_droppable(c)
+                ) || matches!(
+                    (c, k),
+                    (Object::ByteArray(_) | Object::Instance(_), Object::Slice(_))
+                )) || !Self::core_droppable(c)
                 {
                     return None;
                 }
