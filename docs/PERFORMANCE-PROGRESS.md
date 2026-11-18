@@ -736,6 +736,26 @@ branch and pull request.
     leave the runtime's thread registry, which every reap scanned in full
     (thread start and join 663k to 545k instructions over a thousand
     threads, still 3.2 times CPython's).
+  - A second sweep, of 104 statements over the standard library's
+    smaller types and builtins. Complex arithmetic left compiled code for
+    the core loop's operator dispatch each time; the frame JIT's
+    binary-operation helper now computes `+ - * /` of an exact `complex`
+    with a number itself (`c1 * c2` 2,008 instructions to 584, against
+    540). `setattr(obj, name, v)` of a plain instance is a leaf builtin
+    that stores into the instance dictionary as the generic path does,
+    the name interned (1,953 to 1,211, against 699). `functools.reduce`
+    joins the builtins compiled code and the core loop run in place
+    instead of leaving for the full call path (`reduce(operator.add,
+    xs)` 4,641 to 1,916, against 2,033). `sorted(d)` reads a dict's keys
+    directly rather than through an iterator (4,121 to 2,160);
+    `{**d}` and `f(**kw)` copy the source's table into the empty target
+    whole; `str.center`, `ljust`, `rjust` and `zfill` build in one
+    allocation and return an exact `str` that needs no padding as itself
+    (`center` 2,208 to 868, against 923); `bytes.join` of a list or tuple
+    of `bytes` reads the parts in place (3,153 to 2,316); and
+    `struct.unpack` of `bytes` skips the buffer adapter (2,536 to 2,074).
+    `itertools.accumulate` and `product` stay 2.4 and 2.0 times CPython's:
+    their iterator steps spread over a dozen helpers.
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

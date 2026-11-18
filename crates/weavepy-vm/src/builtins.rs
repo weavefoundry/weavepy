@@ -12998,6 +12998,9 @@ fn str_zfill(args: &[Object]) -> Result<Object, RuntimeError> {
     };
     let len = s.chars().count();
     if len >= width {
+        if let Some(o @ Object::Str(_)) = args.first() {
+            return Ok(o.clone());
+        }
         return Ok(str_result(args, s.to_owned()));
     }
     let pad = width - len;
@@ -13006,7 +13009,12 @@ fn str_zfill(args: &[Object]) -> Result<Object, RuntimeError> {
     } else {
         ("", s)
     };
-    Ok(str_result(args, format!("{sign}{}{rest}", "0".repeat(pad))))
+    let mut out = String::with_capacity(s.len() + pad);
+    out.push_str(sign);
+    // SAFETY: ASCII zeros are valid UTF-8.
+    unsafe { out.as_mut_vec() }.resize(sign.len() + pad, b'0');
+    out.push_str(rest);
+    Ok(str_result(args, out))
 }
 
 fn str_ljust(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -13035,17 +13043,35 @@ fn pad_str(args: &[Object], right_align: bool) -> Result<Object, RuntimeError> {
     };
     let len = s.chars().count();
     if len >= width {
+        // (An exact `str` comes back as itself, as CPython's does.)
+        if let Some(o @ Object::Str(_)) = args.first() {
+            return Ok(o.clone());
+        }
         return Ok(str_result(args, s.into_owned()));
     }
-    let pad: String = std::iter::repeat_n(fill, width - len).collect();
-    Ok(str_result(
-        args,
-        if right_align {
-            format!("{pad}{s}")
+    let pad = width - len;
+    let (left, right) = if right_align { (pad, 0) } else { (0, pad) };
+    Ok(str_result(args, pad_around(&s, left, right, fill)))
+}
+
+/// `s` with `left` copies of `fill` before it and `right` after, built in
+/// one allocation of the exact size (`str.center`, `ljust`, `rjust`).
+fn pad_around(s: &str, left: usize, right: usize, fill: char) -> String {
+    let unit = fill.len_utf8();
+    let mut out = String::with_capacity(s.len() + (left + right) * unit);
+    let push_fill = |out: &mut String, n: usize| {
+        if fill.is_ascii() {
+            // SAFETY: an ASCII byte repeated is valid UTF-8.
+            let to = out.len() + n;
+            unsafe { out.as_mut_vec() }.resize(to, fill as u8);
         } else {
-            format!("{s}{pad}")
-        },
-    ))
+            out.extend(std::iter::repeat_n(fill, n));
+        }
+    };
+    push_fill(&mut out, left);
+    out.push_str(s);
+    push_fill(&mut out, right);
+    out
 }
 
 fn str_center(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -13070,6 +13096,10 @@ fn str_center(args: &[Object]) -> Result<Object, RuntimeError> {
     };
     let len = s.chars().count();
     if len >= width {
+        // (An exact `str` comes back as itself, as CPython's does.)
+        if let Some(o @ Object::Str(_)) = args.first() {
+            return Ok(o.clone());
+        }
         return Ok(str_result(args, s.into_owned()));
     }
     let total = width - len;
@@ -13078,9 +13108,7 @@ fn str_center(args: &[Object]) -> Result<Object, RuntimeError> {
     // is `'  Monday '`, not `' Monday  '`.
     let left = total / 2 + (total & width & 1);
     let right = total - left;
-    let lpad: String = std::iter::repeat_n(fill, left).collect();
-    let rpad: String = std::iter::repeat_n(fill, right).collect();
-    Ok(str_result(args, format!("{lpad}{s}{rpad}")))
+    Ok(str_result(args, pad_around(&s, left, right, fill)))
 }
 
 /// `str.expandtabs(tabsize=8)` — `tabsize` is positional-or-keyword in
@@ -17007,6 +17035,37 @@ fn bytes_dunder_rmod(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn bytes_join(args: &[Object]) -> Result<Object, RuntimeError> {
+    // `bytes` joining a list or tuple of `bytes`: one allocation of the
+    // exact size, the parts read in place (reading them runs no code).
+    if let Some(Object::Bytes(sep)) = args.first() {
+        let join = |items: &[Object]| -> Option<Object> {
+            let mut total = sep.len().checked_mul(items.len().saturating_sub(1))?;
+            for v in items {
+                let Object::Bytes(b) = v else {
+                    return None;
+                };
+                total = total.checked_add(b.len())?;
+            }
+            let mut out = Vec::with_capacity(total);
+            for (i, v) in items.iter().enumerate() {
+                if i > 0 {
+                    out.extend_from_slice(sep);
+                }
+                if let Object::Bytes(b) = v {
+                    out.extend_from_slice(b);
+                }
+            }
+            Some(Object::new_bytes(out))
+        };
+        let joined = match args.get(1) {
+            Some(Object::List(l)) => l.try_borrow().ok().and_then(|l| join(&l)),
+            Some(Object::Tuple(t)) => join(t),
+            _ => None,
+        };
+        if let Some(r) = joined {
+            return Ok(r);
+        }
+    }
     let sep = bytes_data(args)?;
     let it = args
         .get(1)

@@ -122,6 +122,9 @@ def calcsize(format, /):
 
 def unpack(format, buffer, /):
     try:
+        # (`bytes`, the common buffer, goes straight to the core.)
+        if type(buffer) is bytes:
+            return _impl.unpack(format, buffer)
         return _impl.unpack(format, _readable(buffer))
     except ValueError as e:
         raise error(str(e)) from None
@@ -129,6 +132,8 @@ def unpack(format, buffer, /):
 
 def unpack_from(format, /, buffer, offset=0):
     try:
+        if type(buffer) is bytes:
+            return _impl.unpack_from(format, buffer, offset)
         return _impl.unpack_from(format, _readable(buffer), offset)
     except ValueError as e:
         raise error(str(e)) from None

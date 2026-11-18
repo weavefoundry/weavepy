@@ -22940,14 +22940,24 @@ impl Interpreter {
                     return None;
                 };
                 let str_keys = |d: &DictData| d.keys().all(|k| matches!(k.0, Object::Str(_)));
-                if !str_keys(&s)
-                    || !str_keys(&t)
-                    || (ins.arg & 1 != 0 && s.keys().any(|k| t.contains_key(k)))
-                {
-                    return None;
-                }
-                for (k, v) in s.iter() {
-                    t.insert(k.clone(), v.clone());
+                // (A keyword splat's keys must be strings: the full
+                // handler raises for any other.)
+                if t.is_empty() && (ins.arg & 1 == 0 || str_keys(&s)) {
+                    // (`{**d}`, `f(**kw)`: the source's table copied whole,
+                    // its keys hashed already and none repeated, so nothing
+                    // compares them.)
+                    let map: &mut crate::object::DictMap = &mut t;
+                    map.clone_from(&s);
+                } else {
+                    if !str_keys(&s)
+                        || !str_keys(&t)
+                        || (ins.arg & 1 != 0 && s.keys().any(|k| t.contains_key(k)))
+                    {
+                        return None;
+                    }
+                    for (k, v) in s.iter() {
+                        t.insert(k.clone(), v.clone());
+                    }
                 }
                 drop((t, s));
                 // SAFETY: the source leaves the stack.
@@ -32578,6 +32588,7 @@ impl Interpreter {
                     ("isinstance", LeafKind::Isinstance),
                     ("getattr", LeafKind::GetAttr),
                     ("hasattr", LeafKind::Fast(Interpreter::leaf_hasattr)),
+                    ("setattr", LeafKind::Fast(Interpreter::leaf_setattr)),
                     ("issubclass", LeafKind::Fast(leaf_issubclass)),
                     // Bodies that run no Python code for any arguments.
                     ("id", LeafKind::Opaque),
@@ -33623,6 +33634,53 @@ impl Interpreter {
     /// `getattr(obj, name, default)`: `True` for a value it finds, `False`
     /// for a name it proves missing. `None` for anything the full call
     /// must decide.
+    /// `setattr(obj, name, value)` of a plain instance whose class sets
+    /// attributes by default and has no descriptor for the name: the
+    /// instance-dictionary store `generic_setattr_instance_with_name` makes
+    /// (the name interned, as there), with nothing to run. `None` for
+    /// everything else, and for an overwrite whose old value's release
+    /// could run code (the full path reaps it promptly).
+    fn leaf_setattr(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+        let [Object::Instance(inst), Object::Str(name), value] = args else {
+            return None;
+        };
+        let cls = inst.cls_raw();
+        if crate::object::exotic_str_keys_possible()
+            || inst.c_body.get() != 0
+            || crate::capi_watchers::dicts_active()
+            || cls.native_kind.get() != 0
+            // (An escaping bound method starts tracking: the full path's.)
+            || matches!(value, Object::BoundMethod(_))
+            || !Self::plain_store_verdict(cls, name)
+        {
+            return None;
+        }
+        if let Some(i) = inst.attr_position_str(name) {
+            // SAFETY: the view ends before the store below.
+            let (_, old) = unsafe { inst.attr_peek_index(i as usize) }?;
+            if !Self::core_droppable(old) {
+                return None;
+            }
+        }
+        let key = crate::stdlib::sys::intern_shared_memo(name);
+        let old = match inst.split_store(&key, value.clone()) {
+            Ok(old) => old,
+            Err(value) => {
+                let dict = inst.dict_cell();
+                let mut d = dict.try_borrow_mut().ok()?;
+                let d = &mut *d;
+                let d = if value.is_gc_atomic() {
+                    d.map_mut_atomic_store()
+                } else {
+                    &mut **d
+                };
+                d.insert(DictKey(Object::Str(key)), value)
+            }
+        };
+        drop(old);
+        Some(Ok(Object::None))
+    }
+
     fn leaf_hasattr(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
         let [obj, name] = args else {
             return None;
@@ -46737,6 +46795,9 @@ impl Interpreter {
             Object::Tuple(items) => Ok(items.to_vec()),
             Object::Set(s) => Ok(s.borrow().iter().map(|k| k.0.clone()).collect()),
             Object::FrozenSet(s) => Ok(s.iter().map(|k| k.0.clone()).collect()),
+            // A dict's keys, as its iterator would give them (cloning them
+            // runs no code).
+            Object::Dict(d) => Ok(d.borrow().keys().map(|k| k.0.clone()).collect()),
             // Draining a view runs no code (the entries' clones and the
             // pairs' tuples), so the dict can't change under it: its entries
             // in order, as its iterator would give them.
@@ -83546,6 +83607,8 @@ fn builtin_fn_lane_ok_uncached(name: &str) -> bool {
             | "_getframe" | "_getframemodulename" | "getrecursionlimit" | "intern" | "exc_info"
             // struct
             | "pack" | "unpack" | "calcsize"
+            // functools (whose callbacks run through reentrant calls)
+            | "reduce"
             // warnings (which reads the whole stack, lean activations included)
             | "warn"
             // asyncio (`gather` reads the running loop's current task)
@@ -90978,6 +91041,38 @@ fn complex_rc_quot(a: f64, br: f64, bi: f64) -> Result<(f64, f64), RuntimeError>
         im = 0.0 * (-a * y);
     }
     Ok((re, im))
+}
+
+/// `a OP b` for an exact `complex` and a `complex`, `float` or machine
+/// `int` (either side), `OP` one of `+ - * /`, as [`binary_op`]'s complex
+/// arm computes it: `None` for anything else, an error included (a
+/// division by zero), which the full handler raises. Runs no Python code.
+pub(crate) fn complex_binop_fast(a: &Object, b: &Object, op: BinOpKind) -> Option<Object> {
+    use BinOpKind as B;
+    if !matches!(op, B::Add | B::Sub | B::Mult | B::Div) {
+        return None;
+    }
+    let real = |o: &Object| match *o {
+        Object::Float(x) => Some(x),
+        // (An `int` past 2**53 rounds as `int.__float__` does.)
+        Object::Int(i) => Some(i as f64),
+        _ => None,
+    };
+    let (ac, bc, mode) = match (a, b) {
+        (Object::Complex(x), Object::Complex(y)) => {
+            ((x.real, x.imag), (y.real, y.imag), ComplexMode::Both)
+        }
+        (Object::Complex(x), other) => {
+            ((x.real, x.imag), (real(other)?, 0.0), ComplexMode::LeftOnly)
+        }
+        (other, Object::Complex(y)) => (
+            (real(other)?, 0.0),
+            (y.real, y.imag),
+            ComplexMode::RightOnly,
+        ),
+        _ => return None,
+    };
+    complex_arith(ac, bc, op, mode).ok()
 }
 
 fn complex_arith(

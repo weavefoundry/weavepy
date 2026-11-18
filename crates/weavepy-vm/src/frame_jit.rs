@@ -6567,6 +6567,10 @@ unsafe extern "C" fn h_binop(at: *mut Object, kind: u32) -> u32 {
             (Object::Str(_), _) | (Object::Int(_), Object::Str(_)) => {
                 Interpreter::core_str_binop(a, b, kind)
             }
+            // Complex arithmetic (an exact `complex` with a number).
+            (Object::Complex(_), _) | (_, Object::Complex(_)) => {
+                crate::complex_binop_fast(a, b, kind)
+            }
             // A list's `+=` extends it in place (`list.__iadd__`), and is
             // the list itself (`a += a` too: the items are copied first).
             (Object::List(x), Object::List(y))
