@@ -792,7 +792,15 @@ branch and pull request.
     `"".join(reversed(s))` reads the string's characters into the
     snapshot directly and joins the rest of it at once (10,403 to 7,664,
     against 4,362); `str.join`'s error for a non-`str` item now names its
-    index, as CPython's does.
+    index, as CPython's does. `list(obj)` of an instance whose `__iter__`
+    returns `iter(self.items)` ran `__len__` (the length hint) and
+    `__iter__` as full calls and stepped the iterator one item at a time;
+    both now evaluate as pure leaves when they can (`iter()` joins the
+    builtins a frameless evaluation may call: it mutates nothing), and a
+    list's or tuple's iterator drains at once (8,138 instructions to
+    5,073, against 2,736). An `__iter__` that returns a list or another
+    non-iterator now raises CPython's `TypeError` on every path; a `for`
+    loop used to iterate it.
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

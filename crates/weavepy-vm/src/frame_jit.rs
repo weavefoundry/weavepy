@@ -12136,17 +12136,15 @@ unsafe fn dunder_call(
                 st.err = Some(crate::binop_type_error(op, inplace, a, b));
                 true
             }
-            Some(records::MethodOp::Iter) if matches!(v, Object::Instance(_)) => {
-                match crate::iter_result(v.clone()) {
-                    Ok(_) => false,
-                    Err(e) => {
-                        st.len = slot;
-                        st.pc = pc + 1;
-                        st.err = Some(e);
-                        true
-                    }
+            Some(records::MethodOp::Iter) => match crate::iter_result_check(v) {
+                Ok(_) => false,
+                Err(e) => {
+                    st.len = slot;
+                    st.pc = pc + 1;
+                    st.err = Some(e);
+                    true
                 }
-            }
+            },
             _ => false,
         };
         // A pure leaf (no native body of its own: it never runs as an

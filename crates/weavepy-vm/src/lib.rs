@@ -11072,6 +11072,38 @@ impl Interpreter {
         Some(self.inline_bind(frame, shell, pc, act, code, Object::Function(hook), guard))
     }
 
+    /// `iter(v)` for a plain instance (no native payload, of a Python
+    /// class without `__length_hint__`) whose `__iter__`, and `__len__` if
+    /// it has one, evaluate as pure leaves, the first answering a native
+    /// iterator (`return iter(self.items)`): that iterator, `PyObject_
+    /// LengthHint`'s `len()` having run with nothing to observe. `None`
+    /// for anything else, having run nothing observable.
+    fn leaf_instance_iter(&self, v: &Object) -> Option<Object> {
+        use crate::types::{vm_key, AttrKey};
+        let Object::Instance(inst) = v else {
+            return None;
+        };
+        let cls = inst.cls_raw();
+        if cls.flags.is_builtin || inst.native.get().is_some() {
+            return None;
+        }
+        let iter = Self::iter_dunder(v)?;
+        if cls.lookup("__length_hint__").is_some() {
+            return None;
+        }
+        if cls.lookup("__len__").is_some() {
+            let len = Self::instance_dunder_function(inst, AttrKey::vm(vm_key::LEN_FN), "__len__")?;
+            match self.call_pure_leaf_with(&len, Some(v), &[])? {
+                Object::Int(n) if n >= 0 => {}
+                _ => return None,
+            }
+        }
+        match self.call_pure_leaf_with(&iter, Some(v), &[])? {
+            it @ Object::Iter(_) => Some(it),
+            _ => None,
+        }
+    }
+
     /// `recv.name` (`name` the `name_idx`th name of `code`) by the class's
     /// `__getattr__` when the default lookup misses it and that hook is a
     /// warm pure leaf of `(self, name)`, evaluated in place; `None` for
@@ -46867,6 +46899,31 @@ impl Interpreter {
         // it (what that releases drops once the iterator is free again).
         if let Object::Iter(it) = v {
             if let Ok(mut cursor) = it.try_borrow_mut() {
+                // A list's or tuple's iterator: the rest at once (cloning
+                // items runs no code), then the step that finds the end, so
+                // the iterator records its exhaustion as stepping it would.
+                let rest = match &mut *cursor {
+                    crate::object::PyIterator::List { items, index, .. } => items
+                        .try_borrow()
+                        .ok()
+                        .map(|xs| xs.get(*index..).map_or_else(Vec::new, <[Object]>::to_vec))
+                        .inspect(|r| *index += r.len()),
+                    crate::object::PyIterator::Tuple { items, index } => {
+                        let r = items
+                            .get(*index..)
+                            .map_or_else(Vec::new, <[Object]>::to_vec);
+                        *index += r.len();
+                        Some(r)
+                    }
+                    _ => None,
+                };
+                if let Some(rest) = rest {
+                    let end = cursor.next_value();
+                    drop(cursor);
+                    debug_assert!(end.is_none());
+                    drop(end);
+                    return Ok(rest);
+                }
                 if let crate::object::PyIterator::Reversed {
                     items,
                     index,
@@ -46921,6 +46978,13 @@ impl Interpreter {
                 // the size, but the *lookup and call* are observable
                 // (test_descr exercises a recording descriptor there), so
                 // run the hook and propagate non-TypeError exceptions.
+                // A plain instance whose `__iter__` (and `__len__`, if any)
+                // evaluates as a pure leaf: the length hint ran with no
+                // effect to observe, and the native iterator it returns
+                // drains directly.
+                if let Some(it) = self.leaf_instance_iter(v) {
+                    return self.collect_iterable(&it, globals);
+                }
                 if let Object::Instance(inst) = v {
                     let cls = inst.cls();
                     if !cls.flags.is_builtin {
@@ -49922,7 +49986,7 @@ impl Interpreter {
                             )));
                         }
                     }
-                    return Ok(result);
+                    return iter_result(result);
                 }
                 // An `xml.etree` element (no `__iter__`; a native
                 // `__getitem__`) walks its children natively.
@@ -75831,8 +75895,10 @@ fn leaf_issubclass(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
 /// effect (a module's may have one: `getrandbits` advances its state), so a
 /// frameless evaluation that declines after calling it did nothing.
 fn pure_fast_half(f: leaf_builtins::Fast) -> bool {
-    let pure: [leaf_builtins::Fast; 18] = [
+    let pure: [leaf_builtins::Fast; 19] = [
         leaf_issubclass,
+        // (A new iterator over its argument, which it leaves alone.)
+        crate::seqiter::iter_fast,
         crate::seqiter::hash_fast,
         Interpreter::leaf_hasattr,
         crate::seqiter::min_fast,
@@ -75957,15 +76023,38 @@ pub(crate) enum MethodOp {
 /// `__iter__`'s result `v` as `GET_ITER` takes it: an instance without
 /// `__next__` is the `TypeError` `Interpreter::make_iter` raises.
 pub(crate) fn iter_result(v: Object) -> Result<Object, RuntimeError> {
-    if let Object::Instance(inst) = &v {
-        if inst.cls().lookup("__next__").is_none() {
-            return Err(type_error(format!(
-                "iter() returned non-iterator of type '{}'",
-                v.type_name_owned()
-            )));
-        }
-    }
+    iter_result_check(&v)?;
     Ok(v)
+}
+
+/// [`iter_result`]'s test, on a borrowed result.
+pub(crate) fn iter_result_check(v: &Object) -> Result<(), RuntimeError> {
+    let not_iterator = match v {
+        Object::Instance(inst) => inst.cls().lookup("__next__").is_none(),
+        // The builtin containers and scalars have no `__next__`.
+        Object::List(_)
+        | Object::Tuple(_)
+        | Object::Dict(_)
+        | Object::Set(_)
+        | Object::FrozenSet(_)
+        | Object::Str(_)
+        | Object::Bytes(_)
+        | Object::ByteArray(_)
+        | Object::Int(_)
+        | Object::Float(_)
+        | Object::Bool(_)
+        | Object::None
+        | Object::Range(_)
+        | Object::Complex(_) => true,
+        _ => false,
+    };
+    if not_iterator {
+        return Err(type_error(format!(
+            "iter() returned non-iterator of type '{}'",
+            v.type_name_owned()
+        )));
+    }
+    Ok(())
 }
 
 /// A lean activation the quiet loop runs *inline*: its frame lives in
