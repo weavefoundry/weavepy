@@ -32705,6 +32705,7 @@ impl Interpreter {
                     ("getattr", LeafKind::GetAttr),
                     ("hasattr", LeafKind::Fast(Interpreter::leaf_hasattr)),
                     ("setattr", LeafKind::Fast(Interpreter::leaf_setattr)),
+                    ("format", LeafKind::Fast(leaf_format)),
                     ("issubclass", LeafKind::Fast(leaf_issubclass)),
                     // Bodies that run no Python code for any arguments.
                     ("id", LeafKind::Opaque),
@@ -61130,7 +61131,16 @@ impl Interpreter {
                                 }
                             }
                             None => String::new(),
-                            Some(_) => return Err(type_error("format() spec must be a string")),
+                            Some(other) => {
+                                let name = if matches!(other, Object::None) {
+                                    "None".to_owned()
+                                } else {
+                                    other.type_name().to_string()
+                                };
+                                return Err(type_error(format!(
+                                    "format() argument 2 must be str, not {name}"
+                                )));
+                            }
                         };
                         let bridged = matches!(args.first(), Some(Object::WStr(_)))
                             || matches!(args.get(1), Some(Object::WStr(_)));
@@ -80122,6 +80132,26 @@ pub(crate) fn format_via_spec(value: &Object, spec: &str) -> Result<String, Runt
     format_via_spec_impl(value, spec, false)
 }
 
+/// `format(value[, spec])`'s leaf half: an exact `float`, `int` or `str`
+/// formatted by its own `__format__`, which runs no Python code. `None`
+/// for anything else (a class's `__format__`, a non-`str` spec).
+fn leaf_format(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let (value, spec) = match args {
+        [value] => (value, ""),
+        [value, Object::Str(spec)] => (value, &**spec),
+        _ => return None,
+    };
+    if !matches!(value, Object::Float(_) | Object::Int(_) | Object::Str(_)) {
+        return None;
+    }
+    if spec.is_empty() {
+        if let Object::Str(_) = value {
+            return Some(Ok(value.clone()));
+        }
+    }
+    Some(format_via_spec(value, spec).map(Object::from_str))
+}
+
 /// `format_via_spec` variant used by the printf (`%`) engine, where a
 /// precision on an integer code means "minimum digits" (CPython's
 /// `str.format` mini-language forbids it; printf mandates it).
@@ -80144,6 +80174,16 @@ fn format_via_spec_impl(
             } else {
                 core
             });
+        }
+        // `g`, `G` or `.Ng` alone: the general format, with no alignment,
+        // sign or grouping to apply (and no `str(x)` to compute first).
+        if let Some((prec, upper)) = plain_general_precision(spec) {
+            return Ok(format_float_general(
+                *f,
+                prec,
+                upper,
+                &ParsedSpec::default(),
+            ));
         }
     }
     // A surrogate-bearing `WStr` bridges its lone surrogates into the PUA
@@ -80172,6 +80212,25 @@ fn plain_fixed_precision(spec: &str) -> Option<usize> {
         }
         _ => None,
     }
+}
+
+/// The precision (6 when omitted) and case of a spec that is exactly `g`,
+/// `G`, `.Ng` or `.NG` (`N` up to two digits), or `None`.
+fn plain_general_precision(spec: &str) -> Option<(usize, bool)> {
+    let (body, upper) = match spec.as_bytes().split_last()? {
+        (b'g', body) => (body, false),
+        (b'G', body) => (body, true),
+        _ => return None,
+    };
+    let prec = match body {
+        [] => 6,
+        [b'.', d] if d.is_ascii_digit() => usize::from(d - b'0'),
+        [b'.', a, b] if a.is_ascii_digit() && b.is_ascii_digit() => {
+            usize::from(a - b'0') * 10 + usize::from(b - b'0')
+        }
+        _ => return None,
+    };
+    Some((prec.max(1), upper))
 }
 
 /// Public wrapper for `ascii()`.
@@ -83112,15 +83171,34 @@ fn format_float_general(f: f64, prec: usize, upper: bool, p: &ParsedSpec) -> Str
 fn general_core(mag: f64, prec: usize, upper: bool, exp_hi: i32) -> String {
     let prec = prec.max(1);
     let sci = format!("{:.*e}", prec - 1, mag);
-    let exp: i32 = sci
-        .rfind('e')
-        .and_then(|k| sci[k + 1..].parse().ok())
-        .unwrap_or(0);
+    let Some(k) = sci.rfind('e') else {
+        return sci;
+    };
+    let exp: i32 = sci[k + 1..].parse().unwrap_or(0);
     if exp < -4 || exp >= exp_hi {
-        normalize_exponent(&sci, upper)
-    } else {
-        fixed_core(mag, (prec as i32 - 1 - exp).max(0) as usize)
+        return normalize_exponent(&sci, upper);
     }
+    // The fixed form has the same `prec` significant digits, rounded at
+    // the same place (the exponent is the rounded one): lay them out
+    // around the point instead of formatting the number again.
+    let digits: String = sci[..k].chars().filter(char::is_ascii_digit).collect();
+    if digits.len() != prec {
+        return fixed_core(mag, (prec as i32 - 1 - exp).max(0) as usize);
+    }
+    let mut out = String::with_capacity(prec + 6);
+    if exp >= 0 {
+        let int_len = exp as usize + 1;
+        out.push_str(&digits[..int_len]);
+        if int_len < prec {
+            out.push('.');
+            out.push_str(&digits[int_len..]);
+        }
+    } else {
+        out.push_str("0.");
+        out.extend(std::iter::repeat_n('0', (-exp - 1) as usize));
+        out.push_str(&digits);
+    }
+    out
 }
 
 /// `float.__format__` with the presentation type omitted: shortest `repr`

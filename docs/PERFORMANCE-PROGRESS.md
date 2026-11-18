@@ -808,7 +808,14 @@ branch and pull request.
     `min(xs, key=len)` ran `len` through the general call for each item,
     the key path taking only some of the leaf builtins' kinds; it takes
     every kind now, and compares machine-int keys directly (5,756 to
-    3,929, against 3,864).
+    3,929, against 3,864). `format(x, 'g')` computed `str(x)`, a shortest
+    repr nothing used, before parsing the spec, then formatted the fixed
+    form a second time after the scientific one: a plain `g`, `G` or
+    `.Ng` spec of a float now goes straight to the general format, which
+    lays the fixed form out from the scientific digits (rounded at the
+    same place), and `format()` of an exact `float`, `int` or `str` is a
+    leaf builtin (5,272 to 3,874, against 2,417). A non-`str` spec raises
+    CPython's message.
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

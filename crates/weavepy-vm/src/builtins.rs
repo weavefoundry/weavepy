@@ -3370,7 +3370,17 @@ fn b_format(args: &[Object]) -> Result<Object, RuntimeError> {
         .unwrap_or_else(|| Object::from_static(""));
     let spec_str = match &spec {
         Object::Str(s) => s.to_string(),
-        _ => return Err(type_error("format() spec must be a string")),
+        other => {
+            // (`_PyArg_BadArgument` names `None` itself.)
+            let name = if matches!(other, Object::None) {
+                "None".to_owned()
+            } else {
+                other.type_name().to_string()
+            };
+            return Err(type_error(format!(
+                "format() argument 2 must be str, not {name}"
+            )));
+        }
     };
     let s = crate::format_via_spec(value, &spec_str)?;
     Ok(Object::from_str(s))
