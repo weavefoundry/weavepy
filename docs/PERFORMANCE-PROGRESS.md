@@ -1010,7 +1010,9 @@ branch and pull request.
     Python classes too, and compiled code's item read stores and returns
     a miss's value where the factory is a common builtin type, as
     `__missing__` does (1,972 and 2,720; `defaultdict(list)` with one
-    miss 11,452 to 4,034, against 3,192).
+    miss 11,452 to 4,034, against 3,192). `OrderedDict()` of the exact
+    class, whose `__init__` does nothing without arguments, builds through
+    the same hook (2,983 to 1,636, against 1,049).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

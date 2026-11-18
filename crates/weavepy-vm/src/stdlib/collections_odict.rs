@@ -801,6 +801,9 @@ fn install_odict(args: &[Object]) -> Result<Object, RuntimeError> {
         ));
     };
     cls.collections_kind.set(KIND_ODICT);
+    // (`OrderedDict()` of the exact class builds in place: its `__init__`
+    // does nothing without arguments, the order starting on first use.)
+    cls.pure_new.set(Some(od_pure_new));
     for view in [k, v, i] {
         view.collections_kind.set(KIND_ODICT_VIEW);
     }
@@ -813,6 +816,23 @@ fn install_odict(args: &[Object]) -> Result<Object, RuntimeError> {
         .native_ext
         .set(crate::rc_unsize!(views => dyn std::any::Any + Send + Sync));
     Ok(Object::None)
+}
+
+/// `OrderedDict()` of the exact class, while its `__init__` is still the
+/// module's own: the instance over an empty dict, as `__new__` and that
+/// `__init__` leave it. `None` for any call with arguments.
+fn od_pure_new(cls: &Rc<TypeObject>, args: &[Object]) -> Option<Object> {
+    if !args.is_empty() {
+        return None;
+    }
+    match cls.lookup("__init__") {
+        Some(Object::Function(f)) if f.code().qualname == "OrderedDict.__init__" => {}
+        _ => return None,
+    }
+    let inst = Rc::new(PyInstance::with_native(cls.clone(), Object::new_dict()));
+    let obj = Object::Instance(inst);
+    crate::gc_trace::track(&obj);
+    Some(obj)
 }
 
 /// A new view of `od` of the given kind (0 keys, 1 values, 2 items): an
