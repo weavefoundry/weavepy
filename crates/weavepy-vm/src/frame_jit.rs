@@ -9074,6 +9074,21 @@ unsafe fn attr_miss_quick(
     }
 }
 
+/// [`inst_dict_read`] once it has answered for the instance's class at
+/// its version: the dict, from the memo alone (no name to compare).
+#[inline]
+fn inst_dict_known(site: &AttrSite, inst: &crate::types::PyInstance) -> Option<Object> {
+    let cls = inst.cls_raw();
+    let (p, ver) = (std::ptr::from_ref(cls) as usize | 1, cls.attr_version.get());
+    let known = site
+        .type_attr
+        .try_borrow()
+        .ok()?
+        .as_ref()
+        .is_some_and(|m| m.cls == p && m.ver == ver && ver != 0);
+    (known && inst.native.get().is_none()).then(|| Object::Dict(inst.dict_shared()))
+}
+
 /// `inst.__dict__` at `site`, where the instance's class keeps its default
 /// managed dict (see `Interpreter::managed_dict_attr`): the dict, the
 /// class's answer memoized in the site's class memo under its attribute
@@ -9744,6 +9759,11 @@ unsafe extern "C" fn attr_local_slow(st: *mut State, site: *const AttrSite) -> u
             }
             // (A class attribute the site has read before.)
             Object::Instance(inst) => {
+                // `inst.__dict__`, as the site answered it before.
+                if let Some(v) = inst_dict_known(site, inst) {
+                    (*st).stack.add(slot).write(v);
+                    return 0;
+                }
                 // A named tuple's field (a data descriptor: no instance
                 // shadows it), as the site's stamp remembers it.
                 if let Some(v) = (*site.ext)
@@ -10589,7 +10609,9 @@ unsafe extern "C" fn attr_stack_slow(st: *mut State, site: *const AttrSite) -> u
             }
             // (A class attribute the site has read before.)
             Object::Instance(inst) => {
-                if let Some(v) = inst_builtin_bound(site, inst, &*at) {
+                if let Some(v) =
+                    inst_dict_known(site, inst).or_else(|| inst_builtin_bound(site, inst, &*at))
+                {
                     if plain_release(&*at) {
                         at.write(v);
                         return 0;

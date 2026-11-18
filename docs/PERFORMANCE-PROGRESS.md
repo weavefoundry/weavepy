@@ -928,6 +928,11 @@ branch and pull request.
     at once now (8,647 to 3,392, against 2,437), and `list(od.items())`
     and the other views take their entries likewise where every key looks
     up natively (14,502 to 6,980, against 4,469).
+  - `obj.__dict__` reached the reader that answers it from the site's
+    memo only after a dozen other lanes (properties, class values,
+    published dicts) declined; a site that has read the managed dict
+    for the instance's class at its version now reads it first (811
+    instructions to 255 in the container).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
