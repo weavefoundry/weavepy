@@ -637,7 +637,10 @@ class OrderedDict(dict):
     pop = _od_pop
     clear = _od_clear
 
-    def __init__(self, other=(), /, **kwds):
+    def __init__(self, other=_NO_ITEMS, /, **kwds):
+        # (Nothing to add: the order dict starts on first use.)
+        if other is _NO_ITEMS and not kwds:
+            return
         self.__update(other, kwds)
 
     def __update(self, other, kwds):
