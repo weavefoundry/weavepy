@@ -1,8 +1,10 @@
-"""`OrderedDict` stores and construction from pairs.
+"""`OrderedDict` stores, construction from pairs, and `list(od)`.
 
 A fresh `OrderedDict`'s first `od[key] = value` starts its order in place,
 as the full store does; construction from an iterable unpacks 2-tuples
 directly and anything else as CPython's `odict` does, with its errors.
+`list(od)` of an exact `OrderedDict` takes the keys in order at once; a
+subclass's own `__iter__` iterates.
 """
 
 import unittest
@@ -55,6 +57,28 @@ class OdictFreshStoreTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             o[[1]] = 2
         self.assertEqual(list(o), [])
+
+    def test_list_of_keys(self):
+        o = OrderedDict([("a", 1), ("b", 2), ("c", 3)])
+        o.move_to_end("a")
+        del o["b"]
+        o["d"] = 4
+        for _ in range(N):
+            r = list(o)
+            t = tuple(o)
+        self.assertEqual(r, ["c", "a", "d"])
+        self.assertEqual(t, ("c", "a", "d"))
+        self.assertEqual(list(OrderedDict()), [])
+
+    def test_list_of_keys_overridden(self):
+        class R(OrderedDict):
+            def __iter__(self):
+                return iter(["z"])
+
+        for _ in range(N):
+            r = list(R(a=1))
+        self.assertEqual(r, ["z"])
+        self.assertEqual(list(OrderedDict(a=1)), ["a"])
 
 
 if __name__ == "__main__":

@@ -922,7 +922,10 @@ branch and pull request.
     12,212 instructions to 7,246, against 2,956). Construction from an
     iterable unpacks an exact 2-tuple directly, the other shapes still
     stepping as CPython's `odict` does for its errors (from a generator of
-    five pairs 47,414 to 36,109, against 10,146).
+    five pairs 47,414 to 36,109, against 10,146). `list(od)` of an exact
+    `OrderedDict` called its `len` and its `__iter__` through the generic
+    protocol and stepped the order's iterator; it takes the order's keys
+    at once now (8,647 to 3,392, against 2,437).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

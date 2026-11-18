@@ -47164,6 +47164,12 @@ impl Interpreter {
                 if let Some(it) = self.leaf_instance_iter(v) {
                     return self.collect_iterable(&it, globals);
                 }
+                // An exact `OrderedDict`'s keys, in order.
+                if let Object::Instance(inst) = v {
+                    if let Some(keys) = crate::stdlib::collections_odict::exact_keys(inst) {
+                        return Ok(keys);
+                    }
+                }
                 if let Object::Instance(inst) = v {
                     let cls = inst.cls();
                     if !cls.flags.is_builtin {

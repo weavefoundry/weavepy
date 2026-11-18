@@ -1656,6 +1656,9 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 })),
             );
         }
+        if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static("od_iter"))) {
+            super::collections_odict::note_iter_builtin(b);
+        }
         for name in super::collections_odict::LEAVES {
             if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static(name))) {
                 crate::leaf_builtins::register(b);

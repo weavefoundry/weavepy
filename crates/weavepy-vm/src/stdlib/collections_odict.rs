@@ -318,6 +318,45 @@ fn od_delitem(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
+/// The native `OrderedDict.__iter__` (see [`note_iter_builtin`]), by
+/// address: the class's entry is it while the class keeps it.
+static ITER_BUILTIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Remember the native `OrderedDict.__iter__` the module installs.
+pub(crate) fn note_iter_builtin(b: &Rc<crate::object::BuiltinFn>) {
+    ITER_BUILTIN.store(Rc::as_ptr(b) as usize, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `list(od)` of an exact `OrderedDict` whose class keeps the native
+/// `__iter__` (and the dict's `__len__`, no `__length_hint__`): its keys
+/// in order, as its iterator gives them (cloning them runs no code).
+/// `None` for anything else.
+pub(crate) fn exact_keys(inst: &PyInstance) -> Option<Vec<Object>> {
+    let cls = inst.cls_raw();
+    if cls.collections_kind.get() != KIND_ODICT || inst.native.get().is_none() {
+        return None;
+    }
+    let ours = ITER_BUILTIN.load(std::sync::atomic::Ordering::Relaxed);
+    match cls.lookup("__iter__") {
+        Some(Object::Builtin(b)) if Rc::as_ptr(&b) as usize == ours && ours != 0 => {}
+        _ => return None,
+    }
+    if !matches!(cls.lookup("__len__"), Some(Object::Builtin(_)))
+        || cls.lookup("__length_hint__").is_some()
+        || inst.slots.try_borrow_mut().is_err()
+    {
+        return None;
+    }
+    let order = order_of(inst);
+    let keys = order
+        .try_borrow()
+        .ok()?
+        .keys()
+        .map(|k| k.0.clone())
+        .collect();
+    Some(keys)
+}
+
 /// `OrderedDict.__iter__(self)`.
 fn od_iter(args: &[Object]) -> Result<Object, RuntimeError> {
     let (inst, main) = receiver(args, "__iter__")?;
