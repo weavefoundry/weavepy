@@ -8460,6 +8460,24 @@ pub(crate) fn sum_small_int_sequence(iterable: &Object, start: &Object) -> Optio
     match iterable {
         Object::List(items) => accumulate(&items.borrow()),
         Object::Tuple(items) => accumulate(items),
+        // A dict's values or keys, read in place.
+        Object::DictView(v) => {
+            let d = v.dict.try_borrow().ok()?;
+            let mut total = i128::from(*start);
+            for (k, val) in d.iter() {
+                let item = match v.kind {
+                    crate::object::DictViewKind::Values => val,
+                    crate::object::DictViewKind::Keys => &k.0,
+                    crate::object::DictViewKind::Items => return None,
+                };
+                total = total.checked_add(match item {
+                    Object::Int(value) => i128::from(*value),
+                    Object::Bool(value) => i128::from(*value),
+                    _ => return None,
+                })?;
+            }
+            Some(crate::object::int_from_i128(total))
+        }
         _ => None,
     }
 }
@@ -8555,6 +8573,20 @@ pub(crate) fn sum_numeric_sequence(
     match iterable {
         Object::List(items) => accumulate(&items.borrow()),
         Object::Tuple(items) => accumulate(items),
+        // A dict's values or keys, copied out first (the sum may run a
+        // float's arithmetic, never Python code, but the dict stays free).
+        Object::DictView(v) if !matches!(v.kind, crate::object::DictViewKind::Items) => {
+            let items: Vec<Object> = {
+                let d = v.dict.try_borrow().ok()?;
+                d.iter()
+                    .map(|(k, val)| match v.kind {
+                        crate::object::DictViewKind::Keys => k.0.clone(),
+                        _ => val.clone(),
+                    })
+                    .collect()
+            };
+            accumulate(&items)
+        }
         _ => None,
     }
 }

@@ -1079,13 +1079,15 @@ fn srcs_ready(iters: &[Object]) -> bool {
 /// `FOR_ITER`): `None` when the step needs the interpreter, nothing
 /// having been consumed. Every source must have an item left, so the
 /// step neither stops partway through the sources nor releases a
-/// source's container (which could queue a finalizer).
+/// source's container (which could queue a finalizer). (So a strict
+/// `zip` steps the same way: its end, where the strictness check is, is
+/// the general step's.)
 pub(crate) fn lazy_pure_next(l: &PyLazyIter) -> Option<Option<Object>> {
     // SAFETY: nothing below runs code; the view ends with this call.
     let st = unsafe { l.state.peek_mut() }?;
     let LazyIterKind::Zip {
         iters,
-        strict: false,
+        strict: _,
         result,
         spare,
         held,
@@ -1206,9 +1208,10 @@ fn fresh_result(
 pub(crate) fn lazy_pure_pair(l: &PyLazyIter) -> Option<(Object, Object)> {
     // SAFETY: nothing below runs code; the view ends with this call.
     let st = unsafe { l.state.peek() }?;
+    // (A strict `zip` too: see `lazy_pure_next`.)
     let LazyIterKind::Zip {
         iters,
-        strict: false,
+        strict: _,
         held,
         ..
     } = st
