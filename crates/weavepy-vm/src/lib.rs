@@ -10252,6 +10252,11 @@ impl Interpreter {
             if covered & (1 << slot) == 0 {
                 locals[slot] = if slot < npos {
                     f.defaults[f.defaults.len() - (npos - slot)].clone()
+                } else if Self::kwonly_aligned(f, code) {
+                    // (The defaults line up with the parameters: no search.)
+                    f.kw_defaults
+                        .get(slot - npos)
+                        .map_or(Object::Unbound, |(_, v)| v.clone())
                 } else {
                     let name = code.varnames[slot].as_str();
                     f.kw_defaults

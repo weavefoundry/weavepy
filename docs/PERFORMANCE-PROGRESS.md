@@ -764,6 +764,16 @@ branch and pull request.
     removed one releases without running code (2,005 to 1,329, against
     1,289; the full path scans the same way first). `dict.pop()` and
     `dict.copy(1)` now raise CPython's messages.
+  - Keyword calls. Compiled code constructing a class with keywords
+    (`Parameter(name, kind, default=d)`) worked out the keywords'
+    permutation onto `__init__`'s parameters, comparing every name, on
+    each call (about 330 instructions); a per-thread memo keyed by the
+    function, its code, the names tuple and the argument count keeps it,
+    asking afresh for a function whose defaults may have been reassigned.
+    The keyword binder also reads keyword-only defaults by position when
+    they line up with the parameters, as positional calls already did.
+    `P("a", 1, default=i)` with two keyword-only parameters 3,294
+    instructions to 2,838 (CPython 3,365).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

@@ -832,6 +832,61 @@ pub(super) unsafe fn ctor_direct(st: &mut State, call: CallAt, len: usize) -> Op
     }
 }
 
+/// [`crate::specialize::kw_perm`] for a constructor's `__init__`, through
+/// a per-thread memo by function, code, names tuple and argument count:
+/// the site has no cache of its own, and the permutation compares every
+/// keyword's name (about 330 instructions for three). A function whose
+/// defaults may have been reassigned asks afresh; another function at a
+/// freed one's address with the same code and as many defaults binds the
+/// same way.
+fn ctor_kw_perm(
+    init: &Rc<crate::object::PyFunction>,
+    code: &CodeObject,
+    argc: usize,
+    names: &crate::tuple_storage::TupleStorage,
+) -> Option<(u32, u32)> {
+    type Key = (usize, usize, usize, usize, usize);
+    const WAYS: usize = 32;
+    thread_local! {
+        static MEMO: [std::cell::Cell<(Key, (u32, u32))>; WAYS] =
+            const { [const { std::cell::Cell::new(((0, 0, 0, 0, 0), (0, 0))) }; WAYS] };
+    }
+    let memo_ok = !init.defaults_maybe_overridden();
+    let key: Key = (
+        Rc::as_ptr(init) as usize,
+        std::ptr::from_ref(code) as usize,
+        std::ptr::from_ref(names).cast::<u8>() as usize,
+        argc,
+        (init.defaults.len() << 16) | init.kw_defaults.len(),
+    );
+    let way = (key.0 >> 4 ^ key.2 >> 4) % WAYS;
+    if memo_ok {
+        let hit = MEMO
+            .try_with(|m| {
+                let e = m[way].get();
+                (e.0 == key).then_some(e.1)
+            })
+            .ok()
+            .flatten();
+        if hit.is_some() {
+            return hit;
+        }
+    }
+    let r = crate::specialize::kw_perm(
+        init,
+        code,
+        argc,
+        names.iter().map(|n| match n {
+            Object::Str(s) => &**s,
+            _ => "",
+        }),
+    )?;
+    if memo_ok {
+        let _ = MEMO.try_with(|m| m[way].set((key, r)));
+    }
+    Some(r)
+}
+
 /// [`ctor_direct`] for a `CALL_KW` of a plain class (`C(i, b=2)`), its
 /// operands from `start` up a `len`-deep stack (the class, its empty self
 /// slot, `argc` positionals, `kwc` keyword values and the names tuple):
@@ -907,15 +962,7 @@ pub(super) unsafe fn ctor_direct_kw(
         if names.len() != kwc || !names.iter().all(|n| matches!(n, Object::Str(_))) {
             return None;
         }
-        let (perm, covered) = crate::specialize::kw_perm(
-            init,
-            code,
-            argc + 1,
-            names.iter().map(|n| match n {
-                Object::Str(s) => &**s,
-                _ => "",
-            }),
-        )?;
+        let (perm, covered) = ctor_kw_perm(init, code, argc + 1, names)?;
         let dc = &*st.depth_cell;
         if dc.get() + 1 > crate::recursion::recursion_limit() {
             return None;
