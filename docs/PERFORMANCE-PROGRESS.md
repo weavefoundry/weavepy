@@ -910,6 +910,11 @@ branch and pull request.
     activation gone from the native stack, and a later flush wrote
     through it (found with memcheck on a system-allocator build). An
     entry now leaves the list from wherever it sits.
+  - `BytesIO.write` had an in-place half only for buffered file writers,
+    so every write to a `BytesIO` took the full native body (1,464
+    instructions to CPython's 545); a write at the stream's end with
+    nothing exported now appends in place (850). `getvalue()` of an open
+    `BytesIO` or `StringIO` gets a leaf half too (1,097 to 922).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

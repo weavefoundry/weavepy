@@ -8192,6 +8192,38 @@ impl PyFile {
         true
     }
 
+    /// `BytesIO.write(data)` at the stream's end with nothing exported (a
+    /// `getbuffer()` view would make it raise): the bytes appended, as
+    /// the full write appends them. `false`, touching nothing, otherwise.
+    pub(crate) fn mem_bytes_append(&self, data: &[u8]) -> bool {
+        if self.io_kind.get() != IoKind::BytesIO || data.is_empty() {
+            return false;
+        }
+        // SAFETY: guard-free views, each dropped at once (nothing here
+        // runs code).
+        if unsafe { self.closed.peek() }.is_none_or(|c| *c) {
+            return false;
+        }
+        let Ok(mut backend) = self.backend.try_borrow_mut() else {
+            return false;
+        };
+        let FileBackend::MemBytes { data: buf, pos } = &mut *backend else {
+            return false;
+        };
+        if bytearray_is_exported(buf) {
+            return false;
+        }
+        let Ok(mut b) = buf.try_borrow_mut() else {
+            return false;
+        };
+        if *pos != b.len() {
+            return false;
+        }
+        b.extend_from_slice(data);
+        *pos = b.len();
+        true
+    }
+
     /// `sys.stdout.write(s)` when the text's bytes go to the shared sink as
     /// they are: `None` for any other stream or text, having touched nothing.
     /// Runs no Python code (a full buffer is written out with the handlers

@@ -511,6 +511,7 @@ fn lookup_method_memo(obj: &Object, name: &str, tag: u8) -> Option<Object> {
         match name {
             "write" => crate::leaf_builtins::register_fast(b, file_write_fast),
             "readline" => crate::leaf_builtins::register_fast(b, file_readline_fast),
+            "getvalue" => crate::leaf_builtins::register_fast(b, file_getvalue_fast),
             _ => {}
         }
     }
@@ -18611,11 +18612,23 @@ fn file_write_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
             }
             f.stdout_write_pure(s).map(|r| r.map(|()| count()))
         }
-        [Object::File(f), Object::Bytes(b)] => f
-            .write_bytes_pure(b)
+        [Object::File(f), Object::Bytes(b)] => (f.write_bytes_pure(b) || f.mem_bytes_append(b))
             .then(|| Ok(Object::Int(b.len() as i64))),
         _ => None,
     }
+}
+
+/// `BytesIO.getvalue()` or `StringIO.getvalue()` of an open stream: the
+/// contents, as the full method returns them. A leaf half, like
+/// [`file_write_fast`].
+fn file_getvalue_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::File(f)] = args else {
+        return None;
+    };
+    if f.is_closed() {
+        return None;
+    }
+    f.getvalue().map(Ok)
 }
 
 /// `f.readline()` when a whole line waits in the stream's buffer (see
