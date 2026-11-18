@@ -667,8 +667,12 @@ branch and pull request.
     A float-heavy loop with such a call stays in tier 2, which saves it
     about 30 instructions a float operation. Fixtures, suite and battery
     are flat. A call of a global function tier 2 can't compile (one with
-    keyword-only parameters, `*args` or `**kwargs`) takes the same
-    generic path and isn't covered yet (`fkw(i, c=4)` 1,115 against 680).
+    keyword-only parameters, `*args` or `**kwargs`) took the same generic
+    path; the analysis now recognizes those too, by the `LOAD_GLOBAL`
+    ahead of the call's self-or-null slot (`fkw(i, c=4)` 1,115 to 350,
+    against 697). Only callees of at most 64 instructions count: the
+    first version of the rule also turned away `nbody`'s driver loop,
+    whose callee is a long function tier 2 compiles itself (+37%).
   - Constructors. A sweep of 45 common constructions against CPython
     found builtin types two to four times slower to build: their calls
     went through the type call, the instance plan and `__new__`/`__init__`

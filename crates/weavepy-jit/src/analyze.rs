@@ -249,6 +249,8 @@ pub struct Probes<'a> {
     /// bound to one, in the requesting activation: a dynamic call of it
     /// runs Python through the generic call helper (see
     /// [`TFunc::py_dyn_calls`]).
+    /// (A global's name index with [`PY_CALLEE_GLOBAL`] set asks the same
+    /// of the global that name resolves to.)
     pub py_callee: &'a mut dyn FnMut(u32) -> bool,
     /// The observed lane of local `slot` in the requesting activation,
     /// graded like [`Self::param`] (scalars, `str`, `bytes`, and the
@@ -943,6 +945,28 @@ impl Region {
 /// Whether tier 2 compiles code of this kind and signature at all. Sync
 /// generator bodies are admitted (RFC 0070 WS2: yields become `Yielded`
 /// side exits; entry is OSR-only); coroutines and async generators aren't.
+/// The flag that marks a [`Probes::py_callee`] argument as a global's name
+/// index rather than a local slot.
+pub const PY_CALLEE_GLOBAL: u32 = 1 << 31;
+
+/// Whether the callee of a dynamic call is a Python function: a local's
+/// value the probe answers for, or (`f` from a `LOAD_GLOBAL` whose
+/// self-or-null slot follows it) the global's.
+fn dyn_callee_is_py(
+    ins: &[weavepy_compiler::Instruction],
+    src: Option<u32>,
+    null_pc: u32,
+    probes: &mut Probes<'_>,
+) -> bool {
+    if let Some(slot) = src {
+        return (probes.py_callee)(slot);
+    }
+    let Some(load) = (null_pc as usize).checked_sub(1).and_then(|i| ins.get(i)) else {
+        return false;
+    };
+    matches!(load.op, OpCode::LoadGlobal) && (probes.py_callee)(PY_CALLEE_GLOBAL | load.arg)
+}
+
 fn signature_admitted(code: &CodeObject) -> bool {
     !(code.is_coroutine
         || code.is_async_generator
@@ -8868,7 +8892,7 @@ fn emit_instr(
                 if !f.ty.is_pinned() {
                     return Err(JitVerdict::UnsupportedOpcode("CALL (callee lane)"));
                 }
-                if f.src.is_some_and(|slot| (probes.py_callee)(slot)) {
+                if dyn_callee_is_py(&code.instructions, f.src, null_pc, probes) {
                     out.py_dyn_calls.push(pc);
                 }
                 for &ty in &arg_tys {
@@ -9081,7 +9105,7 @@ fn emit_instr(
                 if !f.ty.is_pinned() {
                     return Err(JitVerdict::UnsupportedOpcode("CALL_KW (callee lane)"));
                 }
-                if f.src.is_some_and(|slot| (probes.py_callee)(slot)) {
+                if dyn_callee_is_py(&code.instructions, f.src, null_pc, probes) {
                     out.py_dyn_calls.push(pc);
                 }
                 for &ty in &arg_tys {

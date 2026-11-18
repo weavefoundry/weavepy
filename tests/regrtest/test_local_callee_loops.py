@@ -1,8 +1,10 @@
-"""Loops that call a Python function held in a local.
+"""Loops that call a small Python function tier 2 calls generically.
 
-Tier 2 calls such a callee through its generic call helper; a loop doing
-little else runs in the frame JIT, which checks and enters the callee
-directly. Results, a callee that changes partway, a bound method, keyword
+A callee held in a local, or a global one tier 2 doesn't compile (one
+with keyword-only parameters or `*args`), goes through tier 2's generic
+call helper; a loop doing little else runs in the frame JIT, which checks
+and enters the callee directly, while a loop calling a long function
+stays in tier 2. Results, a callee that changes partway, a bound method, keyword
 arguments, a callee that raises, and a loop heavy with arithmetic (which
 tier 2 keeps) all behave as before. Run it past the compile threshold.
 """
@@ -75,7 +77,42 @@ def heavy(n, f):
     return total
 
 
+def kwonly(a, b=2, *, c=3):
+    return a + b + c
+
+
+def star(*args):
+    return len(args)
+
+
+def long_body(xs, k):
+    t = 0
+    for x in xs:
+        t += x * k
+        t -= x
+        t += x // 3
+    return t
+
+
+def globals_loop(n):
+    total = 0
+    xs = [1, 2, 3]
+    for i in range(n):
+        total += kwonly(i, c=4) + star(i, i)
+        total += long_body(xs, i)
+    return total
+
+
+def globals_expected(n):
+    total = 0
+    for i in range(n):
+        total += i + 2 + 4 + 2
+        total += sum(x * i - x + x // 3 for x in (1, 2, 3))
+    return total
+
+
 n = 4000
+assert globals_loop(n) == globals_expected(n)
 assert calls(n, f3) == sum(i + 6 for i in range(n))
 assert swaps(n) == sum(i + 1 for i in range(n // 2)) + sum(i - 2 for i in range(n // 2, n))
 assert bound(n) == 2 * sum(range(n))

@@ -1631,7 +1631,18 @@ impl JitState {
                 obj_global: &mut probe_obj_global,
                 cell: &mut **cell,
                 obj: &mut **obj_live,
-                py_callee: &mut **py_callee,
+                py_callee: &mut |slot| {
+                    if slot & weavepy_jit::PY_CALLEE_GLOBAL == 0 {
+                        return (py_callee)(slot);
+                    }
+                    let Some(name) = code
+                        .names
+                        .get((slot & !weavepy_jit::PY_CALLEE_GLOBAL) as usize)
+                    else {
+                        return false;
+                    };
+                    (resolve_cell.borrow_mut())(name).is_some_and(|f| small_py_callee(&f))
+                },
                 local: &mut probe_local,
                 stack_iter: &mut **stack_iter,
                 pairs: &mut **pairs,
@@ -3126,15 +3137,30 @@ fn probe_obj_live(frame: &super::Frame, slot: u32) -> bool {
         .is_some_and(|o| !matches!(o, Object::Unbound))
 }
 
-/// Whether local `slot` holds a plain Python function, or a method bound
-/// to one, in the requesting activation (see `Probes::py_callee`).
+/// Whether local `slot` holds a small plain Python function, or a method
+/// bound to one, in the requesting activation (see `Probes::py_callee`).
 fn probe_py_callee(frame: &super::Frame, slot: u32) -> bool {
     let locals = frame.locals.borrow();
-    match locals.get(slot as usize) {
-        Some(Object::Function(_)) => true,
-        Some(Object::BoundMethod(bm)) => matches!(bm.function, Object::Function(_)),
-        _ => false,
-    }
+    locals.get(slot as usize).is_some_and(small_py_callee)
+}
+
+/// The most instructions a callee may have for [`small_py_callee`].
+const SMALL_PY_CALLEE: usize = 64;
+
+/// Whether `f` is a Python function, or a method bound to one, short
+/// enough that a generic call's cost (about 800 instructions more than the
+/// frame JIT's entry) is a large part of calling it. A longer body, which
+/// tier 2 likely compiles itself, repays the call.
+fn small_py_callee(f: &Object) -> bool {
+    let func = match f {
+        Object::Function(func) => func,
+        Object::BoundMethod(bm) => match &bm.function {
+            Object::Function(func) => func,
+            _ => return false,
+        },
+        _ => return false,
+    };
+    func.code.borrow().instructions.len() <= SMALL_PY_CALLEE
 }
 
 /// RFC 0073 WS2 — the dict-lane probe: `(key lane, value lane)` of
