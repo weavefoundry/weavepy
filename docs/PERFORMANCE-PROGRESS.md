@@ -954,6 +954,14 @@ branch and pull request.
     pure leaf they step as `filter` does, `takewhile` consuming the item
     that stops it as CPython's does (`list(takewhile(lambda x: x < 3,
     xs))` 8,673 instructions to 6,181 in the container).
+  - A compiled `for i, x in enumerate(xs)` stepped its pairs in place
+    but took its end through the general step, which in a generator
+    expression materialized the generator's frame shell and finished the
+    run in the general loop, once per generator. The end of a list or
+    tuple cursor now retires the iterator in place as those cursors'
+    ends do, detaching from the list where nothing its release frees
+    could finalize (`sum(i * v for i, v in enumerate(xs))` of five
+    items 8,697 instructions to 6,226 in the container).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

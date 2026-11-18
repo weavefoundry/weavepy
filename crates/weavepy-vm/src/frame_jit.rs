@@ -4637,6 +4637,48 @@ unsafe extern "C" fn h_for_iter_rest(
             *index += 1;
             v
         }
+        // `enumerate(xs)` at the end of a list or tuple cursor (its items
+        // are the pair step's): it leaves the stack as those arms retire
+        // theirs, the cursor detached from its list as the end of its own
+        // step detaches it, where nothing the release frees could
+        // finalize.
+        PyIterator::Enumerate { inner, .. } => {
+            // SAFETY: as above; `inner` is a cell of its own.
+            let Some(src) = (unsafe { inner.peek_mut() }) else {
+                return 3;
+            };
+            match src {
+                PyIterator::List {
+                    items,
+                    index,
+                    owner: None,
+                } => {
+                    // SAFETY: as above.
+                    let Some(xs) = (unsafe { items.peek() }) else {
+                        return 3;
+                    };
+                    if *index < xs.len()
+                        || !(crate::sync::Rc::strong_count(items) > 1
+                            || xs.iter().all(plain_scalar))
+                    {
+                        return 3;
+                    }
+                    *items = crate::sync::Rc::new(crate::sync::RefCell::new(Vec::new()));
+                }
+                PyIterator::Tuple { items, index } => {
+                    if *index < items.len()
+                        || (crate::shared_value::ThinArc::strong_count(items) == 1
+                            && !items.iter().all(|x| plain_scalar(x) || held_elsewhere(x)))
+                    {
+                        return 3;
+                    }
+                }
+                _ => return 3,
+            }
+            // SAFETY: the iterator leaves the stack.
+            drop(unsafe { it.read() });
+            return 2;
+        }
         // `reversed(xs)`: the item below the cursor.
         PyIterator::Reversed { items, index, .. } => {
             if *index < 0 {
