@@ -673,6 +673,13 @@ branch and pull request.
     against 697). Only callees of at most 64 instructions count: the
     first version of the rule also turned away `nbody`'s driver loop,
     whose callee is a long function tier 2 compiles itself (+37%).
+    Tier 2 now compiles functions with keyword-only parameters too: they
+    are locals the caller's binding fills before the body runs, so the
+    analysis seeds and guards them like the positional ones. A loop in
+    `def f(n, *, scale=2, off=1)` ran under the frame JIT at 67 ms for
+    twenty calls of 200,000 steps (plus a float loop of the same shape)
+    and runs at 36 ms in tier 2 (CPython 351). Direct native calls still
+    take only positional callees.
   - Constructors. A sweep of 45 common constructions against CPython
     found builtin types two to four times slower to build: their calls
     went through the type call, the instance plan and `__new__`/`__init__`

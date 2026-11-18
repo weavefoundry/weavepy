@@ -972,8 +972,17 @@ fn signature_admitted(code: &CodeObject) -> bool {
         || code.is_async_generator
         || code.is_class_body
         || code.has_varargs
-        || code.has_varkeywords
-        || code.kwonly_count > 0)
+        || code.has_varkeywords)
+}
+
+/// How many local slots the call binds before the body runs: the
+/// positional parameters, then the keyword-only ones (`*args` and
+/// `**kwargs` frames aren't admitted). Keyword-only parameters are plain
+/// locals the caller's binding fills, so a frame entered with them bound
+/// compiles like any other; a direct native call never takes them (see
+/// the embedder's `py_callee_ok`).
+fn param_slots(code: &CodeObject) -> u32 {
+    code.arg_count + code.kwonly_count
 }
 
 /// Whether a failure verdict depends on the activation the compile ran
@@ -1404,7 +1413,7 @@ fn analyze_once(
     // [`Probes::param`]). A seeded slot behaves exactly like one typed
     // by an assignment: conflicting evidence still rejects, and the
     // final `TFunc` entry-guards it.
-    for slot in 0..code.arg_count {
+    for slot in 0..param_slots(code) {
         if local_types[slot as usize].is_none() {
             if let Some(t) = (probes.param)(slot) {
                 // RFC 0071 — `Str`/`Bytes` (WS6) and the nullable
@@ -1766,7 +1775,7 @@ fn analyze_once(
     // kernel first called with ints and later with a float would pack
     // the float as 0 and silently compute garbage.)
     let mut livein = livein;
-    for slot in 0..code.arg_count {
+    for slot in 0..param_slots(code) {
         if local_types.get(slot as usize).copied().flatten().is_some() {
             livein.insert(slot);
         }
@@ -3473,9 +3482,16 @@ fn compute_livein(
     reachable: &[usize],
     n_locals: u32,
 ) -> HashSet<u32> {
-    let width = slot_width(code, n_locals.max(code.arg_count));
-    let assigned_in =
-        assigned_on_entry(code, raw, reachable, None, code.arg_count, n_locals, width);
+    let width = slot_width(code, n_locals.max(param_slots(code)));
+    let assigned_in = assigned_on_entry(
+        code,
+        raw,
+        reachable,
+        None,
+        param_slots(code),
+        n_locals,
+        width,
+    );
     // Collect live-in: a load of a slot not definitely assigned yet.
     let mut livein = HashSet::default();
     let mut cur = SlotBits::empty(width);
@@ -3512,7 +3528,7 @@ fn root_livein(
         raw,
         reachable,
         Some(roots),
-        code.arg_count.min(n_real),
+        param_slots(code).min(n_real),
         n_real,
         width,
     );
@@ -4716,7 +4732,7 @@ fn step_abstract(
                         // A plain local assigned in this body (a
                         // comprehension result, say) may be typed by a
                         // later fixpoint iteration: transient.
-                        if v.src.is_some_and(|slot| slot >= code.arg_count) {
+                        if v.src.is_some_and(|slot| slot >= param_slots(code)) {
                             return Ok(());
                         }
                         // The param probe is a no-op on the unseeded
@@ -5449,7 +5465,7 @@ fn step_abstract(
                         } else if (probes.dict)(slot).is_some() {
                             // RFC 0073 WS2 — `len(d)` on an exact dict.
                             set_local(local_types, slot, JitType::Dict, changed)?;
-                        } else if slot >= code.arg_count {
+                        } else if slot >= param_slots(code) {
                             // A plain local assigned in this body: a
                             // later fixpoint iteration may type it.
                         } else {
