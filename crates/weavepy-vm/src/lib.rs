@@ -12454,6 +12454,20 @@ impl Interpreter {
             SPECIAL_AEXIT => "__aexit__",
             _ => return CoreAttr::Decline,
         };
+        // A native file's (`with open(p) as f`): its type's native method,
+        // bound by the call.
+        if let Some(f @ Object::File(_)) = frame.stack.last() {
+            let Some(Object::Builtin(b)) = builtins::lookup_method(f, name) else {
+                return CoreAttr::Decline;
+            };
+            if !b.binds_instance || !native_call_ic_safe(b.name) {
+                return CoreAttr::Decline;
+            }
+            let owner = frame.stack.pop().expect("checked above");
+            frame.stack.push(Object::Builtin(b));
+            frame.stack.push(owner);
+            return CoreAttr::Done;
+        }
         let Some(Object::Instance(inst)) = frame.stack.last() else {
             return CoreAttr::Decline;
         };

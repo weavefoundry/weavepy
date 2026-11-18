@@ -983,7 +983,10 @@ branch and pull request.
     `sys.audit`, `weakref`'s dead-entry callback, `json`'s encoder
     constructor and the import system's module locks, the rest of the
     census's builtin calls (`hashlib_zlib` 1% fewer instructions,
-    `file_small_open_close` 2%, `os_stat_exists` 12%).
+    `file_small_open_close` 2%, `os_stat_exists` 12%). `with open(p) as
+    f` loaded the file's `__enter__` and `__exit__` through the full step;
+    `LOAD_SPECIAL` takes a native file's own methods in place (another
+    1.5% of `file_small_open_close`).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
