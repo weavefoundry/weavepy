@@ -4197,9 +4197,10 @@ pub(crate) fn object_is_callable(v: &Object) -> bool {
     if intrinsic {
         return true;
     }
-    // Instances are callable when their class exposes `__call__`.
+    // Instances are callable when their class exposes `__call__` (the
+    // class's memoized answer, kept under its attribute version).
     if let Object::Instance(inst) = v {
-        return inst.cls().lookup("__call__").is_some();
+        return inst.cls_raw().dunder(crate::types::Dunder::Call).present();
     }
     false
 }
