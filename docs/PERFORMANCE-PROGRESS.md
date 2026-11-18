@@ -669,6 +669,23 @@ branch and pull request.
     are flat. A call of a global function tier 2 can't compile (one with
     keyword-only parameters, `*args` or `**kwargs`) takes the same
     generic path and isn't covered yet (`fkw(i, c=4)` 1,115 against 680).
+  - Constructors. A sweep of 45 common constructions against CPython
+    found builtin types two to four times slower to build: their calls
+    went through the type call, the instance plan and `__new__`/`__init__`
+    dispatch even when they only make an object. A builtin type now
+    carries a pure constructor for the arguments that run no Python code
+    (the pure arms `builtin_ctor_pure` already had, one per type, so a
+    type without one misses at a load instead of after twenty
+    comparisons): `object()` 2,314 to 815 instructions (CPython 727),
+    `threading.Lock()` 2,797 to 1,547 (965), `io.BytesIO()` 3,875 to 2,015
+    (972), `io.StringIO()` 4,014 to 2,124 (2,028), `complex(1, 2)` 3,115 to
+    724 (1,525), `memoryview(b)` 2,816 to 1,189 (1,523).
+    `threading.RLock()` forwarded an empty `*args, **kwargs` to the native
+    lock: 8,398 to 3,032. Still slow: `array.array` (a pure-Python module,
+    9.6 times CPython), and classes partly in Python (`defaultdict(list)`
+    2.9, `OrderedDict()` 4.6, `functools.partial` 2.9, `itemgetter` 2.8).
+    `os.scandir` and `os.listdir` validate names as UTF-8 before the
+    lossy decoder, which cost about 300 instructions a name.
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
