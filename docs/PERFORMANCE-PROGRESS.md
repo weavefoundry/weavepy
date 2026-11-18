@@ -830,7 +830,8 @@ branch and pull request.
     interpreter for each item; a list or tuple of floats and ints is read
     in place (7,043 to 2,850, against 1,590), and their `TypeError` now
     reads as CPython's. `str.maketrans` joins the builtins run in place
-    (7,615 to 5,968).
+    (7,615 to 5,968), and `sum(reversed(xs))` of ints adds the rest of the
+    reversed snapshot at once (3,558 to 2,286, against 1,755).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

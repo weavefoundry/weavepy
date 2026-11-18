@@ -148,5 +148,20 @@ class NativeShortcutTests(unittest.TestCase):
             str.maketrans("ab", "c")
 
 
+class ReversedSumTests(unittest.TestCase):
+    def test_sum_reversed(self):
+        for _ in range(N):
+            r = reversed([1, 2, 3])
+            a = sum(r)
+            b = list(r)
+            c = sum(reversed([1.5, 2, 1e16, -1e16]))
+            d = sum(reversed([2**62, 2**62, 2**62]))
+            e = sum(reversed([]), 5)
+            r2 = reversed([1, 2, 3])
+            next(r2)
+            f = sum(r2)
+        self.assertEqual((a, b, c, d, e, f), (6, [], 3.5, 3 * 2**62, 5, 3))
+
+
 if __name__ == "__main__":
     unittest.main()

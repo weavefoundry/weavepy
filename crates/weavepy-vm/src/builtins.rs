@@ -8489,6 +8489,30 @@ pub(crate) fn sum_small_int_sequence(iterable: &Object, start: &Object) -> Optio
             }
             Some(crate::object::int_from_i128(total))
         }
+        // `sum(reversed(xs))` of ints (whose order doesn't matter): the rest
+        // of the reversed snapshot at once, the iterator then exhausted and
+        // detached as its last step leaves it.
+        Object::Iter(it) => {
+            let mut cursor = it.try_borrow_mut().ok()?;
+            let PyIterator::Reversed {
+                items,
+                index,
+                owner,
+            } = &mut *cursor
+            else {
+                return None;
+            };
+            let total = {
+                let v = items.try_borrow().ok()?;
+                let i = usize::try_from(*index).ok()?;
+                accumulate(v.get(..=i)?)?
+            };
+            let detached = (std::mem::take(items), owner.take());
+            *index = -1;
+            drop(cursor);
+            drop(detached);
+            Some(total)
+        }
         _ => None,
     }
 }
