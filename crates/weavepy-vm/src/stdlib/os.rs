@@ -2024,7 +2024,7 @@ fn os_listdir(args: &[Object]) -> Result<Object, RuntimeError> {
                 name.to_string_lossy().into_owned().into_bytes(),
             ));
         } else {
-            out.push(Object::from_str(name.to_string_lossy()));
+            out.push(Object::from_str(os_text(&name)));
         }
     }
     Ok(Object::new_list(out))
@@ -3408,13 +3408,13 @@ fn os_scandir(args: &[Object]) -> Result<Object, RuntimeError> {
         .map_err(|e| crate::error::io_error_to_py_named(&e, Some(&dir_path)))?
         .filter_map(|r| r.ok())
         .map(|entry| {
-            let fs_path = entry.path().to_string_lossy().into_owned();
+            let fs_path = os_text(entry.path().as_os_str()).into_owned();
             let (name_obj, path_obj) = if bytes_mode {
                 (dir_entry_name_bytes(&entry), dir_entry_path_bytes(&entry))
             } else {
                 (
-                    Object::from_str(entry.file_name().to_string_lossy()),
-                    Object::from_str(fs_path.clone()),
+                    Object::from_str(os_text(&entry.file_name())),
+                    Object::from_str(fs_path.as_str()),
                 )
             };
             // CPython caches the inode from the directory read, so
@@ -3430,6 +3430,20 @@ fn os_scandir(args: &[Object]) -> Result<Object, RuntimeError> {
         })
         .collect();
     Ok(build_scandir_iterator(entries))
+}
+
+/// An OS string as text, as `to_string_lossy` gives it: validated as UTF-8
+/// first, which runs several times faster than the lossy decoder's scan
+/// for the valid names nearly every directory holds.
+fn os_text(s: &std::ffi::OsStr) -> std::borrow::Cow<'_, str> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        if let Ok(t) = std::str::from_utf8(s.as_bytes()) {
+            return std::borrow::Cow::Borrowed(t);
+        }
+    }
+    s.to_string_lossy()
 }
 
 /// `DirEntry.name` as `bytes` for a `bytes`-mode `scandir`. On Unix the OS
