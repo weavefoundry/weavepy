@@ -33195,6 +33195,28 @@ impl Interpreter {
     /// direct operation when it applies, else the builtin. `None` when the
     /// class's `__next__` is not a registered leaf.
     #[inline]
+    /// `next(it)` of a plain iterator class's instance whose `__next__` is
+    /// a warm pure or effect leaf of `(self)` (`self.i += 1; return x`):
+    /// its value, the stores committed. `None` for anything else, a
+    /// `raise StopIteration` path among it, having done nothing.
+    pub(crate) fn leaf_python_next(&self, it: &Object, inst: &PyInstance) -> Option<Object> {
+        use crate::types::{vm_key, AttrKey};
+        let f = Self::instance_dunder_function(inst, AttrKey::vm(vm_key::NEXT_FN), "__next__")?;
+        let code = f.code();
+        if code.arg_count != 1 || !pure_leaf_warm(&code) {
+            return None;
+        }
+        let pure = code_is_pure_leaf(&code);
+        if !(pure || code_is_effect_leaf(&code)) {
+            return None;
+        }
+        let depth = crate::recursion::current_depth();
+        if depth >= crate::recursion::recursion_limit() {
+            return None;
+        }
+        self.pure_leaf_call(&code, &f, &[std::ptr::from_ref(it)], !pure, depth)
+    }
+
     fn leaf_next_step(
         &self,
         it: &Object,
@@ -50448,8 +50470,9 @@ impl Interpreter {
                     crate::types::AttrKey::vm(crate::types::vm_key::NEXT_FN),
                     "__next__",
                 ) {
+                    // (A warm pure or effect leaf evaluates in place.)
                     return self
-                        .call_python(&f, std::slice::from_ref(iter), &[])
+                        .call_dunder_function(f, std::slice::from_ref(iter))
                         .map(Some);
                 }
                 // A registered native leaf `__next__` (the class cache the

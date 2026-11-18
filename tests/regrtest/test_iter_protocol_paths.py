@@ -147,5 +147,73 @@ class ZipDrainTests(unittest.TestCase):
         self.assertEqual(strict_err, "zip() argument 2 is shorter than argument 1")
 
 
+class PythonNextTests(unittest.TestCase):
+    def test_python_iterator_classes(self):
+        import sys
+
+        class It:
+            def __init__(self, n):
+                self.i = 0
+                self.n = n
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                if self.i >= self.n:
+                    raise StopIteration
+                self.i += 1
+                return self.i
+
+        class Tracked:
+            def __init__(self):
+                self.log = []
+                self.k = 0
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                self.k += 1
+                if self.k > 3:
+                    raise StopIteration("done")
+                self.log.append(self.k)
+                return self.k * 10
+
+        class Bad:
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                raise KeyError("x")
+
+        class Framed:
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                return sys._getframe().f_code.co_name
+
+        for i in range(N):
+            a = [x for x in It(5)]
+            t = Tracked()
+            b = list(t)
+            c = (t.k, t.log)
+            totals = (sum(It(4)), max(It(6)), tuple(It(3)))
+            it = It(3)
+            next(it)
+            d = list(it)
+            try:
+                for x in Bad():
+                    pass
+            except KeyError as e:
+                k = e.args
+            g = next(Framed())
+        self.assertEqual(a, [1, 2, 3, 4, 5])
+        self.assertEqual((b, c), ([10, 20, 30], (4, [1, 2, 3])))
+        self.assertEqual(totals, (10, 6, (1, 2, 3)))
+        self.assertEqual((d, k, g), ([2, 3], ("x",), "__next__"))
+
+
 if __name__ == "__main__":
     unittest.main()

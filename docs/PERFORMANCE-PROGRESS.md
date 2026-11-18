@@ -831,7 +831,15 @@ branch and pull request.
     in place (7,043 to 2,850, against 1,590), and their `TypeError` now
     reads as CPython's. `str.maketrans` joins the builtins run in place
     (7,615 to 5,968), and `sum(reversed(xs))` of ints adds the rest of the
-    reversed snapshot at once (3,558 to 2,286, against 1,755).
+    reversed snapshot at once (3,558 to 2,286, against 1,755). A `for`
+    loop over a Python iterator class ran its `__next__` as a full
+    activation through the general step for every item, compiled code
+    having no lane for it (440 instructions an item to CPython's 136): a
+    `__next__` that evaluates as a pure or effect leaf (`self.i += 1;
+    return x`, its stores committed at the return) now runs frameless from
+    compiled loops and from the native consumers (`list`, `sum`), its
+    `raise StopIteration` still the full path's (248 an item; `list(it)`
+    of ten items 3,279 to 2,738).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
