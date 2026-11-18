@@ -16770,6 +16770,16 @@ fn push_item_repr(out: &mut String, x: &Object) {
         }
         Object::Bool(b) => out.push_str(if *b { "True" } else { "False" }),
         Object::None => out.push_str("None"),
+        // Printable ASCII with no quote or backslash: single-quoted as is.
+        Object::Str(t)
+            if t.as_bytes()
+                .iter()
+                .all(|&c| (0x20..0x7f).contains(&c) && c != b'\'' && c != b'\\') =>
+        {
+            out.push('\'');
+            out.push_str(t);
+            out.push('\'');
+        }
         _ => out.push_str(&x.repr()),
     }
 }
