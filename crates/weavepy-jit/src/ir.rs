@@ -1548,6 +1548,11 @@ pub struct TFunc {
     /// holds nothing. A deopt strictly inside `(live_from, live_to)`
     /// re-inserts it (the `token` field is unused).
     pub null_spans: Vec<CalleeSpanMeta>,
+    /// The pcs of `CallDyn`s whose callee was a Python function (or a
+    /// method bound to one) when the code compiled: tier 2 calls it
+    /// through the interpreter's generic call protocol, where the frame
+    /// JIT checks and enters the callee directly.
+    pub py_dyn_calls: Vec<u32>,
     /// OSR entry points (RFC 0059 WS3b): backward-jump target blocks
     /// enterable via `entry_pc`.
     pub osr_entries: Vec<OsrEntry>,

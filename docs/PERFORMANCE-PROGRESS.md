@@ -656,6 +656,19 @@ branch and pull request.
     13.2; 10.3 ms to 1.3, against 1.3). `bytes.split()` and `bytes.hex()`
     without options build their pieces and digits directly (5,284 to
     3,546 against 3,386, and 2,197 to 1,377 against 1,185).
+  - Loops calling a function held in a local. Tier 2 compiled such a loop
+    and called the function through its generic call helper, about 800
+    instructions more a call than the frame JIT's direct entry: `f(1, 2,
+    3)` of a local `f` ran 932 instructions an iteration under tier 2 and
+    114 with it off (CPython 515). The analysis now records which of a
+    loop's dynamic calls have a Python callee, and a loop whose typed
+    arithmetic and guarded calls don't repay them (24 typed operations,
+    or one guarded call, for each) is left to the frame JIT: 932 to 198.
+    A float-heavy loop with such a call stays in tier 2, which saves it
+    about 30 instructions a float operation. Fixtures, suite and battery
+    are flat. A call of a global function tier 2 can't compile (one with
+    keyword-only parameters, `*args` or `**kwargs`) takes the same
+    generic path and isn't covered yet (`fkw(i, c=4)` 1,115 against 680).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

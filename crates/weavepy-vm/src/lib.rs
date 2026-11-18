@@ -92965,6 +92965,9 @@ assert loop(2000) == 1999000
             assert!(status.success(), "borrowed scalar child: {status}");
             return;
         }
+        // Its loops do little but call a local function, which tier 2
+        // otherwise leaves to the frame JIT (`call_bound`).
+        weavepy_jit::admit_generic_loops();
         std::thread::Builder::new()
             .stack_size(8 * 1024 * 1024)
             .spawn(|| {

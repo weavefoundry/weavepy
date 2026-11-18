@@ -1108,6 +1108,9 @@ fn analyze_admitted(
     if attr_bound(&tfunc) {
         return Err(JitVerdict::UnsupportedOpcode("attribute-bound loop"));
     }
+    if call_bound(&tfunc) {
+        return Err(JitVerdict::UnsupportedOpcode("call-bound loop"));
+    }
     if unpacks_pairs(&tfunc) {
         return Err(JitVerdict::UnsupportedOpcode("tuple-target loop"));
     }
@@ -1253,6 +1256,62 @@ fn attr_bound(tfunc: &TFunc) -> bool {
         }
     }
     attrs > typed
+}
+
+/// Whether `tfunc`'s loops make dynamic calls of Python functions that
+/// outweigh what tier 2 does better: a Python callee called through tier
+/// 2's generic call helper (one held in a local, say) costs about 800
+/// host instructions more than the frame JIT's call of it, which checks
+/// and enters the callee directly or inlines it (`f(1, 2, 3)` of a local
+/// `f`: 932 instructions against 114), where each typed operation saves
+/// tier 2 only a few, and each guarded call (a global function's, a
+/// method's) it makes native-to-native. So a loop with fewer than
+/// [`call_weight`] typed operations, counting a guarded call as that
+/// many, for each such dynamic call runs faster in the frame JIT. Calls
+/// of builtins don't count: tier 2's helper runs those about as fast. A
+/// loop-free body is left alone, as for [`attr_bound`].
+fn call_bound(tfunc: &TFunc) -> bool {
+    use crate::ir::TOp;
+    let weight = call_weight();
+    if weight == 0
+        || tfunc.py_dyn_calls.is_empty()
+        || GENERIC_LOOPS_ADMITTED.load(std::sync::atomic::Ordering::Relaxed)
+        || !has_loop(tfunc)
+    {
+        return false;
+    }
+    let (mut calls, mut typed) = (0usize, 0usize);
+    for st in loop_blocks(tfunc).flat_map(|b| &b.stmts) {
+        match st.op {
+            TOp::CallDyn { .. } if tfunc.py_dyn_calls.binary_search(&st.pc).is_ok() => calls += 1,
+            TOp::CallPy { .. } | TOp::CallPyKw { .. } | TOp::CallMethod { .. } => typed += weight,
+            TOp::IntArith(_)
+            | TOp::FloatArith(_)
+            | TOp::IntTrueDiv
+            | TOp::IntCmp(_)
+            | TOp::FloatCmp(_)
+            | TOp::IntNeg
+            | TOp::FloatNeg
+            | TOp::IntInvert => typed += 1,
+            _ => {}
+        }
+    }
+    calls * weight > typed
+}
+
+/// How many typed operations a loop needs for each dynamic call before
+/// tier 2 takes it (see [`call_bound`]): 24 unless `WEAVEPY_T2_CALLS`
+/// says otherwise (`0` turns the rule off), a tuning aid. (A float
+/// operation saves tier 2 about 30 instructions over the frame JIT, so
+/// some 27 of them repay one generic call; integer ones save less.)
+fn call_weight() -> usize {
+    static WEIGHT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WEIGHT.get_or_init(|| {
+        std::env::var("WEAVEPY_T2_CALLS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(24)
+    })
 }
 
 /// The generic share [`mostly_generic`] admits, in percent, and whether it

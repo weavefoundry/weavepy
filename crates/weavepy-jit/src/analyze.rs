@@ -245,6 +245,11 @@ pub struct Probes<'a> {
     /// *unbound* slot keeps the retriable probe-miss verdict, so a
     /// later training point can still specialize.
     pub obj: &'a mut dyn FnMut(u32) -> bool,
+    /// Whether local `slot` holds a plain Python function, or a method
+    /// bound to one, in the requesting activation: a dynamic call of it
+    /// runs Python through the generic call helper (see
+    /// [`TFunc::py_dyn_calls`]).
+    pub py_callee: &'a mut dyn FnMut(u32) -> bool,
     /// The observed lane of local `slot` in the requesting activation,
     /// graded like [`Self::param`] (scalars, `str`, `bytes`, and the
     /// object lane; lists and dicts stay `None` for their use-site
@@ -630,6 +635,7 @@ pub fn analyze_with_probes(
         obj_global: &mut |_| None,
         cell: &mut |_| None,
         obj: &mut |_| false,
+        py_callee: &mut |_| false,
         local: &mut |_| None,
         stack_iter: &mut |_| None,
         pairs: &mut |_| None,
@@ -664,6 +670,7 @@ pub fn analyze_for_ret(
         obj_global: &mut obj,
         cell: &mut |_| None,
         obj: &mut |_| false,
+        py_callee: &mut |_| false,
         local: &mut |_| None,
         stack_iter: &mut |_| None,
         pairs: &mut |_| None,
@@ -1542,6 +1549,7 @@ fn analyze_once(
         math_guards: Vec::new(),
         math_spans: Vec::new(),
         null_spans: Vec::new(),
+        py_dyn_calls: Vec::new(),
         max_call_args: 0,
         loop_depths: HashMap::default(),
         comp_saved: HashMap::default(),
@@ -1866,6 +1874,12 @@ fn analyze_once(
         math_guards: out.math_guards,
         math_spans: out.math_spans,
         null_spans: out.null_spans,
+        py_dyn_calls: {
+            let mut v = out.py_dyn_calls;
+            v.sort_unstable();
+            v.dedup();
+            v
+        },
         osr_entries,
         resume_entries,
         max_call_args: out.max_call_args,
@@ -7027,6 +7041,9 @@ struct EmitOut {
     /// RFC 0074 WS2 — self-or-null `Unbound` markers of opaque-call
     /// sites (`token` unused, `live_to` = the consuming `CALL` pc).
     null_spans: Vec<CalleeSpanMeta>,
+    /// The pcs of `CallDyn`s whose callee is a Python function (see
+    /// [`TFunc::py_dyn_calls`]).
+    py_dyn_calls: Vec<u32>,
     max_call_args: u32,
     /// RFC 0073 WS1 — per-loop interpreter depth of the erased
     /// iterator, keyed by the loop span's `live_from` pc (recorded at
@@ -8851,6 +8868,9 @@ fn emit_instr(
                 if !f.ty.is_pinned() {
                     return Err(JitVerdict::UnsupportedOpcode("CALL (callee lane)"));
                 }
+                if f.src.is_some_and(|slot| (probes.py_callee)(slot)) {
+                    out.py_dyn_calls.push(pc);
+                }
                 for &ty in &arg_tys {
                     // Any representable lane stages by tag — pins are
                     // meaningful here (the marshal never leaves this
@@ -9060,6 +9080,9 @@ fn emit_instr(
                 // See `CALL`: the helper receives pin bits.
                 if !f.ty.is_pinned() {
                     return Err(JitVerdict::UnsupportedOpcode("CALL_KW (callee lane)"));
+                }
+                if f.src.is_some_and(|slot| (probes.py_callee)(slot)) {
+                    out.py_dyn_calls.push(pc);
                 }
                 for &ty in &arg_tys {
                     if !ty.is_representable() {

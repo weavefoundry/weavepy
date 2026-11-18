@@ -1401,6 +1401,7 @@ impl JitState {
             ctor_field,
             cell,
             obj_live,
+            py_callee,
             stack_iter,
             pairs,
         } = probes;
@@ -1630,6 +1631,7 @@ impl JitState {
                 obj_global: &mut probe_obj_global,
                 cell: &mut **cell,
                 obj: &mut **obj_live,
+                py_callee: &mut **py_callee,
                 local: &mut probe_local,
                 stack_iter: &mut **stack_iter,
                 pairs: &mut **pairs,
@@ -2289,6 +2291,9 @@ struct VmProbes<'a> {
     /// the requesting activation (no grading), for the analyzer's
     /// generic-attribute probe-miss fallback.
     obj_live: &'a mut dyn FnMut(u32) -> bool,
+    /// Whether local `slot` holds a Python function or a method bound to
+    /// one (see [`probe_py_callee`]).
+    py_callee: &'a mut dyn FnMut(u32) -> bool,
     /// The lane of the live loop iterator at an interpreter-stack index
     /// of the requesting activation (see [`probe_stack_iter_lane`]).
     stack_iter: &'a mut dyn FnMut(u32) -> Option<JitType>,
@@ -2749,6 +2754,7 @@ fn method_ret_info(
         cell: &mut |_| None,
         // Depth bound: no live locals to observe in the nested view.
         obj: &mut |_| false,
+        py_callee: &mut |_| false,
         local: &mut |_| None,
         stack_iter: &mut |_| None,
         pairs: &mut |_| None,
@@ -3118,6 +3124,17 @@ fn probe_obj_live(frame: &super::Frame, slot: u32) -> bool {
     locals
         .get(slot as usize)
         .is_some_and(|o| !matches!(o, Object::Unbound))
+}
+
+/// Whether local `slot` holds a plain Python function, or a method bound
+/// to one, in the requesting activation (see `Probes::py_callee`).
+fn probe_py_callee(frame: &super::Frame, slot: u32) -> bool {
+    let locals = frame.locals.borrow();
+    match locals.get(slot as usize) {
+        Some(Object::Function(_)) => true,
+        Some(Object::BoundMethod(bm)) => matches!(bm.function, Object::Function(_)),
+        _ => false,
+    }
 }
 
 /// RFC 0073 WS2 — the dict-lane probe: `(key lane, value lane)` of
@@ -4136,6 +4153,7 @@ fn inline_method_body(
         obj_global: &mut |_| None,
         cell: &mut |_| None,
         obj: &mut |_| false,
+        py_callee: &mut |_| false,
         local: &mut |_| None,
         stack_iter: &mut |_| None,
         pairs: &mut |_| None,
@@ -4434,6 +4452,7 @@ pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::F
             |cls: &str, attr: &str| probe_ctor_field(interp_ref, frame_ref, cls, attr);
         let mut probe_cell = |idx: u32| probe_cell_lane(frame_ref, idx);
         let mut probe_obj = |slot: u32| probe_obj_live(frame_ref, slot);
+        let mut probe_py = |slot: u32| probe_py_callee(frame_ref, slot);
         let mut probe_iter = |depth: u32| probe_stack_iter_lane(frame_ref, depth);
         let mut probe_pairs = |slot: u32| probe_pair_lanes(frame_ref, slot);
         let _ = st.get_compiled(
@@ -4453,6 +4472,7 @@ pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::F
                 ctor_field: &mut probe_ctor_fld,
                 cell: &mut probe_cell,
                 obj_live: &mut probe_obj,
+                py_callee: &mut probe_py,
                 stack_iter: &mut probe_iter,
                 pairs: &mut probe_pairs,
             },
@@ -14733,6 +14753,7 @@ pub(crate) fn try_enter(interp: &mut super::Interpreter, frame: &mut super::Fram
             |cls: &str, attr: &str| probe_ctor_field(interp_ref, frame_ref, cls, attr);
         let mut probe_cell = |idx: u32| probe_cell_lane(frame_ref, idx);
         let mut probe_obj = |slot: u32| probe_obj_live(frame_ref, slot);
+        let mut probe_py = |slot: u32| probe_py_callee(frame_ref, slot);
         let mut probe_iter = |depth: u32| probe_stack_iter_lane(frame_ref, depth);
         let mut probe_pairs = |slot: u32| probe_pair_lanes(frame_ref, slot);
         st.get_compiled(
@@ -14752,6 +14773,7 @@ pub(crate) fn try_enter(interp: &mut super::Interpreter, frame: &mut super::Fram
                 ctor_field: &mut probe_ctor_fld,
                 cell: &mut probe_cell,
                 obj_live: &mut probe_obj,
+                py_callee: &mut probe_py,
                 stack_iter: &mut probe_iter,
                 pairs: &mut probe_pairs,
             },
@@ -14998,6 +15020,7 @@ pub(crate) fn try_enter_osr(interp: &mut super::Interpreter, frame: &mut super::
             |cls: &str, attr: &str| probe_ctor_field(interp_ref, frame_ref, cls, attr);
         let mut probe_cell = |idx: u32| probe_cell_lane(frame_ref, idx);
         let mut probe_obj = |slot: u32| probe_obj_live(frame_ref, slot);
+        let mut probe_py = |slot: u32| probe_py_callee(frame_ref, slot);
         let mut probe_iter = |depth: u32| probe_stack_iter_lane(frame_ref, depth);
         let mut probe_pairs = |slot: u32| probe_pair_lanes(frame_ref, slot);
         st.get_compiled(
@@ -15017,6 +15040,7 @@ pub(crate) fn try_enter_osr(interp: &mut super::Interpreter, frame: &mut super::
                 ctor_field: &mut probe_ctor_fld,
                 cell: &mut probe_cell,
                 obj_live: &mut probe_obj,
+                py_callee: &mut probe_py,
                 stack_iter: &mut probe_iter,
                 pairs: &mut probe_pairs,
             },
@@ -15410,6 +15434,7 @@ pub(crate) fn try_enter_resume(
             |cls: &str, attr: &str| probe_ctor_field(interp_ref, frame_ref, cls, attr);
         let mut probe_cell = |idx: u32| probe_cell_lane(frame_ref, idx);
         let mut probe_obj = |slot: u32| probe_obj_live(frame_ref, slot);
+        let mut probe_py = |slot: u32| probe_py_callee(frame_ref, slot);
         let mut probe_iter = |depth: u32| probe_stack_iter_lane(frame_ref, depth);
         let mut probe_pairs = |slot: u32| probe_pair_lanes(frame_ref, slot);
         st.get_compiled(
@@ -15429,6 +15454,7 @@ pub(crate) fn try_enter_resume(
                 ctor_field: &mut probe_ctor_fld,
                 cell: &mut probe_cell,
                 obj_live: &mut probe_obj,
+                py_callee: &mut probe_py,
                 stack_iter: &mut probe_iter,
                 pairs: &mut probe_pairs,
             },
