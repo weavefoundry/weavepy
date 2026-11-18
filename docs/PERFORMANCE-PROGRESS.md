@@ -915,6 +915,14 @@ branch and pull request.
     instructions to CPython's 545); a write at the stream's end with
     nothing exported now appends in place (850). `getvalue()` of an open
     `BytesIO` or `StringIO` gets a leaf half too (1,097 to 922).
+  - `OrderedDict` is a Python class over a native order dict that starts
+    on the first store. The store's leaf half declined while there was
+    none, so every fresh `OrderedDict`'s first store took the full path;
+    it now starts the order in place (three stores into a fresh one
+    12,212 instructions to 7,246, against 2,956). Construction from an
+    iterable unpacks an exact 2-tuple directly, the other shapes still
+    stepping as CPython's `odict` does for its errors (from a generator of
+    five pairs 47,414 to 36,109, against 10,146).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

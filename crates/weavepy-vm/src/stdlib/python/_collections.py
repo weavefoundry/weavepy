@@ -672,6 +672,12 @@ class OrderedDict(dict):
         if items is not None:
             other = items()
         for pair in other:
+            # (A 2-tuple, the common pair, unpacks as the steps below
+            # would; anything else goes through them for their errors.)
+            if type(pair) is tuple and len(pair) == 2:
+                key, value = pair
+                self[key] = value
+                continue
             it = iter(pair)
             try:
                 key = next(it)

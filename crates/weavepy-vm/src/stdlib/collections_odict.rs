@@ -250,8 +250,13 @@ fn od_setitem_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let Some(Object::Dict(main)) = inst.native.get() else {
         return None;
     };
-    let order = peek_order(inst)?;
     let probe = crate::object::LeafProbe::new(key)?;
+    // (A fresh dict's order starts here, as the full store starts it.)
+    let order = match peek_order(inst) {
+        Some(o) => o,
+        None if inst.slots.try_borrow_mut().is_ok() => order_of(inst),
+        None => return None,
+    };
     let mut m = main.try_borrow_mut().ok()?;
     let mut o = order.try_borrow_mut().ok()?;
     // One probe of each finds the entry or the slot a new key takes.
