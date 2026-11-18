@@ -839,7 +839,9 @@ branch and pull request.
     return x`, its stores committed at the return) now runs frameless from
     compiled loops and from the native consumers (`list`, `sum`), its
     `raise StopIteration` still the full path's (248 an item; `list(it)`
-    of ten items 3,279 to 2,738).
+    of ten items 3,279 to 2,738). The core loop's `FOR_ITER` takes the
+    same shortcut, so a cold loop over one runs 282 an item instead of
+    532.
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

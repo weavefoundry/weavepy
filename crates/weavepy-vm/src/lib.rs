@@ -14445,6 +14445,16 @@ impl Interpreter {
                             // stays exhausted) and ends the loop.
                             obj @ Object::Instance(inst) => {
                                 let Some(step) = self.leaf_next_step(obj, inst) else {
+                                    // A Python `__next__` that evaluates
+                                    // frameless (its end is the full arm's).
+                                    if let Some(v) = self.leaf_python_next(obj, inst) {
+                                        // SAFETY: `len < cap`.
+                                        unsafe { base.add(len).write(v) };
+                                        len += 1;
+                                        last = pc;
+                                        pc += 1;
+                                        continue;
+                                    }
                                     break None;
                                 };
                                 match step {
