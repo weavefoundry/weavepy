@@ -14657,8 +14657,16 @@ fn is_builtin_error_handler(o: &Object) -> bool {
 /// `s.encode([encoding])` with a plain codec, when every character
 /// encodes (an unencodable one raises on the full path).
 pub(crate) fn str_encode_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
-    let (Object::Str(s), rest) = args.split_first()? else {
-        return None;
+    let (recv, rest) = args.split_first()?;
+    // (A `str` subclass's instance, `str.encode` itself being the method
+    // called: its text, as the full method encodes it.)
+    let s = match recv {
+        Object::Str(s) => s,
+        Object::Instance(inst) => match inst.native.get() {
+            Some(Object::Str(s)) => s,
+            _ => return None,
+        },
+        _ => return None,
     };
     if rest.len() > 1 && !(rest.len() == 2 && is_builtin_error_handler(&rest[1])) {
         return None;
