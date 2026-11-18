@@ -225,6 +225,9 @@ impl Interpreter {
         if chain_drain(l, out) {
             return Ok(true);
         }
+        if zip_seq_bulk(l, out) {
+            return Ok(true);
+        }
         let (func, source, filter) = match &*l.state.borrow() {
             LazyIterKind::Map { func, iters, .. } if iters.len() == 1 => {
                 (func.clone(), iters[0].clone(), false)
@@ -1747,6 +1750,112 @@ fn ready_next(it: &Object) -> Option<Object> {
         return None;
     }
     src_step(it)
+}
+
+/// `zip`'s items over sources that are all list or tuple iterators (not
+/// `strict`, nothing held back), drained in one pass: as many tuples as
+/// the shortest has items left, then the end step CPython's takes, one
+/// more item from each source before the first exhausted one (dropped,
+/// as it drops them) and that one stepped to its end. Cloning items runs
+/// no code. `false`, touching nothing, for any other `zip`.
+fn zip_seq_bulk(l: &Rc<PyLazyIter>, out: &mut Vec<Object>) -> bool {
+    use crate::object::PyIterator;
+    const WIDTH: usize = 8;
+    let Ok(st) = l.state.try_borrow() else {
+        return false;
+    };
+    let LazyIterKind::Zip {
+        iters,
+        strict: false,
+        held,
+        ..
+    } = &*st
+    else {
+        return false;
+    };
+    let width = iters.len();
+    if !held.is_empty() || !(2..=WIDTH).contains(&width) {
+        return false;
+    }
+    let mut cells: [Option<Rc<RefCell<PyIterator>>>; WIDTH] = Default::default();
+    for (k, src) in iters.iter().enumerate() {
+        let Object::Iter(c) = src else {
+            return false;
+        };
+        // (A source given twice steps twice a row: the general steps'.)
+        if cells[..k].iter().flatten().any(|d| Rc::ptr_eq(c, d)) {
+            return false;
+        }
+        cells[k] = Some(c.clone());
+    }
+    drop(st);
+    let cells = &cells[..width];
+    // Every source's items and position, read in place (no code runs
+    // while the views live).
+    let mut views: [(&[Object], usize); WIDTH] = [(&[], 0); WIDTH];
+    let mut guards = Vec::with_capacity(width);
+    for c in cells.iter().flatten() {
+        let Ok(cur) = c.try_borrow() else {
+            return false;
+        };
+        guards.push(cur);
+    }
+    let mut list_guards = Vec::with_capacity(width);
+    for g in &guards {
+        match &**g {
+            PyIterator::List { items, .. } => match items.try_borrow() {
+                Ok(v) => list_guards.push(Some(v)),
+                Err(_) => return false,
+            },
+            PyIterator::Tuple { .. } => list_guards.push(None),
+            _ => return false,
+        }
+    }
+    let mut n = usize::MAX;
+    for (k, g) in guards.iter().enumerate() {
+        let (items, index): (&[Object], usize) = match (&**g, &list_guards[k]) {
+            (PyIterator::List { index, .. }, Some(v)) => (v, *index),
+            (PyIterator::Tuple { items, index }, None) => (items, *index),
+            _ => return false,
+        };
+        let index = index.min(items.len());
+        views[k] = (items, index);
+        n = n.min(items.len() - index);
+    }
+    out.reserve(n);
+    for row in 0..n {
+        let item = |k: usize| views[k].0[views[k].1 + row].clone();
+        out.push(match width {
+            2 => Object::new_tuple_array([item(0), item(1)]),
+            3 => Object::new_tuple_array([item(0), item(1), item(2)]),
+            _ => Object::new_tuple((0..width).map(item).collect()),
+        });
+    }
+    // The end step: each source before the first exhausted one gives one
+    // more item, which the step drops.
+    let ends: [bool; WIDTH] =
+        std::array::from_fn(|k| k < width && views[k].1 + n >= views[k].0.len());
+    drop(list_guards);
+    drop(guards);
+    for c in cells.iter().flatten() {
+        match &mut *c.borrow_mut() {
+            PyIterator::List { index, .. } | PyIterator::Tuple { index, .. } => *index += n,
+            _ => unreachable!("checked above"),
+        }
+    }
+    let mut dropped = Vec::new();
+    for (k, c) in cells.iter().flatten().enumerate() {
+        let mut cur = c.borrow_mut();
+        let last = cur.next_value();
+        drop(cur);
+        if ends[k] {
+            debug_assert!(last.is_none());
+            break;
+        }
+        dropped.extend(last);
+    }
+    drop(dropped);
+    true
 }
 
 /// One step of an `itertools` adapter that runs no code and releases

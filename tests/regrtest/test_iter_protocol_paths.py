@@ -111,5 +111,41 @@ class IterProtocolTests(unittest.TestCase):
         self.assertEqual(r2, ((1, 2), []))
 
 
+class ZipDrainTests(unittest.TestCase):
+    def test_end_semantics(self):
+        for i in range(N):
+            a = [1, 2, 3, 4]
+            b = (5, 6, 7)
+            c = [8, 9]
+            ia, ib = iter(a), iter(b)
+            r1 = list(zip(ia, ib, c))
+            rest = (list(ia), list(ib))
+            it = iter([1, 2, 3, 4, 5])
+            pairs = list(zip(it, it))
+            left = list(it)
+            ja, jb = iter([1, 2, 3]), iter((4, 5, 6))
+            full = list(zip(ja, jb))
+            after = (next(ja, "end"), next(jb, "end"))
+            z = zip([1, 2], [3, 4, 5], [6, 7, 8])
+            w = (list(z), list(z))
+        self.assertEqual(r1, [(1, 5, 8), (2, 6, 9)])
+        self.assertEqual(rest, ([4], []))
+        self.assertEqual((pairs, left), ([(1, 2), (3, 4)], []))
+        self.assertEqual((full, after), ([(1, 4), (2, 5), (3, 6)], ("end", "end")))
+        self.assertEqual(w, ([(1, 3, 6), (2, 4, 7)], []))
+
+    def test_wide_and_mixed(self):
+        for i in range(N // 10):
+            big = list(zip(range(3), [1, 2, 3, 4], (5, 6, 7, 8, 9), [0] * 5, "abcdef",
+                           [1] * 9, (2,) * 9, [3] * 9))
+            strict_err = None
+            try:
+                list(zip([1, 2], (3,), strict=True))
+            except ValueError as e:
+                strict_err = str(e)
+        self.assertEqual(big[2], (2, 3, 7, 0, "c", 1, 2, 3))
+        self.assertEqual(strict_err, "zip() argument 2 is shorter than argument 1")
+
+
 if __name__ == "__main__":
     unittest.main()

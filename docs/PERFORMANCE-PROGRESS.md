@@ -815,7 +815,11 @@ branch and pull request.
     lays the fixed form out from the scientific digits (rounded at the
     same place), and `format()` of an exact `float`, `int` or `str` is a
     leaf builtin (5,272 to 3,874, against 2,417). A non-`str` spec raises
-    CPython's message.
+    CPython's message. `list(zip(a, b, c))` over lists and tuples stepped
+    the zip one tuple at a time through the pure steps; it drains in one
+    pass now, then takes the end step CPython's does (one more item from
+    each source before the first exhausted one), so the sources are left
+    exactly as stepping leaves them (9,056 to 6,069, against 4,556).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
