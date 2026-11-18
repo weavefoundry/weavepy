@@ -33010,11 +33010,23 @@ impl Interpreter {
                     calls.insert(Rc::as_ptr(f) as usize, LeafKind::Fast(fast));
                 }
             }
+            let mut method_names: std::collections::HashMap<
+                &'static str,
+                Vec<(LeafRecv, Rc<crate::object::BuiltinFn>)>,
+                crate::fasthash::FxBuildHasher,
+            > = Default::default();
+            for (recv, name, f) in &methods {
+                method_names
+                    .entry(name)
+                    .or_default()
+                    .push((*recv, f.clone()));
+            }
             LeafFns {
                 calls,
                 len_ptr,
                 next_ptr,
                 methods,
+                method_names,
                 range_ty: bt.range_.clone(),
                 list_ty: bt.list_.clone(),
                 str_ty: bt.str_.clone(),
@@ -33201,10 +33213,11 @@ impl Interpreter {
             _ => return None,
         };
         self.leaf_fns()
-            .methods
+            .method_names
+            .get(name)?
             .iter()
-            .find(|(r, n, _)| *r == kind && *n == name)
-            .map(|(_, _, f)| f.clone())
+            .find(|(r, _)| *r == kind)
+            .map(|(_, f)| f.clone())
     }
 
     /// `inst`'s class's `__next__` when it is a registered leaf builtin
@@ -76153,6 +76166,12 @@ struct LeafFns {
     /// `(receiver variant, name, method)` for `LOAD_METHOD_ATTR` on a
     /// builtin receiver.
     methods: Vec<(LeafRecv, &'static str, Rc<crate::object::BuiltinFn>)>,
+    /// The same methods by name, for a lookup without the scan.
+    method_names: std::collections::HashMap<
+        &'static str,
+        Vec<(LeafRecv, Rc<crate::object::BuiltinFn>)>,
+        crate::fasthash::FxBuildHasher,
+    >,
 }
 
 /// A *lean* activation: a plain Python-to-Python call made from the quiet
