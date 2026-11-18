@@ -686,6 +686,22 @@ branch and pull request.
     2.9, `OrderedDict()` 4.6, `functools.partial` 2.9, `itemgetter` 2.8).
     `os.scandir` and `os.listdir` validate names as UTF-8 before the
     lossy decoder, which cost about 300 instructions a name.
+    `OrderedDict()` returns from `__init__` when there's nothing to add
+    (4,762 to 3,077, against 1,039).
+  - Smaller single operations, from a sweep of 80 common statements.
+    `sum(d.values())` and `sum(d.keys())` read the dict in place (3,734 to
+    1,548 for three items, against 1,678). The pure `zip` steps, which
+    only produce an item when every source has one, take strict zips too,
+    as the end where `strict=` is checked stays the general step's (a
+    `for a, b in zip(x, y, strict=True)` loop over five items 16,909 to
+    7,255, against 4,973). `del xs[a:b]` of a unit step drains by its
+    bounds instead of building every index, and compiled code deletes
+    such a run itself when its items release without running code
+    (`L.extend(x); del L[-5:]` 2,873 to 1,460, against 1,399); the items
+    now release last first, as CPython's do. Finished, joined threads
+    leave the runtime's thread registry, which every reap scanned in full
+    (thread start and join 663k to 545k instructions over a thousand
+    threads, still 3.2 times CPython's).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
