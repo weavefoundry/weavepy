@@ -680,6 +680,29 @@ branch and pull request.
     twenty calls of 200,000 steps (plus a float loop of the same shape)
     and runs at 36 ms in tier 2 (CPython 351). Direct native calls still
     take only positional callees.
+  - Helpers that call helpers. A loop calling a short global function
+    that calls another (`g_mid(t)` with `return g_leaf(x)`) ran 1,045
+    instructions an iteration (CPython 932): tier 2 took the loop and
+    called `g_mid` through the frameless evaluator, which interpreted
+    both bodies. The analysis now asks, for each guarded call of a
+    global, whether its callee would run that way (a short loop-free
+    function tier 2 hasn't compiled as a scalar leaf and that isn't one
+    of the evaluator's tiny shapes), and the call-bound rule counts such
+    calls as it counts dynamic ones. The frame JIT then took the loop,
+    but lowered only `g_mid` in line: `g_leaf` had run only nested in
+    `g_mid`'s frameless evaluations, which counted nothing toward its
+    warmth, and its call went through the inlined body's call helper
+    (377 instructions). A callee of a callee lowered in line now counts
+    as warm once the evaluator has built its plan (a counter in the
+    evaluator's in-place call path instead cost `call_overhead` 10% of
+    its cycles at the same instruction count). The chain runs at 342
+    (a closure chain 833 to 358), `g_two` with a branch 651 to 252, and a
+    float loop around a tiny callee keeps tier 2's 155. Code whose
+    loops have run but that tier 2 still holds nothing for (`argparse`'s
+    `_get_values`, whose comprehensions it only ever left cold) went on
+    waiting for tier 2 for good; the frame JIT now takes it after 16
+    such triggers. The battery runs 0.6% fewer instructions (`email`,
+    `traceback` and generator cases 5%); fixtures are flat.
   - Constructors. A sweep of 45 common constructions against CPython
     found builtin types two to four times slower to build: their calls
     went through the type call, the instance plan and `__new__`/`__init__`

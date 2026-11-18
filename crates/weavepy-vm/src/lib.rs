@@ -25381,16 +25381,21 @@ impl Interpreter {
         nest: u8,
     ) -> Option<leaf_plan::LeafRet> {
         let ext = code_vm_ext(code)?;
-        if ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) >= 3 {
-            return self
-                .leaf_eval::<false, false>(code, f, args, nest)
-                .map(leaf_plan::LeafRet::Owned);
+        let r = if ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) >= 3 {
+            self.leaf_eval::<false, false>(code, f, args, nest)
+                .map(leaf_plan::LeafRet::Owned)
+        } else {
+            let plan = ext
+                .leaf_plan
+                .get_or_init(|| leaf_plan::build(code, ext).map(Box::new))
+                .as_deref()?;
+            self.leaf_run_ret::<false, false, false>(code, ext, plan, f, args, nest)
+        };
+        #[cfg(feature = "jit")]
+        if r.is_some() {
+            note_leaf_warm(ext);
         }
-        let plan = ext
-            .leaf_plan
-            .get_or_init(|| leaf_plan::build(code, ext).map(Box::new))
-            .as_deref()?;
-        self.leaf_run_ret::<false, false, false>(code, ext, plan, f, args, nest)
+        r
     }
 
     /// [`Self::leaf_eval`] of a callee certified as one of the tiny
@@ -84927,7 +84932,34 @@ pub(crate) fn callee_warm(code: &CodeObject, ext: &CodeConstObjects) -> bool {
     ext.frame_jit.compiled_nlocals().is_some()
         || code.jit_hint.lean_entries() >= 24
         || (code.jit_hint.is_compiled() && !code.jit_hint.is_not_jitable())
-        || ext.leaf_tries.load(Relaxed) & u64::from(u32::MAX) >= 24
+        || ext.leaf_tries.load(Relaxed) & u64::from(u32::MAX) >= LEAF_WARM_CALLS
+}
+
+/// Finished frameless evaluations after which a callee counts as warm (see
+/// [`callee_warm`]).
+#[cfg(feature = "jit")]
+const LEAF_WARM_CALLS: u64 = 24;
+
+/// Whether the frameless evaluator has built its plan for the code `ext`
+/// extends (it ran there, or tried to).
+#[cfg(feature = "jit")]
+pub(crate) fn leaf_plan_built(ext: &CodeConstObjects) -> bool {
+    ext.leaf_plan.get().is_some_and(Option::is_some)
+}
+
+/// Count a nested frameless evaluation of the code `ext` extends toward
+/// its warmth (see [`callee_warm`]), as a direct one counts: a helper only
+/// ever called from another frameless helper is still worth lowering in
+/// line where a compiled caller inlines that helper. (Counts up to the
+/// mark only, leaving the bails half alone.)
+#[cfg(feature = "jit")]
+#[inline(always)]
+pub(crate) fn note_leaf_warm(ext: &CodeConstObjects) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let tries = ext.leaf_tries.load(Relaxed);
+    if tries & u64::from(u32::MAX) < LEAF_WARM_CALLS {
+        ext.leaf_tries.store(tries + 1, Relaxed);
+    }
 }
 
 /// The `property` getter the `LOAD_ATTR` at `pc` last ran: the function, the

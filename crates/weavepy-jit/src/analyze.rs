@@ -942,12 +942,17 @@ impl Region {
     }
 }
 
-/// Whether tier 2 compiles code of this kind and signature at all. Sync
-/// generator bodies are admitted (RFC 0070 WS2: yields become `Yielded`
-/// side exits; entry is OSR-only); coroutines and async generators aren't.
 /// The flag that marks a [`Probes::py_callee`] argument as a global's name
 /// index rather than a local slot.
 pub const PY_CALLEE_GLOBAL: u32 = 1 << 31;
+
+/// With [`PY_CALLEE_GLOBAL`], asks instead whether a guarded call of the
+/// global (a `CallPy`) runs its callee through the embedder's frameless
+/// evaluator: a short function that tier 2 hasn't compiled and that isn't
+/// one of the evaluator's tiny shapes. Such a call costs several hundred
+/// instructions, as a dynamic one does (see [`crate::engine`]'s
+/// `call_bound`).
+pub const PY_CALLEE_FRAMELESS: u32 = 1 << 30;
 
 /// Whether the callee of a dynamic call is a Python function: a local's
 /// value the probe answers for, or (`f` from a `LOAD_GLOBAL` whose
@@ -967,6 +972,9 @@ fn dyn_callee_is_py(
     matches!(load.op, OpCode::LoadGlobal) && (probes.py_callee)(PY_CALLEE_GLOBAL | load.arg)
 }
 
+/// Whether tier 2 compiles code of this kind and signature at all. Sync
+/// generator bodies are admitted (RFC 0070 WS2: yields become `Yielded`
+/// side exits; entry is OSR-only); coroutines and async generators aren't.
 fn signature_admitted(code: &CodeObject) -> bool {
     !(code.is_coroutine
         || code.is_async_generator
@@ -9071,6 +9079,15 @@ fn emit_instr(
                 interp_depth: mark.interp_depth,
             });
             *max_call_args = (*max_call_args).max(argc as u32);
+            if mark.kind == MarkKind::Py && !mark.ctor && !mark.is_self {
+                let load = code.instructions.get(mark.load_pc as usize);
+                if load.is_some_and(|l| {
+                    l.op == OpCode::LoadGlobal
+                        && (probes.py_callee)(PY_CALLEE_GLOBAL | PY_CALLEE_FRAMELESS | l.arg)
+                }) {
+                    out.py_dyn_calls.push(pc);
+                }
+            }
             push(
                 TOp::CallPy {
                     token: mark.token,

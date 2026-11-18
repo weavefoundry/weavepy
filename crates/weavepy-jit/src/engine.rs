@@ -1283,7 +1283,13 @@ fn call_bound(tfunc: &TFunc) -> bool {
     let (mut calls, mut typed) = (0usize, 0usize);
     for st in loop_blocks(tfunc).flat_map(|b| &b.stmts) {
         match st.op {
-            TOp::CallDyn { .. } if tfunc.py_dyn_calls.binary_search(&st.pc).is_ok() => calls += 1,
+            // (A guarded call the analysis marked runs its callee
+            // frameless, which costs as much as a dynamic call.)
+            TOp::CallDyn { .. } | TOp::CallPy { .. }
+                if tfunc.py_dyn_calls.binary_search(&st.pc).is_ok() =>
+            {
+                calls += 1;
+            }
             TOp::CallPy { .. } | TOp::CallPyKw { .. } | TOp::CallMethod { .. } => typed += weight,
             TOp::IntArith(_)
             | TOp::FloatArith(_)

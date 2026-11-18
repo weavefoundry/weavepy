@@ -815,9 +815,16 @@ impl Slot {
             // got hot that way `CALL_WAITS` times with none of its loops
             // run: a loop that runs is tier 2's to enter by OSR, and one
             // that runs only now and then shouldn't be taken too soon.)
+            // Code whose loops have run but which tier 2 still holds
+            // nothing for after `LEFT_TO_TIER2` such triggers runs loops
+            // too short a call for tier 2 to take (`argparse`'s
+            // `_get_values`, whose comprehensions it only ever left
+            // cold): it would otherwise stay interpreted for good.
+            let looped = code.jit_hint.backedges_seen();
+            let waits = if looped { LEFT_TO_TIER2 } else { CALL_WAITS };
             let taken_for_calls = left == 0
-                && crate::tier2::missed_call_entry(code)
-                && self.call_waits.fetch_add(1, Ordering::Relaxed) + 1 >= CALL_WAITS;
+                && (looped || crate::tier2::missed_call_entry(code))
+                && self.call_waits.fetch_add(1, Ordering::Relaxed) + 1 >= waits;
             // (Nor is code tier 2 keeps failing to compile its to keep.)
             let left_to_tier2 =
                 left < LEFT_TO_TIER2 && !taken_for_calls && !crate::tier2::gave_up_often(code);

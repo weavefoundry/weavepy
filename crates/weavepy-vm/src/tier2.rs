@@ -1635,13 +1635,30 @@ impl JitState {
                     if slot & weavepy_jit::PY_CALLEE_GLOBAL == 0 {
                         return (py_callee)(slot);
                     }
-                    let Some(name) = code
-                        .names
-                        .get((slot & !weavepy_jit::PY_CALLEE_GLOBAL) as usize)
-                    else {
+                    let frameless = slot & weavepy_jit::PY_CALLEE_FRAMELESS != 0;
+                    let Some(name) = code.names.get(
+                        (slot & !(weavepy_jit::PY_CALLEE_GLOBAL | weavepy_jit::PY_CALLEE_FRAMELESS))
+                            as usize,
+                    ) else {
                         return false;
                     };
-                    (resolve_cell.borrow_mut())(name).is_some_and(|f| small_py_callee(&f))
+                    (resolve_cell.borrow_mut())(name).is_some_and(|f| {
+                        if !frameless {
+                            return small_py_callee(&f);
+                        }
+                        // (A callee compiled as a scalar leaf is entered
+                        // natively, see `direct` below.)
+                        let Object::Function(func) = &f else {
+                            return false;
+                        };
+                        let fcode = func.code.borrow();
+                        let k = Rc::as_ptr(&fcode).cast::<CodeObject>();
+                        let direct = cache_ref.get(&k).is_some_and(|e| match &e.tier {
+                            Tier::Compiled(a) => a.cf.direct_leaf(fcode.arg_count).is_some(),
+                            _ => false,
+                        });
+                        !direct && frameless_py_callee(&f)
+                    })
                 },
                 local: &mut probe_local,
                 stack_iter: &mut **stack_iter,
@@ -3161,6 +3178,28 @@ fn small_py_callee(f: &Object) -> bool {
         _ => return false,
     };
     func.code.borrow().instructions.len() <= SMALL_PY_CALLEE
+}
+
+/// Whether a guarded call of `f` (a `CallPy`) evaluates it frameless (see
+/// `wpjit_call_py`), given that tier 2 hasn't compiled it as a scalar leaf
+/// (which native code enters directly): a loop-free plain function short
+/// enough for [`small_py_callee`] that the frameless evaluator takes and
+/// that isn't one of its tiny shapes (answered in a few dozen
+/// instructions). The rest of its kind cost several hundred instructions
+/// a call, where the frame JIT lowers a short callee in line. (A callee
+/// with loops runs as tier 2's own native code.)
+fn frameless_py_callee(f: &Object) -> bool {
+    let Object::Function(func) = f else {
+        return false;
+    };
+    if !small_py_callee(f) {
+        return false;
+    }
+    let code = func.code.borrow();
+    code.jit_hint.loop_free(&code)
+        && crate::code_is_pure_leaf_pub(&code)
+        && crate::code_vm_ext_existing(&code)
+            .is_none_or(|ext| ext.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) < 3)
 }
 
 /// RFC 0073 WS2 — the dict-lane probe: `(key lane, value lane)` of
