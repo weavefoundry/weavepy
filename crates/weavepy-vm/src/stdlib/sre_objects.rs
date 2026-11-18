@@ -146,6 +146,20 @@ fn fast_subject(o: &Object, cc: &CompiledCode) -> bool {
     }
 }
 
+/// The subject a slicing body (`findall`, `split`) reads: a str
+/// subclass's instance reads as its payload, its pieces exact strs as
+/// CPython's slices of it are. (A body that builds match objects keeps the
+/// instance, which `Match.string` returns.)
+fn sliced_subject(o: &Object) -> &Object {
+    match o {
+        Object::Instance(i) => match i.native.get() {
+            Some(p @ Object::Str(_)) => p,
+            _ => o,
+        },
+        _ => o,
+    }
+}
+
 fn empty_like(o: &Object) -> Object {
     match o {
         Object::Bytes(_) => Object::new_bytes(Vec::new()),
@@ -636,7 +650,8 @@ fn pattern_search(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
 }
 
 fn pattern_findall(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
-    let a = exec_args(args)?;
+    let mut a = exec_args(args)?;
+    a.string = sliced_subject(a.string);
     with_pattern(a.recv, a.string, |_, cc, _| {
         let subject = Subject::new(a.string)?;
         let (mut p, e) = clamp(a.pos, a.endpos, subject.len());
@@ -969,6 +984,7 @@ fn pattern_split(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
         [Object::Bool(b)] => i64::from(*b),
         _ => return None,
     };
+    let string = sliced_subject(string);
     with_pattern(recv, string, |_, cc, _| {
         let subject = Subject::new(string)?;
         let e = subject.len();
