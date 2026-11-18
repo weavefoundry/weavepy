@@ -13589,12 +13589,13 @@ impl Object {
                 if !repr_enter(id) {
                     return "(...)".to_owned();
                 }
-                let mut s = String::from("(");
+                let mut s = String::with_capacity(2 + 4 * items.len());
+                s.push('(');
                 for (i, x) in items.iter().enumerate() {
                     if i > 0 {
                         s.push_str(", ");
                     }
-                    s.push_str(&x.repr());
+                    push_item_repr(&mut s, x);
                 }
                 if items.len() == 1 {
                     s.push(',');
@@ -13614,7 +13615,8 @@ impl Object {
                 // (test_list.test_repr_mutate pops it), which CPython's
                 // index-based `list_repr` tolerates — holding the borrow
                 // across the call would instead panic the cell.
-                let mut s = String::from("[");
+                let mut s = String::with_capacity(2 + 4 * items.borrow().len());
+                s.push('[');
                 let mut i = 0usize;
                 loop {
                     let x = {
@@ -13627,7 +13629,7 @@ impl Object {
                     if i > 0 {
                         s.push_str(", ");
                     }
-                    s.push_str(&x.repr());
+                    push_item_repr(&mut s, &x);
                     i += 1;
                 }
                 s.push(']');
@@ -16740,5 +16742,33 @@ mod tests {
         assert_eq!(b, Some(2));
         assert_eq!(c, Some(3));
         assert!(d.is_none());
+    }
+}
+
+/// A container item's repr appended to `out`: an `int`, `bool` or `None`
+/// written in place, anything else through its own [`Object::repr`].
+fn push_item_repr(out: &mut String, x: &Object) {
+    match x {
+        Object::Int(i) => {
+            let mut buf = [0u8; 20];
+            let mut at = buf.len();
+            let mut n = i.unsigned_abs();
+            loop {
+                at -= 1;
+                buf[at] = b'0' + (n % 10) as u8;
+                n /= 10;
+                if n == 0 {
+                    break;
+                }
+            }
+            if *i < 0 {
+                out.push('-');
+            }
+            // SAFETY: the digits are ASCII.
+            out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[at..]) });
+        }
+        Object::Bool(b) => out.push_str(if *b { "True" } else { "False" }),
+        Object::None => out.push_str("None"),
+        _ => out.push_str(&x.repr()),
     }
 }
