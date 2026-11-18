@@ -871,6 +871,11 @@ branch and pull request.
     `__get__` runs through the data descriptors' call lane (1,002 and
     395 instructions; a fresh object's first `cached_property` read
     11,087 to 5,952, against 3,899).
+  - `itertools.starmap` had no in-place step, so each item took the
+    general one (about 2,000 instructions). Over a list or tuple of
+    tuples with a callback that runs as a pure leaf it now steps as
+    `map` does: `list(starmap(operator.add, pairs))` of eight pairs
+    18,403 to 8,135 (CPython 4,572).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

@@ -3665,6 +3665,20 @@ impl Interpreter {
                     return Some(Some(v));
                 }
             },
+            // `starmap(f, pairs)` over a list or tuple of tuples, as `map`
+            // over one source steps (the item's fields the arguments).
+            LazyIterKind::StarMap {
+                func,
+                source: Object::Iter(c),
+            } if pure_callback_maybe(func) => {
+                let v = cursor_peek(c)?;
+                let Object::Tuple(t) = &v else {
+                    return None;
+                };
+                let r = self.pure_callback(func, t, true)?;
+                cursor_advance(c)?;
+                Some(Some(r))
+            }
             // `enumerate(map(...))` and the like: the source's own pure step.
             LazyIterKind::Enumerate {
                 source: Object::LazyIter(src),
