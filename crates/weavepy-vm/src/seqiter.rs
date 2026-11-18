@@ -2278,7 +2278,9 @@ pub(crate) fn builtin_ctor_arms(cls: &Rc<TypeObject>, args: &[Object]) -> Option
                 Object::Tuple(_) => Some(src.clone()),
                 // SAFETY: a read between two instructions (cloning runs no
                 // code).
-                Object::List(l) => Some(Object::new_tuple(unsafe { l.peek() }?.clone())),
+                Object::List(l) => Some(Object::tuple_from_exact(
+                    unsafe { l.peek() }?.iter().map(crate::clone_hot),
+                )),
                 _ => None,
             };
         }

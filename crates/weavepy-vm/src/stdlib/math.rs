@@ -1196,6 +1196,27 @@ fn math_isclose(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
 /// ``_PyIter_GetIter`` flow: try to make an iterator and pull values
 /// until exhaustion, coercing each to f64 along the way.
 fn collect_numbers(arg: &Object, func: &str) -> Result<Vec<f64>, RuntimeError> {
+    // An exact list or tuple of floats and machine ints: read in place.
+    let plain = |items: &[Object]| -> Option<Vec<f64>> {
+        items
+            .iter()
+            .map(|x| match *x {
+                Object::Float(f) => Some(f),
+                // (Exactly as `float(i)` rounds it.)
+                Object::Int(i) => Some(i as f64),
+                Object::Bool(b) => Some(f64::from(u8::from(b))),
+                _ => None,
+            })
+            .collect()
+    };
+    let read = match arg {
+        Object::List(l) => l.try_borrow().ok().and_then(|v| plain(&v)),
+        Object::Tuple(t) => plain(t),
+        _ => None,
+    };
+    if let Some(values) = read {
+        return Ok(values);
+    }
     // Iterate through the interpreter so tuple subclasses, generators, and
     // user `__iter__` work (CPython's `dist`/`fsum` accept any iterable):
     // `dist(T((1,2,3)), ...)` for a `tuple` subclass `T` reaches here as an
@@ -1223,10 +1244,13 @@ fn object_to_f64(value: &Object, func: &str) -> Result<f64, RuntimeError> {
     // take `FloatLike` and `Fraction`-style operands).
     match crate::builtins::coerce_f64_opt(value)? {
         Some(f) => Ok(f),
-        None => Err(type_error(format!(
-            "{func}() element must be a real number, not '{}'",
-            value.type_name()
-        ))),
+        None => {
+            let _ = func;
+            Err(type_error(format!(
+                "must be real number, not {}",
+                value.type_name()
+            )))
+        }
     }
 }
 

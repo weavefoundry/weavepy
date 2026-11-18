@@ -689,6 +689,7 @@ const SHORTCUT_NAMES: &[(u8, &str)] = &[
     (KIND_DATETIME, "fromtimestamp"),
     (KIND_DATETIME, "now"),
     (KIND_DATE, "today"),
+    (KIND_DATE, "fromisoformat"),
     // The slots behind the fields, which `leaf_field` reads by name too.
     (KIND_TIMEDELTA, "_days"),
     (KIND_TIMEDELTA, "_seconds"),
@@ -2697,6 +2698,31 @@ fn dt_now(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
 }
 
 /// `date.today()` of the exact class: `time.localtime()`'s date.
+/// `date.fromisoformat` for an ASCII `YYYY-MM-DD` or `YYYYMMDD` naming a
+/// real date, on the exact class. Anything else (week dates, a subclass,
+/// a bad field) declines to the Python method, which raises its errors.
+fn date_fromisoformat(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Type(cls), Object::Str(s)] = a else {
+        return None;
+    };
+    let st = state_of_cls(cls)?;
+    if !std::ptr::eq(Rc::as_ptr(cls), st.date.as_ptr()) {
+        return None;
+    }
+    let b = s.as_bytes();
+    let (y, m, d) = match b.len() {
+        10 if b[4] == b'-' && b[7] == b'-' => {
+            (digits(&b[0..4])?, digits(&b[5..7])?, digits(&b[8..10])?)
+        }
+        8 => (digits(&b[0..4])?, digits(&b[4..6])?, digits(&b[6..8])?),
+        _ => return None,
+    };
+    if !valid_date(y, m, d) {
+        return None;
+    }
+    Some(Ok(new_date(st, y, m, d)?))
+}
+
 fn date_today(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let [Object::Type(cls)] = a else { return None };
     let st = state_of_cls(cls)?;
@@ -3338,6 +3364,12 @@ const SPECS: &[Spec] = &[
         kind: KIND_DATE,
         name: "today",
         fast: date_today,
+        classmethod: true,
+    },
+    Spec {
+        kind: KIND_DATE,
+        name: "fromisoformat",
+        fast: date_fromisoformat,
         classmethod: true,
     },
 ];

@@ -820,6 +820,17 @@ branch and pull request.
     pass now, then takes the end step CPython's does (one more item from
     each source before the first exhausted one), so the sources are left
     exactly as stepping leaves them (9,056 to 6,069, against 4,556).
+  - A fifth sweep (74 statements over I/O buffers, dates, regular
+    expressions, `itertools` and `functools` variants). `date.fromisoformat`
+    was the pure-Python parse (14,759 instructions to CPython's 1,513); the
+    exact class's `YYYY-MM-DD` and `YYYYMMDD` now parse natively beside
+    `datetime.fromisoformat`'s, every other spelling and every error the
+    Python method's (1,056). `math.fsum` and `math.dist` stepped their
+    argument through the interpreter's iterator, publishing the
+    interpreter for each item; a list or tuple of floats and ints is read
+    in place (7,043 to 2,850, against 1,590), and their `TypeError` now
+    reads as CPython's. `str.maketrans` joins the builtins run in place
+    (7,615 to 5,968).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

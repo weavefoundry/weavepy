@@ -83910,6 +83910,8 @@ fn builtin_fn_lane_ok_uncached(name: &str) -> bool {
             | "pack" | "unpack" | "calcsize"
             // functools (whose callbacks run through reentrant calls)
             | "reduce"
+            // `str.maketrans`/`bytes.maketrans` (static, pure)
+            | "maketrans"
             // warnings (which reads the whole stack, lean activations included)
             | "warn"
             // asyncio (`gather` reads the running loop's current task)
