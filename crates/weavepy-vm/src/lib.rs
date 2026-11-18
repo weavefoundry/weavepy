@@ -19479,6 +19479,26 @@ impl Interpreter {
         let [callee, Object::Unbound, spread, mapping] = &frame.stack[callee_slot..] else {
             return None;
         };
+        // `dict(**kw)`: the mapping the call built (no one else holds it)
+        // is the new dict, its keys all exact strings as keywords are.
+        if let (Object::Type(t), Object::Tuple(sp), Object::Dict(d)) = (callee, spread, mapping) {
+            // SAFETY: a read that runs no code.
+            if Rc::ptr_eq(t, &builtin_types().dict_)
+                && sp.is_empty()
+                && Rc::strong_count(d) == 1
+                && unsafe { d.peek() }
+                    .is_some_and(|m| m.keys().all(|k| matches!(k.0, Object::Str(_))))
+            {
+                let out = frame.stack.pop()?;
+                let ops: Vec<Object> = frame.stack.drain(callee_slot..).collect();
+                frame.pc = pc as u32 + 1;
+                frame.stack.push(out);
+                for o in ops {
+                    self.release(o);
+                }
+                return Some(Ok(()));
+            }
+        }
         // A builtin, or a native method bound to its receiver
         // (`callback(*args, **kwds)` of a saved `log.append`), which takes
         // the receiver first, as a `CALL` of the method passes it.

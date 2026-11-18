@@ -876,6 +876,10 @@ branch and pull request.
     tuples with a callback that runs as a pure leaf it now steps as
     `map` does: `list(starmap(operator.add, pairs))` of eight pairs
     18,403 to 8,135 (CPython 4,572).
+  - `dict(**d)` copied the keyword mapping the call had just built,
+    passing each key through a Rust string on the way. That mapping is
+    held by nothing else, so with all its keys exact strings it is now
+    the new dict (5,948 instructions to 2,367, against 2,443).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
