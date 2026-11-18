@@ -32216,9 +32216,12 @@ impl Interpreter {
         if !std::ptr::eq(cls, b.cls_raw()) {
             return None;
         }
-        let Some(Object::Function(f)) = cls.lookup("__eq__") else {
-            return None;
-        };
+        // (Memoized for the class's version.)
+        let f = Self::instance_dunder_function(
+            a,
+            crate::types::AttrKey::vm(crate::types::vm_key::EQ_FN),
+            "__eq__",
+        )?;
         let code = f.code();
         if !code_is_pure_leaf(&code)
             || !pure_leaf_warm(&code)
