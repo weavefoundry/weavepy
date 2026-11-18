@@ -1002,6 +1002,15 @@ branch and pull request.
     leaf path; a store by a key that hashes and compares natively now
     goes straight into the dict (`d[k] += 1` in a compiled loop 1,276
     instructions to 1,024, against 743).
+  - `defaultdict` construction and misses ran its native `__init__` and
+    `__missing__` through the generic paths: `defaultdict()` 4,817
+    instructions to CPython's 1,484, a miss 6,888 to 2,105. The exact
+    class's plain calls build the instance in place through its own
+    constructor hook, which the native-constructor lane now consults for
+    Python classes too, and compiled code's item read stores and returns
+    a miss's value where the factory is a common builtin type, as
+    `__missing__` does (1,972 and 2,720; `defaultdict(list)` with one
+    miss 11,452 to 4,034, against 3,192).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

@@ -1335,7 +1335,33 @@ fn install_defaultdict(args: &[Object]) -> Result<Object, RuntimeError> {
         d.shift_remove(&DictKey(Object::from_static("__slots__")));
     }
     cls.bump_attr_version();
+    // (The exact class's plain calls build in place; a subclass has its
+    // own, empty, constructor hook.)
+    cls.pure_new.set(Some(dd_pure_new));
     Ok(Object::None)
+}
+
+/// `defaultdict()` or `defaultdict(factory)` of the exact class, with the
+/// factory `None`, a class, a builtin or a function (callable, as
+/// `defdict_init` requires): the instance over an empty dict, its
+/// `default_factory` set, as `__new__` and `__init__` leave it. `None`
+/// for any other call.
+fn dd_pure_new(cls: &Rc<crate::types::TypeObject>, args: &[Object]) -> Option<Object> {
+    let factory = match args {
+        [] => Object::None,
+        [f @ (Object::None | Object::Type(_) | Object::Builtin(_) | Object::Function(_))] => {
+            f.clone()
+        }
+        _ => return None,
+    };
+    let inst = Rc::new(crate::types::PyInstance::with_native(
+        cls.clone(),
+        Object::new_dict(),
+    ));
+    inst.slot_set("default_factory", factory);
+    let obj = Object::Instance(inst);
+    crate::gc_trace::track(&obj);
+    Some(obj)
 }
 
 /// `defaultdict.__init__(self, default_factory=None, /, *args, **kwds)`,
@@ -1424,6 +1450,54 @@ fn dd_missing(args: &[Object]) -> Result<Object, RuntimeError> {
         crate::gc_trace::track(&value);
     }
     crate::builtins::dict_setdefault(&[recv.clone(), key.clone(), value])
+}
+
+/// The native `defaultdict.__missing__` the module installs, by address
+/// (the class's entry is it while the class keeps it).
+static DD_MISSING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `d[key]` of a `defaultdict` (`inst`, over its payload `d`) missing
+/// `key`, where the class keeps the native `__missing__` and the factory
+/// is one whose value builds natively (`list`, `int`, `dict`, ...): the
+/// new value, stored under the key as `__missing__` stores it. `None`,
+/// touching nothing, for anything else (a key only Python code compares,
+/// any other factory).
+pub(crate) fn dd_missing_pure(
+    inst: &crate::types::PyInstance,
+    d: &Rc<RefCell<DictData>>,
+    key: &Object,
+) -> Option<Object> {
+    let ours = DD_MISSING.load(std::sync::atomic::Ordering::Relaxed);
+    match inst.cls_raw().lookup("__missing__") {
+        Some(Object::Builtin(b)) if Rc::as_ptr(&b) as usize == ours && ours != 0 => {}
+        _ => return None,
+    }
+    if crate::capi_watchers::dicts_active() {
+        return None;
+    }
+    let factory = inst
+        .slots
+        .try_borrow()
+        .ok()?
+        .get("default_factory")
+        .cloned()?;
+    let value = builtin_factory_value(&factory)?;
+    let probe = crate::object::LeafProbe::new(key)?;
+    {
+        let mut m = d.try_borrow_mut().ok()?;
+        match m.probe_entry(&probe) {
+            crate::dictmap::ProbeEntry::Vacant(e) if probe.miss_is_exact() => {
+                e.insert(DictKey(key.clone()), value.clone());
+            }
+            _ => return None,
+        }
+    }
+    if matches!(value, Object::List(_) | Object::Dict(_) | Object::Set(_)) {
+        crate::gc_trace::track(&value);
+    }
+    crate::object::dict_watch_bump(d);
+    crate::object::dict_mutation_event(d);
+    Some(value)
 }
 
 // ---------------------------------------------------------------------
@@ -1633,6 +1707,9 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 call_kw: Some(Box::new(dd_init)),
             })),
         );
+        if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static("dd_missing"))) {
+            DD_MISSING.store(Rc::as_ptr(b) as usize, std::sync::atomic::Ordering::Relaxed);
+        }
         // The `OrderedDict` methods (see `collections_odict`).
         for (export, name, body, kw) in super::collections_odict::exports() {
             d.insert(

@@ -28300,6 +28300,14 @@ impl Interpreter {
                 return Some(m);
             }
         }
+        // A class with a native constructor of its own (`defaultdict()`).
+        if !kw && !cls.flags.is_builtin {
+            if let Some(pure) = cls.pure_new.get() {
+                if let Some(v) = pure(cls, ops.get(2..2 + argc)?) {
+                    return Some(v);
+                }
+            }
+        }
         if cls.native_kind.get() == 0 {
             // The exact `itertools` classes: their native adapters, when
             // building one runs no code. (A builtin type's call is
@@ -86578,10 +86586,15 @@ pub(crate) unsafe extern "C" fn h_inst_dict_get<const OWNED: u32>(
         ) else {
             return 1;
         };
-        let Some(v) = Interpreter::dict_get_hot(d, k) else {
-            return 1;
+        let v = match Interpreter::dict_get_hot(d, k) {
+            Some(v) => clone_hot(v),
+            // A `defaultdict`'s miss whose factory builds natively: the
+            // new value, stored as its `__missing__` stores it.
+            None => match crate::stdlib::collections_native::dd_missing_pure(inst, d, k) {
+                Some(v) => v,
+                None => return 1,
+            },
         };
-        let v = clone_hot(v);
         rk.run();
         rc.run();
         out.write(v);
