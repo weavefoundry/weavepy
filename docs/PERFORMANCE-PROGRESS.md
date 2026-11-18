@@ -935,6 +935,15 @@ branch and pull request.
     instructions to 255 in the container). `for k in d` over a plain dict
     steps its keys directly once the iterator's watch is set, without
     the views' and `OrderedDict`'s checks (20 keys 5,167 to 4,341).
+  - `SomeEnum(value)` ran `EnumType.__call__` and `Enum.__new__` in
+    Python for every lookup (`inspect.Parameter` converts its kind that
+    way, `re` its flags): 5,642 instructions for `Color(1)` to CPython's
+    2,659. Where a class's metaclass `__call__` and its `__new__` are
+    `enum`'s own and it has members, a member of the class comes back as
+    it is, and a value that hashes natively is looked up in
+    `_value2member_map_` (the verdict and the maps remembered under the
+    class's and metaclass's versions); anything else is the Python
+    call's (`Color(1)` 1,530, `Color(member)` 960 to 2,521).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

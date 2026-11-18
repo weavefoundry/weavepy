@@ -28118,6 +28118,12 @@ impl Interpreter {
         let (Object::Type(cls), Object::Unbound) = (ops.first()?, ops.get(1)?) else {
             return None;
         };
+        // `SomeEnum(value)` of a member's value: the member.
+        if !kw && argc == 1 && !cls.flags.is_builtin && !Self::plain_metaclass(cls) {
+            if let Some(m) = Self::enum_value_member(cls, ops.get(2)?) {
+                return Some(m);
+            }
+        }
         if cls.native_kind.get() == 0 {
             // The exact `itertools` classes: their native adapters, when
             // building one runs no code. (A builtin type's call is
@@ -28144,6 +28150,96 @@ impl Interpreter {
             return None;
         }
         crate::stdlib::datetime_native::construct_names(cls, args, names, values)?.ok()
+    }
+
+    /// `cls(value)` of an enum class whose metaclass's `__call__` and
+    /// whose `__new__` are `enum`'s own (`EnumType.__call__`,
+    /// `Enum.__new__`), with members: `value` itself when it is a member
+    /// of exactly `cls`, else the member `_value2member_map_` holds for a
+    /// value that hashes and compares natively, as `Enum.__new__` finds
+    /// it. `None` for anything else (a miss, an unhashable value, a
+    /// `_missing_` hook's case), which the Python call decides.
+    fn enum_value_member(cls: &Rc<TypeObject>, value: &Object) -> Option<Object> {
+        type Maps = (
+            crate::sync::Weak<RefCell<DictData>>,
+            crate::sync::Weak<RefCell<DictData>>,
+        );
+        thread_local! {
+            /// The last enum class answered for, under its and its
+            /// metaclass's versions, with its member maps.
+            static MEMO: RefCell<Option<(usize, u64, u64, Maps)>> = const { RefCell::new(None) };
+        }
+        // SAFETY: GIL-serialized raw read, as in `plain_metaclass`.
+        let meta = unsafe { (*cls.metaclass.as_ptr()).as_ref() }?;
+        if meta.c_ext_ptr.get() != 0 || crate::object::exotic_str_keys_possible() {
+            return None;
+        }
+        let key = (
+            Rc::as_ptr(cls) as usize,
+            cls.attr_version.get(),
+            meta.attr_version.get(),
+        );
+        let lookup = |members: &Rc<RefCell<DictData>>, v2m: &Rc<RefCell<DictData>>| {
+            if members.try_borrow().ok()?.is_empty() {
+                return None;
+            }
+            if let Object::Instance(i) = value {
+                if std::ptr::eq(i.cls_raw(), Rc::as_ptr(cls)) {
+                    return Some(value.clone());
+                }
+            }
+            let probe = crate::object::LeafProbe::new(value)?;
+            let m = v2m.try_borrow().ok()?;
+            m.get(&probe).cloned()
+        };
+        let hit = MEMO.with(|m| {
+            let m = m.try_borrow().ok()?;
+            let (p, v, mv, (members, v2m)) = m.as_ref()?;
+            ((*p, *v, *mv) == key && key.1 != 0)
+                .then(|| Some((members.upgrade()?, v2m.upgrade()?)))
+                .flatten()
+        });
+        if let Some((members, v2m)) = hit {
+            return lookup(&members, &v2m);
+        }
+        let is_enum_fn = |f: &Rc<PyFunction>, qualname: &str| {
+            // SAFETY: GIL-serialized raw read of the function's code cell.
+            let code: &CodeObject = unsafe { &*f.code.as_ptr() };
+            code.qualname == qualname
+                && f.globals.try_borrow().is_ok_and(|g| {
+                    matches!(
+                        g.get(&crate::object::StrKey("__name__")),
+                        Some(Object::Str(n)) if &**n == "enum"
+                    )
+                })
+        };
+        match meta.lookup("__call__") {
+            Some(Object::Function(f)) if is_enum_fn(&f, "EnumType.__call__") => {}
+            _ => return None,
+        }
+        match cls.lookup("__new__") {
+            Some(Object::Function(f)) if is_enum_fn(&f, "Enum.__new__") => {}
+            _ => return None,
+        }
+        let Some(Object::Dict(members)) = cls.lookup("_member_map_") else {
+            return None;
+        };
+        let Some(Object::Dict(v2m)) = cls.lookup("_value2member_map_") else {
+            return None;
+        };
+        // (The maps are the class's attributes: a new one moves its
+        // version.)
+        MEMO.with(|m| {
+            if let Ok(mut m) = m.try_borrow_mut() {
+                *m = Some((
+                    key.0,
+                    key.1,
+                    key.2,
+                    (Rc::downgrade(&members), Rc::downgrade(&v2m)),
+                ));
+            }
+        });
+        lookup(&members, &v2m)
     }
 
     /// A keyword call of a natively served method (see
