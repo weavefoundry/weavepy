@@ -1018,6 +1018,20 @@ branch and pull request.
     against 1,801), and `deque()` and `deque(xs)` of a list or tuple, laid
     out as its `__init__` lays it (3,713 to 1,960 and 5,694 to 2,326,
     against 2,283 and 4,228).
+  - `email`'s header parsing ran three of its common steps through the
+    full handler on every call. A compiled pattern's `findall` declined a
+    str subclass's instance (the parser's tokens), so `_validate_xtext`
+    cost 43,662 instructions to CPython's 2,945; `findall` and `split`
+    now read the instance as its string and return exact strs, as
+    CPython's slices do (2,671). `super().value` of a property built the
+    super proxy each time; the getter now runs as an inline activation in
+    the core loop and as a direct call from compiled code, its site
+    remembering the property for the receiver's class (6,885 to 2,106,
+    against 1,201). The core loop's subscript arm had slice cases for
+    `bytearray`s and str, list and tuple subclasses that its own type
+    check never let through, so `token[:]` took the slow step (2,895 to
+    1,718, against 831). Setting a `From` header on a new message went
+    from 1,092,000 instructions to 941,000 (CPython 553,000).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
