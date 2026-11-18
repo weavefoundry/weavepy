@@ -5376,6 +5376,42 @@ unsafe fn ascii_from(
     Some(Some((&bytes[i as usize..], i as usize)))
 }
 
+/// `s.startswith(t)` / `s.endswith(t)` of a tuple of `str`s with no start
+/// position: whether any matches (a byte prefix or suffix of valid UTF-8 is
+/// a character one). `None` to decline.
+///
+/// # Safety
+///
+/// As [`Kernel`]'s.
+unsafe fn str_affix_tuple(
+    recv: *const Object,
+    a: *const Object,
+    b: *const Object,
+    ends: bool,
+) -> Option<bool> {
+    // SAFETY: the caller's contract.
+    let (Object::Str(s), Object::Tuple(t)) = (unsafe { (&*recv, &*a) }) else {
+        return None;
+    };
+    if !b.is_null() {
+        return None;
+    }
+    let text = s.as_bytes();
+    let mut hit = false;
+    for p in t.iter() {
+        let Object::Str(p) = p else {
+            return None;
+        };
+        let p = p.as_bytes();
+        hit |= if ends {
+            text.ends_with(p)
+        } else {
+            text.starts_with(p)
+        };
+    }
+    Some(hit)
+}
+
 unsafe extern "C" fn k_str_startswith(
     out: *mut Object,
     recv: *const Object,
@@ -5385,6 +5421,10 @@ unsafe extern "C" fn k_str_startswith(
 ) -> u32 {
     // SAFETY: as `Kernel`'s.
     unsafe {
+        if let Some(hit) = str_affix_tuple(recv, a, b, false) {
+            out.write(Object::Bool(hit));
+            return 0;
+        }
         let Some((s, p)) = two_strs(recv, a) else {
             return 1;
         };
@@ -5406,6 +5446,10 @@ unsafe extern "C" fn k_str_endswith(
 ) -> u32 {
     // SAFETY: as `Kernel`'s.
     unsafe {
+        if let Some(hit) = str_affix_tuple(recv, a, b, true) {
+            out.write(Object::Bool(hit));
+            return 0;
+        }
         let Some((s, p)) = two_strs(recv, a) else {
             return 1;
         };

@@ -11945,17 +11945,21 @@ fn str_match_prefix_suffix(
                         }
                     }
                     None => {
-                        return Err(type_error(
-                            "startswith/endswith first arg must be str or tuple of str",
-                        ));
+                        return Err(type_error(format!(
+                            "tuple for {} must only contain str, not {}",
+                            if prefix { "startswith" } else { "endswith" },
+                            item.type_name()
+                        )));
                     }
                 }
             }
             Ok(false)
         }
-        _ => Err(type_error(
-            "startswith/endswith first arg must be str or tuple of str",
-        )),
+        _ => Err(type_error(format!(
+            "{} first arg must be str or a tuple of str, not {}",
+            if prefix { "startswith" } else { "endswith" },
+            target.type_name()
+        ))),
     }
 }
 
