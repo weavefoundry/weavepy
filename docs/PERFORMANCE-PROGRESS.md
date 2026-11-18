@@ -888,6 +888,11 @@ branch and pull request.
     call (3,013 instructions to CPython's 1,291). A string's or
     container's method now binds in place as the attribute load binds it
     (1,589).
+  - `member in SomeEnum` bound `EnumType.__contains__` to the class and
+    called the bound method generically; a metaclass's plain-function
+    `__contains__` is now called with the class directly, through the
+    dunder lane that evaluates pure leaves in place (4,455 instructions to
+    2,718, against 1,141).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

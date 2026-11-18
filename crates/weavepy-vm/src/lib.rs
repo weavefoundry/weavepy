@@ -49885,6 +49885,18 @@ impl Interpreter {
                 }
             }
         }
+        // A class whose Python metaclass defines `__contains__` as a plain
+        // function (`member in SomeEnum`): called with the class, no bound
+        // method made.
+        if let Object::Type(t) = &container {
+            let meta = t.metaclass_or_type();
+            if !Rc::ptr_eq(&meta, &builtin_types().type_) {
+                if let Some(Object::Function(f)) = meta.lookup("__contains__") {
+                    let r = self.call_dunder_function(f, &[container.clone(), item.clone()])?;
+                    return Ok(r.is_truthy());
+                }
+            }
+        }
         let found = if let Some(method) = instance_method(&container, "__contains__")
             .or_else(|| metaclass_method(&container, "__contains__"))
         {
