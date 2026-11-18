@@ -925,7 +925,9 @@ branch and pull request.
     five pairs 47,414 to 36,109, against 10,146). `list(od)` of an exact
     `OrderedDict` called its `len` and its `__iter__` through the generic
     protocol and stepped the order's iterator; it takes the order's keys
-    at once now (8,647 to 3,392, against 2,437).
+    at once now (8,647 to 3,392, against 2,437), and `list(od.items())`
+    and the other views take their entries likewise where every key looks
+    up natively (14,502 to 6,980, against 4,469).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

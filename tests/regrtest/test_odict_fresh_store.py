@@ -80,6 +80,45 @@ class OdictFreshStoreTests(unittest.TestCase):
         self.assertEqual(r, ["z"])
         self.assertEqual(list(OrderedDict(a=1)), ["a"])
 
+    def test_list_of_views(self):
+        o = OrderedDict([("a", 1), ("b", 2), ("c", 3)])
+        o.move_to_end("a")
+        for _ in range(N):
+            k = list(o.keys())
+            v = list(o.values())
+            i = list(o.items())
+        self.assertEqual(k, ["b", "c", "a"])
+        self.assertEqual(v, [2, 3, 1])
+        self.assertEqual(i, [("b", 2), ("c", 3), ("a", 1)])
+
+    def test_views_with_python_keys(self):
+        class K:
+            def __init__(self, n):
+                self.n = n
+
+            def __hash__(self):
+                return hash(self.n)
+
+            def __eq__(self, other):
+                return isinstance(other, K) and other.n == self.n
+
+        o = OrderedDict([(K(1), "x"), (K(2), "y")])
+        for _ in range(N):
+            v = list(o.values())
+            i = [(k.n, w) for k, w in list(o.items())]
+        self.assertEqual(v, ["x", "y"])
+        self.assertEqual(i, [(1, "x"), (2, "y")])
+
+    def test_subclass_views(self):
+        class O2(OrderedDict):
+            pass
+
+        o = O2(a=1)
+        o["b"] = 2
+        for _ in range(N):
+            i = list(o.items())
+        self.assertEqual(i, [("a", 1), ("b", 2)])
+
 
 if __name__ == "__main__":
     unittest.main()

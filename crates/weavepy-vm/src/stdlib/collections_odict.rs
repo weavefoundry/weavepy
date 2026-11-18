@@ -33,6 +33,10 @@ pub(crate) const ORDER: &str = "<order>";
 /// class itself (subclasses are recognized through their MRO).
 pub(crate) const KIND_ODICT: u8 = 2;
 
+/// [`crate::types::TypeObject::collections_kind`] of the `OrderedDict`
+/// view classes (`odict_keys`, `odict_values`, `odict_items`) themselves.
+pub(crate) const KIND_ODICT_VIEW: u8 = 3;
+
 /// Whether `cls` is `OrderedDict` or a subclass of it.
 fn is_odict_class(cls: &TypeObject) -> bool {
     cls.collections_kind.get() == KIND_ODICT
@@ -318,13 +322,73 @@ fn od_delitem(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
-/// The native `OrderedDict.__iter__` (see [`note_iter_builtin`]), by
-/// address: the class's entry is it while the class keeps it.
-static ITER_BUILTIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The native `__iter__`s of `OrderedDict` and of its keys, values and
+/// items views (see [`note_iter_builtin`]), by address: a class's entry is
+/// one while the class keeps it.
+static ITER_BUILTINS: [std::sync::atomic::AtomicUsize; 4] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 4];
 
-/// Remember the native `OrderedDict.__iter__` the module installs.
-pub(crate) fn note_iter_builtin(b: &Rc<crate::object::BuiltinFn>) {
-    ITER_BUILTIN.store(Rc::as_ptr(b) as usize, std::sync::atomic::Ordering::Relaxed);
+/// Remember a native `__iter__` the module installs (0 the dict's, then
+/// the keys, values and items views').
+pub(crate) fn note_iter_builtin(i: usize, b: &Rc<crate::object::BuiltinFn>) {
+    ITER_BUILTINS[i].store(Rc::as_ptr(b) as usize, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether `cls`'s `__iter__` is the native one [`note_iter_builtin`]
+/// recorded at `i`, with no `__length_hint__` to call (a `len` presize of
+/// these is the dict's own, native).
+fn native_iter(cls: &TypeObject, i: usize) -> bool {
+    let ours = ITER_BUILTINS[i].load(std::sync::atomic::Ordering::Relaxed);
+    matches!(cls.lookup("__iter__"), Some(Object::Builtin(b))
+        if Rc::as_ptr(&b) as usize == ours && ours != 0)
+        && cls.lookup("__length_hint__").is_none()
+}
+
+/// `list(view)` of a keys, values or items view of an exact `OrderedDict`
+/// whose classes keep their native `__iter__`s: the entries in order, as
+/// the view's iterator gives them, where every key looks up in the dict
+/// natively. `None` for anything else.
+pub(crate) fn exact_view_entries(view: &PyInstance) -> Option<Vec<Object>> {
+    if view.cls_raw().collections_kind.get() != KIND_ODICT_VIEW {
+        return None;
+    }
+    let mapping = view.slots.try_borrow().ok()?.get("_mapping").cloned();
+    let od = match mapping? {
+        Object::Instance(od) => od,
+        _ => return None,
+    };
+    let ocls = od.cls_raw();
+    if ocls.collections_kind.get() != KIND_ODICT {
+        return None;
+    }
+    let views = ocls.native_ext.get()?.downcast_ref::<ViewTypes>()?;
+    let vcls = view.cls_raw();
+    let kind = views
+        .0
+        .iter()
+        .position(|w| std::ptr::eq(w.as_ptr(), std::ptr::from_ref(vcls)))?;
+    if !native_iter(vcls, kind + 1) {
+        return None;
+    }
+    let keys = exact_keys(&od)?;
+    if kind == 0 {
+        return Some(keys);
+    }
+    let Some(Object::Dict(main)) = od.native.get() else {
+        return None;
+    };
+    let m = main.try_borrow().ok()?;
+    keys.into_iter()
+        .map(|k| {
+            let probe = crate::object::LeafProbe::new(&k)?;
+            let v = m.get(&probe)?.clone();
+            Some(if kind == 1 {
+                v
+            } else {
+                Object::new_tuple_array([k, v])
+            })
+        })
+        .collect()
 }
 
 /// `list(od)` of an exact `OrderedDict` whose class keeps the native
@@ -336,13 +400,8 @@ pub(crate) fn exact_keys(inst: &PyInstance) -> Option<Vec<Object>> {
     if cls.collections_kind.get() != KIND_ODICT || inst.native.get().is_none() {
         return None;
     }
-    let ours = ITER_BUILTIN.load(std::sync::atomic::Ordering::Relaxed);
-    match cls.lookup("__iter__") {
-        Some(Object::Builtin(b)) if Rc::as_ptr(&b) as usize == ours && ours != 0 => {}
-        _ => return None,
-    }
-    if !matches!(cls.lookup("__len__"), Some(Object::Builtin(_)))
-        || cls.lookup("__length_hint__").is_some()
+    if !native_iter(cls, 0)
+        || !matches!(cls.lookup("__len__"), Some(Object::Builtin(_)))
         || inst.slots.try_borrow_mut().is_err()
     {
         return None;
@@ -742,6 +801,9 @@ fn install_odict(args: &[Object]) -> Result<Object, RuntimeError> {
         ));
     };
     cls.collections_kind.set(KIND_ODICT);
+    for view in [k, v, i] {
+        view.collections_kind.set(KIND_ODICT_VIEW);
+    }
     let views = Rc::new(ViewTypes([
         Rc::downgrade(k),
         Rc::downgrade(v),

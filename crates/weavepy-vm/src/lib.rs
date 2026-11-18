@@ -47166,7 +47166,9 @@ impl Interpreter {
                 }
                 // An exact `OrderedDict`'s keys, in order.
                 if let Object::Instance(inst) = v {
-                    if let Some(keys) = crate::stdlib::collections_odict::exact_keys(inst) {
+                    if let Some(keys) = crate::stdlib::collections_odict::exact_keys(inst)
+                        .or_else(|| crate::stdlib::collections_odict::exact_view_entries(inst))
+                    {
                         return Ok(keys);
                     }
                 }

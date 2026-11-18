@@ -1656,8 +1656,18 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 })),
             );
         }
-        if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static("od_iter"))) {
-            super::collections_odict::note_iter_builtin(b);
+        for (i, name) in [
+            "od_iter",
+            "odv_keys_iter",
+            "odv_values_iter",
+            "odv_items_iter",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static(name))) {
+                super::collections_odict::note_iter_builtin(i, b);
+            }
         }
         for name in super::collections_odict::LEAVES {
             if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static(name))) {
