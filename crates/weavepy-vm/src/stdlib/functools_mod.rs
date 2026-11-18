@@ -116,6 +116,15 @@ fn partial_new_for(args: &[Object]) -> Result<Object, RuntimeError> {
         py_new: py_new.clone(),
         laid_out: std::sync::OnceLock::new(),
     });
+    // (`partial(f, *args)` of the exact class builds in place through the
+    // class's constructor hook, which finds this registration on it.)
+    if cls
+        .native_ext
+        .set(crate::rc_unsize!(reg.clone() => dyn std::any::Any + Send + Sync))
+        .is_ok()
+    {
+        cls.pure_new.set(Some(partial_pure_new));
+    }
     let reg_kw = reg.clone();
     Ok(Object::Builtin(Rc::new(BuiltinFn {
         name: "__new__",
@@ -254,6 +263,41 @@ fn partial_new(
     let Object::Type(sub) = &args[0] else {
         unreachable!("checked above");
     };
+    Ok(build_partial(reg, &cls, sub, &args[1], &args[2..], kwargs))
+}
+
+/// `partial(func, *args)` of the exact class, from its constructor hook:
+/// as [`partial_new`] builds the common shape (a callable that isn't a
+/// partial, no `Placeholder`), anything else left to the call.
+fn partial_pure_new(cls: &Rc<crate::types::TypeObject>, args: &[Object]) -> Option<Object> {
+    let reg = cls.native_ext.get()?.downcast_ref::<PartialReg>()?;
+    let own = reg.cls.upgrade()?;
+    if !Rc::ptr_eq(&own, cls) {
+        return None;
+    }
+    let [func, rest @ ..] = args else {
+        return None;
+    };
+    if !crate::builtins::object_is_callable(func)
+        || matches!(func, Object::Instance(i) if i.cls().is_subclass_of(&own))
+        || rest.iter().any(|a| a.is_same(&reg.placeholder))
+    {
+        return None;
+    }
+    Some(build_partial(reg, &own, cls, func, rest, &[]))
+}
+
+/// A new `partial` instance of `sub` (a subclass of `cls`, the registered
+/// class) over `func`, the stored positionals and keywords, its slots laid
+/// out as both constructors lay them out.
+fn build_partial(
+    reg: &PartialReg,
+    cls: &Rc<crate::types::TypeObject>,
+    sub: &Rc<crate::types::TypeObject>,
+    func: &Object,
+    rest: &[Object],
+    kwargs: &[(String, Object)],
+) -> Object {
     let mut kw = DictData::default();
     for (k, v) in kwargs {
         kw.insert(DictKey(Object::from_str(k.clone())), v.clone());
@@ -261,15 +305,15 @@ fn partial_new(
     let keywords = Object::Dict(Rc::new(RefCell::new(kw)));
     crate::gc_trace::track(&keywords);
     let values = [
-        args[1].clone(),
-        Object::new_tuple(args[2..].to_vec()),
+        func.clone(),
+        Object::new_tuple(rest.to_vec()),
         keywords,
         Object::Int(0),
         Object::None,
     ];
     // (The exact class's slots in one piece; a subclass's own layout has
     // its own slots after these.)
-    let layout = Rc::ptr_eq(sub, &cls)
+    let layout = Rc::ptr_eq(sub, cls)
         .then(|| cls.own_slot_layout())
         .flatten()
         .filter(|layout| {
@@ -296,7 +340,7 @@ fn partial_new(
     };
     let obj = Object::Instance(Rc::new(inst));
     crate::gc_trace::track(&obj);
-    Ok(obj)
+    obj
 }
 
 /// `partial.__call__(self, /, *args, **keywords)` without a Python

@@ -1012,7 +1012,10 @@ branch and pull request.
     `__missing__` does (1,972 and 2,720; `defaultdict(list)` with one
     miss 11,452 to 4,034, against 3,192). `OrderedDict()` of the exact
     class, whose `__init__` does nothing without arguments, builds through
-    the same hook (2,983 to 1,636, against 1,049).
+    the same hook (2,983 to 1,636, against 1,049), and so does
+    `functools.partial(func, *args)` over a callable that isn't itself a
+    partial, laid out as its native `__new__` lays it (4,837 to 2,317,
+    against 1,801).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
