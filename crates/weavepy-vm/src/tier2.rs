@@ -9937,10 +9937,15 @@ fn builtin_seq_step(cell: &Rc<GilRefCell<crate::object::PyIterator>>) -> Option<
 /// the lane, any other iterator, or one already borrowed.
 #[inline]
 fn seq_scalar_step(cell: &Rc<GilRefCell<PyIterator>>, elem_tag: i64) -> Option<u64> {
-    let lane = match u32::try_from(elem_tag).ok().map(SlotTag::from_raw) {
-        Some(SlotTag::Int) => JitType::Int,
-        Some(SlotTag::Float) => JitType::Float,
-        Some(SlotTag::Bool) => JitType::Bool,
+    // (The tag's discriminants compared directly: a conversion first
+    // cost a tenth of a step.)
+    const INT: i64 = SlotTag::Int as i64;
+    const FLOAT: i64 = SlotTag::Float as i64;
+    const BOOL: i64 = SlotTag::Bool as i64;
+    let lane = match elem_tag {
+        INT => JitType::Int,
+        FLOAT => JitType::Float,
+        BOOL => JitType::Bool,
         _ => return None,
     };
     // SAFETY: the views end before anything that could borrow either cell
@@ -9991,6 +9996,22 @@ unsafe extern "C" fn wpjit_iter_next(frame: *mut JitFrame, pin: i64, elem_tag: i
             return 0;
         }
     }
+    // (The rest in a frame of its own, so this step's stays small.)
+    // SAFETY: the caller's contract.
+    unsafe { iter_next_rest(frame, pin, elem_tag) }
+}
+
+/// [`wpjit_iter_next`] past its scalar list-or-tuple step.
+///
+/// # Safety
+///
+/// Same contract as [`wpjit_call_py`].
+#[inline(never)]
+unsafe fn iter_next_rest(frame: *mut JitFrame, pin: i64, elem_tag: i64) -> i64 {
+    // SAFETY: see wpjit_call_py — same live-buffer contract.
+    let jf = unsafe { &mut *frame };
+    #[allow(clippy::cast_ptr_alignment)]
+    let ctx = unsafe { &*jf.ctx.cast::<CallCtx>() };
     // A list, tuple, range, set or dict iterator's next element for any
     // lane it packs into (a dict's keys, a set's strings): stepped in place,
     // no Python run. Its end, and an element outside the lane, take the
