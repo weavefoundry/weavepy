@@ -21513,10 +21513,8 @@ impl Interpreter {
                 if x.len().checked_mul(times)? > Self::CORE_REPEAT_MAX {
                     return None;
                 }
-                let mut out = Vec::with_capacity(x.len() * times);
-                for _ in 0..times {
-                    out.extend(x.iter().cloned());
-                }
+                let mut out = Vec::new();
+                repeat_objects(x, times, &mut out);
                 Some(Object::new_tuple(out))
             }
             Object::List(x) => {
@@ -21527,10 +21525,8 @@ impl Interpreter {
                 if x.len().checked_mul(times)? > Self::CORE_REPEAT_MAX {
                     return None;
                 }
-                let mut out = Vec::with_capacity(x.len() * times);
-                for _ in 0..times {
-                    out.extend(x.iter().cloned());
-                }
+                let mut out = Vec::new();
+                repeat_objects(&x, times, &mut out);
                 drop(x);
                 let obj = Object::new_list(out);
                 gc_trace::track_built(&obj);
@@ -88853,6 +88849,46 @@ pub fn sequence_concat_native(a: &Object, b: &Object) -> Result<Object, RuntimeE
 
 /// `out` (empty) made `times` copies of `unit`, back to back, by doubling
 /// what it holds (a copy per repeat made `b"\0" * 65536` 65,536 calls).
+/// `unit` repeated `times` times, the items of a sequence's repetition
+/// (CPython's aliasing: each a new reference to the same object). A unit
+/// of values without a reference count (`None`, `bool`, `int`, `float`)
+/// copies bitwise, doubling, as `bytes * n` does; anything else clones
+/// per item.
+pub(crate) fn repeat_objects(unit: &[Object], times: usize, out: &mut Vec<Object>) {
+    let total = unit.len() * times;
+    out.reserve(total);
+    let inert = unit.iter().all(|o| {
+        matches!(
+            o,
+            Object::None | Object::Bool(_) | Object::Int(_) | Object::Float(_)
+        )
+    });
+    if !inert || total == 0 {
+        if let [one] = unit {
+            out.resize(out.len() + times, one.clone());
+        } else {
+            for _ in 0..times {
+                out.extend(unit.iter().cloned());
+            }
+        }
+        return;
+    }
+    // SAFETY: the reserved room takes all `total` items; each copied item
+    // is one of the variants above, which own nothing, so a bitwise copy
+    // is a clone of it.
+    unsafe {
+        let start = out.as_mut_ptr().add(out.len());
+        std::ptr::copy_nonoverlapping(unit.as_ptr(), start, unit.len());
+        let mut done = unit.len();
+        while done < total {
+            let n = done.min(total - done);
+            std::ptr::copy_nonoverlapping(start, start.add(done), n);
+            done += n;
+        }
+        out.set_len(out.len() + total);
+    }
+}
+
 /// `unit * times` as a new `bytes`, built in its own allocation (a fill for
 /// one byte, doubling copies otherwise); `None` past a size where the
 /// allocation should fail softly (`MemoryError`) instead.
@@ -89311,9 +89347,7 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             let body = x.borrow().clone();
             let times = checked_repeat_count(body.len(), *n, "list")?;
             let mut out = try_alloc_vec(body.len() * times)?;
-            for _ in 0..times {
-                out.extend(body.iter().cloned());
-            }
+            repeat_objects(&body, times, &mut out);
             let out = Object::new_list(out);
             gc_trace::track_built(&out);
             Ok(out)
@@ -89331,9 +89365,7 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             }
             let times = checked_repeat_count(x.len(), *n, "tuple")?;
             let mut out: Vec<Object> = try_alloc_vec(x.len() * times)?;
-            for _ in 0..times {
-                out.extend(x.iter().cloned());
-            }
+            repeat_objects(x, times, &mut out);
             Ok(Object::new_tuple(out))
         }
 

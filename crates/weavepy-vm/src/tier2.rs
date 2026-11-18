@@ -10604,10 +10604,8 @@ unsafe extern "C" fn wpjit_list_repeat(frame: *mut JitFrame, pin: i64, count: i6
     if total > (isize::MAX as usize) / size_of::<Object>() {
         return -1;
     }
-    let mut out = Vec::with_capacity(total);
-    for _ in 0..reps {
-        out.extend(items.iter().cloned());
-    }
+    let mut out = Vec::new();
+    crate::repeat_objects(&items, reps, &mut out);
     drop(items);
     let fresh = Object::List(Rc::new(crate::sync::RefCell::new(out)));
     // See `wpjit_build_list`: deferred without scanning its elements (each

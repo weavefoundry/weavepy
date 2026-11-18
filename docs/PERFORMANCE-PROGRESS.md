@@ -641,12 +641,19 @@ branch and pull request.
     8 KiB chunks went from 5.9 million instructions to 3.6 million
     (CPython 1.7 million), reading it whole from 12.8 to 4.4 (1.5),
     writing it from 8.6 to 4.2 (4.2), and `b"x" * 4_000_000` from 9.4 to
-    4.7 (1.0). What's left of the last two is page faults: mimalloc maps
+    4.7 (1.0). The rest of the last two was page faults: mimalloc maps
     blocks over 2 MiB from the OS and unmaps them when freed (see
     `alloc.rs`), where macOS's allocator keeps a freed large block for
-    reuse, so each round faults its 4 MB in again; with nothing freed, as
-    when the results are kept, CPython pays the same faults and WeavePy
-    retires half its instructions. `bytes.split()` and `bytes.hex()`
+    reuse, so each round faulted its 4 MB in again. The allocator now
+    keeps up to four such blocks (32 MiB each, 64 MiB in all) for an
+    allocation of about their size, freeing any idle past the purge delay
+    at the runtime's memory ticks. In wall time, `b"x" * 4_000_000` went
+    from 1.9 ms to 0.08 (CPython 0.33), a 4 MB whole-file read from 2.3 to
+    0.22 (0.52), and `bytearray(4_000_000)` from 1.4 to 0.08 (0.31), with
+    the suite's peak RSS unchanged. `[0] * 1_000_000` also copied each
+    item through an iterator: a unit of values without a reference count
+    now copies bitwise, doubling (58 million instructions to 5.1, against
+    13.2; 10.3 ms to 1.3, against 1.3). `bytes.split()` and `bytes.hex()`
     without options build their pieces and digits directly (5,284 to
     3,546 against 3,386, and 2,197 to 1,377 against 1,185).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
