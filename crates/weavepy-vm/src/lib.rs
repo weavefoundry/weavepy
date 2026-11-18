@@ -32651,6 +32651,9 @@ impl Interpreter {
                         ("keys", LeafKind::DictKeys),
                         ("values", LeafKind::DictValues),
                         ("items", LeafKind::DictItems),
+                        ("pop", LeafKind::Fast(crate::builtins::dict_pop_leaf)),
+                        // (A table copy: no key is hashed or compared.)
+                        ("copy", LeafKind::Opaque),
                     ],
                 ),
                 (
@@ -32662,6 +32665,7 @@ impl Interpreter {
                         ("discard", LeafKind::SetDiscard),
                         ("remove", LeafKind::SetRemove),
                         ("pop", LeafKind::SetPop),
+                        ("copy", LeafKind::Opaque),
                     ],
                 ),
                 (

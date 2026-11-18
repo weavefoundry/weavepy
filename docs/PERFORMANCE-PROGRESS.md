@@ -755,7 +755,15 @@ branch and pull request.
     of `bytes` reads the parts in place (3,153 to 2,316); and
     `struct.unpack` of `bytes` skips the buffer adapter (2,536 to 2,074).
     `itertools.accumulate` and `product` stay 2.4 and 2.0 times CPython's:
-    their iterator steps spread over a dozen helpers.
+    their iterator steps spread over a dozen helpers. Container methods
+    without an in-place lane paid the method-call protocol, about 250
+    instructions around a cheap body: `dict.copy` and `set.copy` now run
+    as opaque bodies compiled code calls directly, `dict.pop` of a `str`
+    or `int` key is a leaf (778 to 588, against 542), and `list.remove`
+    has a kernel when the items up to the match compare natively and the
+    removed one releases without running code (2,005 to 1,329, against
+    1,289; the full path scans the same way first). `dict.pop()` and
+    `dict.copy(1)` now raise CPython's messages.
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration

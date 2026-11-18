@@ -13854,6 +13854,21 @@ fn list_remove(args: &[Object]) -> Result<Object, RuntimeError> {
         return Err(type_error("list.remove() expected 1 argument"));
     }
     let l = list_self(args)?;
+    // Items that compare natively: one scan, no clones.
+    let mut at = None;
+    if list_scan_native(&args[0], &args[1], |i| {
+        at = Some(i);
+        false
+    })
+    .is_some()
+    {
+        let Some(i) = at else {
+            return Err(value_error("list.remove(x): x not in list"));
+        };
+        let removed = l.borrow_mut().remove(i);
+        drop(removed);
+        return Ok(Object::None);
+    }
     // CPython `list.remove` walks the *live* list by index with
     // `PyObject_RichCompareBool` (identity-first, then Python `__eq__`),
     // so `ALWAYS_EQ` matches the first element and a mutating `__eq__`
@@ -13892,7 +13907,7 @@ fn list_remove(args: &[Object]) -> Result<Object, RuntimeError> {
 /// compares): `f` sees each match in order and may stop the scan. `None`
 /// when an item needs the full comparison (the caller then discards what
 /// `f` saw and takes the full path, as nothing has run).
-fn list_scan_native(
+pub(crate) fn list_scan_native(
     list: &Object,
     needle: &Object,
     mut f: impl FnMut(usize) -> bool,
@@ -14756,6 +14771,37 @@ pub(crate) fn dict_getitem_leaf(args: &[Object]) -> Option<Result<Object, Runtim
     d.get(&probe).map(|v| Ok(v.clone()))
 }
 
+/// `dict.pop(key[, default])`'s leaf half: a `str`/`int` key removed by
+/// exact native equality (its stored key releases without running code),
+/// or the default for a miss no stored key could equal. A miss without a
+/// default (the `KeyError`), and anything that could run Python, takes the
+/// full path.
+pub(crate) fn dict_pop_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let (recv, key, default) = match args {
+        [recv, key] => (recv, key, None),
+        [recv, key, default] => (recv, key, Some(default)),
+        _ => return None,
+    };
+    if crate::capi_watchers::dicts_active() {
+        return None;
+    }
+    let probe = crate::object::LeafProbe::new(key)?;
+    let cell = leaf_dict_of(recv)?;
+    let mut m = cell.try_borrow_mut().ok()?;
+    match m.get_index_of(&probe) {
+        Some(i) => {
+            let (k, v) = m.shift_remove_index(i)?;
+            drop(m);
+            crate::object::dict_watch_bump(cell);
+            crate::object::dict_mutation_event(cell);
+            drop(k);
+            Some(Ok(v))
+        }
+        None if probe.miss_is_exact() => default.map(|d| Ok(d.clone())),
+        None => None,
+    }
+}
+
 /// `dict.__setitem__`'s leaf half: a `str`/`int` key replacing an
 /// exact-key entry, or inserting one no stored key could equal. Anything
 /// that could run Python (an exotic stored key, a dict watcher) takes the
@@ -14877,7 +14923,7 @@ fn dict_delitem(args: &[Object]) -> Result<Object, RuntimeError> {
 fn dict_view_no_args(args: &[Object], name: &str) -> Result<(), RuntimeError> {
     if args.len() > 1 {
         return Err(type_error(format!(
-            "{name}() takes no arguments ({} given)",
+            "dict.{name}() takes no arguments ({} given)",
             args.len() - 1
         )));
     }
@@ -14935,7 +14981,7 @@ fn dict_pop(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let key = args
         .get(1)
-        .ok_or_else(|| type_error("dict.pop() expected at least 1 argument"))?;
+        .ok_or_else(|| type_error("pop expected at least 1 argument, got 0"))?;
     ensure_dict_key(key)?;
     let removed = dict_remove(&d, key)?;
     if let Some((k, v)) = removed {

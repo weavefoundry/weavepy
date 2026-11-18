@@ -5065,10 +5065,11 @@ fn kernel_for(tag: u64, kind: crate::LeafKind, nargs: usize) -> Option<Kernel> {
         (1, K::ListPop, 0) => k_list_pop,
         (1, K::ListExtend, 1) => k_list_extend,
         (1, K::ListInsert, 2) => k_list_insert,
+        (1, K::ListRemove, 1) => k_list_remove,
         (1, K::ListReverse | K::ListCopy, 0) => k_body,
         (2, K::DictGet, 1 | 2) => k_dict_get,
-        (2, K::DictKeys | K::DictValues | K::DictItems, 0) => k_body,
-        (3, K::SetPop, 0) => k_body,
+        (2, K::DictKeys | K::DictValues | K::DictItems | K::Opaque, 0) => k_body,
+        (3, K::SetPop | K::Opaque, 0) => k_body,
         (3, K::SetAdd, 1) => k_set_add,
         (3, K::SetDiscard, 1) => k_set_discard,
         (3, K::SetRemove, 1) => k_set_remove,
@@ -5213,6 +5214,43 @@ unsafe extern "C" fn k_list_pop(
             return 1;
         };
         out.write(v);
+        0
+    }
+}
+
+/// `list.remove(x)` where every item up to the match compares with `x`
+/// without running code, and the removed item releases without running
+/// any: anything else (a miss's `ValueError` included) is declined.
+unsafe extern "C" fn k_list_remove(
+    out: *mut Object,
+    recv: *const Object,
+    a: *const Object,
+    _: *const Object,
+    _: *const crate::object::BuiltinFn,
+) -> u32 {
+    // SAFETY: as `Kernel`'s; the removed item moves out.
+    unsafe {
+        let (list, needle) = (&*recv, &*a);
+        let Object::List(l) = list else {
+            return 1;
+        };
+        let mut at = None;
+        if crate::builtins::list_scan_native(list, needle, |i| {
+            at = Some(i);
+            false
+        })
+        .is_none()
+        {
+            return 1;
+        }
+        let (Some(i), Some(items)) = (at, l.peek_mut()) else {
+            return 1;
+        };
+        if i >= items.len() || !droppable(&items[i]) {
+            return 1;
+        }
+        crate::drop_hot(items.remove(i));
+        out.write(Object::None);
         0
     }
 }
