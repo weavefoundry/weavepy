@@ -2164,21 +2164,19 @@ pub(crate) fn itertools_pure_next(l: &PyLazyIter) -> Option<Option<Object>> {
                 *total = Some(init.clone());
                 return Some(Some(init));
             }
-            if !src_ready(source, false) {
-                return None;
-            }
+            // (A plain cursor's next item, peeked and skipped in one view
+            // each: none left is the general step's end.)
             let Object::Iter(c) = source else {
                 return None;
             };
-            // SAFETY: a read that runs no code (a distinct cell).
-            let item = unsafe { c.peek() }?.pure_peek()?;
+            let item = cursor_peek(c)?;
             let next = match (&*total, &item) {
                 (None, _) => item,
                 (Some(Object::Int(a)), Object::Int(b)) => Object::Int(a.checked_add(*b)?),
                 (Some(Object::Float(a)), Object::Float(b)) => Object::Float(a + b),
                 _ => return None,
             };
-            src_step(source)?;
+            cursor_advance(c)?;
             *total = Some(next.clone());
             Some(Some(next))
         }
