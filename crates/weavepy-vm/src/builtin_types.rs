@@ -255,6 +255,22 @@ impl BuiltinTypes {
         let float_ = mk("float", vec![object_.clone()]);
         let bool_ = mk("bool", vec![int_.clone()]);
         let complex_ = mk("complex", vec![object_.clone()]);
+        // `complex()`, `complex(x)` and `complex(x, y)` of plain numbers.
+        complex_.pure_new.set(Some(|_, args| {
+            let num = |o: &Object| match o {
+                Object::Int(i) => Some(*i as f64),
+                Object::Float(f) => Some(*f),
+                Object::Bool(b) => Some(f64::from(u8::from(*b))),
+                _ => None,
+            };
+            let (re, im) = match args {
+                [] => (0.0, 0.0),
+                [a] => (num(a)?, 0.0),
+                [a, b] => (num(a)?, num(b)?),
+                _ => return None,
+            };
+            Some(Object::new_complex(re, im))
+        }));
         let str_ = mk("str", vec![object_.clone()]);
         let bytes_ = mk("bytes", vec![object_.clone()]);
         let bytearray_ = mk("bytearray", vec![object_.clone()]);
@@ -266,6 +282,11 @@ impl BuiltinTypes {
         let range_ = mk("range", vec![object_.clone()]);
         let slice_ = mk("slice", vec![object_.clone()]);
         let memoryview_ = mk("memoryview", vec![object_.clone()]);
+        // `memoryview(b)` of a `bytes` or `bytearray`.
+        memoryview_.pure_new.set(Some(|_, args| match args {
+            [Object::Bytes(_) | Object::ByteArray(_)] => crate::builtins::b_memoryview(args).ok(),
+            _ => None,
+        }));
         let mappingproxy_ = mk("mappingproxy", vec![object_.clone()]);
         // `types.MappingProxyType(mapping)` is a live read-only *view*:
         // wrapping a dict shares the underlying storage (CPython's

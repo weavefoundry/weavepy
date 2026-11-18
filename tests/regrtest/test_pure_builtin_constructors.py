@@ -1,7 +1,8 @@
 """Builtin types whose calls build the object directly.
 
-`object()`, `threading.Lock()`, `threading.RLock()`, `io.BytesIO()` and
-`io.StringIO()` skip the generic constructor when the call has nothing
+`object()`, `threading.Lock()`, `threading.RLock()`, `io.BytesIO()`,
+`io.StringIO()`, `complex()` of plain numbers and `memoryview()` of
+`bytes` or a `bytearray` skip the generic constructor when the call has nothing
 for it to do; each object is new and works, arguments the shortcut
 doesn't take (or rejects) behave as before, and subclasses construct as
 they did. Run it past the compile threshold.
@@ -35,6 +36,22 @@ def run(n):
                 assert rl._is_owned()
         assert not rl._is_owned()
         assert type(Sub()) is Sub
+        c = complex(i, -0.0)
+        assert c.real == i and str(c.imag) == "-0.0" and complex() == 0j
+        assert complex(True) == 1 and complex(1.5, 2) == 1.5 + 2j
+        assert complex("1+2j") == 1 + 2j and complex(1 + 1j) == 1 + 1j
+        ba = bytearray(b"xy")
+        mv = memoryview(ba)
+        assert mv.obj is ba and bytes(mv) == b"xy"
+        try:
+            ba.append(1)
+        except BufferError:
+            pass
+        else:
+            raise AssertionError("resized an exported bytearray")
+        mv.release()
+        ba.append(1)
+        assert memoryview(b"ab")[1] == 98
         try:
             object(1)
         except TypeError:
