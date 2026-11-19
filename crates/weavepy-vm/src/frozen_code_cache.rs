@@ -175,7 +175,7 @@ fn prune_stale(name: &str, keep: &std::path::Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let day = std::time::Duration::from_secs(24 * 60 * 60);
+    let day = std::time::Duration::from_hours(24);
     for entry in entries.flatten() {
         let file = entry.file_name();
         let Some(file) = file.to_str() else {

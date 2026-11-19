@@ -89160,7 +89160,7 @@ fn code_pure_leaf_decide(code: &CodeObject, ext: &CodeConstObjects) -> bool {
     };
     // (A body that always raises has nothing to evaluate.)
     let structural = structural && nkept > 0;
-    let ok = structural && body().all(|i| pure_op(i));
+    let ok = structural && body().all(&pure_op);
     // An effect leaf: a pure leaf but for attribute stores, which its
     // evaluation buffers and commits at the return (see
     // `Interpreter::pure_leaf_eval`).
