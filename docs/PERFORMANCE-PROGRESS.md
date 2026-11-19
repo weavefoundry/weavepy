@@ -1090,7 +1090,10 @@ branch and pull request.
     class value and field its local twin checks (a loop reading a global
     slotted instance's field from 520 instructions an iteration to 251,
     a class value from 390 to 302, a named tuple field from 699 to 288;
-    CPython 282, 278 and 417).
+    CPython 282, 278 and 417). A `functools.partial` call found its
+    fields by comparing their names on every call; it now remembers the
+    slot layout as `deque`'s methods do (1,870 instructions a call to
+    1,693, against 939).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
