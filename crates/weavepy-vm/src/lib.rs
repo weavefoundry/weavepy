@@ -54786,6 +54786,11 @@ impl Interpreter {
                         _ => return Ok(None),
                     };
                     Ok(Some(s))
+                } else if let (Object::MappingProxy(_) | Object::MappingProxyObj(_), 's') =
+                    (obj, kind)
+                {
+                    // A `mappingproxy`'s `str()` is its mapping's.
+                    Ok(Some(self.stringify(obj, globals)?))
                 } else {
                     Ok(None)
                 }

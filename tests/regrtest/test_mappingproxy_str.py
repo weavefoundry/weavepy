@@ -2,7 +2,7 @@
 
 As CPython's `mappingproxy_str`, a proxy's `str()` is its mapping's (a
 class's `__dict__` prints as a dict), and `format()` with an empty spec
-is that `str()`; `repr()` keeps the `mappingproxy(...)` wrapper, and a
+is that `str()`, as is `%s`; `repr()` keeps the `mappingproxy(...)` wrapper, and a
 non-empty spec raises `TypeError`.
 """
 
@@ -20,6 +20,8 @@ class MappingProxyStrTests(unittest.TestCase):
         self.assertEqual(f"{m!r}", "mappingproxy({'a': 1})")
         with self.assertRaises(TypeError):
             format(m, "x")
+        self.assertEqual("%s" % m, "{'a': 1}")
+        self.assertEqual("%s|%r" % (m, m), "{'a': 1}|mappingproxy({'a': 1})")
 
     def test_class_dict(self):
         class C:
