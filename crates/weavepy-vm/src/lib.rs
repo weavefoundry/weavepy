@@ -84375,7 +84375,7 @@ fn format_float_general(f: f64, prec: usize, upper: bool, p: &ParsedSpec) -> Str
     let core = if p.alt {
         ensure_decimal_point(&core)
     } else {
-        strip_g_zeros(&core)
+        strip_g_zeros(core)
     };
     finish_float(f.is_sign_negative(), core, p)
 }
@@ -84398,22 +84398,24 @@ fn general_core(mag: f64, prec: usize, upper: bool, exp_hi: i32) -> String {
     // The fixed form has the same `prec` significant digits, rounded at
     // the same place (the exponent is the rounded one): lay them out
     // around the point instead of formatting the number again.
-    let digits: String = sci[..k].chars().filter(char::is_ascii_digit).collect();
-    if digits.len() != prec {
+    // (The mantissa's digits, read in place: ASCII, the point skipped.)
+    let digits = || sci.as_bytes()[..k].iter().filter(|b| b.is_ascii_digit());
+    if digits().count() != prec {
         return fixed_core(mag, (prec as i32 - 1 - exp).max(0) as usize);
     }
     let mut out = String::with_capacity(prec + 6);
     if exp >= 0 {
         let int_len = exp as usize + 1;
-        out.push_str(&digits[..int_len]);
-        if int_len < prec {
-            out.push('.');
-            out.push_str(&digits[int_len..]);
+        for (i, &d) in digits().enumerate() {
+            if i == int_len {
+                out.push('.');
+            }
+            out.push(char::from(d));
         }
     } else {
         out.push_str("0.");
         out.extend(std::iter::repeat_n('0', (-exp - 1) as usize));
-        out.push_str(&digits);
+        out.extend(digits().map(|&d| char::from(d)));
     }
     out
 }
@@ -84433,7 +84435,7 @@ fn format_float_no_type(f: f64, p: &ParsedSpec) -> String {
         None => crate::object::float_repr(f.abs()),
         // Type omitted: like `g` but scientific kicks in one exponent earlier
         // (`decpt > precision - 1`), per CPython's `ADD_DOT_0` path.
-        Some(prec) => strip_g_zeros(&general_core(f.abs(), prec, false, prec.max(1) as i32 - 1)),
+        Some(prec) => strip_g_zeros(general_core(f.abs(), prec, false, prec.max(1) as i32 - 1)),
     };
     let core = if core.contains(['.', 'e', 'E']) {
         core
@@ -84538,17 +84540,16 @@ fn format_complex(re: f64, im: f64, parsed: &ParsedSpec) -> Result<String, Runti
 /// Strip trailing fractional zeros (and a bare decimal point) from a
 /// magnitude string, preserving any exponent suffix. Implements the `g`
 /// presentation type's zero trimming.
-fn strip_g_zeros(core: &str) -> String {
-    let (mant, exp) = match core.find(['e', 'E']) {
-        Some(k) => (&core[..k], &core[k..]),
-        None => (core, ""),
-    };
-    let mant = if mant.contains('.') {
-        mant.trim_end_matches('0').trim_end_matches('.')
-    } else {
-        mant
-    };
-    format!("{mant}{exp}")
+fn strip_g_zeros(mut core: String) -> String {
+    let k = core.find(['e', 'E']).unwrap_or(core.len());
+    let mant = &core[..k];
+    if !mant.contains('.') {
+        return core;
+    }
+    let keep = mant.trim_end_matches('0').trim_end_matches('.').len();
+    // (In place: the exponent, if any, moves down over the zeros.)
+    core.replace_range(keep..k, "");
+    core
 }
 
 fn with_sign(neg: bool, body: &str, p: &ParsedSpec) -> String {
