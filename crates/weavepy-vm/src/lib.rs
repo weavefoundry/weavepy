@@ -48466,6 +48466,16 @@ impl Interpreter {
         // as `typing` aliases (`typing.List`, `int | typing.List`) and ABC
         // shims implemented as ordinary instances.
         if let Object::Instance(inst) = classinfo {
+            // A plain Python function (found once per class version, the
+            // `typing` aliases' own): called with the alias, unbound.
+            if let Some(f) = Self::instance_dunder_function(
+                inst,
+                crate::types::AttrKey::vm(crate::types::vm_key::INSTANCECHECK_FN),
+                "__instancecheck__",
+            ) {
+                let res = self.call_dunder_function(f, &[classinfo.clone(), obj.clone()])?;
+                return Ok(Object::Bool(res.is_truthy()));
+            }
             if let Some(hook) = inst.cls().lookup("__instancecheck__") {
                 // `dispatch` so a descriptor `__instancecheck__` honours its
                 // `__get__` (test_descr test_special_method_lookup).
@@ -48630,6 +48640,15 @@ impl Interpreter {
         // PEP 3119: a `__subclasscheck__` on `type(classinfo)` overrides the
         // default (class-like instances such as `typing` aliases / unions).
         if let Object::Instance(inst) = classinfo {
+            // (As `__instancecheck__` above.)
+            if let Some(f) = Self::instance_dunder_function(
+                inst,
+                crate::types::AttrKey::vm(crate::types::vm_key::SUBCLASSCHECK_FN),
+                "__subclasscheck__",
+            ) {
+                let res = self.call_dunder_function(f, &[classinfo.clone(), cls.clone()])?;
+                return Ok(Object::Bool(res.is_truthy()));
+            }
             if let Some(hook) = inst.cls().lookup("__subclasscheck__") {
                 // `dispatch` so a descriptor `__subclasscheck__` honours its
                 // `__get__` (test_descr test_special_method_lookup).
