@@ -1322,6 +1322,17 @@ branch and pull request.
   - Fixed: a `StopIteration` thrown into a generator that never started
     was converted to `RuntimeError`; CPython's PEP 479 conversion covers
     only the body past its start, so it escapes as it is there.
+  - `setattr(obj, name, value)` of an attribute already there interned
+    and hashed the name and stored it through a dictionary insert; it now
+    replaces the value at the position it found (1,193 instructions to
+    891, against 726). Fixed alongside: when the replaced value was its
+    last reference, its `__del__` ran one statement late; that case now
+    takes the full path, which runs it at once.
+  - `format(x, 'g')` (and `%g`, the type-omitted form with a precision)
+    copied the digits through four strings; it lays them out from the one
+    scientific formatting and strips zeros in place (3,850 instructions to
+    3,283, against 2,416). A test pins the output for 6,000 values and 15
+    specs to CPython's.
   - Looked at and left: thread start-up (a started and joined thread
     costs about 470,000 instructions to CPython's 150,000; the main thread
     waits on the GIL hand-off and the kernel's thread teardown, and a
