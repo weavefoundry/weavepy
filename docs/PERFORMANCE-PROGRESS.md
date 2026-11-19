@@ -1032,6 +1032,23 @@ branch and pull request.
     check never let through, so `token[:]` took the slow step (2,895 to
     1,718, against 831). Setting a `From` header on a new message went
     from 1,092,000 instructions to 941,000 (CPython 553,000).
+  - A getter like `return list(self.defects)` stopped evaluating in place
+    once its leaf plan compiled: the compiled plan's call step lacked the
+    interpreted plan's builtin-constructor case, so every call declined,
+    and 64 declines in a row withdraw a function's leaf verdict for good.
+    With the case added, the read costs 1,683 instructions instead of
+    1,944 (CPython 1,089). Inside a generator's step, which can't call a
+    getter that runs as an activation, the miss had also walked every
+    other attribute read before declining; it now declines at once.
+    Together, `sum((x.all_defects for x in xs), [])` over four items went
+    from 36,700 instructions to 14,800 (CPython 7,700). `sum()` of lists
+    extends the list it built after the first item instead of building a
+    new one per item, as the intermediate totals are unobservable.
+  - `os.walk` stepped its directory listing with `next(scandir_it)`
+    through the general call; `next()` now steps a scandir iterator in
+    place, and `os.scandir` takes the builtin lane (a warm walk of a
+    42-entry tree from 764,000 instructions to 738,000, against 565,000).
+    A walk's remaining time is mostly system calls.
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
