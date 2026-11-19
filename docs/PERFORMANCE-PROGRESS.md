@@ -1140,6 +1140,19 @@ branch and pull request.
     4,400), `dict(d)` of 20 entries from 3,080 to 2,500 (1,910),
     `list(t)` of 100 strings from 5,810 to 3,760 (4,490), and a loop over
     `enumerate` of ten items from 6,400 to 5,760 (4,120).
+  - Dunder reads that took the full attribute lookup. A never-raised
+    exception's `__traceback__`, `__cause__` and `__context__` are unset
+    slots, which the slot reads in compiled code and the interpreter
+    declined, so each read cost about 4,000 instructions (CPython 200);
+    they now answer the slot descriptor's default. A bound method's
+    `__self__`, `__func__`, `__name__`, `__qualname__` and `__doc__` read
+    in place (1,690 instructions to 490 compiled, 1,750 to 615
+    interpreted, against 530), and `cls.__qualname__` joins the per-site
+    memo `__name__` has, now that assigning it moves the class's version
+    (1,380 to 230, against 420; interpreted, the core loop reads a class's
+    names directly, 1,700 to 1,080). `cls.__mro__` and `__bases__` still
+    build a tuple per read (3.4 and 4 times CPython's cost) because
+    keeping one on the class needs the collector to see it.
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
