@@ -1384,13 +1384,27 @@ impl CmdOutput {
         let mut tail = lines[start..].join("\n");
         // A Rust panic's own line (and its message, on the next line when
         // the location ends it) names the cause; the backtrace and the
-        // abort after it can push it out of the tail.
-        if let Some(at) = lines[..start]
+        // abort after it can push it out of the tail. The first panic is
+        // the cause: a later one is the abort of a panic that reached a
+        // function that can't unwind ("panic in a function that cannot
+        // unwind"), kept too.
+        let panics: Vec<usize> = lines[..start]
             .iter()
-            .rposition(|l| l.contains(" panicked at "))
-        {
-            let end = (at + 2).min(start);
-            tail = format!("{}\n[…]\n{tail}", lines[at..end].join("\n"));
+            .enumerate()
+            .filter(|(_, l)| l.contains(" panicked at "))
+            .map(|(i, _)| i)
+            .collect();
+        if let (Some(&first), Some(&last)) = (panics.first(), panics.last()) {
+            let mut kept = lines[first..(first + 3).min(start)]
+                .iter()
+                .take_while(|l| !l.trim_start().starts_with("stack backtrace:"))
+                .copied()
+                .collect::<Vec<_>>();
+            if last != first {
+                kept.push("[…]");
+                kept.extend(&lines[last..(last + 2).min(start)]);
+            }
+            tail = format!("{}\n[…]\n{tail}", kept.join("\n"));
         }
         if tail.trim().is_empty() {
             // A silent nonzero exit (e.g. a crash) would otherwise
@@ -1986,8 +2000,37 @@ mod tests {
             combined: out,
         };
         let t = o.tail();
-        assert!(t.starts_with("thread '<unnamed>' panicked at src/x.rs:1:2:\nboom\n[…]\n"));
+        assert!(
+            t.starts_with("thread '<unnamed>' panicked at src/x.rs:1:2:\nboom\n  0: frame\n[…]\n")
+        );
         assert!(t.ends_with("Fatal Python error: Aborted"));
+        // A panic that reached a non-unwinding function: the first panic
+        // (the cause) and the abort's.
+        let mut out = String::from(
+            "thread '<unnamed>' panicked at src/gil.rs:5:9:\nalready borrowed\nstack backtrace:\n",
+        );
+        for k in 0..20 {
+            out.push_str(&format!("  {k}: frame\n"));
+        }
+        out.push_str("thread '<unnamed>' panicked at library/core/src/panicking.rs:225:5:\npanic in a function that cannot unwind\n");
+        for k in 0..20 {
+            out.push_str(&format!("  {k}: frame\n"));
+        }
+        out.push_str("thread caused non-unwinding panic. aborting.\n");
+        let o = CmdOutput {
+            success: false,
+            code: None,
+            combined: out,
+        };
+        let t = o.tail();
+        assert!(
+            t.starts_with(
+                "thread '<unnamed>' panicked at src/gil.rs:5:9:\nalready borrowed\n[…]\n\
+                 thread '<unnamed>' panicked at library/core/src/panicking.rs:225:5:\n\
+                 panic in a function that cannot unwind\n[…]\n"
+            ),
+            "{t}"
+        );
         let quiet = CmdOutput {
             success: false,
             code: Some(1),
