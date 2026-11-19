@@ -1359,6 +1359,29 @@ branch and pull request.
     costs 30M to CPython's 11M, spread over decoding cached code,
     interning its names and running module bodies, with nothing over
     3%.
+  - A sweep of 198 more single statements (string, `re`, dict, list,
+    call, `os.path`, `pathlib`, `datetime` and small standard-library
+    operations) reads a geomean of 0.95 times CPython's instructions.
+    From its tail: tier 2's generic `BINARY_OP` helper always took the
+    interpreter's full operator dispatch, where compiled frames have
+    direct helpers; it now builds two lists' or tuples' concatenation, two
+    dicts' union, sets' algebra and `bytes` concatenation off its
+    borrowed operands (`xs + [y]` in a loop 2,992 instructions to 2,251,
+    against 1,461; `d | e` 3,261 to 2,340, against 1,727). `len()` of a
+    range joined the builtin's fast half (2,026 to 1,053, against 980),
+    and `dict(mapping, **kw)` copies the mapping once and interns its
+    keyword names (4,329 to 3,712, against 1,560; the keyword call's own
+    route is the rest).
+  - Fixed: compiled code's check that an attribute certainly misses (ahead
+    of calling `__getattr__`) probed the instance dictionary with a
+    comparison that runs a colliding key's Python `__eq__`, from a
+    frameless activation: the `__eq__` saw its caller's caller in
+    `sys._getframe`, and ran four times a lookup instead of once. The
+    probe now runs no Python and leaves such a dictionary to the full
+    lookup. This was the bug that a stricter generic-share limit for tier
+    2 had exposed; that limit still isn't adopted, since it now costs
+    the `nbody` fixture 38% (tier 2 runs its boxed float arithmetic
+    faster than the frame JIT does).
   - Looked at and left: thread start-up (a started and joined thread
     costs about 470,000 instructions to CPython's 150,000; the main thread
     waits on the GIL hand-off and the kernel's thread teardown, and a
