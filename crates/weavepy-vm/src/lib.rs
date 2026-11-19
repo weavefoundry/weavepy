@@ -76949,10 +76949,7 @@ fn checks_like_type(cls: &TypeObject, hook: &str) -> bool {
         return true;
     }
     let meta = cls.metaclass_or_type();
-    meta.c_ext_ptr.get() == 0
-        && meta
-            .lookup_with_owner(hook)
-            .is_some_and(|(_, owner)| Rc::ptr_eq(&owner, &builtin_types().type_))
+    meta.c_ext_ptr.get() == 0 && meta_check_is_type(&meta, hook == "__subclasscheck__")
 }
 
 fn leaf_issubclass(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
@@ -92719,14 +92716,30 @@ fn native_scalar_compare(a: &Object, b: &Object, op: CompareKind) -> Option<bool
 
 /// Whether `meta`, a metaclass, inherits `type.__subclasscheck__` (or
 /// `type.__instancecheck__`), which the default check computes without a call.
+/// The answer is remembered per metaclass version (an ABC's `isinstance`
+/// asks on every call).
 fn meta_check_is_type(meta: &TypeObject, subclass: bool) -> bool {
-    let name = if subclass {
-        "__subclasscheck__"
+    use crate::types::{vm_key, AttrKey, LeafAttrKind as K};
+    let (name, key) = if subclass {
+        ("__subclasscheck__", vm_key::TYPE_SUBCLASSCHECK)
     } else {
-        "__instancecheck__"
+        ("__instancecheck__", vm_key::TYPE_INSTANCECHECK)
     };
-    meta.lookup_with_owner(name)
-        .is_some_and(|(_, owner)| Rc::ptr_eq(&owner, &builtin_types().type_))
+    let key = AttrKey::vm(key);
+    let ver = meta.attr_version.get();
+    match meta.leaf_attrs.get(key, ver) {
+        Some(K::InstanceOnly) => return true,
+        Some(_) => return false,
+        None => {}
+    }
+    let is_type = meta
+        .lookup_with_owner(name)
+        .is_some_and(|(_, owner)| Rc::ptr_eq(&owner, &builtin_types().type_));
+    if !crate::object::exotic_str_keys_possible() {
+        meta.leaf_attrs
+            .set(key, ver, if is_type { K::InstanceOnly } else { K::Other });
+    }
+    is_type
 }
 
 /// [`plain_compare`] of the operands at `at` and above it, when releasing

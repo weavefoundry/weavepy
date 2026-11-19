@@ -1,8 +1,10 @@
-"""`isinstance`/`issubclass` with a class-like instance as the classinfo.
+"""`isinstance`/`issubclass` hooks: class-like instances and metaclasses.
 
-A plain function `__instancecheck__`/`__subclasscheck__` on the
-instance's class (the `typing` aliases') is called directly; descriptor
-hooks, errors, and hooks replaced on the class behave as before.
+A plain function `__instancecheck__`/`__subclasscheck__` on a class-like
+instance's class (the `typing` aliases') is called directly, and whether
+a metaclass keeps `type`'s own hooks is remembered per metaclass version;
+descriptor hooks, errors, and hooks added, replaced or removed behave as
+before.
 """
 
 import typing
@@ -61,6 +63,23 @@ class InstanceClassinfoTests(unittest.TestCase):
         del C.__instancecheck__
         with self.assertRaises(TypeError):
             isinstance(0, c)
+
+
+    def test_metaclass_hooks_change(self):
+        class M(type):
+            pass
+
+        class A(metaclass=M):
+            pass
+
+        for _ in range(N // 10):
+            r = (isinstance(A(), A), isinstance(1, A), issubclass(int, A))
+        self.assertEqual(r, (True, False, False))
+        M.__instancecheck__ = lambda cls, obj: obj == 1
+        M.__subclasscheck__ = lambda cls, c: c is int
+        self.assertEqual((isinstance(1, A), isinstance(2, A), issubclass(int, A)), (True, False, True))
+        del M.__instancecheck__, M.__subclasscheck__
+        self.assertEqual((isinstance(1, A), issubclass(int, A)), (False, False))
 
 
 if __name__ == "__main__":

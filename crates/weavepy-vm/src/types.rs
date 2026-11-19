@@ -816,6 +816,10 @@ pub(crate) mod vm_key {
     pub(crate) const NATIVE_LEN: u32 = 96;
     pub(crate) const NATIVE_CONTAINS: u32 = 97;
     pub(crate) const SUBCLASSCHECK_FN: u32 = 98;
+    /// Whether a metaclass's `__subclasscheck__` / `__instancecheck__`
+    /// is `type`'s own.
+    pub(crate) const TYPE_SUBCLASSCHECK: u32 = 99;
+    pub(crate) const TYPE_INSTANCECHECK: u32 = 100;
 }
 
 /// A builtin type's pure constructor (see [`TypeObject::pure_new`]).
