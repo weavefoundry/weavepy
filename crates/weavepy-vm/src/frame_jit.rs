@@ -23982,6 +23982,50 @@ impl<'a> Lower<'a> {
         true
     }
 
+    /// [`Self::field_store_in_line`]'s replacement of the value at `place`
+    /// (an instance's laid-out value, `inst` the instance) by the one at
+    /// `value`, going on to `done`: the value there now a scalar or a heap
+    /// one another owner keeps (not an unset one), and the new one a
+    /// scalar or the instance tracked; anything else to `helper`,
+    /// untouched. (The release gates were checked clear.)
+    fn replace_field_in_line(
+        &mut self,
+        place: Value,
+        value: Value,
+        inst: Value,
+        deferred_at: i32,
+        done: Block,
+        helper: Block,
+    ) {
+        let old = self.tag_at(place);
+        let unset = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, old, i64::from(self.tags.unbound));
+        self.branch_out(unset, helper);
+        let plain_old = self.is_scalar(old);
+        let heap = self.b.create_block();
+        let checked = self.b.create_block();
+        self.b.ins().brif(plain_old, checked, &[], heap, &[]);
+        self.b.switch_to_block(heap);
+        let word = self.b.ins().load(self.ptr, FLAGS, place, 8);
+        let n = self.b.ins().load(types::I64, FLAGS, word, 0);
+        let last = self.b.ins().icmp_imm(IntCC::SignedLessThanOrEqual, n, 1);
+        self.branch_out(last, helper);
+        self.b.ins().jump(checked, &[]);
+        self.b.switch_to_block(checked);
+        let new = self.tag_at(value);
+        let plain_new = self.is_scalar(new);
+        let deferred = self.b.ins().uload8(types::I32, FLAGS, inst, deferred_at);
+        let tracked = self.b.ins().icmp_imm(IntCC::Equal, deferred, 0);
+        let ok = self.b.ins().bor(plain_new, tracked);
+        let barrier = self.b.ins().icmp_imm(IntCC::Equal, ok, 0);
+        self.branch_out(barrier, helper);
+        self.release_checked_old(Some(plain_old), place);
+        self.copy16(place, value);
+        self.b.ins().jump(done, &[]);
+    }
+
     /// The plain decrement [`Self::field_store_in_line`] checked for the
     /// heap value at `place` (`plain_old` its scalar test), if it isn't a
     /// scalar.
@@ -24059,6 +24103,22 @@ impl<'a> Lower<'a> {
             // The next value of values laid out over the class's names,
             // with room for it, of an instance with no native body.
             inline::FieldMemo::Split { block, len } if append => {
+                // (Already there, from an earlier pass over the same
+                // instances: replaced in place, as a replacing site's.)
+                if !release_recv && !cfg!(debug_assertions) {
+                    let present =
+                        self.b
+                            .ins()
+                            .icmp_imm(IntCC::UnsignedGreaterThan, len, i64::from(idx));
+                    let replace = self.b.create_block();
+                    let add = self.b.create_block();
+                    self.b.ins().brif(present, replace, &[], add, &[]);
+                    self.b.switch_to_block(replace);
+                    let off = i64::from(idx) * 16 + i64::from(l.split_values);
+                    let place = self.b.ins().iadd_imm(block, off);
+                    self.replace_field_in_line(place, value, inst, deferred_at, done, helper);
+                    self.b.switch_to_block(add);
+                }
                 let cap = self.b.ins().uload32(FLAGS, block, l.split_cap);
                 let body = self.b.ins().uload8(types::I64, FLAGS, inst, l.inst_c_body);
                 let next = self.b.ins().icmp_imm(IntCC::NotEqual, len, i64::from(idx));

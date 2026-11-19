@@ -2,8 +2,10 @@
 
 A compiled `obj.attr = value` that replaces another object releases the
 old one in place when another owner keeps it, and through the general
-path when it was the last reference (its finalizer runs at once).
-Reference counts, finalizers and the stored values stay right.
+path when it was the last reference (its finalizer runs at once, in
+every tier). A site that first added the attribute replaces it in place
+on later passes. Reference counts, finalizers, `__dict__` order and the
+stored values stay right.
 """
 
 import sys
@@ -64,6 +66,38 @@ class FieldReplaceTests(unittest.TestCase):
             n.v = objs[i % len(objs)]
         self.assertIs(n.v, objs[(N - 1) % len(objs)])
         self.assertEqual(sys.getrefcount(objs[3]), sys.getrefcount([3]) + 2)
+
+
+    def test_add_then_replace(self):
+        nodes = [Node() for _ in range(50)]
+
+        def mark(v):
+            for x in nodes:
+                x.seen = v
+                x.prev = x
+
+        for i in range(N // 10):
+            mark(i)
+        self.assertTrue(all(x.seen == N // 10 - 1 and x.prev is x for x in nodes))
+        self.assertEqual(sys.getrefcount(nodes[0]), sys.getrefcount(nodes[1]))
+        del nodes[3].seen
+        mark(-1)
+        self.assertEqual(list(nodes[3].__dict__), ["prev", "seen"])
+        self.assertEqual(list(nodes[4].__dict__), ["seen", "prev"])
+
+    def test_replace_finalizes_in_loops(self):
+        Dying.deaths.clear()
+        holders = [Node() for _ in range(20)]
+
+        def fill(k):
+            for h in holders:
+                h.d = Dying(k)
+
+        fill(0)
+        for k in range(1, N // 10):
+            fill(k)
+            self.assertEqual(len(Dying.deaths), 20 * k)
+        self.assertEqual(sorted(set(Dying.deaths))[:2], [0, 1])
 
 
 if __name__ == "__main__":
