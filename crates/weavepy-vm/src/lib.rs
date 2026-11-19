@@ -77345,6 +77345,10 @@ enum SumState {
     Float(CompensatedSum),
     Complex(CompensatedSum, CompensatedSum),
     Generic(Object),
+    /// A list the sum built itself (`sum(lists, [])` past its first
+    /// item), which nothing else can reach: a further list item extends
+    /// it in place, as the new list `total + item` would read.
+    OwnList(Object),
 }
 
 /// CPython's `CompensatedSum`: Neumaier's improved Kahan–Babuška sum.
@@ -77427,13 +77431,44 @@ impl SumState {
                 sum.add(value);
                 true
             }
-            SumState::Generic(_) => false,
+            SumState::Generic(_) | SumState::OwnList(_) => false,
         }
     }
 
     fn add(&mut self, interp: &mut Interpreter, x: Object) -> Result<(), RuntimeError> {
         if self.add_scalar(&x) {
             return Ok(());
+        }
+        // Exact lists concatenate natively (no reflected operand can take
+        // part): the first into a new list, the rest onto it.
+        if let Object::List(item) = &x {
+            let built = match &*self {
+                SumState::OwnList(Object::List(total)) => {
+                    if let (Ok(src), Ok(mut dst)) = (item.try_borrow(), total.try_borrow_mut()) {
+                        dst.extend(src.iter().cloned());
+                        return Ok(());
+                    }
+                    None
+                }
+                SumState::Generic(Object::List(start)) => {
+                    match (start.try_borrow(), item.try_borrow()) {
+                        (Ok(a), Ok(b)) => {
+                            let mut v = Vec::with_capacity(a.len() + b.len());
+                            v.extend(a.iter().cloned());
+                            v.extend(b.iter().cloned());
+                            Some(v)
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some(v) = built {
+                let out = Object::new_list(v);
+                crate::gc_trace::track_built(&out);
+                *self = SumState::OwnList(out);
+                return Ok(());
+            }
         }
         // A big int in a compensated phase converts (or overflows).
         if let (SumState::Float(re) | SumState::Complex(re, _), Object::Long(v)) = (&mut *self, &x)
@@ -77473,7 +77508,7 @@ impl SumState {
                 return Ok(());
             }
             SumState::Complex(re, im) => Object::new_complex(re.value(), im.value()),
-            SumState::Generic(t) => t,
+            SumState::Generic(t) | SumState::OwnList(t) => t,
         };
         *self = SumState::Generic(interp.op_binary(&total, &x, BinOpKind::Add)?);
         Ok(())
@@ -77484,7 +77519,7 @@ impl SumState {
             SumState::Int(i) => Object::Int(i),
             SumState::Float(re) => crate::object::fresh_float(re.value()),
             SumState::Complex(re, im) => Object::new_complex(re.value(), im.value()),
-            SumState::Generic(t) => t,
+            SumState::Generic(t) | SumState::OwnList(t) => t,
         }
     }
 }
