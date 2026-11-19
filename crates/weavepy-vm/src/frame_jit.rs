@@ -14580,7 +14580,15 @@ unsafe extern "C" fn h_call(
                 let args = std::slice::from_raw_parts(base.add(first), len - first);
                 if Interpreter::core_all_droppable(args) {
                     let r = match kind {
-                        Some(LeafKind::Fast(f)) => f(args),
+                        // (`next(it)` of a Python iterator class's instance,
+                        // as `FOR_ITER` steps it.)
+                        Some(LeafKind::Fast(f)) => f(args).or_else(|| {
+                            if b.name == "next" {
+                                (*st.interp).leaf_next_instance(args)
+                            } else {
+                                None
+                            }
+                        }),
                         _ => Interpreter::core_isinstance(args),
                     };
                     match r {
@@ -15143,7 +15151,15 @@ unsafe fn call_leaf_in_place(
                 })
             };
             let r = match site.kind {
-                Some(LeafKind::Fast(f)) => f(args),
+                // (`next(it)` of a Python iterator class's instance, as
+                // `FOR_ITER` steps it.)
+                Some(LeafKind::Fast(f)) => f(args).or_else(|| {
+                    if b.name == "next" {
+                        (*s.interp).leaf_next_instance(args)
+                    } else {
+                        None
+                    }
+                }),
                 Some(LeafKind::Len) => len_fast(args),
                 Some(LeafKind::Isinstance) => Interpreter::core_isinstance(args),
                 Some(LeafKind::Opaque) => body(),

@@ -15629,7 +15629,15 @@ impl Interpreter {
                                 };
                                 if Self::core_all_droppable(ops) {
                                     let r = match kind {
-                                        Some(LeafKind::Fast(f)) => f(ops),
+                                        Some(LeafKind::Fast(f)) => f(ops).or_else(|| {
+                                            // `next(it)` of a Python iterator
+                                            // class's instance, as `FOR_ITER`.
+                                            if b.name == "next" {
+                                                self.leaf_next_instance(ops)
+                                            } else {
+                                                None
+                                            }
+                                        }),
                                         Some(LeafKind::Isinstance) => Self::core_isinstance(ops),
                                         Some(LeafKind::Opaque) => Some(match b.call_kw.as_ref() {
                                             Some(ckw) => ckw(ops, &[]),
@@ -33829,6 +33837,33 @@ impl Interpreter {
             return None;
         }
         self.pure_leaf_call(&code, &f, &[std::ptr::from_ref(it)], !pure, depth)
+    }
+
+    /// `next(it)` or `next(it, default)` (the builtin's leaf operands) of
+    /// an instance whose class's `__next__` is a registered native leaf or
+    /// a warm frameless Python leaf, stepped as `FOR_ITER` steps it (see
+    /// [`Self::leaf_next_step`], [`Self::leaf_python_next`]). `None` for
+    /// anything else, having done nothing.
+    pub(crate) fn leaf_next_instance(
+        &self,
+        args: &[Object],
+    ) -> Option<Result<Object, RuntimeError>> {
+        let (it, default) = match args {
+            [it] => (it, None),
+            [it, d] => (it, Some(d)),
+            _ => return None,
+        };
+        let Object::Instance(inst) = it else {
+            return None;
+        };
+        match self.leaf_next_step(it, inst) {
+            Some(Err(e)) if default.is_some() && crate::seqiter::is_stop_iteration(&e) => {
+                return default.cloned().map(Ok);
+            }
+            Some(r) => return Some(r),
+            None => {}
+        }
+        self.leaf_python_next(it, inst).map(Ok)
     }
 
     fn leaf_next_step(
