@@ -1199,6 +1199,19 @@ branch and pull request.
     8,090 instructions to 6,310, against 4,050). Every comparison of two
     instances also paid 28 instructions to rule out a struct sequence;
     only instances of builtin classes check now.
+  - A memory leak: every `threading.Thread` (each makes a
+    `_thread._ThreadHandle`) left its handle's state, a lock among it, in
+    a process-wide registry that nothing ever removed from, so a program
+    that keeps starting threads grew without bound and paid an ever larger
+    map's inserts. The registry now holds the states weakly (the handle's
+    methods keep them alive) and sweeps dead entries when it doubles.
+  - Looked at and left: thread start-up (a started and joined thread
+    costs about 470,000 instructions to CPython's 150,000; the main thread
+    waits on the GIL hand-off and the kernel's thread teardown, and a
+    smaller worker stack reserve changed nothing), the rest of
+    `threading.Thread()` (`_ThreadHandle()` 6,800 against 1,400, `Event()`
+    12,200 against 7,800), and `Enum` class creation (2.2 times CPython's
+    instructions, spread over `enum.py`'s Python code).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
