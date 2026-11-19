@@ -1105,6 +1105,17 @@ branch and pull request.
     instructions to 19,500 (CPython 7,600) and `Path.relative_to` from
     337,000 to 303,000 (169,000); the lazy resume's own cost is most of
     what's left.
+  - A struct sequence (`os.stat_result`, `time.struct_time`,
+    `sys.version_info`, `os.terminal_size`) keeps its fields in its
+    instance dict, but its class answers each name with a property whose
+    getter is a native function, so `st.st_mode` was a descriptor call
+    through the general attribute path. The attribute caches now treat
+    those properties as the instance's own field, the fields' keys are the
+    interned names compiled code holds, and the type rejects `del` of a
+    field as CPython does ("readonly attribute"). A struct sequence
+    compares with a tuple as its own tuple, without a method call. Reads
+    went from about 2,100 instructions to 500-800 (CPython 270-390) and
+    `sys.version_info >= (3, 8)` from 3,740 to 2,310 (700).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
