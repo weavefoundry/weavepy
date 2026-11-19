@@ -1170,6 +1170,16 @@ branch and pull request.
     the entry by identity or the slot is free (`x[Color.RED] = v` 3,780
     to 1,500, against 1,230; a ten-entry dict comprehension of such keys
     35,900 to 16,700, against 10,300).
+  - `"%r" % x` sent every `%r` through the general conversion, which
+    formats through a spec with alignment even for a bare `int`; an `int`,
+    `bool`, `None` or `str` now renders in place (`"P(%r)" % 5` from 2,820
+    instructions to 1,140, against 1,730). A container's repr found each
+    item's Python `__repr__` by walking the class's MRO and called it as a
+    bound method; it now calls the memoized function directly, and a
+    pure-leaf `__hash__` is tried before the native kinds' checks
+    (`repr(p)` of an instance whose `__repr__` is `"P(%r)" % self.x` from
+    6,230 to 4,500, against 2,390; `set(xs)` of ten such keys from 22,500
+    to 19,700, against 8,800).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
