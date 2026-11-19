@@ -3526,11 +3526,6 @@ fn os_access(args: &[Object], _kwargs: &[(String, Object)]) -> Result<Object, Ru
     }
 }
 
-/// Wrap the materialised `DirEntry` list in a CPython-shaped
-/// `ScandirIterator`: an iterator that is *also* a context manager
-/// (`with os.scandir(p) as it:`) with a no-op `close()`. CPython's
-/// `glob`/`os.walk`/`shutil` all use the `with`-statement form, which a
-/// plain list can't satisfy.
 thread_local! {
     /// The `posix.ScandirIterator` class, made on first use.
     static SCANDIR_CLS: RefCell<Option<Rc<crate::types::TypeObject>>> =
@@ -3560,6 +3555,11 @@ pub(crate) fn scandir_step(inst: &crate::types::PyInstance) -> Option<Option<Obj
     Some(v)
 }
 
+/// Wrap the materialised `DirEntry` list in a CPython-shaped
+/// `ScandirIterator`: an iterator that is *also* a context manager
+/// (`with os.scandir(p) as it:`) with a no-op `close()`. CPython's
+/// `glob`/`os.walk`/`shutil` all use the `with`-statement form, which a
+/// plain list can't satisfy.
 fn build_scandir_iterator(entries: Vec<Object>) -> Object {
     use crate::types::{PyInstance, TypeObject};
     let class = SCANDIR_CLS.with(|slot| {
