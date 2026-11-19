@@ -1153,6 +1153,23 @@ branch and pull request.
     names directly, 1,700 to 1,080). `cls.__mro__` and `__bases__` still
     build a tuple per read (3.4 and 4 times CPython's cost) because
     keeping one on the class needs the collector to see it.
+  - A class now keeps the tuples `__mro__` and `__bases__` read as, while
+    its links stay the same (the collector visits and clears them with the
+    MRO), so `C.__mro__ is C.__mro__` as in CPython and a read no longer
+    allocates (1,480 instructions to 1,090 compiled, 1,100 to 760
+    interpreted).
+  - Native code calling back into Python. `max(xs, key=attrgetter("x"))`
+    called the getter through the general call, a bound method for each
+    item, where `sorted` already evaluated such keys in place; `min` and
+    `max` now do too (25,750 instructions for ten items to 8,960, against
+    5,350; `itemgetter` 18,500 to 4,870, against 3,970). A dict or set
+    store of a key whose `__hash__` is Python (an `Enum` member, a frozen
+    dataclass) left compiled code at every store, and every hash ran a
+    reentrant call; a `__hash__` that evaluates as a pure leaf now runs in
+    place, and compiled code stores the key with that hash when it meets
+    the entry by identity or the slot is free (`x[Color.RED] = v` 3,780
+    to 1,500, against 1,230; a ten-entry dict comprehension of such keys
+    35,900 to 16,700, against 10,300).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
