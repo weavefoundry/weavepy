@@ -439,8 +439,9 @@ fn partial_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
 
 /// `cmp_to_key(mycmp)` — CPython implements this in C so the module
 /// attribute is a non-binding builtin (a test class stores it as a
-/// class attribute and calls it through `self.`). The K-class factory
-/// itself stays in the frozen `functools.py` (`_cmp_to_key_py`).
+/// class attribute and calls it through `self.`). The key factory it
+/// returns is the frozen `functools.py`'s `_CmpToKey`, one class for every
+/// call (`_cmp_to_key_py`, the pure-Python version, makes a class a call).
 fn cmp_to_key(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let mycmp = match (args, kwargs) {
         ([m], []) => m.clone(),
@@ -465,7 +466,7 @@ fn cmp_to_key(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
     let Some(functools) = interp.module_cache().get("functools") else {
         return Err(type_error("cmp_to_key() requires functools to be imported"));
     };
-    let factory = interp.load_attr_public(&functools, "_cmp_to_key_py")?;
+    let factory = interp.load_attr_public(&functools, "_CmpToKey")?;
     let globals = interp.builtins_dict();
     interp.call(&factory, &[mycmp], &[], &globals)
 }

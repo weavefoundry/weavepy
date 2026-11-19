@@ -8208,8 +8208,9 @@ pub(crate) struct MethodSite {
     builtin: [u64; 2],
     /// A value of the receiver's own (`self.fn(...)` of a function an
     /// instance holds): its class's version, its values' shared names (or
-    /// [`OWN_PUBLISHED`] for a materialized dict) and the value's position
-    /// among them (`0` versions: none yet).
+    /// [`OWN_PUBLISHED`] for a materialized dict, [`OWN_SLOT`] for a
+    /// `__slots__` member) and the value's position among them (`0`
+    /// versions: none yet).
     own: (u64, u64, u32),
     /// A `staticmethod` or `classmethod` of the receiver's class the site
     /// loaded last: the class's version, whether it binds the class, and
@@ -8293,6 +8294,11 @@ unsafe extern "C" fn h_method(st: *mut State, site: *mut MethodSite) -> u32 {
 /// sits at this address).
 const OWN_PUBLISHED: u64 = 1;
 
+/// [`MethodSite::own`]'s names for a `__slots__` member (`self._fn(...)`
+/// of a callable a slot holds), at its position in the class's slot
+/// layout: a data descriptor, which no instance entry shadows.
+const OWN_SLOT: u64 = 2;
+
 /// [`h_method`] for a receiver the site's first cache doesn't know.
 #[inline(never)]
 unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
@@ -8375,7 +8381,10 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
             Object::Instance(inst) => {
                 let (ver, keys, idx) = s.own;
                 if ver != 0 && ver == inst.cls_raw().attr_version.get() && droppable(&*top) {
-                    let v = if keys == OWN_PUBLISHED {
+                    let v = if keys == OWN_SLOT {
+                        // (The class's version settles its layout.)
+                        inst.laid_out_slot(idx as usize)
+                    } else if keys == OWN_PUBLISHED {
                         // (Its entry at the position, by the site's name.)
                         let code = &*s.code;
                         inst.attr_peek_index(idx as usize)
@@ -8422,6 +8431,19 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
                         let f = crate::clone_hot(func);
                         crate::drop_hot(std::mem::replace(&mut *top, f));
                         (*st).stack.add(s.len as usize).write(self_slot);
+                        return 0;
+                    }
+                }
+                // A `__slots__` member the class resolves the name to (its
+                // slot descriptor, which no instance entry shadows): the
+                // value and an empty self slot, its position for the next
+                // time.
+                if let Some(i) = slot_member_position(s, inst) {
+                    if let (Some(v), true) = (inst.laid_out_slot(i as usize), droppable(&*top)) {
+                        let v = crate::clone_hot(v);
+                        s.own = (inst.cls_raw().attr_version.get(), OWN_SLOT, i);
+                        crate::drop_hot(std::mem::replace(&mut *top, v));
+                        (*st).stack.add(s.len as usize).write(Object::Unbound);
                         return 0;
                     }
                 }
@@ -8522,6 +8544,31 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
         }
         0
     }
+}
+
+/// The position in `inst`'s class's slot layout of the `__slots__` member
+/// the method site `s` loads, when the class resolves the name to that
+/// member's descriptor under its default attribute lookup. `None` for any
+/// other name.
+fn slot_member_position(s: &MethodSite, inst: &crate::types::PyInstance) -> Option<u32> {
+    let cls = inst.cls_raw();
+    if cls.slot_layout.get().is_none_or(Option::is_none)
+        || cls.attr_version.get() == 0
+        || !Interpreter::default_getattribute(cls)
+    {
+        return None;
+    }
+    // SAFETY: the site's code is live (the caller's code runs it).
+    let code = unsafe { &*s.code };
+    let name = code
+        .names
+        .get(code.instructions[s.pc as usize].arg as usize)?;
+    if matches!(name.as_str(), "__dict__" | "__weakref__")
+        || !matches!(cls.lookup(name), Some(Object::SlotDescriptor(sd)) if sd.name == *name && sd.default.is_none())
+    {
+        return None;
+    }
+    inst.laid_out_position(name).map(|(i, _)| i)
 }
 
 /// Record in `s` the `staticmethod` or `classmethod` of `inst`'s class that
