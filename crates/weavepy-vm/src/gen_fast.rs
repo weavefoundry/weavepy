@@ -1348,7 +1348,7 @@ impl Interpreter {
             if stalls >= STALL_LIMIT {
                 ext.gen_stalls
                     .store(stalls.saturating_add(1), Ordering::Relaxed);
-                if (stalls - STALL_LIMIT) % STALL_RETRY != 0 {
+                if !(stalls - STALL_LIMIT).is_multiple_of(STALL_RETRY) {
                     return GenNext::Declined;
                 }
             }
