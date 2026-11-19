@@ -3531,12 +3531,38 @@ fn os_access(args: &[Object], _kwargs: &[(String, Object)]) -> Result<Object, Ru
 /// (`with os.scandir(p) as it:`) with a no-op `close()`. CPython's
 /// `glob`/`os.walk`/`shutil` all use the `with`-statement form, which a
 /// plain list can't satisfy.
+thread_local! {
+    /// The `posix.ScandirIterator` class, made on first use.
+    static SCANDIR_CLS: RefCell<Option<Rc<crate::types::TypeObject>>> =
+        const { RefCell::new(None) };
+}
+
+/// `next(it)` of a `ScandirIterator` (`os.walk`'s loop), as its
+/// `__next__` steps it: `Some(Some(entry))`, or `Some(None)` at the end
+/// (the iterator then closed); `None` for any other instance.
+pub(crate) fn scandir_step(inst: &crate::types::PyInstance) -> Option<Option<Object>> {
+    let ours = SCANDIR_CLS.with(|slot| {
+        slot.try_borrow().ok().and_then(|c| {
+            c.as_ref()
+                .map(|c| std::ptr::eq(Rc::as_ptr(c), inst.cls_raw()))
+        })
+    })?;
+    if !ours {
+        return None;
+    }
+    let Some(Object::Iter(it)) = inst.native.get() else {
+        return None;
+    };
+    let v = it.try_borrow_mut().ok()?.next_value();
+    if v.is_none() {
+        scandir_mark_closed(inst);
+    }
+    Some(v)
+}
+
 fn build_scandir_iterator(entries: Vec<Object>) -> Object {
     use crate::types::{PyInstance, TypeObject};
-    thread_local! {
-        static CLS: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
-    }
-    let class = CLS.with(|slot| {
+    let class = SCANDIR_CLS.with(|slot| {
         if let Some(c) = slot.borrow().as_ref() {
             return c.clone();
         }

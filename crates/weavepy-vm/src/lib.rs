@@ -84315,6 +84315,7 @@ fn builtin_needs_interp_uncached(name: &str) -> bool {
                 | "getcwd"
                 | "access"
                 | "listdir"
+                | "scandir"
                 | "setlocale"
                 | ".format_map"
                 | ".gc.collect"
@@ -84591,7 +84592,8 @@ fn builtin_fn_lane_ok_uncached(name: &str) -> bool {
             | "insort_left" | "insort_right"
             // os, through the interpreter's call (a path-like argument's
             // `__fspath__`), and `locale.setlocale`'s query
-            | "stat" | "lstat" | "fspath" | "getcwd" | "access" | "listdir" | "setlocale"
+            | "stat" | "lstat" | "fspath" | "getcwd" | "access" | "listdir" | "scandir"
+            | "setlocale"
             | "fsdecode" | "fsencode" | "dir"
             // hashing and compression, `sys.audit` (whose hooks run through
             // the call), `weakref`'s dead-entry callback, `json`'s encoder

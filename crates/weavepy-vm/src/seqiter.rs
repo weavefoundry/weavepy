@@ -1390,6 +1390,17 @@ pub(crate) fn next_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>>
             v
         }
         Object::LazyIter(l) => lazy_pure_next(l)??,
+        // An `os.scandir` iterator (`os.walk`'s `next(scandir_it)`): its
+        // `__next__`'s step, the default or `StopIteration` at the end.
+        Object::Instance(inst) => match crate::stdlib::os::scandir_step(inst)? {
+            Some(v) => v,
+            None => {
+                return Some(match args {
+                    [_, default] => Ok(default.clone()),
+                    _ => Err(crate::error::stop_iteration()),
+                })
+            }
+        },
         _ => return None,
     };
     Some(Ok(v))
