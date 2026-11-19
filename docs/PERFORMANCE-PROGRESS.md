@@ -1116,6 +1116,18 @@ branch and pull request.
     compares with a tuple as its own tuple, without a method call. Reads
     went from about 2,100 instructions to 500-800 (CPython 270-390) and
     `sys.version_info >= (3, 8)` from 3,740 to 2,310 (700).
+  - `shutil.get_terminal_size()`, which argparse's help formatter calls
+    for every formatter it makes, cost 62,600 instructions against
+    CPython's 29,500. Three of its steps left compiled code: the
+    `os.environ` misses (`_Environ.__getitem__` subscripts a dict keyed by
+    `bytes`, whose missing key only the interpreter raised), the
+    `OSError` from `os.get_terminal_size()` (a builtin the core loop
+    didn't call in place), and `os.terminal_size(fallback)`, which went
+    through the general class call into the type's `__init__`. A missing
+    `bytes` key now raises where the code catches it, the call runs in the
+    core loop's lane, and a struct sequence built from a tuple or list of
+    plain values is made directly (6,000 instructions to 3,640, against
+    1,930). The call as a whole now costs 49,300.
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
