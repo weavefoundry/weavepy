@@ -32518,6 +32518,39 @@ impl Interpreter {
     /// `type(inst).<name>` when it is a plain Python function, cached on
     /// the class under its attribute version at `key` (one of the VM's
     /// own, see `types::vm_key`; one per dunder).
+    /// The native `__next__` of `inst`'s class that runs no Python code
+    /// (as [`instance_native_dunder`] admits one), remembered per class
+    /// version. `None` for a Python `__next__`, or none.
+    fn instance_native_next(inst: &PyInstance) -> Option<Rc<crate::object::BuiltinFn>> {
+        use crate::types::{vm_key, AttrKey, LeafAttrKind as K};
+        let cls = inst.cls_raw();
+        let key = AttrKey::vm(vm_key::NEXT_NATIVE);
+        let ver = cls.attr_version.get();
+        match cls.leaf_attrs.get(key, ver) {
+            Some(K::BuiltinMethod(b)) => return Some(b.clone()),
+            Some(_) => return None,
+            None => {}
+        }
+        if crate::object::exotic_str_keys_possible() {
+            return None;
+        }
+        let found = match cls.lookup("__next__") {
+            Some(Object::Builtin(b)) if b.binds_instance && !builtin_needs_interp(b.name) => {
+                Some(b)
+            }
+            _ => None,
+        };
+        cls.leaf_attrs.set(
+            key,
+            ver,
+            match &found {
+                Some(b) => K::BuiltinMethod(b.clone()),
+                None => K::Other,
+            },
+        );
+        found
+    }
+
     fn instance_dunder_function(
         inst: &PyInstance,
         key: crate::types::AttrKey,
@@ -51498,6 +51531,17 @@ impl Interpreter {
                         // alive through the call, whose body runs no Python.
                         let b = unsafe { &*b };
                         return (b.call)(std::slice::from_ref(iter)).map(Some);
+                    }
+                }
+                // A native `__next__` (an `io.StringIO`'s line), found once
+                // per class version.
+                if !crate::trace::any_observers_active() {
+                    if let Some(b) = Self::instance_native_next(inst) {
+                        return match b.call_kw.as_ref() {
+                            Some(ckw) => ckw(std::slice::from_ref(iter), &[]),
+                            None => (b.call)(std::slice::from_ref(iter)),
+                        }
+                        .map(Some);
                     }
                 }
                 if let Some(r) = instance_native_dunder(iter, "__next__", None) {

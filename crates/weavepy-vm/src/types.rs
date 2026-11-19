@@ -820,6 +820,8 @@ pub(crate) mod vm_key {
     /// is `type`'s own.
     pub(crate) const TYPE_SUBCLASSCHECK: u32 = 99;
     pub(crate) const TYPE_INSTANCECHECK: u32 = 100;
+    /// A class's native `__next__` that runs no Python code.
+    pub(crate) const NEXT_NATIVE: u32 = 101;
 }
 
 /// A builtin type's pure constructor (see [`TypeObject::pure_new`]).

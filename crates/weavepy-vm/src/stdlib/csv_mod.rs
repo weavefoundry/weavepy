@@ -1055,9 +1055,7 @@ fn reader_iternext(args: &[Object]) -> Result<Object, RuntimeError> {
         // `__next__` hands it out and leaves NULL behind. A re-entrant
         // `next(reader)` from inside the input iterator that completes
         // therefore makes the outer call see NULL and raise (gh-145105).
-        inst.dict_cell()
-            .borrow_mut()
-            .insert(keys.fields_live.clone(), Object::Bool(true));
+        set_reader_value(&inst, &keys.fields_live, Object::Bool(true));
         loop {
             match interp.iter_next_object(input_iter.clone())? {
                 None => {
@@ -1086,11 +1084,17 @@ fn reader_iternext(args: &[Object]) -> Result<Object, RuntimeError> {
                         if !matches!(d.get(&keys.fields_live), Some(Object::Bool(true))) {
                             return Err(csv_error("iterator has already advanced the reader"));
                         }
-                        let n = match d.get(&keys.line_num) {
-                            Some(Object::Int(n)) => *n,
-                            _ => 0,
-                        };
-                        d.insert(keys.line_num.clone(), Object::Int(n + 1));
+                        // (Updated in place: the key is there after the
+                        // first line.)
+                        match d.get_mut(&keys.line_num) {
+                            Some(v @ Object::Int(_)) => {
+                                let Object::Int(n) = *v else { unreachable!() };
+                                *v = Object::Int(n + 1);
+                            }
+                            _ => {
+                                d.insert(keys.line_num.clone(), Object::Int(1));
+                            }
+                        }
                     }
                     // Runs of a field's ordinary characters go in whole; the
                     // characters that mean something go through the machine.
@@ -1112,11 +1116,25 @@ fn reader_iternext(args: &[Object]) -> Result<Object, RuntimeError> {
                 break;
             }
         }
-        inst.dict_cell()
-            .borrow_mut()
-            .insert(keys.fields_live.clone(), Object::Bool(false));
+        set_reader_value(&inst, &keys.fields_live, Object::Bool(false));
         Ok(Object::new_list(std::mem::take(&mut p.fields)))
     })
+}
+
+/// `inst.<key> = value` on a reader's state: replaced in place when it is
+/// there (every row's), inserted otherwise.
+fn set_reader_value(inst: &PyInstance, key: &DictKey, value: Object) {
+    let mut d = inst.dict_cell().borrow_mut();
+    match d.get_mut(key) {
+        Some(v) => {
+            let old = std::mem::replace(v, value);
+            drop(d);
+            drop(old);
+        }
+        None => {
+            d.insert(key.clone(), value);
+        }
+    }
 }
 
 fn reader_type() -> Rc<TypeObject> {
