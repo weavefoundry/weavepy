@@ -45732,6 +45732,16 @@ impl Interpreter {
                 Err(unsupported_format_string(value))
             };
         }
+        // A `mappingproxy` has `object.__format__`: its `str()` for an
+        // empty spec.
+        if let Object::MappingProxy(_) | Object::MappingProxyObj(_) = value {
+            let s = self.stringify(value, globals)?;
+            return if spec.is_empty() {
+                Ok(s)
+            } else {
+                Err(unsupported_format_string(value))
+            };
+        }
         // `format(SomeClass)` — a class consults its *metaclass*
         // `__format__`, defaulting to `object.__format__` (str(cls), which
         // itself dispatches the metaclass `__str__`/`__repr__`).
@@ -50176,6 +50186,15 @@ impl Interpreter {
                 }
             }
             return self.repr_of(v, globals);
+        }
+        // A `mappingproxy`'s is its mapping's (`mappingproxy_str`).
+        match v {
+            Object::MappingProxy(d) => return self.stringify(&Object::Dict(d.clone()), globals),
+            Object::MappingProxyObj(inner) => {
+                let inner = (**inner).clone();
+                return self.stringify(&inner, globals);
+            }
+            _ => {}
         }
         // `str(SomeClass)` consults the metaclass (`EnumType.__str__`).
         if let Object::Type(_) = v {
