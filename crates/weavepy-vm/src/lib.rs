@@ -34044,8 +34044,18 @@ impl Interpreter {
         let inst = match recv {
             Object::Instance(inst) => inst,
             // A function's stored attribute (`__doc__` once read,
-            // `__wrapped__`).
-            Object::Function(f) => return function_stored_attr(f, name_obj),
+            // `__wrapped__`), or with a default one the full read found
+            // missing (`inspect`'s `getattr(func, "__signature__", None)`).
+            Object::Function(f) => {
+                if let Some(v) = function_stored_attr(f, name_obj) {
+                    return Some(v);
+                }
+                let d = default?;
+                let c = function_miss_class(recv, name)?;
+                return (c.verdict_cached(crate::types::Verdict::ValueAttrMissing, name)
+                    == Some(true))
+                .then(|| d.clone());
+            }
             Object::Type(cls) => return Self::leaf_type_getattr(cls, name, default),
             // A plain module's global (`hasattr(os, 'getpid')`): its
             // dictionary's value (`ModuleType`'s descriptors are dunders;
@@ -34054,6 +34064,22 @@ impl Interpreter {
                 if !name.starts_with("__") && !crate::object::module_classes_possible() =>
             {
                 return m.dict.borrow().get(&crate::object::StrKey(name)).cloned();
+            }
+            // A generator's (or coroutine's) public name it doesn't have
+            // (`hasattr(gen, "keys")`, as a mapping update probes its
+            // argument): its public attributes are its methods and its
+            // `gi_`/`cr_`/`ag_` fields.
+            Object::Generator(_) | Object::Coroutine(_) | Object::AsyncGenerator(_)
+                if !name.starts_with('_')
+                    && !name.starts_with("gi_")
+                    && !name.starts_with("cr_")
+                    && !name.starts_with("ag_")
+                    && !matches!(
+                        name,
+                        "send" | "throw" | "close" | "asend" | "athrow" | "aclose"
+                    ) =>
+            {
+                return default.cloned();
             }
             // A built-in kind's method (`hasattr(stream, "write")`): its
             // lookup runs no code, and a found method means the attribute
@@ -34831,11 +34857,41 @@ impl Interpreter {
         let read = |d: &DictData| d.get_full(&probe).map(|(_, _, v)| Self::clone_operand(v));
         if crate::object::is_function_slot(name) {
             let slots = f.slots().try_borrow().ok()?;
-            read(&slots)
-        } else {
+            if let Some(v) = read(&slots) {
+                return Some(v);
+            }
+            drop(slots);
+            // What the full read makes of an unset slot (`inspect`'s
+            // signature reads them).
+            return match name {
+                "__defaults__" if f.defaults.is_empty() => Some(Object::None),
+                "__defaults__" => Some(Object::new_tuple(f.defaults.to_vec())),
+                "__kwdefaults__" if f.kw_defaults.is_empty() => Some(Object::None),
+                "__kwdefaults__" => {
+                    let mut d = DictData::default();
+                    for (k, v) in &f.kw_defaults {
+                        d.insert(DictKey(Object::from_str(k)), v.clone());
+                    }
+                    Some(Object::Dict(Rc::new(RefCell::new(d))))
+                }
+                _ => None,
+            };
+        }
+        {
             let attrs = f.attrs.try_borrow().ok()?;
-            let dict = attrs.as_ref()?.try_borrow().ok()?;
-            read(&dict)
+            if let Some(dict) = attrs.as_ref() {
+                if let Some(v) = read(&*dict.try_borrow().ok()?) {
+                    return Some(v);
+                }
+            }
+        }
+        // The function type's own fields, under no dict entry (the full
+        // read's order).
+        match name {
+            "__code__" => Some(Object::Code(f.code())),
+            "__globals__" => Some(Object::Dict(f.globals.clone())),
+            "__builtins__" => Some(Object::Dict(f.builtins.clone())),
+            _ => None,
         }
     }
 
@@ -48724,7 +48780,8 @@ impl Interpreter {
                 return Ok(args[2].clone());
             }
         }
-        let value_class = builtin_value_class(&args[0]);
+        let value_class =
+            builtin_value_class(&args[0]).or_else(|| function_miss_class(&args[0], &name));
         if let Some(c) = &value_class {
             if c.verdict_cached(crate::types::Verdict::ValueAttrMissing, &name) == Some(true) {
                 return Ok(args[2].clone());
@@ -48785,7 +48842,8 @@ impl Interpreter {
                 return Ok(Object::Bool(false));
             }
         }
-        let value_class = builtin_value_class(&args[0]);
+        let value_class =
+            builtin_value_class(&args[0]).or_else(|| function_miss_class(&args[0], &name));
         if let Some(c) = &value_class {
             if c.verdict_cached(crate::types::Verdict::ValueAttrMissing, &name) == Some(true) {
                 return Ok(Object::Bool(false));
@@ -89844,6 +89902,39 @@ fn function_stored_attr(f: &crate::object::PyFunction, name: &SharedStr) -> Opti
     let attrs = f.attrs.try_borrow().ok()?;
     let dict = attrs.as_ref()?.try_borrow().ok()?;
     dict.get(&key).cloned()
+}
+
+/// Whether function `f` stores nothing under `name` (in its slots or its
+/// `__dict__`), when that can be told without waiting on a borrow.
+fn function_stores_none(f: &crate::object::PyFunction, name: &str) -> bool {
+    if matches!(name, "__class__" | "__new__") {
+        return false;
+    }
+    if crate::object::is_function_slot(name) {
+        return f
+            .slots()
+            .try_borrow()
+            .is_ok_and(|d| d.get(&crate::object::StrKey(name)).is_none());
+    }
+    let Ok(attrs) = f.attrs.try_borrow() else {
+        return false;
+    };
+    attrs.as_ref().is_none_or(|d| {
+        d.try_borrow()
+            .is_ok_and(|d| d.get(&crate::object::StrKey(name)).is_none())
+    })
+}
+
+/// The function type, when `obj` is a function storing nothing under
+/// `name`: the full read's miss for it then depends on the type alone, and
+/// is remembered on the type (see `Verdict::ValueAttrMissing`).
+fn function_miss_class(obj: &Object, name: &str) -> Option<Rc<TypeObject>> {
+    match obj {
+        Object::Function(f) if function_stores_none(f, name) => {
+            Some(crate::builtins::class_of(obj))
+        }
+        _ => None,
+    }
 }
 
 fn code_name_leaf_probe(

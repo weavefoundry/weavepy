@@ -184,7 +184,9 @@ pub(crate) enum Verdict {
     /// A value of the builtin class (one whose attributes all come from
     /// the class, see `builtin_value_class`) answered `name` with
     /// `AttributeError`: enum asks `hasattr(value, '__get__')` of every
-    /// member value. Recorded like [`Self::TypeAttrMissing`].
+    /// member value. On the function type, a function storing nothing
+    /// under `name` did (`inspect` asks `getattr(func, '__signature__',
+    /// None)`). Recorded like [`Self::TypeAttrMissing`].
     ValueAttrMissing = 7,
     /// The class's instances finalize through the native asyncio `__del__`
     /// `name` names (`"Future"` or `"Task"`): a Python subclass of the
