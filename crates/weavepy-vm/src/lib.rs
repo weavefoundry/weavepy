@@ -2086,6 +2086,15 @@ impl Interpreter {
         args: &[Object],
         kwargs: &[(String, Object)],
     ) -> Result<Object, RuntimeError> {
+        // A native function's callback (`bisect`'s `key`, a hook) from a
+        // VM frame of this interpreter: already published, its handles
+        // active, so the call is all that's left.
+        if crate::vm_singletons::current_interpreter_ptr() == Some(std::ptr::from_mut::<Self>(self))
+            && crate::vm_singletons::thread_handles_are(&self.frame_stack)
+        {
+            let globals = self.builtins.clone();
+            return self.call(&callable, args, kwargs, &globals);
+        }
         let _interp_guard =
             crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
         let _handles = self.activate_thread_handles();
@@ -2104,6 +2113,12 @@ impl Interpreter {
         kwargs: &[(String, Object)],
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Object, RuntimeError> {
+        // (Published and active already: see `call_object`.)
+        if crate::vm_singletons::current_interpreter_ptr() == Some(std::ptr::from_mut::<Self>(self))
+            && crate::vm_singletons::thread_handles_are(&self.frame_stack)
+        {
+            return self.call(callable, args, kwargs, globals);
+        }
         let _interp_guard =
             crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
         let _handles = self.activate_thread_handles();
@@ -55228,9 +55243,15 @@ impl Interpreter {
             return Ok(Object::Bool(r));
         }
         // A struct sequence compares as its tuple, against a tuple or one
-        // of its own type (`sys.version_info >= (3, 8)`).
-        if let Some((ta, tb)) = crate::stdlib::os::struct_seq_compare_operands(a, b) {
-            return self.rich_compare_obj(&ta, &tb, op, globals);
+        // of its own type (`sys.version_info >= (3, 8)`). (A struct
+        // sequence's class is a builtin one: a user class's instances skip
+        // the check.)
+        let builtin_instance =
+            |o: &Object| matches!(o, Object::Instance(i) if i.cls_raw().flags.is_builtin);
+        if builtin_instance(a) || builtin_instance(b) {
+            if let Some((ta, tb)) = crate::stdlib::os::struct_seq_compare_operands(a, b) {
+                return self.rich_compare_obj(&ta, &tb, op, globals);
+            }
         }
         // Two instances whose left one's comparison dunder is a Python
         // function, and whose right one's class doesn't subclass the left's

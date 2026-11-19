@@ -685,6 +685,20 @@ pub fn activate_thread_handles(handles: ThreadHandles) -> ThreadHandlesGuard {
     ThreadHandlesGuard { _private: () }
 }
 
+/// Whether the handles on top of this thread's stack are the ones whose
+/// frame stack is `frame_stack`: its interpreter activated them already
+/// (an embedder entry's re-activation would only push the same again).
+pub(crate) fn thread_handles_are(frame_stack: &crate::object::FrameStack) -> bool {
+    CURRENT_THREAD_HANDLES
+        .try_with(|cell| {
+            cell.try_borrow()
+                .ok()
+                .and_then(|v| v.last().map(|h| Rc::ptr_eq(&h.frame_stack, frame_stack)))
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
 /// Read-only view of the current thread's handles. Returns `None`
 /// if no interpreter has activated yet on this thread (e.g. the C
 /// shim is being called before `Py_Initialize`). The `sys` module
