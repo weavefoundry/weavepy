@@ -213,10 +213,15 @@ fn with_partial_fields<R>(
     inst: &crate::types::PyInstance,
     f: impl FnOnce([&Object; 4]) -> R,
 ) -> Option<R> {
+    /// The `__slots__` layout found led by the four names (see
+    /// `SlotStorage::leading_memo`): a store with it skips their
+    /// comparison at every call.
+    static PARTIAL_LAYOUT: crate::types::LayoutMemo = crate::types::LayoutMemo::new();
     PARTIAL_KEYS.with(|keys| {
         // SAFETY: a read; `f` runs no code that could borrow the slots.
         let slots = unsafe { inst.slots.peek() }?;
-        let fields = slots.leading_interned([&keys[0], &keys[1], &keys[2], &keys[3]])?;
+        let fields =
+            slots.leading_memo(&PARTIAL_LAYOUT, [&keys[0], &keys[1], &keys[2], &keys[3]])?;
         Some(f(fields))
     })
 }
