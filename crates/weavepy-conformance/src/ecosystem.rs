@@ -1381,7 +1381,17 @@ impl CmdOutput {
     fn tail_n(&self, n: usize) -> String {
         let lines: Vec<&str> = self.combined.lines().collect();
         let start = lines.len().saturating_sub(n);
-        let tail = lines[start..].join("\n");
+        let mut tail = lines[start..].join("\n");
+        // A Rust panic's own line (and its message, on the next line when
+        // the location ends it) names the cause; the backtrace and the
+        // abort after it can push it out of the tail.
+        if let Some(at) = lines[..start]
+            .iter()
+            .rposition(|l| l.contains(" panicked at "))
+        {
+            let end = (at + 2).min(start);
+            tail = format!("{}\n[…]\n{tail}", lines[at..end].join("\n"));
+        }
         if tail.trim().is_empty() {
             // A silent nonzero exit (e.g. a crash) would otherwise
             // produce an empty, undebuggable reason.
@@ -1962,6 +1972,29 @@ mod simple_tables {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tail_keeps_a_panic_line_above_it() {
+        let mut out = String::from("start\nthread '<unnamed>' panicked at src/x.rs:1:2:\nboom\n");
+        for k in 0..30 {
+            out.push_str(&format!("  {k}: frame\n"));
+        }
+        out.push_str("Fatal Python error: Aborted\n");
+        let o = CmdOutput {
+            success: false,
+            code: None,
+            combined: out,
+        };
+        let t = o.tail();
+        assert!(t.starts_with("thread '<unnamed>' panicked at src/x.rs:1:2:\nboom\n[…]\n"));
+        assert!(t.ends_with("Fatal Python error: Aborted"));
+        let quiet = CmdOutput {
+            success: false,
+            code: Some(1),
+            combined: "a\nb\n".to_owned(),
+        };
+        assert_eq!(quiet.tail(), "a\nb");
+    }
 
     // -- manifest parsing ---------------------------------------------------
 
