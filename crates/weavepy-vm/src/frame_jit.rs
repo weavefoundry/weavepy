@@ -12908,6 +12908,40 @@ unsafe extern "C" fn h_countdown(countdown: *mut u32) -> u32 {
     0
 }
 
+/// The `CALL` at `pc` (its operands from `start` up a `len`-deep stack)
+/// of a builtin container type with one argument, which
+/// `Interpreter::core_type_lane` builds (see `core_type_lane_class`),
+/// run there with the frame synced as `h_call` syncs it: `0` or `RELOAD`
+/// as `h_call` answers after the lane, `None` when the lane declined.
+///
+/// # Safety
+///
+/// As `h_call`'s, with a running activation's switch in `st`.
+unsafe fn type_lane_direct(st: *mut State, pc: u64, len: usize, start: usize) -> Option<u32> {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let st = &mut *st;
+        if st.sw.is_null() {
+            return None;
+        }
+        let frame = &mut *st.frame;
+        frame.stack.set_len(len);
+        frame.pc = pc as u32;
+        settle(st);
+        *(*st.sw).last = st.last;
+        let sw = &mut *st.sw;
+        let interp = &mut *st.interp.cast_mut();
+        if !interp.core_type_lane(sw) {
+            return None;
+        }
+        Some(if finished_in_place(st, start) {
+            0
+        } else {
+            RELOAD
+        })
+    }
+}
+
 /// `CALL` of a Python class: a class whose memoized plan proved its
 /// construction to be a store-only `__init__`'s stores runs them straight
 /// from here (`Interpreter::core_store_init`, as the core loop's
@@ -12949,6 +12983,14 @@ unsafe extern "C" fn h_call_ctor(
                     s.stack.add(start).write(v);
                     s.len = start + 1;
                     return 0;
+                }
+                // `list(it)`, `tuple(it)` ... of anything else: straight to
+                // the core loop's lane, as `h_call` would take it after
+                // the same attempt again.
+                if argc == 1 && Interpreter::core_type_lane_class(t) {
+                    if let Some(r) = type_lane_direct(st, pc, len as usize, start) {
+                        return r;
+                    }
                 }
             }
         }
@@ -15254,6 +15296,13 @@ unsafe extern "C" fn h_call_type(
                     return left_marked(st, pc as u32, start + 1);
                 }
                 return 0;
+            }
+            // `list(it)`, `tuple(it)`, `set(it)` ... of anything else
+            // (`list(map(f, xs))`): straight to the core loop's lane.
+            if site.argc == 1 && Interpreter::core_type_lane_class(&site.cls) {
+                if let Some(r) = type_lane_direct(st, pc, lenu, start) {
+                    return r;
+                }
             }
         }
         h_call(st, code, ext, pc, len)

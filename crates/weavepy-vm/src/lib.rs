@@ -19097,6 +19097,23 @@ impl Interpreter {
     /// ordinary call with the caller published
     /// (consuming the argument may run Python code), as the builtin lane
     /// runs a builtin function. `false` touches nothing.
+    /// Whether [`Self::core_type_lane`] builds `ty`'s one-argument call
+    /// itself (`list(x)`, `tuple(x)`, `set(x)`, `frozenset(x)`, `dict(x)`,
+    /// `str(x)`), rather than through the ordinary protocol.
+    pub(crate) fn core_type_lane_class(ty: &Rc<TypeObject>) -> bool {
+        let bt = builtin_types();
+        [
+            &bt.list_,
+            &bt.tuple_,
+            &bt.set_,
+            &bt.frozenset_,
+            &bt.dict_,
+            &bt.str_,
+        ]
+        .iter()
+        .any(|t| Rc::ptr_eq(t, ty))
+    }
+
     fn core_type_lane(&mut self, sw: &mut CoreSwitch) -> bool {
         // SAFETY: see `CoreSwitch`: the running activation is synced and
         // unborrowed here.
@@ -19123,18 +19140,7 @@ impl Interpreter {
             return false;
         }
         // (`str(obj)` runs the object's `__str__`.)
-        if ins.arg != 1
-            || ![
-                &bt.list_,
-                &bt.tuple_,
-                &bt.set_,
-                &bt.frozenset_,
-                &bt.dict_,
-                &bt.str_,
-            ]
-            .iter()
-            .any(|t| Rc::ptr_eq(t, ty))
-        {
+        if ins.arg != 1 || !Self::core_type_lane_class(ty) {
             // Any other class's call takes the ordinary protocol, on the
             // operands where they are.
             // SAFETY: the activation is synced, and the shape was checked;

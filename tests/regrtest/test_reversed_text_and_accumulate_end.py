@@ -2,7 +2,9 @@
 
 `reversed(s)` of a `str` or `bytes` builds its iterator without the
 general type call; builtin type constructors are reused across calls; and
-a function-less `accumulate` over a list or tuple ends in place. Results,
+a function-less `accumulate` or a `pairwise` over a list or tuple ends in
+place; and compiled `list(x)`, `tuple(x)`, `set(x)`, `dict(x)` and
+`str(x)` calls of adapters go straight to the container lane. Results,
 errors, and the iterators' later behavior are unchanged.
 """
 
@@ -62,6 +64,64 @@ class ReversedTextTests(unittest.TestCase):
         self.assertEqual(list(itertools.accumulate([2, 3], lambda a, b: a * b)), [2, 6])
         self.assertEqual(list(itertools.accumulate(["a", "b"])), ["a", "ab"])
         self.assertEqual(list(itertools.accumulate([])), [])
+
+
+    def test_pairwise_ends(self):
+        for _ in range(N):
+            r = list(itertools.pairwise([1, 2, 3]))
+            for a, b in itertools.pairwise((1, 2)):
+                pass
+        self.assertEqual(r, [(1, 2), (2, 3)])
+        p = itertools.pairwise("abc")
+        self.assertEqual(list(p), [("a", "b"), ("b", "c")])
+        self.assertEqual(list(p), [])
+        self.assertEqual(next(p, "end"), "end")
+        objs = [object(), object()]
+        self.assertEqual(list(itertools.pairwise(objs)), [(objs[0], objs[1])])
+        self.assertEqual(list(itertools.pairwise([1])), [])
+
+
+class ContainerLaneTests(unittest.TestCase):
+    def test_lane_calls(self):
+        xs = [3, -1, 2]
+        for _ in range(N):
+            r = (
+                list(map(abs, xs)),
+                tuple(map(abs, xs)),
+                set(map(abs, xs)),
+                frozenset(map(abs, xs)),
+                dict(zip("abc", xs)),
+                str(map),
+                list(x * 2 for x in xs),
+            )
+        self.assertEqual(r[0], [3, 1, 2])
+        self.assertEqual(r[1], (3, 1, 2))
+        self.assertEqual(r[2], {1, 2, 3})
+        self.assertEqual(r[3], frozenset({1, 2, 3}))
+        self.assertEqual(r[4], {"a": 3, "b": -1, "c": 2})
+        self.assertEqual(r[5], "<class 'map'>")
+        self.assertEqual(r[6], [6, -2, 4])
+
+    def test_lane_errors(self):
+        def bad(x):
+            raise KeyError(x)
+
+        for _ in range(N // 10):
+            with self.assertRaises(KeyError):
+                list(map(bad, [1]))
+            with self.assertRaises(TypeError):
+                set(map(list, [[1]]))
+            with self.assertRaises(ValueError):
+                dict(map(tuple, ["abc"]))
+        try:
+            tuple(map(bad, [7]))
+        except KeyError as e:
+            tb = e.__traceback__
+        names = []
+        while tb is not None:
+            names.append(tb.tb_frame.f_code.co_name)
+            tb = tb.tb_next
+        self.assertEqual(names, ["test_lane_errors", "bad"])
 
 
 if __name__ == "__main__":

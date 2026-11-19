@@ -2222,6 +2222,20 @@ pub(crate) fn itertools_pure_next(l: &PyLazyIter) -> Option<Option<Object>> {
             source: Some(source),
             old: Some(old),
         } => {
+            // At its source's end it lets go of both, as the general step
+            // does, when releasing them runs nothing.
+            if cursor_at_end(source) {
+                if !(plain_value(old) && quiet_source(source)) {
+                    return None;
+                }
+                let (src, prev) = (std::mem::replace(source, Object::None), old.clone());
+                *st = LazyIterKind::Pairwise {
+                    source: None,
+                    old: None,
+                };
+                drop((src, prev));
+                return Some(None);
+            }
             let new = ready_next(source)?;
             let prev = std::mem::replace(old, new.clone());
             Some(Some(Object::new_tuple_array([prev, new])))
