@@ -1680,7 +1680,11 @@ fn get_main_thread_ident(_args: &[Object]) -> Result<Object, RuntimeError> {
 pub fn after_fork_in_child() {
     let surviving = main_thread_ident_now();
     MAIN_THREAD_IDENT.store(surviving, Ordering::Release);
-    for state in handle_registry().lock().values() {
+    for state in handle_registry()
+        .lock()
+        .values()
+        .filter_map(std::sync::Weak::upgrade)
+    {
         let id = state.ident.load(Ordering::Acquire);
         // ident 0 = an unstarted handle; leave it. The surviving thread's own
         // handle stays alive; everything else is now dead.
@@ -1712,10 +1716,27 @@ struct ThreadHandleState {
 /// instance dict as `_wp_hid`) to its shared state, so
 /// `start_joinable_thread` can wire a worker to a pre-constructed
 /// handle.
-fn handle_registry() -> &'static parking_lot::Mutex<HashMap<u64, Arc<ThreadHandleState>>> {
-    static REG: OnceLock<parking_lot::Mutex<HashMap<u64, Arc<ThreadHandleState>>>> =
+/// Every live handle's state by its `_wp_hid`. The handle object's own
+/// methods hold the state; the registry holds it weakly, so a handle that
+/// dies (with its `threading.Thread`) leaves nothing behind but an entry
+/// the next registration's sweep drops.
+fn handle_registry() -> &'static parking_lot::Mutex<HashMap<u64, std::sync::Weak<ThreadHandleState>>>
+{
+    static REG: OnceLock<parking_lot::Mutex<HashMap<u64, std::sync::Weak<ThreadHandleState>>>> =
         OnceLock::new();
     REG.get_or_init(|| parking_lot::Mutex::new(HashMap::new()))
+}
+
+/// Register `state` under `hid`, first sweeping out the entries of dead
+/// handles once the registry has doubled since the last sweep.
+fn register_handle(hid: u64, state: &Arc<ThreadHandleState>) {
+    static SWEEP_AT: AtomicUsize = AtomicUsize::new(64);
+    let mut reg = handle_registry().lock();
+    if reg.len() >= SWEEP_AT.load(Ordering::Relaxed) {
+        reg.retain(|_, w| w.strong_count() > 0);
+        SWEEP_AT.store((reg.len() * 2).max(64), Ordering::Relaxed);
+    }
+    reg.insert(hid, Arc::downgrade(state));
 }
 
 static NEXT_HANDLE_ID: AtomicU64 = AtomicU64::new(1);
@@ -1746,7 +1767,7 @@ fn thread_handle_type() -> Rc<TypeObject> {
 /// from a handle the caller pre-created.
 fn make_thread_handle_object(state: Arc<ThreadHandleState>, ident: Object) -> Object {
     let hid = NEXT_HANDLE_ID.fetch_add(1, Ordering::AcqRel);
-    handle_registry().lock().insert(hid, state.clone());
+    register_handle(hid, &state);
 
     let dict = Rc::new(RefCell::new(DictData::default()));
 
@@ -1874,7 +1895,10 @@ fn handle_state_of(obj: &Object) -> Option<Arc<ThreadHandleState>> {
             _ => return None,
         }
     };
-    handle_registry().lock().get(&hid).cloned()
+    handle_registry()
+        .lock()
+        .get(&hid)
+        .and_then(std::sync::Weak::upgrade)
 }
 
 /// `_thread._ThreadHandle()` — a fresh, unstarted handle.
