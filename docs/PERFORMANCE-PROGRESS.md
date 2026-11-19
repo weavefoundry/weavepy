@@ -1049,6 +1049,25 @@ branch and pull request.
     place, and `os.scandir` takes the builtin lane (a warm walk of a
     42-entry tree from 764,000 instructions to 738,000, against 565,000).
     A walk's remaining time is mostly system calls.
+  - Only about half of the linker order file's names still matched the
+    binary's functions, so start-up on Linux touched 10.5 MB of code (the
+    kernel maps 64 KiB around each page a fault touches) and peaked at
+    17 MB against CPython's 9. Extending the order with callgrind
+    profiles of start-up, import mixes, the bench fixtures and ten
+    battery cases (`scripts/extend-order-file.py`) halves the resident
+    code: peak RSS goes from 17.1 to 12.0 MB at start-up and from 23.6
+    to 17.4 MB after importing `json`, `re` and `collections`, and
+    start-up is about 3% faster. On macOS, which faults single pages,
+    peak RSS drops 2-4%.
+  - `inspect.signature` read a function's `__defaults__`,
+    `__kwdefaults__` and `__code__`, and probed the names it lacks
+    (`getattr(func, "__signature__", None)`, `hasattr(func,
+    "__wrapped__")`), through the full attribute lookup. The fields now
+    read in place, and a miss the full lookup found on a function that
+    stores nothing under the name is remembered on the function type
+    (`inspect.signature` of a one-parameter function from 105,600
+    instructions to 87,100; `f.__defaults__, f.__kwdefaults__` from 4,870
+    to 2,733, against 1,136).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
