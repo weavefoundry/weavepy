@@ -16520,6 +16520,24 @@ unsafe extern "C" fn h_await_iter(st: *mut State, at: *mut Object, kind: u64) ->
         if ok {
             return 0;
         }
+        // `yield from xs` of a builtin container: its iterator, in place
+        // (an iterator is its own).
+        if kind == 1
+            && matches!(
+                top,
+                Object::List(_)
+                    | Object::Tuple(_)
+                    | Object::Range(_)
+                    | Object::Str(_)
+                    | Object::Iter(_)
+            )
+            && Interpreter::core_droppable(top)
+        {
+            if let Some(Ok(it)) = crate::seqiter::iter_fast(std::slice::from_ref(top)) {
+                crate::drop_hot(std::mem::replace(&mut *at, it));
+                return 0;
+            }
+        }
         if matches!(top, Object::Instance(_)) && Interpreter::core_droppable(top) {
             let name = if kind == 0 { "__await__" } else { "__iter__" };
             if let Some(gen) = (*st.interp).instance_gen_call(top, name) {
@@ -16550,6 +16568,28 @@ unsafe extern "C" fn h_send(st: *mut State, pc: u64, len: u64) -> u32 {
     unsafe {
         let st = &mut *st;
         let len = len as usize;
+        // A list's or tuple's cursor (`yield from xs`) steps in place: its
+        // next item takes the sent `None`'s place for this code's
+        // `YIELD_VALUE`, and at its end the `None` stays as the result for
+        // the `END_SEND`, as CPython's `SEND` steps an iterator.
+        if len >= 2 {
+            if let (Object::Iter(rc), Object::None) =
+                (&*st.stack.add(len - 2), &*st.stack.add(len - 1))
+            {
+                if let Some(cur) = rc.peek_mut() {
+                    if let Some(v) = cur.pure_peek() {
+                        cur.pure_skip();
+                        st.stack.add(len - 1).write(v);
+                        st.len = len;
+                        return SEND_YIELDED;
+                    }
+                }
+                if crate::seqiter::cursor_at_end(&*st.stack.add(len - 2)) {
+                    st.len = len;
+                    return 0;
+                }
+            }
+        }
         if st.sw.is_null()
             || len < 2
             || !matches!(

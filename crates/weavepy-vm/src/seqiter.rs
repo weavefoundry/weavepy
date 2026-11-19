@@ -1584,7 +1584,7 @@ pub(crate) fn lazy_stops_quietly(l: &Rc<PyLazyIter>) -> bool {
 }
 
 /// Whether `it` is a tuple's or an unowned list's cursor at its end.
-fn cursor_at_end(it: &Object) -> bool {
+pub(crate) fn cursor_at_end(it: &Object) -> bool {
     use crate::object::PyIterator;
     let Object::Iter(c) = it else {
         return false;
