@@ -15525,8 +15525,11 @@ impl Interpreter {
                             unsafe { std::slice::from_raw_parts(base.add(start), len - start) };
                         let r = match &ops[0] {
                             // A natively served class's constructor (see
-                            // `stdlib::datetime_native`).
-                            Object::Type(ty) if ty.native_kind.get() != 0 => {
+                            // `stdlib::datetime_native`), or an exact
+                            // `itertools` class's adapter.
+                            Object::Type(ty)
+                                if ty.native_kind.get() != 0 || ty.lazy_ctor.get() != 0 =>
+                            {
                                 Self::core_native_ctor_kw(ops, argc, true)
                             }
                             // A native method of an exact `decimal.Decimal`
@@ -28590,12 +28593,20 @@ impl Interpreter {
             // The exact `itertools` classes: their native adapters, when
             // building one runs no code. (A builtin type's call is
             // `core_builtin_ctor`'s, which every caller tries as well.)
-            if kw || cls.flags.is_builtin || cls.lazy_ctor.get() == 0 {
+            if cls.flags.is_builtin || cls.lazy_ctor.get() == 0 {
                 return None;
             }
             let args = ops.get(2..2 + argc)?;
             if !Self::core_all_droppable(ops) {
                 return None;
+            }
+            // (`product(xs, repeat=2)`: the keyword values, then the names.)
+            if kw {
+                let Object::Tuple(names) = ops.last()? else {
+                    return None;
+                };
+                let values = ops.get(2 + argc..2 + argc + names.len())?;
+                return crate::stdlib::itertools_mod::native_new_pure_kw(cls, args, names, values);
             }
             return crate::stdlib::itertools_mod::native_new_pure(cls, args);
         }

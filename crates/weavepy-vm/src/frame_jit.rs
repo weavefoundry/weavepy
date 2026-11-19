@@ -15768,7 +15768,8 @@ unsafe extern "C" fn h_call_kw(st: *mut State, code: *const CodeObject, pc: u64,
         let ops = std::slice::from_raw_parts(base.add(start), len - start);
         let interp = &*st.interp;
         let r = match &ops[0] {
-            Object::Type(ty) if ty.native_kind.get() != 0 => {
+            // (A natively served class, or an exact `itertools` one.)
+            Object::Type(ty) if ty.native_kind.get() != 0 || ty.lazy_ctor.get() != 0 => {
                 Interpreter::core_native_ctor_kw(ops, argc, true)
             }
             Object::Builtin(_)

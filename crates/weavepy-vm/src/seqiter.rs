@@ -1721,8 +1721,9 @@ pub(crate) fn machine_step(st: &mut LazyIterKind) -> Option<Option<Object>> {
                 *started = true;
                 indices.clear();
                 indices.resize(pools.len(), 0);
-                let t: Vec<Object> = pools.iter().map(|p| p[0].clone()).collect();
-                return Some(Some(Object::new_tuple(t)));
+                return Some(Some(Object::tuple_from_exact(
+                    pools.iter().map(|p| p[0].clone()),
+                )));
             }
             let n = pools.len();
             let mut i = n as i64 - 1;
@@ -1739,12 +1740,12 @@ pub(crate) fn machine_step(st: &mut LazyIterKind) -> Option<Option<Object>> {
                 *stopped = true;
                 return Some(None);
             }
-            let t: Vec<Object> = pools
-                .iter()
-                .zip(indices.iter())
-                .map(|(p, &ix)| p[ix].clone())
-                .collect();
-            Some(Some(Object::new_tuple(t)))
+            Some(Some(Object::tuple_from_exact(
+                pools
+                    .iter()
+                    .zip(indices.iter())
+                    .map(|(p, &ix)| p[ix].clone()),
+            )))
         }
         LazyIterKind::Permutations {
             pool,
@@ -1761,8 +1762,9 @@ pub(crate) fn machine_step(st: &mut LazyIterKind) -> Option<Option<Object>> {
             let r = *r;
             if !*started {
                 *started = true;
-                let t: Vec<Object> = indices[..r].iter().map(|&ix| pool[ix].clone()).collect();
-                return Some(Some(Object::new_tuple(t)));
+                return Some(Some(Object::tuple_from_exact(
+                    indices[..r].iter().map(|&ix| pool[ix].clone()),
+                )));
             }
             if n == 0 {
                 *stopped = true;
@@ -1778,8 +1780,9 @@ pub(crate) fn machine_step(st: &mut LazyIterKind) -> Option<Option<Object>> {
                 } else {
                     let j = n - cycles[k];
                     indices.swap(k, j);
-                    let t: Vec<Object> = indices[..r].iter().map(|&ix| pool[ix].clone()).collect();
-                    return Some(Some(Object::new_tuple(t)));
+                    return Some(Some(Object::tuple_from_exact(
+                        indices[..r].iter().map(|&ix| pool[ix].clone()),
+                    )));
                 }
                 i -= 1;
             }
@@ -1800,8 +1803,9 @@ pub(crate) fn machine_step(st: &mut LazyIterKind) -> Option<Option<Object>> {
             let r = *r;
             if !*started {
                 *started = true;
-                let t: Vec<Object> = indices.iter().map(|&ix| pool[ix].clone()).collect();
-                return Some(Some(Object::new_tuple(t)));
+                return Some(Some(Object::tuple_from_exact(
+                    indices.iter().map(|&ix| pool[ix].clone()),
+                )));
             }
             let mut i = r as i64 - 1;
             while i >= 0 && indices[i as usize] == i as usize + n - r {
@@ -1816,8 +1820,9 @@ pub(crate) fn machine_step(st: &mut LazyIterKind) -> Option<Option<Object>> {
             for j in k + 1..r {
                 indices[j] = indices[j - 1] + 1;
             }
-            let t: Vec<Object> = indices.iter().map(|&ix| pool[ix].clone()).collect();
-            Some(Some(Object::new_tuple(t)))
+            Some(Some(Object::tuple_from_exact(
+                indices.iter().map(|&ix| pool[ix].clone()),
+            )))
         }
         LazyIterKind::Cwr {
             pool,
@@ -1833,8 +1838,9 @@ pub(crate) fn machine_step(st: &mut LazyIterKind) -> Option<Option<Object>> {
             let r = *r;
             if !*started {
                 *started = true;
-                let t: Vec<Object> = indices.iter().map(|&ix| pool[ix].clone()).collect();
-                return Some(Some(Object::new_tuple(t)));
+                return Some(Some(Object::tuple_from_exact(
+                    indices.iter().map(|&ix| pool[ix].clone()),
+                )));
             }
             let mut i = r as i64 - 1;
             while i >= 0 && indices[i as usize] == n - 1 {
@@ -1849,8 +1855,9 @@ pub(crate) fn machine_step(st: &mut LazyIterKind) -> Option<Option<Object>> {
             for slot in indices[k..].iter_mut() {
                 *slot = v;
             }
-            let t: Vec<Object> = indices.iter().map(|&ix| pool[ix].clone()).collect();
-            Some(Some(Object::new_tuple(t)))
+            Some(Some(Object::tuple_from_exact(
+                indices.iter().map(|&ix| pool[ix].clone()),
+            )))
         }
         _ => None,
     }

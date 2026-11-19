@@ -953,6 +953,33 @@ pub(crate) fn native_new_pure(
     Some(with_class(core, cls))
 }
 
+/// [`native_new_pure`] with keywords, `names` (strings) naming `values`
+/// (`product(xs, repeat=2)`): `None` for every other shape.
+pub(crate) fn native_new_pure_kw(
+    cls: &Rc<crate::types::TypeObject>,
+    args: &[Object],
+    names: &[Object],
+    values: &[Object],
+) -> Option<Object> {
+    let kwargs = names
+        .iter()
+        .zip(values)
+        .map(|(n, v)| match n {
+            Object::Str(s) => Some((s.to_string(), v.clone())),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let core = native_new(
+        cls.lazy_ctor.get(),
+        args,
+        &kwargs,
+        &mut pure_iter,
+        &mut pure_pool,
+    )?
+    .ok()?;
+    Some(with_class(core, cls))
+}
+
 /// `cls(*args, **kwargs)` for a registered exact class: `None` to run
 /// the class's own `__new__`.
 pub(crate) fn native_new_interp(

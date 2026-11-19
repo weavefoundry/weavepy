@@ -81,6 +81,40 @@ class ReversedTextTests(unittest.TestCase):
         self.assertEqual(list(itertools.pairwise([1])), [])
 
 
+    def test_combinatorics_and_keywords(self):
+        L = [1, 2, 3]
+        for _ in range(N):
+            r = (
+                list(itertools.product(L, repeat=2))[-1],
+                list(itertools.product("ab", "c")),
+                list(itertools.permutations(L))[3],
+                list(itertools.combinations(L, 2)),
+                list(itertools.combinations_with_replacement("ab", 2)),
+                list(itertools.accumulate(L, initial=10)),
+                list(itertools.zip_longest("ab", "c", fillvalue="-")),
+                list(itertools.islice(itertools.count(start=5, step=2), 3)),
+            )
+        self.assertEqual(r, (
+            (3, 3),
+            [("a", "c"), ("b", "c")],
+            (2, 3, 1),
+            [(1, 2), (1, 3), (2, 3)],
+            [("a", "a"), ("a", "b"), ("b", "b")],
+            [10, 11, 13, 16],
+            [("a", "c"), ("b", "-")],
+            [5, 7, 9],
+        ))
+        self.assertEqual(list(itertools.combinations(L, 0)), [()])
+        self.assertEqual(list(itertools.product(L, repeat=0)), [()])
+        for _ in range(N // 10):
+            with self.assertRaises(ValueError):
+                itertools.product(L, repeat=-1)
+            with self.assertRaises(TypeError):
+                itertools.product(L, bogus=2)
+            with self.assertRaises(TypeError):
+                itertools.accumulate(L, initial=1, extra=2)
+
+
 class ContainerLaneTests(unittest.TestCase):
     def test_lane_calls(self):
         xs = [3, -1, 2]
