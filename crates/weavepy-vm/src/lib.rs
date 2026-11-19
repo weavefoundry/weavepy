@@ -13429,6 +13429,10 @@ impl Interpreter {
                                         len -= 1;
                                         last = pc + 1;
                                         pc += 2;
+                                        // (The value it replaced may have
+                                        // queued a finalizer, which runs
+                                        // before the next instruction.)
+                                        after_release!();
                                         continue;
                                     }
                                     clone_hot(other)
@@ -17020,6 +17024,9 @@ impl Interpreter {
                         len -= 2;
                         last = pc;
                         pc += 1;
+                        // (The value it replaced may have queued a finalizer,
+                        // which runs before the next instruction.)
+                        after_release!();
                     }
                     // `yield from`'s delegate: a generator (or, in a
                     // coroutine, a coroutine) stays; an instance whose

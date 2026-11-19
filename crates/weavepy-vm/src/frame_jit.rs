@@ -23982,6 +23982,25 @@ impl<'a> Lower<'a> {
         true
     }
 
+    /// The plain decrement [`Self::field_store_in_line`] checked for the
+    /// heap value at `place` (`plain_old` its scalar test), if it isn't a
+    /// scalar.
+    fn release_checked_old(&mut self, plain_old: Option<Value>, place: Value) {
+        let Some(plain_old) = plain_old else {
+            return;
+        };
+        let heap = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.ins().brif(plain_old, done, &[], heap, &[]);
+        self.b.switch_to_block(heap);
+        let word = self.b.ins().load(self.ptr, FLAGS, place, 8);
+        let n = self.b.ins().load(types::I64, FLAGS, word, 0);
+        let n = self.b.ins().iadd_imm(n, -1);
+        self.b.ins().store(FLAGS, n, word, 0);
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(done);
+    }
+
     /// `STORE_ATTR` at `pc` of the value at `value` into the instance at
     /// `recv` (a local's slot, or with `release_recv` the stack's, whose
     /// reference then goes), in line when the site settled on one field of
@@ -24061,12 +24080,33 @@ impl<'a> Lower<'a> {
             }
             memo => (self.field_place(memo, idx, helper), None),
         };
-        if grown.is_none() {
+        // A heap value there now goes by a plain decrement (another owner
+        // keeping it, no release gate): checked here, before anything is
+        // written, and given up as the new value moves in.
+        let heap_old = if grown.is_none() && !cfg!(debug_assertions) {
             let old = self.tag_at(place);
             let plain_old = self.is_scalar(old);
-            let held = self.b.ins().icmp_imm(IntCC::Equal, plain_old, 0);
+            let heap = self.b.create_block();
+            let checked = self.b.create_block();
+            self.b.ins().brif(plain_old, checked, &[], heap, &[]);
+            self.b.switch_to_block(heap);
+            let word = self.b.ins().load(ptr, FLAGS, place, 8);
+            let n = self.b.ins().load(types::I64, FLAGS, word, 0);
+            let last = self.b.ins().icmp_imm(IntCC::SignedLessThanOrEqual, n, 1);
+            let held = self.b.ins().bor(last, gates);
             self.branch_out(held, helper);
-        }
+            self.b.ins().jump(checked, &[]);
+            self.b.switch_to_block(checked);
+            Some(plain_old)
+        } else {
+            if grown.is_none() {
+                let old = self.tag_at(place);
+                let plain_old = self.is_scalar(old);
+                let held = self.b.ins().icmp_imm(IntCC::Equal, plain_old, 0);
+                self.branch_out(held, helper);
+            }
+            None
+        };
         let new = self.tag_at(value);
         let plain_new = self.is_scalar(new);
         let deferred = self.b.ins().uload8(types::I32, FLAGS, inst, deferred_at);
@@ -24080,10 +24120,12 @@ impl<'a> Lower<'a> {
             let n = self.b.ins().load(types::I64, FLAGS, inst, 0);
             let last = self.b.ins().icmp_imm(IntCC::SignedLessThanOrEqual, n, 1);
             self.branch_out(last, helper);
+            self.release_checked_old(heap_old, place);
             self.copy16(place, value);
             let n = self.b.ins().iadd_imm(n, -1);
             self.b.ins().store(FLAGS, n, inst, 0);
         } else {
+            self.release_checked_old(heap_old, place);
             self.copy16(place, value);
         }
         if let Some(block) = grown {
