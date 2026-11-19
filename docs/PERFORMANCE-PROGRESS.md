@@ -1180,6 +1180,16 @@ branch and pull request.
     (`repr(p)` of an instance whose `__repr__` is `"P(%r)" % self.x` from
     6,230 to 4,500, against 2,390; `set(xs)` of ten such keys from 22,500
     to 19,700, against 8,800).
+  - `functools.cmp_to_key(f)` built a new class for every call (the
+    pure-Python fallback's, which the native function forwarded to), so
+    `sorted(xs, key=cmp_to_key(f))` of ten items cost 253,000 instructions
+    against CPython's 18,000. It now returns a key factory of one shared
+    class. And `self._cmp(a, b)` in that class's methods, a call of a
+    function a `__slots__` member holds, left compiled code at every call:
+    the method load now reads a laid-out slot member and remembers its
+    position. The sort now costs 88,000 instructions; CPython's C key
+    wrapper makes no Python calls but `f`'s, which the rest of the gap
+    is.
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
