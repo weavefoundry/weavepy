@@ -1250,6 +1250,27 @@ branch and pull request.
     tuple's cursor without leaving (5,734, the same as the equivalent
     `for` loop of yields), and a class whose `__iter__` is such a
     generator iterates in 6,299 instructions instead of 13,055 (2,538).
+  - Keyword calls of the `itertools` classes (`product(xs, repeat=2)`,
+    `accumulate(xs, initial=0)`) left compiled code at `CALL_KW` and bound
+    their keywords through the general call, about 2,700 instructions:
+    the adapter is now built in place (5,945 to 3,074, CPython 3,354).
+    The combinatoric adapters also build each tuple straight from its
+    items, without an intermediate vector (`list(product(xs, xs))` 12,046
+    to 9,524).
+  - `iter(obj)` of a class with a Python `__iter__` looked the method up
+    twice uncached and called it as a bound method; it now calls the
+    cached function directly, as `for` loops do (3,159 instructions to
+    2,273, against 1,284). `struct.unpack` was a Python wrapper over the
+    native one; like `pack`, it now reads a `bytes` or `bytearray` buffer
+    natively and keeps the wrapper for other buffers and errors (2,088
+    to 1,229, against 1,061).
+  - A dict iterator under `zip` or `enumerate` (`heapq.nlargest(n,
+    d.items())`, as `Counter.most_common` calls it) took the general
+    step for every item, since only sequence cursors counted as ready to
+    step in place. A dict iterator past its first, checked, step now
+    counts too while its dict is unchanged (`zip(range(3), it)` over a
+    dict's items 15,122 instructions to 12,227, `most_common(3)` 38,153
+    to 33,766, against 18,348).
   - Looked at and left: thread start-up (a started and joined thread
     costs about 470,000 instructions to CPython's 150,000; the main thread
     waits on the GIL hand-off and the kernel's thread teardown, and a
