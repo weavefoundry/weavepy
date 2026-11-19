@@ -80028,9 +80028,14 @@ fn default_lookup_misses(obj: &Object, name: &str, hooked: bool) -> bool {
         return !dunder && slot_member_unset(&cls, inst, name);
     }
     match inst.dict.published() {
-        Some(d) => d
-            .try_borrow()
-            .is_ok_and(|d| !d.contains_key(&crate::object::StrKey(name))),
+        // (Probed without running Python: a stored key that only a user
+        // `__eq__` could equate to the name leaves the miss uncertain, for
+        // the full lookup, which runs that comparison from a frame its
+        // caller can see.)
+        Some(d) => d.try_borrow().is_ok_and(|d| {
+            let probe = crate::object::LeafNameProbe::new(name, crate::object::py_str_hash(name));
+            !d.contains_key(&probe) && !probe.saw_exotic()
+        }),
         None => inst
             .dict
             .split_cell()
