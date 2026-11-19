@@ -86,7 +86,8 @@ fn note_key(k: usize) {
 /// under the lock and dropped after it is released (their drops can
 /// re-enter here).
 pub(crate) fn forget(k: usize) {
-    if !TAGGED.write().remove(&k) {
+    // (The common case, a builtin no table knows, under the read lock.)
+    if !TAGGED.read().contains(&k) || !TAGGED.write().remove(&k) {
         return;
     }
     DESCR_META.write().remove(&k);

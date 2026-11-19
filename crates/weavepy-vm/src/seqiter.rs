@@ -1539,31 +1539,58 @@ pub(crate) fn islice_collect(l: &PyLazyIter) -> Option<Vec<Object>> {
     Some(out)
 }
 
-/// Whether a `zip` stops now with nothing consumed (its first source, a
-/// tuple or list cursor, is at its end) and releasing it, when this is
-/// the last reference, frees nothing that could hold a finalizer: the
-/// core loop's `FOR_ITER` end, in place.
-pub(crate) fn zip_stops_quietly(l: &Rc<PyLazyIter>) -> bool {
-    use crate::object::PyIterator;
+/// Whether a native adapter stops now with nothing consumed and its
+/// release, when this is the last reference, frees nothing that could
+/// hold a finalizer: the core loop's `FOR_ITER` end, in place. A `zip`
+/// whose first source, a tuple or list cursor, is at its end, and an
+/// `accumulate` without a function over one (its end changes no state,
+/// as CPython's doesn't).
+pub(crate) fn lazy_stops_quietly(l: &Rc<PyLazyIter>) -> bool {
     // SAFETY: reads that run no code, ending with this call.
     let Some(st) = (unsafe { l.state.peek() }) else {
         return false;
     };
-    let LazyIterKind::Zip {
-        iters,
-        strict: false,
-        result,
-        spare,
-        held,
-    } = st
-    else {
+    let last = Rc::strong_count(l) == 1;
+    match st {
+        LazyIterKind::Zip {
+            iters,
+            strict: false,
+            result,
+            spare,
+            held,
+        } => {
+            let Some(first) = iters.first() else {
+                return false;
+            };
+            if !held.is_empty() || !cursor_at_end(first) {
+                return false;
+            }
+            !last
+                || (iters.iter().all(quiet_source)
+                    && quiet_tuple(result.as_ref())
+                    && quiet_tuple(spare.as_ref()))
+        }
+        LazyIterKind::Accumulate {
+            source,
+            func: None,
+            total,
+            initial: None,
+        } => {
+            cursor_at_end(source)
+                && (!last || (quiet_source(source) && total.as_ref().is_none_or(plain_value)))
+        }
+        _ => false,
+    }
+}
+
+/// Whether `it` is a tuple's or an unowned list's cursor at its end.
+fn cursor_at_end(it: &Object) -> bool {
+    use crate::object::PyIterator;
+    let Object::Iter(c) = it else {
         return false;
     };
-    let Some(Object::Iter(first)) = iters.first() else {
-        return false;
-    };
-    // SAFETY: as above.
-    let at_end = match unsafe { first.peek() } {
+    // SAFETY: reads that run no code, ending with this call.
+    match unsafe { c.peek() } {
         Some(PyIterator::Tuple { items, index }) => *index >= items.len(),
         Some(PyIterator::List {
             items,
@@ -1571,53 +1598,49 @@ pub(crate) fn zip_stops_quietly(l: &Rc<PyLazyIter>) -> bool {
             owner: None,
         }) => unsafe { items.peek() }.is_some_and(|v| *index >= v.len()),
         _ => false,
-    };
-    if !held.is_empty() || !at_end {
-        return false;
     }
-    if Rc::strong_count(l) > 1 {
+}
+
+/// A scalar dies quietly.
+fn plain_value(v: &Object) -> bool {
+    matches!(
+        v,
+        Object::Int(_)
+            | Object::Float(_)
+            | Object::Bool(_)
+            | Object::None
+            | Object::Str(_)
+            | Object::Bytes(_)
+    )
+}
+
+/// A source whose sequence another owner keeps (or that holds only
+/// scalars) releases quietly.
+fn quiet_source(o: &Object) -> bool {
+    use crate::object::PyIterator;
+    let Object::Iter(rc) = o else {
+        return false;
+    };
+    if Rc::strong_count(rc) > 1 {
         return true;
     }
-    // A scalar dies quietly.
-    fn plain(v: &Object) -> bool {
-        matches!(
-            v,
-            Object::Int(_)
-                | Object::Float(_)
-                | Object::Bool(_)
-                | Object::None
-                | Object::Str(_)
-                | Object::Bytes(_)
-        )
+    // SAFETY: reads that run no code, ending with this call.
+    match unsafe { rc.peek() } {
+        Some(PyIterator::Tuple { items, .. }) => {
+            crate::shared_value::ThinArc::strong_count(items) > 1 || items.iter().all(plain_value)
+        }
+        Some(PyIterator::List { items, .. }) => {
+            Rc::strong_count(items) > 1
+                || unsafe { items.peek() }.is_some_and(|v| v.iter().all(plain_value))
+        }
+        Some(PyIterator::Range { .. }) => true,
+        _ => false,
     }
-    // A source whose sequence another owner keeps (or that holds only
-    // scalars) releases quietly.
-    let quiet_source = |o: &Object| {
-        let Object::Iter(rc) = o else {
-            return false;
-        };
-        if Rc::strong_count(rc) > 1 {
-            return true;
-        }
-        // SAFETY: as above.
-        match unsafe { rc.peek() } {
-            Some(PyIterator::Tuple { items, .. }) => {
-                crate::shared_value::ThinArc::strong_count(items) > 1 || items.iter().all(plain)
-            }
-            Some(PyIterator::List { items, .. }) => {
-                Rc::strong_count(items) > 1
-                    || unsafe { items.peek() }.is_some_and(|v| v.iter().all(plain))
-            }
-            Some(PyIterator::Range { .. }) => true,
-            _ => false,
-        }
-    };
-    let quiet_result = |t: &Option<crate::object::SharedTuple>| {
-        t.as_ref().is_none_or(|t| {
-            crate::shared_value::ThinArc::strong_count(t) > 1 || t.iter().all(plain)
-        })
-    };
-    iters.iter().all(quiet_source) && quiet_result(result) && quiet_result(spare)
+}
+
+/// A result tuple a `zip` keeps for reuse, released quietly.
+fn quiet_tuple(t: Option<&crate::object::SharedTuple>) -> bool {
+    t.is_none_or(|t| crate::shared_value::ThinArc::strong_count(t) > 1 || t.iter().all(plain_value))
 }
 
 /// A tuple's or an unowned list's cursor: the items, and the position.
@@ -2176,7 +2199,11 @@ pub(crate) fn itertools_pure_next(l: &PyLazyIter) -> Option<Option<Object>> {
                 return Some(Some(init));
             }
             // (A plain cursor's next item, peeked and skipped in one view
-            // each: none left is the general step's end.)
+            // each. At its end this is the end, as the general step's
+            // would be: nothing changes.)
+            if cursor_at_end(source) {
+                return Some(None);
+            }
             let Object::Iter(c) = source else {
                 return None;
             };
@@ -2631,9 +2658,12 @@ pub(crate) fn builtin_ctor_arms(cls: &Rc<TypeObject>, args: &[Object]) -> Option
     }
     if Rc::ptr_eq(cls, &bt.reversed_) {
         return match args {
-            [Object::List(_) | Object::Tuple(_) | Object::Range(_) | Object::Dict(_)] => {
-                crate::builtins::b_reversed(args).ok()
-            }
+            [Object::List(_)
+            | Object::Tuple(_)
+            | Object::Range(_)
+            | Object::Dict(_)
+            | Object::Str(_)
+            | Object::Bytes(_)] => crate::builtins::b_reversed(args).ok(),
             _ => None,
         };
     }

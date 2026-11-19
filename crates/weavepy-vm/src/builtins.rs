@@ -58,6 +58,27 @@ pub fn build_class_builtin() -> BuiltinFn {
 /// `builtins.set is set` (a type) while `set(...)` still constructs through
 /// the native helper.
 pub(crate) fn builtin_type_constructor(name: &str) -> Option<Rc<BuiltinFn>> {
+    thread_local! {
+        /// The constructors built so far, by type name: a type call that
+        /// reaches here (`reversed(s)`, `int(x, 16)`) reuses one instead
+        /// of allocating it and releasing it again.
+        static CTORS: std::cell::RefCell<Vec<(&'static str, Rc<BuiltinFn>)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    if let Some(hit) = CTORS.with(|c| {
+        c.borrow()
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, f)| f.clone())
+    }) {
+        return Some(hit);
+    }
+    let f = make_builtin_type_constructor(name)?;
+    CTORS.with(|c| c.borrow_mut().push((f.name, f.clone())));
+    Some(f)
+}
+
+fn make_builtin_type_constructor(name: &str) -> Option<Rc<BuiltinFn>> {
     macro_rules! ctor {
         ($n:literal, $body:expr) => {
             Some(Rc::new(BuiltinFn {
@@ -8871,8 +8892,16 @@ pub(crate) fn b_reversed(args: &[Object]) -> Result<Object, RuntimeError> {
     // `__reversed__` or `__len__`+`__getitem__`; a forward snapshot
     // reproduces the same sequence for the finite iterables handled here.)
     let buf: Vec<Object> = if let Object::Str(text) = iterable {
-        // (A `str`'s characters, read directly.)
-        text.chars().map(Object::from_char).collect()
+        // (A `str`'s characters, read directly: an ASCII one's are the
+        // shared one-character strings, sized exactly.)
+        if text.is_ascii() {
+            text.as_bytes()
+                .iter()
+                .map(|&c| Object::Str(crate::shared_value::SharedStr::ascii_char(c)))
+                .collect()
+        } else {
+            text.chars().map(Object::from_char).collect()
+        }
     } else {
         let mut it = iterable.make_iter()?;
         let mut buf = Vec::new();

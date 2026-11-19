@@ -62742,8 +62742,10 @@ impl Interpreter {
         }
         // A struct sequence from a tuple or list (`os.terminal_size((80,
         // 24))`), filled directly.
-        if let Some(v) = crate::stdlib::os::struct_seq_from_sequence(ty, arg) {
-            return Some(Ok(v));
+        if matches!(arg, Object::Tuple(_) | Object::List(_)) {
+            if let Some(v) = crate::stdlib::os::struct_seq_from_sequence(ty, arg) {
+                return Some(Ok(v));
+            }
         }
         let bt = builtin_types();
         // `str(x)`: `x`'s `__str__` (see `type_call_default`).

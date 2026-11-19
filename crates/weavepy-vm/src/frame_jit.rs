@@ -4515,9 +4515,10 @@ unsafe extern "C" fn h_for_iter_rest(
                 unsafe { out.write(v) };
                 return 1;
             }
-            // A `zip` at the end of its first sequence, whose release runs
-            // nothing: it leaves the stack, as the core loop's end does.
-            if crate::seqiter::zip_stops_quietly(l) {
+            // A `zip` at the end of its first sequence (or an
+            // `accumulate` at its source's), whose release runs nothing: it
+            // leaves the stack, as the core loop's end does.
+            if crate::seqiter::lazy_stops_quietly(l) {
                 // SAFETY: the iterator leaves the stack.
                 drop(unsafe { it.read() });
                 return 2;
