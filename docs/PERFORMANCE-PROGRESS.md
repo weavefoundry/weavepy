@@ -1313,6 +1313,15 @@ branch and pull request.
     builds misleading). Artifacts are now named by module and source
     hash, and a write removes the module's day-old artifacts for other
     sources.
+  - Stepping an instance whose class has a native `__next__` (an
+    `io.StringIO` under `csv.reader`, a `for` loop over one) looked the
+    method up by name on every step; it is found once per class version
+    now. The CSV reader also updates its per-row state (`line_num` and
+    its re-entry flag) in place rather than re-inserting it: reading 200
+    rows went from 1,568,659 instructions to 1,482,021 (CPython 912,416).
+  - Fixed: a `StopIteration` thrown into a generator that never started
+    was converted to `RuntimeError`; CPython's PEP 479 conversion covers
+    only the body past its start, so it escapes as it is there.
   - Looked at and left: thread start-up (a started and joined thread
     costs about 470,000 instructions to CPython's 150,000; the main thread
     waits on the GIL hand-off and the kernel's thread teardown, and a
