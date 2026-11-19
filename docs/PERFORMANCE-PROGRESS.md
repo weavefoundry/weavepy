@@ -1224,6 +1224,22 @@ branch and pull request.
     2,783 (CPython 554). Their `__iter__` returned the native core rather
     than the object, so a subclass's own `__next__` was skipped by `for`
     loops and `islice`; it returns the object now, as CPython's do.
+  - `reversed(s)` of a string took the general type call, which built
+    a new native constructor object for the call and released it again
+    (taking the descriptor registry's write lock on the way out, though
+    its comment promised a read probe), and copied the characters one
+    `chars()` step at a time. Its pure constructor now admits `str` and
+    `bytes`, the type-call path reuses one constructor per type, the
+    registry's release probes under the read lock first, and an ASCII
+    string's characters are copied by index: `reversed(s)` from 4,158
+    instructions to 1,557 (CPython 907), `''.join(reversed(s))` from
+    7,547 to 4,984 (4,340).
+  - An `accumulate` without a function ended each loop through the
+    general step (its pure step declined at the end): it now ends in
+    place, as `zip`'s does (`for` over five items 5,297 to 4,155 against
+    2,600, `list()` 6,837 to 6,018 against 3,157). What remains of
+    `list(adapter)` is the type call's route, about 900 instructions of
+    attempts before the drain starts.
   - Looked at and left: thread start-up (a started and joined thread
     costs about 470,000 instructions to CPython's 150,000; the main thread
     waits on the GIL hand-off and the kernel's thread teardown, and a
