@@ -160,12 +160,21 @@ fn runset(samples: &[Sample]) -> RunSet {
 }
 
 /// Time a single fixture under the PR binary *and* a merge-base
-/// binary, interleaving the legs sample by sample (PR, base, CPython,
-/// PR, base, CPython, …) so slow drift on a shared runner — thermal
-/// ramp, a neighbor tenant spinning up — lands on both legs equally
-/// and cancels in the PR/base ratio. This is what makes the A/B gate
-/// immune to the machine skew that a committed-baseline comparison
-/// spends its whole envelope absorbing.
+/// binary, interleaving the legs round by round so slow drift on a
+/// shared runner — thermal ramp, a neighbor tenant spinning up — lands
+/// on both legs equally and cancels in the PR/base ratio. This is what
+/// makes the A/B gate immune to the machine skew that a
+/// committed-baseline comparison spends its whole envelope absorbing.
+///
+/// Within a round the two binaries run in a balanced order (PR, base,
+/// base, PR, then CPython; the next round base, PR, PR, base), two
+/// samples each. A fixed PR, base, CPython order put every PR sample
+/// right after another program's run and every base sample right after
+/// a near-identical one's, so whatever a leg inherits from the process
+/// before it (shared cache and page-cache state, the frozen code
+/// cache's files) favored the base: a PR that changed no code could
+/// fail the gate. Balanced, each binary follows the other program, the
+/// other binary and itself equally often.
 ///
 /// A base-leg failure is not an error: a fixture added by the PR
 /// under test may exercise syntax the merge-base binary cannot run
@@ -183,24 +192,27 @@ pub fn run_one_ab(
     } else {
         opts.samples
     };
-    let mut pr_samples = Vec::with_capacity(opts.samples as usize);
-    let mut base_samples = Vec::with_capacity(opts.samples as usize);
+    let mut pr_samples = Vec::with_capacity(2 * opts.samples as usize);
+    let mut base_samples = Vec::with_capacity(2 * opts.samples as usize);
     let mut py_samples = Vec::with_capacity(opts.samples as usize);
     let mut base_ok = true;
     for i in 0..runs {
         let keep = !opts.warmup || i > 0;
-        let pr = time_subprocess(weavepy.as_os_str(), fix, &[])?;
-        if keep {
-            pr_samples.push(pr);
-        }
-        if base_ok {
-            match time_subprocess(base.as_os_str(), fix, &[]) {
-                Ok(b) => {
-                    if keep {
-                        base_samples.push(b);
-                    }
+        for is_pr in ab_order(i) {
+            if is_pr {
+                let pr = time_subprocess(weavepy.as_os_str(), fix, &[])?;
+                if keep {
+                    pr_samples.push(pr);
                 }
-                Err(_) => base_ok = false,
+            } else if base_ok {
+                match time_subprocess(base.as_os_str(), fix, &[]) {
+                    Ok(b) => {
+                        if keep {
+                            base_samples.push(b);
+                        }
+                    }
+                    Err(_) => base_ok = false,
+                }
             }
         }
         if let Some(py) = python {
@@ -220,6 +232,14 @@ pub fn run_one_ab(
         None,
     )
     .with_base(base_set))
+}
+
+/// The order of round `round`'s four A/B legs (`true` the PR binary's):
+/// PR, base, base, PR on even rounds and its mirror on odd ones (see
+/// [`run_one_ab`]).
+fn ab_order(round: u32) -> [bool; 4] {
+    let pr_first = round.is_multiple_of(2);
+    [pr_first, !pr_first, !pr_first, pr_first]
 }
 
 /// Run all known fixtures A/B (see [`run_one_ab`]) and return one
@@ -854,7 +874,26 @@ fn demangle_rust(sym: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{demangle_rust, median, parse_bench_ns, parse_sample_output, ScalingRow};
+    use super::{ab_order, demangle_rust, median, parse_bench_ns, parse_sample_output, ScalingRow};
+
+    /// Over any two consecutive rounds each binary runs four times, and
+    /// each is once the leg right after the CPython leg (a round's first)
+    /// and once the leg right before it (its last).
+    #[test]
+    fn ab_order_is_balanced() {
+        for start in 0..4u32 {
+            let rounds = [ab_order(start), ab_order(start + 1)];
+            let pr = rounds.iter().flatten().filter(|&&is_pr| is_pr).count();
+            assert_eq!(pr, 4);
+            assert_ne!(rounds[0][0], rounds[1][0]);
+            assert_ne!(rounds[0][3], rounds[1][3]);
+            for r in rounds {
+                assert_eq!(r[0], r[3]);
+                assert_eq!(r[1], r[2]);
+                assert_ne!(r[0], r[1]);
+            }
+        }
+    }
 
     #[test]
     fn demangles_legacy_rust_symbols() {
