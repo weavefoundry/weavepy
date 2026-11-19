@@ -9346,6 +9346,11 @@ unsafe fn attr_miss(st: *mut State, site: &AttrSite, at: *mut Object, local: boo
                 // activation (`TokenList.value` read over a token tree's
                 // nodes): the property wins over every read below, so it's
                 // called now.
+                // A generator's fast step can't run one (it has no switch):
+                // it declines at once, as every read below would.
+                if (*st).sw.is_null() && ms.getter(ver).is_some() {
+                    return CALL_DECLINED;
+                }
                 if !(*st).sw.is_null() && !site.direct.is_null() {
                     if let Some(getter) = ms.getter(ver).map(|(f, _)| f) {
                         if let Some(r) = property_call(
