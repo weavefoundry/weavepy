@@ -1128,6 +1128,18 @@ branch and pull request.
     core loop's lane, and a struct sequence built from a tuple or list of
     plain values is made directly (6,000 instructions to 3,640, against
     1,930). The call as a whole now costs 49,300.
+  - Releasing containers. A dying dict dropped each key and value through
+    a call to its drop glue, even an `int` key, and a list did the same for
+    each item unless all of them were scalars; a tuple from the free list
+    was refilled through checks a parked tuple can't fail. A dict now
+    gives each entry up in line (a plain decrement for a value someone
+    else still holds), a list does the same for items it doesn't own last
+    (a dying one still goes through the nested release), and a pooled
+    tuple's slots are written directly. `d.copy()` of a 100-entry dict
+    with its release went from 8,270 instructions to 5,010 (CPython
+    4,400), `dict(d)` of 20 entries from 3,080 to 2,500 (1,910),
+    `list(t)` of 100 strings from 5,810 to 3,760 (4,490), and a loop over
+    `enumerate` of ten items from 6,400 to 5,760 (4,120).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
