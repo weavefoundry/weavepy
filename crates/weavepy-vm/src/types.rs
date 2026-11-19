@@ -1253,6 +1253,10 @@ pub struct TypeObject {
     /// `tp_name` it was computed under, the qualified name, and whether
     /// the module is `__main__`.
     display_name_memo: RefCell<Option<(u64, u64, usize, String, bool)>>,
+    /// The interned `str` objects `cls.__name__` and `cls.__qualname__`
+    /// read as (see [`Self::interned_names`]), the second with the text
+    /// it was made from.
+    name_objs: RefCell<(Option<Object>, Option<Object>)>,
     /// The most attributes an instance's `__dict__` was seen to hold
     /// (capped): new instances' dicts are presized to it, so `__init__`'s
     /// stores do not regrow them.
@@ -1735,6 +1739,7 @@ impl TypeObject {
             metaclass: RefCell::new(None),
             leaf_attrs: LeafAttrCache::new(),
             display_name_memo: RefCell::new(None),
+            name_objs: RefCell::new((None, None)),
             inst_dict_hint: std::sync::atomic::AtomicU32::new(0),
             shared_keys: crate::sync::LazyArc::new(),
             native_kind: Cell::new(0),
@@ -2226,6 +2231,34 @@ impl TypeObject {
     /// subclass. Call after any class-dict mutation or MRO reshaping that
     /// can change what an attribute name resolves to; specialised
     /// LOAD_ATTR/STORE_ATTR sites guard on the version and deopt.
+    /// `cls.__name__` (`qualified` false) or `cls.__qualname__` as the
+    /// class's own string, the interned object `Object::interned_str`
+    /// makes, remembered on the class: reading a class's name doesn't take
+    /// the intern table's lock each time. (A class dict entry for the name,
+    /// which a read finds first, is the caller's.)
+    pub(crate) fn interned_names(&self, qualified: bool) -> Object {
+        let qual = if qualified {
+            self.qualname.borrow().clone()
+        } else {
+            None
+        };
+        let text: &str = qual.as_deref().unwrap_or(&self.name);
+        if let Ok(memo) = self.name_objs.try_borrow() {
+            let slot = if qualified { &memo.1 } else { &memo.0 };
+            if let Some(Object::Str(s)) = slot {
+                if &**s == text {
+                    return Object::Str(s.clone());
+                }
+            }
+        }
+        let obj = Object::interned_str(text);
+        if let Ok(mut memo) = self.name_objs.try_borrow_mut() {
+            let slot = if qualified { &mut memo.1 } else { &mut memo.0 };
+            *slot = Some(obj.clone());
+        }
+        obj
+    }
+
     pub fn bump_attr_version(&self) {
         use std::sync::atomic::Ordering::Relaxed;
         self.attr_version.bump();

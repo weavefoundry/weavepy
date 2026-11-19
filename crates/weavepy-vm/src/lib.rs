@@ -16750,6 +16750,20 @@ impl Interpreter {
                                             pc += 1;
                                             continue;
                                         }
+                                        // A class's own names and links
+                                        // (`cls.__qualname__`, `__mro__`).
+                                        if let Some(v) = Self::leaf_type_name(code, cls, ins.arg) {
+                                            if Rc::strong_count(cls) > 1 {
+                                                // SAFETY: the receiver is
+                                                // replaced in place.
+                                                unsafe {
+                                                    drop_hot(std::mem::replace(&mut *top, v))
+                                                };
+                                                last = pc;
+                                                pc += 1;
+                                                continue;
+                                            }
+                                        }
                                         offload!(OFFLOAD_HELPER);
                                     }
                                 }
@@ -16778,6 +16792,22 @@ impl Interpreter {
                                     continue;
                                 }
                                 offload!(OFFLOAD_HELPER);
+                            }
+                            // A bound method's receiver, function, or its
+                            // function's names.
+                            Object::BoundMethod(bm) => {
+                                match Self::leaf_bound_method_read(code, bm, ins.arg) {
+                                    Some(v) if Self::core_droppable(unsafe { &*top }) => {
+                                        // SAFETY: the receiver (droppable) is
+                                        // replaced in place.
+                                        unsafe { drop_hot(std::mem::replace(&mut *top, v)) };
+                                        last = pc;
+                                        pc += 1;
+                                        after_release!();
+                                        continue;
+                                    }
+                                    _ => offload!(OFFLOAD_HELPER),
+                                }
                             }
                             // A builtin container's method read as a value
                             // (`append = y.append`), a frame's or code
@@ -23943,7 +23973,16 @@ impl Interpreter {
         };
         // SAFETY: a read between two instructions; the value is cloned
         // before anything else runs.
-        let v = (unsafe { inst.laid_out_slot(idx) }).map(Self::clone_operand)?;
+        let v = match unsafe { inst.laid_out_slot_any(idx) }? {
+            // Unset: the descriptor's default, where it has one (a
+            // never-raised exception's `__traceback__` is `None`); a
+            // `__slots__` member's `AttributeError` is the full path's.
+            Object::Unbound => match cls.lookup(code.names.get(name_idx as usize)?) {
+                Some(Object::SlotDescriptor(sd)) => sd.default.clone()?,
+                _ => return None,
+            },
+            v => Self::clone_operand(v),
+        };
         // The site's inline cache takes the slot shape too, as the full
         // handler's specialization would: the frameless evaluators read
         // the member through it.
@@ -29048,6 +29087,9 @@ impl Interpreter {
                     return Some(v);
                 }
             }
+        }
+        if let Object::BoundMethod(bm) = local {
+            return Self::leaf_bound_method_read(code, bm, name_idx);
         }
         // (Decoded once for the arms below.)
         let cache = code.caches.get(attr_pc as u32);
@@ -34858,11 +34900,55 @@ impl Interpreter {
             // site's own polymorphic entries first, then the class's cache
             // (which refills them on an instance-dict hit).
             (_, Object::Instance(inst)) => {
+                if inst.cls_raw().flags.is_exception {
+                    if let Some(v) = Self::leaf_exc_slot_read(code, inst, name_idx) {
+                        return Some(v);
+                    }
+                }
                 Self::leaf_attr_resolve_site(code, inst, receiver, cache_pc, name_idx)
             }
             (_, Object::Function(f)) => Self::leaf_function_read(code, f, name_idx),
+            (_, Object::BoundMethod(bm)) => Self::leaf_bound_method_read(code, bm, name_idx),
             _ => None,
         }
+    }
+
+    /// `m.name` of a bound method as the full path reads it (see
+    /// `load_attr_inner`): its receiver, its function, or a Python
+    /// function's name, qualified name or docstring, which the method
+    /// forwards, read in place. `None` for anything else.
+    pub(crate) fn leaf_bound_method_read(
+        code: &CodeObject,
+        bm: &BoundMethod,
+        name_idx: u32,
+    ) -> Option<Object> {
+        match code.names.get(name_idx as usize)?.as_str() {
+            "__self__" => Some(Self::clone_operand(&bm.receiver)),
+            "__func__" => Some(Self::clone_operand(&bm.function)),
+            "__name__" | "__qualname__" | "__doc__" => match &bm.function {
+                Object::Function(f) => Self::leaf_function_read(code, f, name_idx),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// `e.name` for an exception whose class resolves the name to a slot
+    /// descriptor (`args`, `__traceback__`, `__cause__`, ...), a data
+    /// descriptor no instance entry shadows: the slot's value, or the
+    /// descriptor's default when it's unset (a never-raised exception's
+    /// `__traceback__` is `None`). `None` for anything else, an unset
+    /// slot with no default included.
+    fn leaf_exc_slot_read(code: &CodeObject, inst: &PyInstance, name_idx: u32) -> Option<Object> {
+        let cls = inst.cls_raw();
+        if !Self::default_getattribute(cls) || crate::object::exotic_str_keys_possible() {
+            return None;
+        }
+        let name = code.names.get(name_idx as usize)?;
+        let Some(Object::SlotDescriptor(sd)) = cls.lookup(name) else {
+            return None;
+        };
+        inst.slot_get(name).or_else(|| sd.default.clone())
     }
 
     /// `f.name` for a Python function, as `load_attr_inner` resolves it
@@ -35814,12 +35900,7 @@ impl Interpreter {
         {
             return Some(v.clone());
         }
-        if name == "__qualname__" {
-            if let Some(q) = cls.qualname.borrow().as_ref() {
-                return Some(Object::interned_str(q));
-            }
-        }
-        Some(Object::interned_str(&cls.name))
+        Some(cls.interned_names(name == "__qualname__"))
     }
 
     /// [`Self::type_method_pair`] for the attribute protocol's own dunders
@@ -57859,6 +57940,9 @@ impl Interpreter {
             };
             *ty.qualname.borrow_mut() = Some(s.to_string());
             ty.forget_display_names();
+            // (Sites that remember what the class's names read hold them
+            // for its version.)
+            ty.bump_attr_version();
             return Ok(());
         }
         // The `type.__dict__` / `type.__mro__` getsets have no setter in

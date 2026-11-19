@@ -9266,6 +9266,23 @@ unsafe fn attr_miss(st: *mut State, site: &AttrSite, at: *mut Object, local: boo
                 }
             }
         }
+        // A bound method's receiver, function, or its function's names.
+        if let Object::BoundMethod(bm) = &*at {
+            let code = &*site.code;
+            let arg = code.instructions[site.pc as usize].arg;
+            if let Some(v) = Interpreter::leaf_bound_method_read(code, bm, arg) {
+                if local {
+                    (*st).stack.add(site.slot as usize).write(v);
+                } else {
+                    if !droppable(&*at) {
+                        drop(v);
+                        return left(st, site.pc, site.last, site.slot as usize + 1);
+                    }
+                    crate::drop_hot(std::mem::replace(&mut *at, v));
+                }
+                return 0;
+            }
+        }
         // A namespace's own entry (a `typing` union's `__args__`, a
         // `SimpleNamespace`'s field): the full handler's first answer.
         if let Object::SimpleNamespace(d) = &*at {
@@ -9700,8 +9717,9 @@ unsafe fn pub_hit<'a>(site: &AttrSite, inst: &'a crate::types::PyInstance) -> Op
 /// A read at `site` of an exception's pseudo-slot (`e.args`): the value
 /// its slot storage holds, when the class resolves the site's name to a
 /// slot descriptor (a data descriptor: no instance dict shadows it), as
-/// the site last found for the class's version. `None` for anything else,
-/// an unset slot included.
+/// the site last found for the class's version; an unset one's default
+/// (a never-raised exception's `__traceback__` is `None`). `None` for
+/// anything else, an unset slot with no default included.
 fn exc_slot_read(site: &AttrSite, inst: &crate::types::PyInstance) -> Option<Object> {
     let cls = inst.cls_raw();
     if !cls.flags.is_exception {
@@ -9722,7 +9740,10 @@ fn exc_slot_read(site: &AttrSite, inst: &crate::types::PyInstance) -> Option<Obj
         }
         site.exc_slot.set(ver);
     }
-    inst.slot_get(name)
+    inst.slot_get(name).or_else(|| match cls.lookup(name) {
+        Some(Object::SlotDescriptor(sd)) => sd.default.clone(),
+        _ => None,
+    })
 }
 
 /// A read at `site` of an instance with a published dict, resolved as the
@@ -10298,14 +10319,14 @@ unsafe extern "C" fn h_class_read(dst: *mut Object, src: *const Object) -> u32 {
 
 /// Whether `site` reads one of the names every class answers with a string
 /// of its own (`cls.__name__`, as logging, reprs and error messages read
-/// it), which [`type_name_note`] memoizes. (Not `__qualname__`: assigning
-/// it leaves the class's version where it was.)
+/// it), which [`type_name_note`] memoizes. (Assigning any of them moves
+/// the class's version.)
 fn type_name_site(site: &AttrSite) -> bool {
     // SAFETY: the site's code is live (the caller's code runs it).
     let code = unsafe { &*site.code };
     code.names
         .get(code.instructions[site.pc as usize].arg as usize)
-        .is_some_and(|name| matches!(name.as_str(), "__name__" | "__module__"))
+        .is_some_and(|name| matches!(name.as_str(), "__name__" | "__module__" | "__qualname__"))
 }
 
 /// Remember what the full lookup just read for `cls.__name__` (or
