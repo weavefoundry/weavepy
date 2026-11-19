@@ -1333,6 +1333,32 @@ branch and pull request.
     scientific formatting and strips zeros in place (3,850 instructions to
     3,283, against 2,416). A test pins the output for 6,000 values and 15
     specs to CPython's.
+  - A compiled `len(obj)` site whose leaf half declined an instance went
+    through the builtin's lane to reach a frameless `__len__`; it
+    evaluates it in place now (1,670 instructions to 1,245, against
+    1,004). Operator and subscript dunder calls enter a warm leaf's
+    compiled plan rather than its interpreted one.
+  - The bench gate's A/B legs ran in a fixed order, PR, base, CPython,
+    so every PR sample followed another program's run and every base
+    sample a near-identical one's; a PR that changed no code could fail
+    it, and this PR's Linux gate flagged `fib` and `richards` three runs
+    in a row while both builds executed the same instruction counts with
+    the same simulated cache misses and branch mispredictions (the PR's
+    slightly fewer). The legs now run in a balanced order (PR, base,
+    base, PR, then the mirror), two samples each a round.
+  - Where the everyday battery's worst cases stand, measured on
+    `argparse_ops` (2.1 times CPython's instructions): its 60 iterations
+    are 85% warm-up. In steady state an iteration costs 2.1M
+    instructions against CPython's 1.5M (1.37 times); iterations 2 to 60
+    average 4.8M against 1.7M. Interpreted, an iteration costs 2.9M (the
+    core loop averages 39 instructions a bytecode: its pc and
+    instruction pointer live on the stack, so dispatch alone is about
+    ten), and through iteration 60 the JITs add about 1M an iteration
+    more than they save: tier 2's analysis of code it then rejects is
+    about 8% of the case, the frame JIT's compiles 2%. `import argparse`
+    costs 30M to CPython's 11M, spread over decoding cached code,
+    interning its names and running module bodies, with nothing over
+    3%.
   - Looked at and left: thread start-up (a started and joined thread
     costs about 470,000 instructions to CPython's 150,000; the main thread
     waits on the GIL hand-off and the kernel's thread teardown, and a
