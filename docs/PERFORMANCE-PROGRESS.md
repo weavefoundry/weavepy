@@ -1237,9 +1237,19 @@ branch and pull request.
   - An `accumulate` without a function ended each loop through the
     general step (its pure step declined at the end): it now ends in
     place, as `zip`'s does (`for` over five items 5,297 to 4,155 against
-    2,600, `list()` 6,837 to 6,018 against 3,157). What remains of
-    `list(adapter)` is the type call's route, about 900 instructions of
-    attempts before the drain starts.
+    2,600), and so does a `pairwise`. A compiled `list(x)`, `tuple(x)`,
+    `set(x)`, `dict(x)` or `str(x)` whose pure constructor declined (`x`
+    a `map`, a generator) tried the same attempt again and three more
+    before reaching the container lane; it goes there directly now, about
+    380 instructions a call (`list(accumulate(xs))` 6,837 to 5,643
+    against 3,147, `list(pairwise(xs))` 8,105 to 6,837 against 3,760).
+  - `yield from xs` of a list in compiled code left at
+    `GET_YIELD_FROM_ITER` and at the delegation's end in every generator:
+    a three-item one cost 12,515 instructions against 2,303. Compiled code
+    now takes a builtin sequence's iterator in place and steps a list's or
+    tuple's cursor without leaving (5,734, the same as the equivalent
+    `for` loop of yields), and a class whose `__iter__` is such a
+    generator iterates in 6,299 instructions instead of 13,055 (2,538).
   - Looked at and left: thread start-up (a started and joined thread
     costs about 470,000 instructions to CPython's 150,000; the main thread
     waits on the GIL hand-off and the kernel's thread teardown, and a
