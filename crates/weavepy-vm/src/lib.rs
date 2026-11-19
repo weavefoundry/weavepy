@@ -35359,6 +35359,12 @@ impl Interpreter {
                 // A non-binding native function: the same object through a
                 // class or an instance.
                 Some(Object::Builtin(b)) => K::Value(Object::Builtin(b)),
+                // A struct sequence's field reads its instance dict.
+                Some(Object::Property(p))
+                    if crate::stdlib::os::struct_seq_field_descr(name, &p) =>
+                {
+                    K::InstanceOnly
+                }
                 Some(Object::Property(p)) => K::Property(Rc::downgrade(&p)),
                 Some(
                     v @ (Object::None
@@ -55094,6 +55100,11 @@ impl Interpreter {
     ) -> Result<Object, RuntimeError> {
         if let Some(r) = plain_compare(a, b, op) {
             return Ok(Object::Bool(r));
+        }
+        // A struct sequence compares as its tuple, against a tuple or one
+        // of its own type (`sys.version_info >= (3, 8)`).
+        if let Some((ta, tb)) = crate::stdlib::os::struct_seq_compare_operands(a, b) {
+            return self.rich_compare_obj(&ta, &tb, op, globals);
         }
         // Two instances whose left one's comparison dunder is a Python
         // function, and whose right one's class doesn't subclass the left's

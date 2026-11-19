@@ -2820,7 +2820,7 @@ fn stat_fields_finish(inst: &crate::types::PyInstance, fields: StatFields) {
             let (name, value) = values.next().expect("n fields");
             let at = name.as_ptr() as usize;
             if keys.get(i).is_none_or(|k| k.0 != at) {
-                let key = DictKey(Object::from_static(name));
+                let key = static_name_key(name);
                 let entry = (at, crate::object::dict_key_hash(&key.0), key);
                 if i < keys.len() {
                     keys[i] = entry;
@@ -3016,29 +3016,26 @@ fn stat_result_from_libc_stat(st: &libc::stat) -> Object {
                 st.st_ctime as i64 * 1_000_000_000 + st.st_ctime_nsec as i64,
             ),
         ] {
-            d.insert(DictKey(Object::from_static(k)), Object::Int(v));
+            d.insert(static_name_key(k), Object::Int(v));
         }
         for (k, v) in [
             ("st_mtime", mtime),
             ("st_atime", atime),
             ("st_ctime", ctime),
         ] {
-            d.insert(DictKey(Object::from_static(k)), Object::Float(v));
+            d.insert(static_name_key(k), Object::Float(v));
         }
         // The BSD extras CPython exposes on macOS (`st_flags`, `st_gen`,
         // `st_birthtime`) come straight off the raw struct.
         #[cfg(target_os = "macos")]
         {
             d.insert(
-                DictKey(Object::from_static("st_flags")),
+                static_name_key("st_flags"),
                 Object::Int(i64::from(st.st_flags)),
             );
+            d.insert(static_name_key("st_gen"), Object::Int(i64::from(st.st_gen)));
             d.insert(
-                DictKey(Object::from_static("st_gen")),
-                Object::Int(i64::from(st.st_gen)),
-            );
-            d.insert(
-                DictKey(Object::from_static("st_birthtime")),
+                static_name_key("st_birthtime"),
                 Object::Float(ns(st.st_birthtime as i64, st.st_birthtime_nsec as i64)),
             );
         }
@@ -7167,6 +7164,12 @@ thread_local! {
     > = RefCell::new(std::collections::HashMap::new());
 }
 
+thread_local! {
+    /// The addresses of the registry's types, for [`struct_seq_tuple_of`]'s
+    /// check (a handful, scanned without hashing a name).
+    static STRUCT_SEQ_TYPES: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+}
+
 /// Fetch a memoised struct-sequence type (and its layout) by name.
 fn struct_seq_lookup(
     name: &str,
@@ -7184,6 +7187,58 @@ pub(crate) fn is_struct_seq_type(ty: &Rc<crate::types::TypeObject>) -> bool {
         r.borrow()
             .get(ty.name.as_str())
             .is_some_and(|(t, _)| Rc::ptr_eq(t, ty))
+    })
+}
+
+/// The tuple a struct sequence's instance keeps of its visible fields:
+/// `None` for any other instance (a subclass's included, which may
+/// override the comparisons).
+fn struct_seq_tuple_of(inst: &crate::types::PyInstance) -> Option<Object> {
+    let cls = inst.cls_raw();
+    if !cls.flags.is_builtin {
+        return None;
+    }
+    let t @ Object::Tuple(_) = inst.native.get()? else {
+        return None;
+    };
+    let at = std::ptr::from_ref(cls) as usize;
+    STRUCT_SEQ_TYPES
+        .with(|types| types.borrow().contains(&at))
+        .then(|| t.clone())
+}
+
+/// The operands of a comparison of a struct sequence with a tuple or with
+/// one of its own type, as the struct sequence's `__eq__`/`__lt__`/...
+/// compare them: as tuples of the visible fields. `None` for anything else.
+pub(crate) fn struct_seq_compare_operands(a: &Object, b: &Object) -> Option<(Object, Object)> {
+    match (a, b) {
+        (Object::Instance(ia), Object::Tuple(_)) => Some((struct_seq_tuple_of(ia)?, b.clone())),
+        (Object::Tuple(_), Object::Instance(ib)) => Some((a.clone(), struct_seq_tuple_of(ib)?)),
+        (Object::Instance(ia), Object::Instance(ib))
+            if std::ptr::eq(ia.cls_raw(), ib.cls_raw()) =>
+        {
+            Some((struct_seq_tuple_of(ia)?, struct_seq_tuple_of(ib)?))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `p`, found on a class's MRO under `name`, is a struct sequence's
+/// own field descriptor: a read-only property whose getter returns the
+/// instance dict's entry for the name. A read through it is then the
+/// instance dict's read (a missing entry is the descriptor's error, which
+/// the full path raises), so the attribute caches treat the name as the
+/// instance's own (`st.st_mode`, `time.localtime().tm_year`).
+pub(crate) fn struct_seq_field_descr(name: &str, p: &Rc<crate::object::PyProperty>) -> bool {
+    if !matches!(&*p.fset.borrow(), Object::None)
+        || !matches!(&*p.fget.borrow(), Object::Builtin(b) if b.name == name)
+    {
+        return false;
+    }
+    crate::descr_registry::lookup(&Object::Property(p.clone())).is_some_and(|m| {
+        matches!(m.kind, crate::descr_registry::DescrKind::Member)
+            && m.name == name
+            && is_struct_seq_type(&m.objclass)
     })
 }
 
@@ -7317,6 +7372,23 @@ pub(crate) fn struct_seq_type_layout(
                 )))
             }
         });
+        // Deletion fails the same way (`del st.st_mode` is CPython's
+        // "readonly attribute"). The override also keeps the fields off
+        // the instance-dict delete paths, which the attribute caches would
+        // otherwise offer them (see `struct_seq_field_descr`).
+        struct_seq_method(&mut dict, "__delattr__", move |args| {
+            let attr = match args.get(1) {
+                Some(Object::Str(s)) => s.to_string(),
+                _ => String::new(),
+            };
+            if layout.is_named(&attr) {
+                Err(crate::error::attribute_error("readonly attribute"))
+            } else {
+                Err(crate::error::attribute_error(format!(
+                    "'{name}' object has no attribute '{attr}'"
+                )))
+            }
+        });
         // CPython struct sequences subclass `tuple`, so `==`/`!=`/`hash()`
         // compare the visible fields by value (e.g. `os.stat(a) == os.stat(a)`
         // in `test_pathlib`, and using a `stat_result` as a dict key). Compare
@@ -7420,6 +7492,7 @@ pub(crate) fn struct_seq_type_layout(
             cls.dict.borrow_mut().insert(key, prop);
         }
         reg.borrow_mut().insert(name, (cls.clone(), layout));
+        STRUCT_SEQ_TYPES.with(|t| t.borrow_mut().push(Rc::as_ptr(&cls) as usize));
         cls
     })
 }
@@ -7709,6 +7782,17 @@ fn struct_seq_getitem(
 /// slots (`stat_result`'s integer times) that the named dict can't represent.
 /// Instances built before the native view existed fall back to the named
 /// visible fields, with `0` in any gap.
+/// The visible fields as a tuple: the instance's own when it keeps one.
+fn struct_seq_tuple(
+    layout: &'static StructSeqLayout,
+    inst: &Rc<crate::types::PyInstance>,
+) -> Object {
+    match inst.native.get() {
+        Some(t @ Object::Tuple(_)) => t.clone(),
+        _ => Object::new_tuple(struct_seq_values(layout, inst)),
+    }
+}
+
 fn struct_seq_values(
     layout: &'static StructSeqLayout,
     inst: &Rc<crate::types::PyInstance>,
@@ -7809,10 +7893,10 @@ fn struct_seq_richcompare(
             "struct sequence comparison requires an instance",
         ));
     };
-    let self_tuple = Object::new_tuple(struct_seq_values(layout, inst));
+    let self_tuple = struct_seq_tuple(layout, inst);
     let other = match args.get(1) {
         Some(Object::Instance(other_inst)) if Rc::ptr_eq(&inst.cls(), &other_inst.cls()) => {
-            Object::new_tuple(struct_seq_values(layout, other_inst))
+            struct_seq_tuple(layout, other_inst)
         }
         Some(t @ Object::Tuple(_)) => t.clone(),
         Some(Object::List(items)) => Object::new_tuple(items.borrow().clone()),
@@ -7834,8 +7918,7 @@ fn struct_seq_hash(
     let Some(Object::Instance(inst)) = args.first() else {
         return Err(type_error("struct sequence hash requires an instance"));
     };
-    let tuple = Object::new_tuple(struct_seq_values(layout, inst));
-    crate::builtins::hash_object(&tuple)
+    crate::builtins::hash_object(&struct_seq_tuple(layout, inst))
 }
 
 /// Build an instance of a [`struct_seq_type`], binding `values` positionally to
@@ -7925,9 +8008,14 @@ pub(crate) fn static_name_key(name: &'static str) -> DictKey {
         let key = keys
             .entry((name.as_ptr() as usize, name.len()))
             .or_insert_with(|| {
-                let s = crate::shared_value::SharedStr::from(name);
-                crate::shared_value::SharedStr::hash_cached(&s);
-                Object::Str(s)
+                // The interned name: code that reads the field by name
+                // (`st.st_mode`) holds that same string, so a cached read
+                // matches the key by pointer.
+                let key = crate::stdlib::sys::intern_name(name);
+                if let Object::Str(s) = &key {
+                    crate::shared_value::SharedStr::hash_cached(s);
+                }
+                key
             });
         DictKey(key.clone())
     })
