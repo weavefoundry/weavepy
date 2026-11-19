@@ -913,6 +913,9 @@ unsafe extern "C" fn h_call<const EFFECT: bool>(
     if n > 8 {
         return 1;
     }
+    // (A builtin type's pure constructor half, as the plan's interpreter
+    // calls it: `list(self.items)`, `str(n)`.)
+    let mut ctor = None;
     let (fp, native) = match reg(0) {
         V::Fn(fp) => (fp, None),
         V::Bi(b) => (std::ptr::null(), Some((b, None))),
@@ -920,6 +923,10 @@ unsafe extern "C" fn h_call<const EFFECT: bool>(
         V::R(p) => match unsafe { &*p } {
             Object::Function(func) => (Rc::as_ptr(func), None),
             Object::Builtin(b) => (std::ptr::null(), Some((Rc::as_ptr(b), Some(b)))),
+            Object::Type(t) if t.flags.is_builtin => {
+                ctor = Some(t);
+                (std::ptr::null(), None)
+            }
             _ => return 1,
         },
         _ => return 1,
@@ -942,7 +949,7 @@ unsafe extern "C" fn h_call<const EFFECT: bool>(
         };
         ptrs[k] = staged[k].write(o);
     }
-    if let Some((b, rc)) = native {
+    if native.is_some() || ctor.is_some() {
         // A read-only builtin, on borrowed copies of the arguments: never
         // dropped, so no reference moves.
         let mut copies = [const { std::mem::MaybeUninit::<Object>::uninit() }; 8];
@@ -953,7 +960,12 @@ unsafe extern "C" fn h_call<const EFFECT: bool>(
         }
         // SAFETY: the first `n` copies were written.
         let args = unsafe { std::slice::from_raw_parts(copies.as_ptr().cast::<Object>(), n) };
-        let Some(r) = c.interp.leaf_pure_builtin(code, pc as usize, b, rc, args) else {
+        let r = match (native, ctor) {
+            (Some((b, rc)), _) => c.interp.leaf_pure_builtin(code, pc as usize, b, rc, args),
+            (None, Some(t)) => crate::seqiter::builtin_ctor_pure(t, args),
+            (None, None) => None,
+        };
+        let Some(r) = r else {
             return 1;
         };
         return match c.owned.own(r) {
