@@ -32202,7 +32202,7 @@ impl Interpreter {
     /// registered native leaf builtin (found through the class's leaf
     /// attribute cache): the length, or `None` for the full path (which
     /// raises whatever a missing or misbehaving `__len__` must).
-    fn leaf_instance_len(&self, v: &Object) -> Option<Object> {
+    pub(crate) fn leaf_instance_len(&self, v: &Object) -> Option<Object> {
         use crate::types::LeafAttrKind as K;
         let Object::Instance(inst) = v else {
             return None;

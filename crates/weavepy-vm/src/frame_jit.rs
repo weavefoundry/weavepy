@@ -12517,7 +12517,10 @@ unsafe fn dunder_call(
                 at.add(1).cast_const(),
                 at.add(2).cast_const(),
             ];
-            if let Some(v) = (*st.interp).pure_leaf_eval::<false, false>(code, &f, &ptrs[..n]) {
+            // (Through the frameless call's entry: a warm plan runs as its
+            // native code.)
+            let depth = crate::recursion::current_depth();
+            if let Some(v) = (*st.interp).pure_leaf_call(code, &f, &ptrs[..n], false, depth) {
                 for k in (0..n).rev() {
                     crate::drop_hot_at(at.add(k));
                 }
@@ -15210,7 +15213,12 @@ unsafe fn call_leaf_in_place(
                         None
                     }
                 }),
-                Some(LeafKind::Len) => len_fast(args),
+                // (An instance's frameless `__len__`, as the full call's
+                // leaf half would find it.)
+                Some(LeafKind::Len) => len_fast(args).or_else(|| match args {
+                    [Object::Instance(_)] => (*s.interp).leaf_instance_len(&args[0]).map(Ok),
+                    _ => None,
+                }),
                 Some(LeafKind::Isinstance) => Interpreter::core_isinstance(args),
                 Some(LeafKind::Opaque) => body(),
                 Some(LeafKind::Scalar) => {
