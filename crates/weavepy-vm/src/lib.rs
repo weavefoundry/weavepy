@@ -34628,9 +34628,24 @@ impl Interpreter {
         if let Some(i) = inst.attr_position_str(name) {
             // SAFETY: the view ends before the store below.
             let (_, old) = unsafe { inst.attr_peek_index(i as usize) }?;
-            if !Self::core_droppable(old) {
+            // (A last reference's release may queue a finalizer, which the
+            // full path runs at once.)
+            let shared = old.strong_word().is_none_or(|w| {
+                // SAFETY: a counted variant's word, live while `old` is.
+                unsafe { &*w }.load(std::sync::atomic::Ordering::Relaxed) > 1
+            });
+            if !Self::core_droppable(old) || !shared {
                 return None;
             }
+            // (Already there: replaced at its position, with no key to
+            // intern or hash again.)
+            return match inst.attr_replace_index(i as usize, value.clone()) {
+                Ok(old) => {
+                    drop(old);
+                    Some(Ok(Object::None))
+                }
+                Err(_) => None,
+            };
         }
         let key = crate::stdlib::sys::intern_shared_memo(name);
         let old = match inst.split_store(&key, value.clone()) {
