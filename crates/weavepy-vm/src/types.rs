@@ -1257,6 +1257,10 @@ pub struct TypeObject {
     /// read as (see [`Self::interned_names`]), the second with the text
     /// it was made from.
     name_objs: RefCell<(Option<Object>, Option<Object>)>,
+    /// The tuples `cls.__mro__` and `cls.__bases__` read as (see
+    /// [`Self::links_tuple`]). The collector visits and clears them with
+    /// the class's other links.
+    pub(crate) link_tuples: RefCell<(Option<Object>, Option<Object>)>,
     /// The most attributes an instance's `__dict__` was seen to hold
     /// (capped): new instances' dicts are presized to it, so `__init__`'s
     /// stores do not regrow them.
@@ -1740,6 +1744,7 @@ impl TypeObject {
             leaf_attrs: LeafAttrCache::new(),
             display_name_memo: RefCell::new(None),
             name_objs: RefCell::new((None, None)),
+            link_tuples: RefCell::new((None, None)),
             inst_dict_hint: std::sync::atomic::AtomicU32::new(0),
             shared_keys: crate::sync::LazyArc::new(),
             native_kind: Cell::new(0),
@@ -2257,6 +2262,41 @@ impl TypeObject {
             *slot = Some(obj.clone());
         }
         obj
+    }
+
+    /// `cls.__mro__` (`bases` false) or `cls.__bases__` as one tuple
+    /// for as long as the links stay what they are, as CPython's
+    /// `tp_mro` and `tp_bases` are (`C.__mro__ is C.__mro__`): the tuple
+    /// made at the first read, while its items are still the class's
+    /// links, else a new one. `None` for an empty MRO (a class mid-
+    /// creation, which the full path answers).
+    pub(crate) fn links_tuple(&self, bases: bool) -> Option<Object> {
+        let current = if bases {
+            self.bases.try_borrow().ok()?
+        } else {
+            self.mro.try_borrow().ok()?
+        };
+        if !bases && current.is_empty() {
+            return None;
+        }
+        if let Ok(memo) = self.link_tuples.try_borrow() {
+            if let Some(Object::Tuple(t)) = if bases { &memo.1 } else { &memo.0 } {
+                if t.len() == current.len()
+                    && t.iter()
+                        .zip(current.iter())
+                        .all(|(o, c)| matches!(o, Object::Type(x) if Rc::ptr_eq(x, c)))
+                {
+                    return Some(Object::Tuple(t.clone()));
+                }
+            }
+        }
+        let tuple = Object::new_tuple(current.iter().map(|b| Object::Type(b.clone())).collect());
+        drop(current);
+        crate::gc_trace::track_built(&tuple);
+        if let Ok(mut memo) = self.link_tuples.try_borrow_mut() {
+            *(if bases { &mut memo.1 } else { &mut memo.0 }) = Some(tuple.clone());
+        }
+        Some(tuple)
     }
 
     pub fn bump_attr_version(&self) {

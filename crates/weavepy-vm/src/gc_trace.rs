@@ -3521,6 +3521,13 @@ fn traverse_impl<const PEEK: bool, V: Visit + ?Sized>(obj: &Object, visit: &mut 
                     visit_rc::<PEEK, _, V>(visit, meta, Object::Type);
                 }
             }
+            // The `__mro__`/`__bases__` tuples the class keeps (see
+            // `TypeObject::links_tuple`), the MRO's one holding the class.
+            if let Ok(links) = t.link_tuples.try_borrow() {
+                for tuple in [&links.0, &links.1].into_iter().flatten() {
+                    visit.visit(tuple);
+                }
+            }
             // The cached instantiation plan holds strong refs to the
             // resolved `__new__`/`__init__` (usually aliases of the dict
             // entries visited above, but still *extra* edges). Without
@@ -3905,6 +3912,9 @@ pub fn clear_object_fields(obj: &Object) -> bool {
             }
             if let Ok(mut mro) = t.mro.try_borrow_mut() {
                 mro.clear();
+            }
+            if let Ok(mut links) = t.link_tuples.try_borrow_mut() {
+                *links = (None, None);
             }
             if let Ok(mut meta) = t.metaclass.try_borrow_mut() {
                 *meta = None;

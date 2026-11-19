@@ -35855,15 +35855,7 @@ impl Interpreter {
             "__class__" => return Some(Object::Type(cls.metaclass_or_type())),
             // (`type_mro_get`: a class still being made has none, which the
             // full path answers.)
-            "__mro__" => {
-                let mro = cls.mro.try_borrow().ok()?;
-                if mro.is_empty() {
-                    return None;
-                }
-                return Some(Object::new_tuple(
-                    mro.iter().map(|b| Object::Type(b.clone())).collect(),
-                ));
-            }
+            "__mro__" => return cls.links_tuple(false),
             // (A class made with a tuple subclass of bases keeps that object;
             // its dict says so.)
             "__bases__" => {
@@ -35873,10 +35865,8 @@ impl Interpreter {
                 {
                     return None;
                 }
-                let bases = cls.bases.try_borrow().ok()?;
-                return Some(Object::new_tuple(
-                    bases.iter().map(|b| Object::Type(b.clone())).collect(),
-                ));
+                drop(d);
+                return cls.links_tuple(true);
             }
             // The class's own entry, when it's a string.
             "__module__" => {
@@ -44472,6 +44462,9 @@ impl Interpreter {
                 {
                     return Ok(orig.clone());
                 }
+                if let Some(t) = ty.links_tuple(true) {
+                    return Ok(t);
+                }
                 let bases = ty
                     .bases
                     .borrow()
@@ -44518,13 +44511,9 @@ impl Interpreter {
                 if ty.mro.borrow().is_empty() && !ty.flags.is_builtin {
                     return Ok(Object::None);
                 }
-                let mro = ty
-                    .mro
-                    .borrow()
-                    .iter()
-                    .map(|b| Object::Type(b.clone()))
-                    .collect();
-                return Ok(Object::new_tuple(mro));
+                return Ok(ty
+                    .links_tuple(false)
+                    .unwrap_or_else(|| Object::new_tuple(Vec::new())));
             }
             "__class__" => return Ok(Object::Type(meta)),
             // PEP 695: `type.__type_params__` is a getset defaulting to
