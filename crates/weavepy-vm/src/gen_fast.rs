@@ -132,6 +132,16 @@ fn op_native(code: &CodeObject, pc: usize) -> bool {
     }
 }
 
+/// Native steps of one body that stopped partway, net of those that ran to
+/// a yield, past which [`Interpreter::gen_native_next`] declines the body's
+/// steps (a `for` loop over a generator whose body calls a Python
+/// `__getitem__`: the loop's switched resume calls it, where each step
+/// would stop at it and finish on the general path). One step in
+/// [`STALL_RETRY`] past the limit runs again, and one that reaches a yield
+/// starts the count over.
+pub(crate) const STALL_LIMIT: u32 = 64;
+const STALL_RETRY: u32 = 256;
+
 /// [`code_ok`]'s verdicts (kept in the code's extension table).
 const CODE_NO: u8 = 1;
 const CODE_OK: u8 = 2;
@@ -1332,6 +1342,16 @@ impl Interpreter {
                     _ => {}
                 }
             }
+            // A body whose steps keep stopping partway: declined untouched,
+            // for the caller's resume (but one in `STALL_RETRY`).
+            let stalls = ext.gen_stalls.load(Ordering::Relaxed);
+            if stalls >= STALL_LIMIT {
+                ext.gen_stalls
+                    .store(stalls.saturating_add(1), Ordering::Relaxed);
+                if (stalls - STALL_LIMIT) % STALL_RETRY != 0 {
+                    return GenNext::Declined;
+                }
+            }
             let Some(native) = ext.frame_jit.get(frame.locals.len()) else {
                 break 'lean;
             };
@@ -1386,16 +1406,26 @@ impl Interpreter {
             frame.stack.push_fast(Object::None);
             // SAFETY: the checks above.
             let ran = unsafe { self.gen_native_run(frame, native, locals, snap_gen, 0, dead) };
+            let stalls = ext.gen_stalls.load(Ordering::Relaxed);
             return match ran {
-                Ok((v, false)) => {
-                    Self::park_stepped(g, boxed);
-                    GenNext::Yielded(v)
-                }
-                Ok((v, true)) => {
-                    self.retire_gen(g, boxed);
-                    GenNext::Exhausted(v)
+                Ok((v, done)) => {
+                    if stalls != 0 {
+                        // (A retry past the limit that ran clean starts over.)
+                        let next = if stalls >= STALL_LIMIT { 0 } else { stalls - 1 };
+                        ext.gen_stalls.store(next, Ordering::Relaxed);
+                    }
+                    if done {
+                        self.retire_gen(g, boxed);
+                        GenNext::Exhausted(v)
+                    } else {
+                        Self::park_stepped(g, boxed);
+                        GenNext::Yielded(v)
+                    }
                 }
                 Err(at) => {
+                    if stalls < STALL_LIMIT {
+                        ext.gen_stalls.store(stalls + 1, Ordering::Relaxed);
+                    }
                     self.gen_resume_rest(g, boxed, ext, start, false, at, snap_gen, 0, None, dead)
                 }
             };

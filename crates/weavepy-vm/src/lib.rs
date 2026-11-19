@@ -84949,6 +84949,11 @@ struct CodeConstObjects {
     /// Whether the code is a generator body fast steps run (see
     /// `gen_fast`): 0 not yet scanned, 1 no, 2 yes.
     gen_fast: std::sync::atomic::AtomicU8,
+    /// Native generator steps of this body that stopped partway (a call
+    /// to Python code a step can't make), less those that ran to a yield:
+    /// past `gen_fast::STALL_LIMIT` the steps are skipped, for the resume
+    /// a running activation's loop makes (see `gen_native_next`).
+    pub(crate) gen_stalls: std::sync::atomic::AtomicU32,
     /// Whether the code's `**kwargs` dict can outlive its call (see
     /// [`varkw_stays_local`]): 0 not yet scanned, 1 it can't, 2 it can.
     varkw_local: std::sync::atomic::AtomicU8,
@@ -89362,6 +89367,7 @@ fn code_vm_ext_build(code: &CodeObject) -> &CodeConstObjects {
             dunders: std::sync::OnceLock::new(),
             fast_pairs: std::sync::OnceLock::new(),
             gen_fast: std::sync::atomic::AtomicU8::new(0),
+            gen_stalls: std::sync::atomic::AtomicU32::new(0),
             varkw_local: std::sync::atomic::AtomicU8::new(0),
             gen_start: std::sync::atomic::AtomicU32::new(0),
             field_slots: SiteSlots::new(),
