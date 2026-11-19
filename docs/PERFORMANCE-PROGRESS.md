@@ -1297,6 +1297,22 @@ branch and pull request.
   - `dict(x)` from compiled code reached the general type call after the
     container lane declined it; the lane builds it now (a mapping, a
     lazy iterable of pairs, or an eager container).
+  - A function's first call decides whether it is a frameless leaf; the
+    decision allocated four vectors to walk the body, about 1,000
+    instructions of a first call's 6,000 (CPython's first call costs about
+    150). It walks the body (at most 64 instructions) in stack buffers
+    now, and only generator-shaped code scans its body for a generator
+    start: a first call of a fresh function went from 7,937 instructions
+    to 6,611. The rest is building the code's tables and the first pass's
+    site caches, which CPython does when it quickens the code.
+  - Fixed: the frozen standard library's code cache named its artifacts by
+    module alone, so two builds whose embedded sources differ (a merge
+    base and a PR in the bench gate, a developer's branches) recompiled
+    and replaced each other's artifacts at every start, about 14 million
+    instructions a run (it also made whole-process A/B counts of two
+    builds misleading). Artifacts are now named by module and source
+    hash, and a write removes the module's day-old artifacts for other
+    sources.
   - Looked at and left: thread start-up (a started and joined thread
     costs about 470,000 instructions to CPython's 150,000; the main thread
     waits on the GIL hand-off and the kernel's thread teardown, and a
