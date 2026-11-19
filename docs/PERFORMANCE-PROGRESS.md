@@ -1271,6 +1271,15 @@ branch and pull request.
     counts too while its dict is unchanged (`zip(range(3), it)` over a
     dict's items 15,122 instructions to 12,227, `most_common(3)` 38,153
     to 33,766, against 18,348).
+  - `isinstance(x, C)` for an ABC `C` asked, on every call, whether the
+    metaclass keeps `type`'s `__instancecheck__`, by a string lookup
+    through its MRO; the answer is now remembered per metaclass version
+    (`isinstance(o, Base)` 1,238 instructions to 1,009, against 2,179;
+    `issubclass(Impl, Base)` 2,442 to 1,922, against 2,052). A
+    class-like instance's plain Python `__instancecheck__` or
+    `__subclasscheck__` (the `typing` aliases') is called directly rather
+    than as a fresh bound method (`isinstance(i, typing.Hashable)` 8,130
+    to 7,753, against 4,649; the rest is its two Python calls).
   - Looked at and left: thread start-up (a started and joined thread
     costs about 470,000 instructions to CPython's 150,000; the main thread
     waits on the GIL hand-off and the kernel's thread teardown, and a
