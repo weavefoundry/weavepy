@@ -1190,6 +1190,15 @@ branch and pull request.
     position. The sort now costs 88,000 instructions; CPython's C key
     wrapper makes no Python calls but `f`'s, which the rest of the gap
     is.
+  - Native modules that call back into Python (`bisect`'s `key`, about a
+    hundred other call sites) went through `Interpreter::call_object`,
+    the embedder's entry, which publishes the interpreter and activates
+    its thread handles (cloning four of them) for every call. From a frame
+    of the same interpreter both are in effect already, so the call goes
+    straight on (`bisect_left` with a `key` over a 34-item list from
+    8,090 instructions to 6,310, against 4,050). Every comparison of two
+    instances also paid 28 instructions to rule out a struct sequence;
+    only instances of builtin classes check now.
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
