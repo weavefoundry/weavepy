@@ -7167,7 +7167,8 @@ thread_local! {
 thread_local! {
     /// The addresses of the registry's types, for [`struct_seq_tuple_of`]'s
     /// check (a handful, scanned without hashing a name).
-    static STRUCT_SEQ_TYPES: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    static STRUCT_SEQ_TYPES: RefCell<Vec<(usize, &'static StructSeqLayout)>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 /// Fetch a memoised struct-sequence type (and its layout) by name.
@@ -7201,10 +7202,93 @@ fn struct_seq_tuple_of(inst: &crate::types::PyInstance) -> Option<Object> {
     let t @ Object::Tuple(_) = inst.native.get()? else {
         return None;
     };
+    struct_seq_layout_of(cls).map(|_| t.clone())
+}
+
+/// The layout of `cls` when it's a struct sequence type itself.
+fn struct_seq_layout_of(cls: &crate::types::TypeObject) -> Option<&'static StructSeqLayout> {
     let at = std::ptr::from_ref(cls) as usize;
-    STRUCT_SEQ_TYPES
-        .with(|types| types.borrow().contains(&at))
-        .then(|| t.clone())
+    STRUCT_SEQ_TYPES.with(|types| {
+        types
+            .borrow()
+            .iter()
+            .find_map(|&(t, layout)| (t == at).then_some(layout))
+    })
+}
+
+/// The keys of a layout's named fields in slot order (all of its slots
+/// are named), made once per thread.
+fn struct_seq_layout_keys(layout: &'static StructSeqLayout) -> std::rc::Rc<[DictKey]> {
+    thread_local! {
+        static KEYS: RefCell<Vec<(usize, std::rc::Rc<[DictKey]>)>> = const { RefCell::new(Vec::new()) };
+    }
+    let at = std::ptr::from_ref(layout) as usize;
+    KEYS.with(|k| {
+        if let Some((_, keys)) = k.borrow().iter().find(|(a, _)| *a == at) {
+            return keys.clone();
+        }
+        let keys: std::rc::Rc<[DictKey]> = layout
+            .slots
+            .iter()
+            .flatten()
+            .map(|f| static_name_key(f))
+            .collect();
+        k.borrow_mut().push((at, keys.clone()));
+        keys
+    })
+}
+
+/// `T(seq)` of a struct sequence type `ty` whose fields are all named,
+/// from a tuple or list of an accepted length, made directly as
+/// `struct_seq_init` would fill it: the leading items are the visible
+/// fields, the rest (and `None` past them) the hidden ones. `None` for
+/// anything else (a type with its own `__new__`, which refuses instances,
+/// another argument, a length the full path rejects, or a value other
+/// than a number, string or `None`).
+pub(crate) fn struct_seq_from_sequence(
+    ty: &Rc<crate::types::TypeObject>,
+    arg: &Object,
+) -> Option<Object> {
+    let layout = struct_seq_layout_of(ty)?;
+    let n_fields = layout.n_fields();
+    if layout.slots.iter().any(Option::is_none)
+        || layout.name == "stat_result"
+        || ty
+            .dict
+            .borrow()
+            .get(&crate::object::StrKey("__new__"))
+            .is_some()
+    {
+        return None;
+    }
+    let mut values = match arg {
+        Object::Tuple(t) if (layout.n_sequence..=n_fields).contains(&t.len()) => t.to_vec(),
+        Object::List(l) => {
+            let l = l.borrow();
+            if !(layout.n_sequence..=n_fields).contains(&l.len()) {
+                return None;
+            }
+            l.clone()
+        }
+        _ => return None,
+    };
+    // (Only values the instance may hold untracked, as the builders'.)
+    if !values.iter().all(|v| {
+        matches!(
+            v,
+            Object::Int(_) | Object::Float(_) | Object::Str(_) | Object::Bool(_) | Object::None
+        )
+    }) {
+        return None;
+    }
+    let mut hidden = values.split_off(layout.n_sequence);
+    hidden.resize(n_fields - layout.n_sequence, Object::None);
+    Some(struct_seq_instance_keyed(
+        ty.clone(),
+        &struct_seq_layout_keys(layout),
+        values,
+        &hidden,
+    ))
 }
 
 /// The operands of a comparison of a struct sequence with a tuple or with
@@ -7492,7 +7576,7 @@ pub(crate) fn struct_seq_type_layout(
             cls.dict.borrow_mut().insert(key, prop);
         }
         reg.borrow_mut().insert(name, (cls.clone(), layout));
-        STRUCT_SEQ_TYPES.with(|t| t.borrow_mut().push(Rc::as_ptr(&cls) as usize));
+        STRUCT_SEQ_TYPES.with(|t| t.borrow_mut().push((Rc::as_ptr(&cls) as usize, layout)));
         cls
     })
 }
@@ -7632,7 +7716,7 @@ fn struct_seq_init(
         let mut d = inst.dict_cell().borrow_mut();
         for (i, v) in values.iter().enumerate() {
             if let Some(f) = layout.slots[i] {
-                d.insert(DictKey(Object::from_static(f)), v.clone());
+                d.insert(static_name_key(f), v.clone());
             }
         }
         // Hidden slots the sequence didn't reach: fill from `dict`, default
@@ -7643,11 +7727,11 @@ fn struct_seq_init(
             let f = slot.expect("hidden struct-seq slots are named");
             let v = dict_arg
                 .as_ref()
-                .and_then(|d2| d2.borrow().get(&DictKey(Object::from_static(f))).cloned());
+                .and_then(|d2| d2.borrow().get(&static_name_key(f)).cloned());
             if v.is_some() {
                 n_found += 1;
             }
-            d.insert(DictKey(Object::from_static(f)), v.unwrap_or(Object::None));
+            d.insert(static_name_key(f), v.unwrap_or(Object::None));
         }
         if let Some(d2) = &dict_arg {
             if d2.borrow().len() > n_found {
@@ -7667,7 +7751,7 @@ fn struct_seq_init(
     if name == "stat_result" {
         let mut d = inst.dict_cell().borrow_mut();
         for (slot, f) in [(7usize, "st_atime"), (8, "st_mtime"), (9, "st_ctime")] {
-            let key = DictKey(Object::from_static(f));
+            let key = static_name_key(f);
             if matches!(d.get(&key), None | Some(Object::None)) {
                 if let Some(v) = values.get(slot) {
                     d.insert(key, v.clone());

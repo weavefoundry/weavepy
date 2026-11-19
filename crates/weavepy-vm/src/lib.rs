@@ -62484,6 +62484,11 @@ impl Interpreter {
         if !ty.flags.is_builtin {
             return None;
         }
+        // A struct sequence from a tuple or list (`os.terminal_size((80,
+        // 24))`), filled directly.
+        if let Some(v) = crate::stdlib::os::struct_seq_from_sequence(ty, arg) {
+            return Some(Ok(v));
+        }
         let bt = builtin_types();
         // `str(x)`: `x`'s `__str__` (see `type_call_default`).
         if Rc::ptr_eq(ty, &bt.str_) {
@@ -84705,7 +84710,7 @@ fn builtin_fn_lane_ok_uncached(name: &str) -> bool {
             // os, through the interpreter's call (a path-like argument's
             // `__fspath__`), and `locale.setlocale`'s query
             | "stat" | "lstat" | "fspath" | "getcwd" | "access" | "listdir" | "scandir"
-            | "setlocale"
+            | "setlocale" | "get_terminal_size" | "isatty"
             | "fsdecode" | "fsencode" | "dir"
             // hashing and compression, `sys.audit` (whose hooks run through
             // the call), `weakref`'s dead-entry callback, `json`'s encoder

@@ -5927,7 +5927,11 @@ unsafe fn subscr_raise_missing(st: &mut State, pc: u64, len: usize) -> Option<u6
     // SAFETY: per the caller.
     unsafe {
         let (c, k) = (&*st.stack.add(len - 2), &*st.stack.add(len - 1));
-        let (Object::Dict(d), Object::Str(_) | Object::Int(_) | Object::Tuple(_)) = (c, k) else {
+        let (
+            Object::Dict(d),
+            Object::Str(_) | Object::Int(_) | Object::Tuple(_) | Object::Bytes(_),
+        ) = (c, k)
+        else {
             return None;
         };
         let probe = crate::object::LeafProbe::new(k)?;
