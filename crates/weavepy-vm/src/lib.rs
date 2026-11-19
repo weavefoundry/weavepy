@@ -48087,7 +48087,35 @@ impl Interpreter {
             }
             _ => None,
         };
-        let key_of = |slf: &mut Self, item: &Object| -> Result<Object, RuntimeError> {
+        // A key that runs no code (`attrgetter("x")`, `itemgetter(1)`, a
+        // pure-leaf function) evaluates in place, as `sort_with_key`
+        // evaluates one; after one decline the rest take the full call.
+        let mut pure = key_fn
+            .as_ref()
+            .is_some_and(|f| leaf.is_none() && crate::seqiter::pure_callback_maybe(f));
+        let call_fast = match &key_fn {
+            Some(f) if pure => self.instance_call_fast(f),
+            _ => None,
+        };
+        let mut key_of = |slf: &mut Self, item: &Object| -> Result<Object, RuntimeError> {
+            if let (Some(fast), Some(f)) = (call_fast, &key_fn) {
+                // SAFETY: bitwise views of the live key function and item,
+                // never dropped (the fast half clones what it keeps).
+                let views = std::mem::ManuallyDrop::new(unsafe {
+                    [std::ptr::read(f), std::ptr::read(item)]
+                });
+                if let Some(Ok(k)) = fast(&views[..]) {
+                    return Ok(k);
+                }
+            }
+            if pure {
+                if let Some(f) = &key_fn {
+                    if let Some(k) = slf.pure_callback(f, std::slice::from_ref(item), true) {
+                        return Ok(k);
+                    }
+                    pure = false;
+                }
+            }
             if let Some((b, kind)) = &leaf {
                 let arg = std::slice::from_ref(item);
                 match kind {

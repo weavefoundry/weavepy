@@ -4176,6 +4176,15 @@ fn current_interp_hash(obj: &Object) -> Option<i64> {
     interp.reentrant_py_hash(obj)
 }
 
+/// [`current_interp_hash`] for an instance whose `__hash__` evaluates as a
+/// pure leaf (see `Interpreter::leaf_instance_hash`): no reentrant call,
+/// and no code run. `None` when it doesn't apply.
+fn current_interp_pure_hash(obj: &Object) -> Option<i64> {
+    let ptr = crate::vm_singletons::current_interpreter_ptr()?;
+    // SAFETY: see `current_interp_hash`; the evaluation reads only.
+    unsafe { &*ptr }.leaf_instance_hash(obj)
+}
+
 /// Companion to [`current_interp_hash`] for `a == b` via Python `__eq__`.
 fn current_interp_eq(a: &Object, b: &Object) -> Option<bool> {
     let ptr = crate::vm_singletons::current_interpreter_ptr()?;
@@ -15842,7 +15851,9 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
                 // (`DictKey::eq` / `dict_reentrant_probe`), CPython reads the
                 // entry, never re-invoking `__hash__` — `test_dict`'s
                 // `test_setdefault_atomic` counts exactly one call per key.
-                let h = current_interp_hash(obj);
+                // (A `__hash__` that evaluates as a pure leaf, an `Enum`
+                // member's, in place: the same value with no call.)
+                let h = current_interp_pure_hash(obj).or_else(|| current_interp_hash(obj));
                 if let Some(hv) = h {
                     inst.hash_cache.store(hv);
                 }

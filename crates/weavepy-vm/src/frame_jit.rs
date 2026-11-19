@@ -4978,6 +4978,21 @@ unsafe extern "C" fn h_list_append_ref(
 /// key the native probe settles (no stored key could equal it) or a scalar
 /// value replaced (its release runs nothing); anything else declined
 /// untouched.
+/// [`crate::object::LeafProbe::new`], or for an instance whose class's
+/// Python `__hash__` evaluates as a pure leaf (an `Enum` member, a frozen
+/// dataclass; see `Interpreter::leaf_instance_hash`), a probe carrying that
+/// hash: a stored key it meets is equal by identity alone, and any other of
+/// the same hash makes the probe foreign (its miss inexact).
+fn leaf_or_pure_probe(key: &Object) -> Option<crate::object::LeafProbe<'_>> {
+    crate::object::LeafProbe::new(key).or_else(|| {
+        let p = crate::vm_singletons::current_interpreter_ptr()?;
+        // SAFETY: the interpreter running on this thread, dormant while the
+        // helper runs; a pure-leaf evaluation runs no other code.
+        let h = unsafe { &*p }.leaf_instance_hash(key)?;
+        Some(crate::object::LeafProbe::with_hash(key, h))
+    })
+}
+
 unsafe extern "C" fn h_map_add(
     dict: *const Object,
     key: *const Object,
@@ -5002,7 +5017,7 @@ unsafe extern "C" fn h_map_add(
         if crate::capi_watchers::dicts_active() {
             return 1;
         }
-        let Some(probe) = crate::object::LeafProbe::new(&*key) else {
+        let Some(probe) = leaf_or_pure_probe(&*key) else {
             return 1;
         };
         let Some(d) = cell.peek_mut() else {
@@ -5011,12 +5026,18 @@ unsafe extern "C" fn h_map_add(
         let added = match d.probe_entry(&probe) {
             crate::dictmap::ProbeEntry::Occupied(e) => {
                 let slot = e.into_mut();
+                // (An instance key hits by identity: the dict holds it, so
+                // the new reference's release is never its last.)
                 if !matches!(
                     slot,
                     Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
                 ) || !matches!(
                     &*key,
-                    Object::Int(_) | Object::Str(_) | Object::Bool(_) | Object::None
+                    Object::Int(_)
+                        | Object::Str(_)
+                        | Object::Bool(_)
+                        | Object::None
+                        | Object::Instance(_)
                 ) {
                     return 1;
                 }
@@ -5055,7 +5076,7 @@ unsafe extern "C" fn h_set_add(set: *const Object, value: *const Object, owned: 
         let Object::Set(cell) = &*set else {
             return 1;
         };
-        let Some(probe) = crate::object::LeafProbe::new(&*value) else {
+        let Some(probe) = leaf_or_pure_probe(&*value) else {
             return 1;
         };
         let Some(s) = cell.peek_mut() else {
@@ -5074,10 +5095,15 @@ unsafe extern "C" fn h_set_add(set: *const Object, value: *const Object, owned: 
             || crate::object::DictKey(take()),
         ) {
             Some(true) => 0,
+            // (An instance hits by identity: the set holds it.)
             Some(false)
                 if matches!(
                     &*value,
-                    Object::Int(_) | Object::Str(_) | Object::Bool(_) | Object::None
+                    Object::Int(_)
+                        | Object::Str(_)
+                        | Object::Bool(_)
+                        | Object::None
+                        | Object::Instance(_)
                 ) =>
             {
                 if owned != 0 {
@@ -6385,7 +6411,7 @@ unsafe fn store_subscr_fast(
                 if crate::capi_watchers::dicts_active() {
                     return 1;
                 }
-                let Some(probe) = crate::object::LeafProbe::new(k) else {
+                let Some(probe) = leaf_or_pure_probe(k) else {
                     return 1;
                 };
                 let Some(d) = cell.peek_mut() else {
