@@ -9809,6 +9809,27 @@ unsafe fn inst_builtin_bound(
     )))
 }
 
+/// A `__slots__` member the site's field slot names for the instance's
+/// class at its version (`p.x` of a global's, after `slot_note`): read off
+/// the instance's laid-out slots.
+#[inline]
+unsafe fn slot_field_hit<'a>(
+    site: &AttrSite,
+    inst: &'a crate::types::PyInstance,
+) -> Option<&'a Object> {
+    if site.field.is_null() {
+        return None;
+    }
+    // SAFETY: the site's field slot lives as long as the code does.
+    let (want, idx) = unsafe { (*site.field).get() };
+    if want == 0 || want != inst.cls_raw().attr_version.get() || idx & crate::SLOT_FIELD == 0 {
+        return None;
+    }
+    // SAFETY: as in `h_attr_local_slot`: the position was noted for this
+    // class at this version (`slot_field_note`), over its own layout.
+    unsafe { inst.laid_out_slot((idx & !crate::SLOT_FIELD) as usize) }
+}
+
 /// [`h_attr_local`] past its commonest shape.
 #[inline(never)]
 unsafe extern "C" fn attr_local_slow(st: *mut State, site: *const AttrSite) -> u32 {
@@ -9907,7 +9928,9 @@ unsafe extern "C" fn h_attr_stack(st: *mut State, site: *const AttrSite) -> u32 
         let s = &*site;
         let at = (*st).stack.add(s.slot as usize);
         let v = match &*at {
-            Object::Instance(inst) => field_hit(s, inst).map(crate::clone_hot),
+            Object::Instance(inst) => field_hit(s, inst)
+                .or_else(|| slot_field_hit(s, inst))
+                .map(crate::clone_hot),
             // A class's constant the site memoized (`Direction.FORWARD`).
             Object::Type(cls) => type_attr_memo(s, cls),
             // A module's value the site noted (`os.path`).
@@ -10682,6 +10705,21 @@ unsafe extern "C" fn attr_stack_slow(st: *mut State, site: *const AttrSite) -> u
             }
             // (A class attribute the site has read before.)
             Object::Instance(inst) => {
+                // A plain class value the site memoized for the class (no
+                // descriptor or native method shares its version), or a
+                // named tuple's field, as the local read's path finds them
+                // first.
+                if let Some(v) = class_poly_hit(site, inst).or_else(|| {
+                    (*site.ext)
+                        .stamp_slot(site.pc as usize)
+                        .and_then(|s| crate::tuple_field_hit(s, inst))
+                }) {
+                    if plain_release(&*at) {
+                        at.write(v);
+                        return 0;
+                    }
+                    drop(v);
+                }
                 if let Some(v) =
                     inst_dict_known(site, inst).or_else(|| inst_builtin_bound(site, inst, &*at))
                 {
