@@ -13448,6 +13448,71 @@ fn deliver_dyn_result(
     2
 }
 
+/// `a <op> b` of the two staged operands when it runs no Python code,
+/// by the helpers compiled frames use (`frame_jit::h_binop`): two exact
+/// lists' or tuples' concatenation, two dicts' union and two sets'
+/// algebra over keys that hash and compare natively, two `bytes`'
+/// concatenation. `None` leaves the operation to the interpreter.
+///
+/// # Safety
+///
+/// As [`dyn_operands`].
+unsafe fn dyn_leaf_binop(
+    jf: &JitFrame,
+    ctx: &CallCtx,
+    kind: weavepy_compiler::BinOpKind,
+) -> Option<Object> {
+    use weavepy_compiler::BinOpKind as K;
+    // SAFETY: per the function contract.
+    let (a_bits, a_tag, b_bits, b_tag) = unsafe {
+        (
+            *jf.call_args,
+            *jf.call_tags,
+            *jf.call_args.add(1),
+            *jf.call_tags.add(1),
+        )
+    };
+    // (A pinned list is its real list, whatever element lane the compile
+    // assumed for it.)
+    fn operand<'a>(
+        bits: u64,
+        tag: u32,
+        pins: &'a PinTable,
+        tmp: &'a mut Option<Object>,
+    ) -> Option<&'a Object> {
+        match SlotTag::from_raw(tag) {
+            SlotTag::ListPin | SlotTag::ObjPin => match pins.get(bits as usize)? {
+                Pin::Obj(o) => Some(o),
+                Pin::List(l, _) => Some(tmp.insert(Object::List(l.clone()))),
+            },
+            _ => staged_ref(bits, tag, pins, tmp),
+        }
+    }
+    let (mut a_tmp, mut b_tmp) = (None, None);
+    let a = operand(a_bits, a_tag, &ctx.pins, &mut a_tmp)?;
+    let b = operand(b_bits, b_tag, &ctx.pins, &mut b_tmp)?;
+    match (a, b) {
+        (Object::List(_), Object::List(_)) | (Object::Tuple(_), Object::Tuple(_))
+            if kind == K::Add =>
+        {
+            super::Interpreter::core_seq_concat(a, b)
+        }
+        (Object::Dict(_), Object::Dict(_)) if kind == K::BitOr => super::dict_union_plain(a, b),
+        (Object::Set(_) | Object::FrozenSet(_), Object::Set(_) | Object::FrozenSet(_))
+            if matches!(kind, K::BitOr | K::BitAnd | K::Sub | K::BitXor) =>
+        {
+            super::set_algebra_fast(a, b, kind)
+        }
+        (Object::Bytes(x), Object::Bytes(y)) if kind == K::Add => {
+            let mut out = Vec::with_capacity(x.len() + y.len());
+            out.extend_from_slice(x);
+            out.extend_from_slice(y);
+            Some(Object::new_bytes(out))
+        }
+        _ => None,
+    }
+}
+
 /// The `wpjit_dyn_binop` helper (`weavepy_jit::TOp::DynBinary`): run the
 /// interpreter's own `BINARY_OP` dispatch for `arg` (the operator and the
 /// in-place flag) on the two staged operands — the full `__op__` /
@@ -13465,12 +13530,30 @@ unsafe extern "C" fn wpjit_dyn_binop(frame: *mut JitFrame, arg: i64, _unused: i6
     let ctx = unsafe { &mut *jf.ctx.cast::<CallCtx>() };
     // SAFETY: the `&mut Interpreter` is dormant while the helper runs.
     let interp = unsafe { &mut *ctx.interp };
-    // SAFETY: native code staged both operands.
-    let (a, b) = unsafe { dyn_operands(jf, ctx) };
     let arg = arg as u32;
     // SAFETY: `BinOpKind` is `repr(u8)` and the compiler only emits valid
     // kinds (the interpreter's `binary_op_step` decodes it the same way).
     let kind: weavepy_compiler::BinOpKind = unsafe { std::mem::transmute(arg as u8) };
+    // A result no Python code computes, built off the borrowed operands
+    // (as `wpjit_dyn_getitem` reads one): no guard can have changed, so
+    // none is rechecked.
+    if arg & weavepy_compiler::BINARY_OP_INPLACE_FLAG == 0 {
+        // SAFETY: native code staged both operands.
+        if let Some(v) = unsafe { dyn_leaf_binop(jf, ctx, kind) } {
+            if !ctx.temporary_pin_limit_reached() {
+                if let Some(bits) = pin_any(v.clone(), &mut ctx.pins) {
+                    jf.ret_bits = bits;
+                    return 0;
+                }
+            } else {
+                ctx.pin_pressure_exit = true;
+            }
+            ctx.parked = Some(v);
+            return 2;
+        }
+    }
+    // SAFETY: native code staged both operands.
+    let (a, b) = unsafe { dyn_operands(jf, ctx) };
     let globals = ctx.globals.clone();
     ctx.dirty = true;
     let r = if arg & weavepy_compiler::BINARY_OP_INPLACE_FLAG != 0 {

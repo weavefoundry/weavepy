@@ -14964,6 +14964,10 @@ fn len_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
             [Object::Bytes(b)] => b.len(),
             // A dict's keys, values or items view: the dict's size.
             [Object::DictView(v)] => v.dict.peek()?.len(),
+            // A machine-word range's count.
+            [Object::Range(r)] if r.big.is_none() => {
+                usize::try_from(crate::object::range_len_i128(r)).ok()?
+            }
             // A builtin subclass's own `__len__`: its payload's.
             [Object::Instance(inst)] => {
                 let native = Interpreter::native_payload_for(

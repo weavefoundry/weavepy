@@ -66214,10 +66214,14 @@ impl Interpreter {
                 let global_dummy = Rc::new(RefCell::new(DictData::default()));
                 let mut d = DictData::default();
                 if let Some(arg0) = args.first() {
-                    if let Some(Object::Dict(inner)) =
+                    if let Object::Dict(src) = arg0 {
+                        // (An exact dict: its table copied once.)
+                        d = src.borrow().clone();
+                    } else if let Some(Object::Dict(inner)) =
                         self.try_dict_from_mapping(arg0, &global_dummy)?
                     {
-                        d = inner.borrow().clone();
+                        // (The copy just made is this call's own.)
+                        d = std::mem::take(&mut *inner.borrow_mut());
                     } else {
                         let items = self.collect_iterable(arg0, &global_dummy)?;
                         for (i, pair) in items.into_iter().enumerate() {
@@ -66235,10 +66239,15 @@ impl Interpreter {
                         }
                     }
                 }
+                // (Keyword names are interned strings, hashed once.)
+                let str_keys = d.keys().all(|k| matches!(k.0, Object::Str(_)));
                 for (k, v) in kwargs {
-                    crate::object::key_cmp_scope(|| {
-                        d.insert(DictKey(Object::Str(SharedStr::from(k.as_str()))), v.clone())
-                    })?;
+                    let key = DictKey(crate::stdlib::sys::intern_name(k));
+                    if str_keys {
+                        d.insert(key, v.clone());
+                    } else {
+                        crate::object::key_cmp_scope(|| d.insert(key, v.clone()))?;
+                    }
                 }
                 let out = Object::Dict(Rc::new(RefCell::new(d)));
                 crate::gc_trace::track_built(&out);
