@@ -1280,6 +1280,23 @@ branch and pull request.
     `__subclasscheck__` (the `typing` aliases') is called directly rather
     than as a fresh bound method (`isinstance(i, typing.Hashable)` 8,130
     to 7,753, against 4,649; the rest is its two Python calls).
+  - A compiled `obj.attr = value` stored in line only over a scalar; one
+    that replaced an object (`node.next = other`, `self.current = node`)
+    took a helper, about 124 instructions more, even when another owner
+    kept the old value. The in-line store now gives the old value up by a
+    plain decrement when it isn't the last reference. A site that first
+    added its attribute (a loop's first pass) settled on appending and
+    took the helper for every later pass's replacement; it now replaces
+    in line too. Replacing an object in 100 instances went from 30,957
+    instructions to 17,297 (CPython 17,669), and a second pass's stores
+    from 54,605 to 29,666 (29,001).
+  - Fixed: the core loop's instance attribute stores left a finalizer the
+    replaced value queued for the next safe point, so `holder.d =
+    Dying()` ran the old object's `__del__` one statement late (at the
+    next call) in every tier.
+  - `dict(x)` from compiled code reached the general type call after the
+    container lane declined it; the lane builds it now (a mapping, a
+    lazy iterable of pairs, or an eager container).
   - Looked at and left: thread start-up (a started and joined thread
     costs about 470,000 instructions to CPython's 150,000; the main thread
     waits on the GIL hand-off and the kernel's thread teardown, and a
