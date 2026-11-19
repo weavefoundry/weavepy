@@ -52848,6 +52848,16 @@ impl Interpreter {
     ) -> Result<Object, RuntimeError> {
         let prev_state = std::mem::replace(&mut *gen.state().borrow_mut(), GeneratorState::Running);
         let mut frame = match prev_state {
+            // A `StopIteration` thrown into a generator that never started
+            // escapes as it is: CPython's PEP 479 conversion is a handler
+            // over the body past its start, which the throw never enters.
+            GeneratorState::Created(_)
+                if matches!(gen.kind, crate::object::CoroutineKind::Generator)
+                    && exc.type_name() == "StopIteration" =>
+            {
+                *gen.state().borrow_mut() = GeneratorState::Finished;
+                return Err(RuntimeError::PyException(exc));
+            }
             GeneratorState::Created(boxed) | GeneratorState::Suspended(boxed) => *boxed,
             GeneratorState::Finished => {
                 *gen.state().borrow_mut() = GeneratorState::Finished;
