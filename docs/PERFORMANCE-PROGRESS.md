@@ -1094,6 +1094,17 @@ branch and pull request.
     fields by comparing their names on every call; it now remembers the
     slot layout as `deque`'s methods do (1,870 instructions a call to
     1,693, against 939).
+  - A `for` loop over a generator first tries the generator's native
+    step, which has no switch and so can't call Python code: a body that
+    subscripts an object with a Python `__getitem__` (as
+    `collections.abc.Sequence.__iter__` does, behind `x in path.parents`)
+    stopped partway at every item and finished on the general path. A
+    body whose steps keep stopping now skips them, and the loop resumes it
+    through its switched path, which calls the method directly (one step
+    in 256 retries). A five-item generator of that shape went from 33,800
+    instructions to 19,500 (CPython 7,600) and `Path.relative_to` from
+    337,000 to 303,000 (169,000); the lazy resume's own cost is most of
+    what's left.
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
