@@ -67763,12 +67763,16 @@ impl Interpreter {
             && code.kwonly_count == 0
             && !code.has_varargs
             && !code.has_varkeywords;
-        let start = code
-            .instructions
-            .iter()
-            .position(|i| !matches!(i.op, OpCode::MakeCell | OpCode::CopyFreeVars))
-            .filter(|&start| shaped && code.instructions[start].op == OpCode::ReturnGenerator);
-        let delegates = code.instructions.iter().any(|i| i.op == OpCode::Send);
+        // (Any other code's verdict needs no scan of its body.)
+        let start = shaped
+            .then(|| {
+                code.instructions
+                    .iter()
+                    .position(|i| !matches!(i.op, OpCode::MakeCell | OpCode::CopyFreeVars))
+            })
+            .flatten()
+            .filter(|&start| code.instructions[start].op == OpCode::ReturnGenerator);
+        let delegates = start.is_some() && code.instructions.iter().any(|i| i.op == OpCode::Send);
         ext.gen_start.store(
             start.map_or(u32::MAX, |at| {
                 (at as u32 + 1) | if delegates { GEN_DELEGATES } else { 0 }
@@ -88995,6 +88999,54 @@ pub(crate) fn body_pcs(code: &CodeObject) -> Vec<usize> {
     out
 }
 
+/// The most instructions a pure or effect leaf's code has.
+const LEAF_BODY_MAX: usize = 64;
+
+/// [`body_pcs`] of code with at most [`LEAF_BODY_MAX`] instructions, into
+/// `out` without allocating: how many pcs.
+fn body_pcs_small(code: &CodeObject, out: &mut [u8; LEAF_BODY_MAX]) -> usize {
+    let ins = &code.instructions;
+    let n = ins.len();
+    debug_assert!(n <= LEAF_BODY_MAX);
+    let mut seen = 0u64;
+    // (Each pc pushes at most two successors, and is expanded once; a
+    // successor past the end, at most `LEAF_BODY_MAX + 255`, is skipped.)
+    let mut work = [0u16; 2 * LEAF_BODY_MAX + 1];
+    let mut top = 1;
+    let mut k = 0;
+    while top > 0 {
+        top -= 1;
+        let pc = usize::from(work[top]);
+        if pc >= n || seen & (1 << pc) != 0 {
+            continue;
+        }
+        seen |= 1 << pc;
+        out[k] = pc as u8;
+        k += 1;
+        let i = ins[pc];
+        let next = pc + 1;
+        let mut push = |t: usize| {
+            work[top] = t.min(usize::from(u16::MAX)) as u16;
+            top += 1;
+        };
+        match i.op {
+            OpCode::ReturnValue | OpCode::RaiseVarargs | OpCode::Reraise => {}
+            OpCode::JumpForward => push(next + i.arg as usize),
+            OpCode::JumpBackward => push(next.saturating_sub(i.arg as usize)),
+            OpCode::PopJumpIfFalse
+            | OpCode::PopJumpIfTrue
+            | OpCode::PopJumpIfNone
+            | OpCode::PopJumpIfNotNone
+            | OpCode::ForIter => {
+                push(next + i.arg as usize);
+                push(next);
+            }
+            _ => push(next),
+        }
+    }
+    k
+}
+
 /// [`code_is_pure_leaf`]'s first answer for `code`, recorded in `ext`.
 #[cold]
 #[inline(never)]
@@ -89011,7 +89063,7 @@ fn code_pure_leaf_decide(code: &CodeObject, ext: &CodeConstObjects) -> bool {
         && !code.has_varargs
         && leaf_arity(code) <= 8
         && code.varnames.len() <= 16
-        && code.instructions.len() <= 64;
+        && code.instructions.len() <= LEAF_BODY_MAX;
     let pure_op = |ins: &weavepy_compiler::Instruction| {
         // A fresh empty list or dict is unobservable until stored, so
         // a declined evaluation that made one still did nothing; so is a
@@ -89075,27 +89127,47 @@ fn code_pure_leaf_decide(code: &CodeObject, ext: &CodeConstObjects) -> bool {
     // plan can't express, before anything it does is seen, and the
     // ordinary call then raises: those paths needn't be pure, so a body
     // guarded by `if bad: raise ...` still evaluates frameless.)
-    let pcs = if structural {
-        body_pcs(code)
+    // (A structural body has at most 64 instructions: its pcs gather on
+    // the stack, and a body with no raise needs no raise analysis.)
+    let mut buf = [0u8; LEAF_BODY_MAX];
+    let pcs: &[u8] = if structural {
+        let k = body_pcs_small(code, &mut buf);
+        &buf[..k]
+    } else {
+        &[]
+    };
+    let raises = pcs
+        .iter()
+        .any(|&pc| code.instructions[usize::from(pc)].op == OpCode::RaiseVarargs);
+    let doomed = if raises {
+        let wide: Vec<usize> = pcs.iter().map(|&pc| usize::from(pc)).collect();
+        raise_bound_pcs(code, &wide)
     } else {
         Vec::new()
     };
-    let doomed = raise_bound_pcs(code, &pcs);
-    let body: Vec<&weavepy_compiler::Instruction> = pcs
-        .iter()
-        .filter(|&&pc| !doomed[pc])
-        .map(|&pc| &code.instructions[pc])
-        .collect();
+    let mut kept = [0u8; LEAF_BODY_MAX];
+    let mut nkept = 0;
+    for &pc in pcs {
+        if !doomed.get(usize::from(pc)).copied().unwrap_or(false) {
+            kept[nkept] = pc;
+            nkept += 1;
+        }
+    }
+    let body = || {
+        kept[..nkept]
+            .iter()
+            .map(|&pc| &code.instructions[usize::from(pc)])
+    };
     // (A body that always raises has nothing to evaluate.)
-    let structural = structural && !body.is_empty();
-    let ok = structural && body.iter().all(|i| pure_op(i));
+    let structural = structural && nkept > 0;
+    let ok = structural && body().all(|i| pure_op(i));
     // An effect leaf: a pure leaf but for attribute stores, which its
     // evaluation buffers and commits at the return (see
     // `Interpreter::pure_leaf_eval`).
     let effect = !ok
         && structural
-        && body.iter().all(|i| pure_op(i) || i.op == OpCode::StoreAttr)
-        && body.iter().any(|i| i.op == OpCode::StoreAttr);
+        && body().all(|i| pure_op(i) || i.op == OpCode::StoreAttr)
+        && body().any(|i| i.op == OpCode::StoreAttr);
     let shape = if ok {
         let body = code.instructions.as_slice();
         let body = if body.first().is_some_and(|i| i.op == OpCode::Resume) {
