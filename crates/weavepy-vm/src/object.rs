@@ -11672,6 +11672,22 @@ impl PyIterator {
             PyIterator::Enumerate { inner, .. } | PyIterator::Shared(inner) => {
                 inner.try_borrow().is_ok_and(|i| i.pure_ready())
             }
+            // A plain dict's forward iterator past its first (checked) step,
+            // its dict unchanged and an entry left: the step `next_value`
+            // takes is the checked one's.
+            PyIterator::DictKeys {
+                index,
+                dict: Some(d),
+                len,
+                watch: Some(w),
+                reverse: false,
+                odict: None,
+                ..
+            } => {
+                !w.changed()
+                    && d.try_borrow()
+                        .is_ok_and(|data| data.len() == *len && data.get_index(*index).is_some())
+            }
             _ => false,
         }
     }
