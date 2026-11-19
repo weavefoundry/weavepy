@@ -32462,6 +32462,25 @@ impl Interpreter {
         }
     }
 
+    /// `repr(obj)` for an instance whose class's `__repr__` is a Python
+    /// function (found once per class version), called with the instance
+    /// directly: no bound method, and no walk of the MRO. `None` for any
+    /// other object.
+    pub(crate) fn instance_python_repr(
+        &mut self,
+        obj: &Object,
+    ) -> Option<Result<Object, RuntimeError>> {
+        let Object::Instance(inst) = obj else {
+            return None;
+        };
+        let f = Self::instance_dunder_function(
+            inst,
+            crate::types::AttrKey::vm(crate::types::vm_key::REPR_FN),
+            "__repr__",
+        )?;
+        Some(self.call_dunder_function(f, std::slice::from_ref(obj)))
+    }
+
     /// Whether `cls` resolves `name` to nothing on its MRO, cached on the
     /// class under its attribute version at `key` (as
     /// [`Self::instance_dunder_function`]).
@@ -81760,6 +81779,21 @@ fn percent_render_plain(template: &str, args: PercentArgs<'_>) -> Option<String>
             }
             _ => return None,
         };
+        // `%r` of a plain value: its repr in place.
+        if *bytes.get(k)? == b'r' {
+            match v {
+                Object::Int(n) => {
+                    let _ = write!(out, "{n}");
+                }
+                Object::Bool(b) => out.push_str(if *b { "True" } else { "False" }),
+                Object::None => out.push_str("None"),
+                Object::Str(_) => out.push_str(&v.repr()),
+                _ => k = percent_render_spec(&mut out, bytes, k, v)?,
+            }
+            i = k + 1;
+            lit = i;
+            continue;
+        }
         if !matches!(bytes.get(k)?, b's' | b'd' | b'i') {
             k = percent_render_spec(&mut out, bytes, k, v)?;
             i = k + 1;

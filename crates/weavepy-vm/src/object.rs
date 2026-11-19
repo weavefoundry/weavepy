@@ -13960,6 +13960,23 @@ impl Object {
                 file.repr_with_addr(Rc::as_ptr(file) as usize)
             }
             Object::Instance(inst) => {
+                // A class whose `__repr__` is a Python function: called
+                // directly through the live interpreter (as below, with the
+                // same error handling).
+                if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                    // SAFETY: published by an enclosing VM frame still live on
+                    // this thread; the GIL keeps it exclusive.
+                    let interp = unsafe { &mut *ptr };
+                    if let Some(r) = interp.instance_python_repr(self) {
+                        return match r {
+                            Ok(r) => r.to_str(),
+                            Err(e) => {
+                                stash_repr_error(e);
+                                format!("<{} object>", inst.cls().name)
+                            }
+                        };
+                    }
+                }
                 // The `Ellipsis` / `NotImplemented` singletons render as
                 // fixed text — CPython's `ellipsis`/`NotImplementedType`
                 // `tp_repr`. We supply it here, keyed on the registry type
@@ -15798,6 +15815,16 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
                 && inst.class_dunder(crate::types::Dunder::Hash).object_owner()
             {
                 return Some(identity_hash(obj));
+            }
+            // A Python `__hash__` that evaluates as a pure leaf (an `Enum`
+            // member's, a frozen dataclass's): in place, ahead of the native
+            // kinds below, none of which has one. (Recorded as the dispatch
+            // below records its result.)
+            if inst.native.get().is_none() {
+                if let Some(h) = current_interp_pure_hash(obj) {
+                    inst.hash_cache.store(h);
+                    return Some(h);
+                }
             }
             // A compiled pattern hashes natively (see
             // `stdlib::sre_objects::native_hash`).
