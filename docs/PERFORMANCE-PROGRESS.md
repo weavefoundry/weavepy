@@ -1082,6 +1082,15 @@ branch and pull request.
     million, against 233 million: the parser's two largest functions
     still run interpreted). A start-up also no longer calls `globals()`
     195 times in `posix`'s re-export loop (0.9% of its instructions).
+  - Compiled code read a receiver that isn't a local (`p.x` of a global)
+    through a slower helper than a local's: a `__slots__` member, a
+    class's plain value through an instance, and a named tuple's field
+    were each found only after the helper had tried the other kinds. The
+    stack helper now checks the slot the site recorded and, first, the
+    class value and field its local twin checks (a loop reading a global
+    slotted instance's field from 520 instructions an iteration to 251,
+    a class value from 390 to 302, a named tuple field from 699 to 288;
+    CPython 282, 278 and 417).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
