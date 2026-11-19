@@ -62818,6 +62818,13 @@ impl Interpreter {
             };
             let globals = self.builtins.clone();
             self.do_list_or_tuple_call(name, arg, &globals)
+        } else if Rc::ptr_eq(ty, &bt.dict_) {
+            // `dict(x)`: a mapping or a lazy iterable of pairs through the
+            // VM, an eager container of pairs by the plain builtin.
+            match self.dict_from_one(arg) {
+                Some(r) => r,
+                None => crate::builtins::b_dict(std::slice::from_ref(arg)),
+            }
         } else if Rc::ptr_eq(ty, &bt.set_) || Rc::ptr_eq(ty, &bt.frozenset_) {
             let is_set = Rc::ptr_eq(ty, &bt.set_);
             if matches!(
@@ -65683,6 +65690,88 @@ impl Interpreter {
         }
     }
 
+    /// `dict(arg)` (one positional, no keywords) where the plain builtin
+    /// can't build it: a mapping (anything with `keys()`), or a lazy
+    /// iterable of pairs (a generator, a `zip`/`map`/`filter` view, an
+    /// instance) through the VM-aware collector. `None` for an eager
+    /// container of pairs, which `builtins::b_dict` builds.
+    fn dict_from_one(&mut self, arg: &Object) -> Option<Result<Object, RuntimeError>> {
+        let global_dummy = Rc::new(RefCell::new(DictData::default()));
+        match self.try_dict_from_mapping(arg, &global_dummy) {
+            Ok(Some(d)) => return Some(Ok(d)),
+            Ok(None) => {}
+            Err(e) => return Some(Err(e)),
+        }
+        if !(matches!(
+            arg,
+            Object::Generator(_) | Object::Iter(_) | Object::Instance(_)
+        ) || object_needs_vm_iter(arg))
+        {
+            return None;
+        }
+        Some(self.dict_from_lazy_pairs(arg))
+    }
+
+    /// [`Self::dict_from_one`]'s lazy iterable of pairs.
+    fn dict_from_lazy_pairs(&mut self, arg: &Object) -> Result<Object, RuntimeError> {
+        let args = std::slice::from_ref(arg);
+        let global_dummy = Rc::new(RefCell::new(DictData::default()));
+        // `dict(zip(ks, vs))`: the pairs straight from the two
+        // sources, in the order the zip would step them, with
+        // no tuple between.
+        let pairs: Vec<(Object, Object)> = match self.zip2_pairs(&args[0], &global_dummy) {
+            Some(pairs) => pairs?,
+            None => {
+                let items = self.collect_iterable(&args[0], &global_dummy)?;
+                let mut pairs = Vec::with_capacity(items.len());
+                for (i, pair) in items.into_iter().enumerate() {
+                    // A 2-tuple is its own pair.
+                    pairs.push(match &pair {
+                            Object::Tuple(t) if t.len() == 2 => {
+                                (t[0].clone(), t[1].clone())
+                            }
+                            _ => {
+                                let kv = self.collect_iterable(&pair, &global_dummy)?;
+                                if kv.len() != 2 {
+                                    return Err(value_error(format!(
+                                        "dictionary update sequence element #{i} has length {}; 2 is required",
+                                        kv.len()
+                                    )));
+                                }
+                                let mut kv = kv.into_iter();
+                                (kv.next().expect("two"), kv.next().expect("two"))
+                            }
+                        });
+                }
+                pairs
+            }
+        };
+        let mut d = DictData::default();
+        // While every key compares natively (as all so far
+        // have), an insert runs no Python comparison to catch.
+        let mut native = true;
+        for (key, value) in pairs {
+            crate::builtins::ensure_dict_key(&key)?;
+            native &= matches!(
+                key,
+                Object::Str(_)
+                    | Object::Int(_)
+                    | Object::Bool(_)
+                    | Object::None
+                    | Object::Float(_)
+                    | Object::Bytes(_)
+            );
+            if native {
+                d.insert(DictKey(key), value);
+            } else {
+                crate::object::key_cmp_scope(|| d.insert(DictKey(key), value))?;
+            }
+        }
+        let out = Object::Dict(Rc::new(RefCell::new(d)));
+        crate::gc_trace::track_built(&out);
+        Ok(out)
+    }
+
     /// Allocate an instance of `cls`, then run the `__new__` /
     /// `__init__` two-phase initialisation. The descriptor protocol
     /// gives us classmethod binding for `__new__` for free.
@@ -66013,87 +66102,25 @@ impl Interpreter {
                 return self.do_list_or_tuple_call(cls.name.as_str(), &args[0], &global_dummy);
             }
             // CPython's `dict(obj)` accepts a mapping (anything with
-            // `keys()`); recognise that path before falling through to
-            // the simple "iter of pairs" builtin.
+            // `keys()`) or a lazy iterable of pairs (see `dict_from_one`).
             if cls.name == "dict" && args.len() == 1 && kwargs.is_empty() {
-                let global_dummy = Rc::new(RefCell::new(DictData::default()));
-                if let Some(d) = self.try_dict_from_mapping(&args[0], &global_dummy)? {
-                    return Ok(d);
+                if let Some(r) = self.dict_from_one(&args[0]) {
+                    return r;
                 }
             }
-            // `set(it)` / `frozenset(it)` / `dict(iter-of-pairs)` must
-            // route lazy iterables (generators, `zip`/`map`/`filter`
-            // views, genexprs) through the VM-aware collector — the plain
-            // builtins below can only drive eager containers (RFC 0033).
+            // `set(it)` / `frozenset(it)` must route lazy iterables
+            // (generators, `zip`/`map`/`filter` views, genexprs) through
+            // the VM-aware collector — the plain builtins below can only
+            // drive eager containers (RFC 0033).
             if (matches!(
                 &args.first(),
                 Some(Object::Generator(_) | Object::Iter(_) | Object::Instance(_))
             ) || args.first().is_some_and(object_needs_vm_iter))
                 && args.len() == 1
                 && kwargs.is_empty()
+                && (cls.name == "set" || cls.name == "frozenset")
             {
-                if cls.name == "set" || cls.name == "frozenset" {
-                    return self.set_from_vm_iter(&args[0], cls.name == "set");
-                }
-                if cls.name == "dict" {
-                    let global_dummy = Rc::new(RefCell::new(DictData::default()));
-                    // `dict(zip(ks, vs))`: the pairs straight from the two
-                    // sources, in the order the zip would step them, with
-                    // no tuple between.
-                    let pairs: Vec<(Object, Object)> = match self
-                        .zip2_pairs(&args[0], &global_dummy)
-                    {
-                        Some(pairs) => pairs?,
-                        None => {
-                            let items = self.collect_iterable(&args[0], &global_dummy)?;
-                            let mut pairs = Vec::with_capacity(items.len());
-                            for (i, pair) in items.into_iter().enumerate() {
-                                // A 2-tuple is its own pair.
-                                pairs.push(match &pair {
-                                        Object::Tuple(t) if t.len() == 2 => {
-                                            (t[0].clone(), t[1].clone())
-                                        }
-                                        _ => {
-                                            let kv = self.collect_iterable(&pair, &global_dummy)?;
-                                            if kv.len() != 2 {
-                                                return Err(value_error(format!(
-                                                    "dictionary update sequence element #{i} has length {}; 2 is required",
-                                                    kv.len()
-                                                )));
-                                            }
-                                            let mut kv = kv.into_iter();
-                                            (kv.next().expect("two"), kv.next().expect("two"))
-                                        }
-                                    });
-                            }
-                            pairs
-                        }
-                    };
-                    let mut d = DictData::default();
-                    // While every key compares natively (as all so far
-                    // have), an insert runs no Python comparison to catch.
-                    let mut native = true;
-                    for (key, value) in pairs {
-                        crate::builtins::ensure_dict_key(&key)?;
-                        native &= matches!(
-                            key,
-                            Object::Str(_)
-                                | Object::Int(_)
-                                | Object::Bool(_)
-                                | Object::None
-                                | Object::Float(_)
-                                | Object::Bytes(_)
-                        );
-                        if native {
-                            d.insert(DictKey(key), value);
-                        } else {
-                            crate::object::key_cmp_scope(|| d.insert(DictKey(key), value))?;
-                        }
-                    }
-                    let out = Object::Dict(Rc::new(RefCell::new(d)));
-                    crate::gc_trace::track_built(&out);
-                    return Ok(out);
-                }
+                return self.set_from_vm_iter(&args[0], cls.name == "set");
             }
             // `dict(**kw)` / `dict(mapping, **kw)` / `dict(pairs, **kw)`:
             // CPython seeds the dict from at most one positional (a mapping

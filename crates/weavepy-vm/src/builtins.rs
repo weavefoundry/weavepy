@@ -7454,7 +7454,7 @@ fn b_tuple(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::new_tuple(out))
 }
 
-fn b_dict(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn b_dict(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.is_empty() {
         let obj = Object::new_dict();
         crate::gc_trace::track(&obj);
