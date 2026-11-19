@@ -923,6 +923,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         register(&mut d, "pack", b_pack);
         register(&mut d, "_pack_plain", b_pack_plain);
         register(&mut d, "_native_pack", b_native_pack);
+        register(&mut d, "_native_unpack", b_native_unpack);
         register(&mut d, "_clearcache", b_clearcache);
         register(&mut d, "unpack", b_unpack);
         register(&mut d, "pack_into", b_pack_into);
@@ -1278,6 +1279,48 @@ fn b_native_pack(args: &[Object]) -> Result<Object, RuntimeError> {
     });
     crate::leaf_builtins::register_fast(&b, pack_fast);
     Ok(Object::Builtin(b))
+}
+
+/// `struct.unpack(format, buffer)`'s fast half: a `str` format over a
+/// `bytes` or `bytearray` buffer, read at once; `None` (nothing done) for anything else
+/// or any error, which the Python function raises as `struct.error`.
+fn unpack_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Str(fmt), buffer] = args else {
+        return None;
+    };
+    let vals = match buffer {
+        Object::Bytes(b) => compiled_for(fmt)?.unpack(b).ok()?,
+        Object::ByteArray(b) => compiled_for(fmt)?.unpack(&b.try_borrow().ok()?).ok()?,
+        _ => return None,
+    };
+    Some(Ok(Object::new_tuple(vals)))
+}
+
+/// `_native_unpack(python_unpack)`: the public `struct.unpack`, which
+/// reads a `bytes` buffer in place (see [`unpack_fast`]) and calls the
+/// Python function `python_unpack` for anything else.
+fn b_native_unpack(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [fallback] = args else {
+        return Err(type_error("_native_unpack() takes the Python unpack"));
+    };
+    let fallback = fallback.clone();
+    let b = Rc::new(BuiltinFn {
+        name: "unpack",
+        binds_instance: false,
+        call: Box::new(move |a: &[Object]| match unpack_fast(a) {
+            Some(r) => r,
+            None => {
+                let interp = crate::builtins::reentrant_interp()?;
+                let globals = interp.builtins_dict();
+                interp.call(&fallback, a, &[], &globals)
+            }
+        }),
+        call_kw: None,
+    });
+    crate::leaf_builtins::register_fast(&b, unpack_fast);
+    let obj = Object::Builtin(b);
+    crate::descr_registry::register_text_signature(&obj, "(format, buffer, /)");
+    Ok(obj)
 }
 
 fn b_unpack(args: &[Object]) -> Result<Object, RuntimeError> {

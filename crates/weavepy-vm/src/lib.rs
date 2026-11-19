@@ -50952,6 +50952,27 @@ impl Interpreter {
                         }
                     }
                 }
+                // A Python `__iter__` (found once per class version): called
+                // with the instance, without a bound method (a warm leaf,
+                // `return iter(self.d)`, evaluates in place).
+                if let Object::Instance(inst) = v {
+                    if let Some(f) = Self::instance_dunder_function(
+                        inst,
+                        crate::types::AttrKey::vm(crate::types::vm_key::ITER_FN),
+                        "__iter__",
+                    ) {
+                        let result = self.call_dunder_function(f, std::slice::from_ref(v))?;
+                        if let Object::Instance(_) = &result {
+                            if instance_method(&result, "__next__").is_none() {
+                                return Err(type_error(format!(
+                                    "iter() returned non-iterator of type '{}'",
+                                    result.type_name_owned()
+                                )));
+                            }
+                        }
+                        return iter_result(result);
+                    }
+                }
                 // `__iter__ = None` disables the slot (CPython's
                 // "anti-registration" convention — typing's special forms
                 // use it so `iter(Union[int, str])` raises "not iterable"

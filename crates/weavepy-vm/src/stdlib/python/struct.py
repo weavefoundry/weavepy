@@ -156,6 +156,10 @@ def pack(format, /, *v):
 # above for anything else (coercions, and every error).
 pack = _impl._native_pack(pack)
 
+# Likewise `unpack`: a `bytes` buffer is read natively; anything else
+# (another buffer, every error) goes through the function above.
+unpack = _impl._native_unpack(unpack)
+
 
 def _writable(buffer):
     """Resolve `buffer` to a read-write target the Rust core can pack into.
