@@ -2220,6 +2220,29 @@ pub(crate) fn seq_ctor_pure(cls: &Rc<TypeObject>, args: &[Object]) -> Option<Obj
     Interpreter::seq_new_pure(SeqType::of_exact(cls)?, args)
 }
 
+/// The value of an `int` subclass's instance whose class keeps `int`'s own
+/// `__int__`, as `int(x)` returns it: an exact `int`. `None` for any other
+/// instance.
+fn int_subclass_value(
+    inst: &crate::types::PyInstance,
+    bt: &crate::builtin_types::BuiltinTypes,
+) -> Option<Object> {
+    let v @ (Object::Int(_) | Object::Long(_)) = inst.native.get()? else {
+        return None;
+    };
+    let own = bt
+        .int_
+        .dict
+        .try_borrow()
+        .ok()?
+        .get(&crate::object::StrKey("__int__"))
+        .cloned()?;
+    match inst.cls_raw().lookup("__int__") {
+        Some(g) if g.is_same(&own) => Some(v.clone()),
+        _ => None,
+    }
+}
+
 /// [`builtin_ctor_pure`]'s arms for the builtin types `builtin_types`
 /// registers it on.
 pub(crate) fn builtin_ctor_arms(cls: &Rc<TypeObject>, args: &[Object]) -> Option<Object> {
@@ -2240,6 +2263,9 @@ pub(crate) fn builtin_ctor_arms(cls: &Rc<TypeObject>, args: &[Object]) -> Option
         return match args {
             [] => Some(Object::Int(0)),
             [Object::Int(i)] => Some(Object::Int(*i)),
+            // An `int` subclass's instance whose class keeps `int`'s own
+            // `__int__` (`re`'s named opcode constants): its value, exact.
+            [Object::Instance(inst)] => int_subclass_value(inst, bt),
             [Object::Bool(b)] => Some(Object::Int(i64::from(*b))),
             // Truncated toward zero, inside the machine range.
             [Object::Float(f)] if f.is_finite() && f.abs() < 9.0e18 => Some(Object::Int(*f as i64)),

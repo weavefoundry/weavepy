@@ -23027,6 +23027,25 @@ impl Interpreter {
                         // stack into the list.
                         std::mem::replace(&mut xs[i as usize], unsafe { base.add(len - 3).read() })
                     }
+                    // `buf[i] = n` of a `bytearray` by an int index, the value
+                    // a byte (`re`'s charset map).
+                    (Object::ByteArray(b), Object::Int(i)) => {
+                        // SAFETY: `len >= 3`.
+                        let byte = match unsafe { &*base.add(len - 3) } {
+                            Object::Int(v) if (0..=255).contains(v) => *v as u8,
+                            Object::Bool(t) => u8::from(*t),
+                            _ => return None,
+                        };
+                        let mut bs = b.try_borrow_mut().ok()?;
+                        let n = bs.len() as i64;
+                        let i = if *i < 0 { *i + n } else { *i };
+                        if i < 0 || i >= n {
+                            return None;
+                        }
+                        bs[i as usize] = byte;
+                        // SAFETY: the value slot (a scalar) leaves the stack.
+                        unsafe { base.add(len - 3).read() }
+                    }
                     // Any key the leaf probe hashes and compares natively
                     // (a `str`, an `int`, a tuple of them, or an object
                     // keyed by identity).
