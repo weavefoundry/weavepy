@@ -1068,6 +1068,20 @@ branch and pull request.
     (`inspect.signature` of a one-parameter function from 105,600
     instructions to 87,100; `f.__defaults__, f.__kwdefaults__` from 4,870
     to 2,733, against 1,136).
+  - Compiling a regular expression that isn't in the on-disk program
+    cache cost about 2.7 million instructions per pattern, against
+    CPython's 580,000. Three steps took the general paths every time:
+    `int(c)` over the program's named opcode constants (an `int`
+    subclass), `charmap[i] = 1` on the charset's `bytearray`, and
+    iteration over the parser's `SubPattern`, which has `__getitem__` but
+    no `__iter__`, so each item went through the sequence protocol's
+    Python iterator and a Python `__getitem__` call. `int()` of an `int`
+    subclass that keeps `int`'s `__int__` now answers in place, the core
+    loop stores bytes into a `bytearray`, and `SubPattern` iterates its
+    list (400 uncached patterns from 1,101 million instructions to 930
+    million, against 233 million: the parser's two largest functions
+    still run interpreted). A start-up also no longer calls `globals()`
+    195 times in `posix`'s re-export loop (0.9% of its instructions).
   - What's left. Battery geomean 1.178 instructions and 1.052 cycles
     (from 1.197 and about 1.08 at the day's start). The worst cases are
     flat profiles of interpreted library code: argparse's per-iteration
