@@ -1205,6 +1205,25 @@ branch and pull request.
     that keeps starting threads grew without bound and paid an ever larger
     map's inserts. The registry now holds the states weakly (the handle's
     methods keep them alive) and sweeps dead entries when it doubles.
+  - Iterator classes written in Python. `next(it)` of one went from the
+    compiled call site through the builtin's full call path to a bound
+    `__next__` call, about 900 instructions more than a `for` loop's step
+    of the same iterator; it now steps a frameless `__next__` as `FOR_ITER`
+    does (`self.i += 1; return self.i`: 2,046 instructions to 1,574,
+    against 1,124). And a bare `raise StopIteration` that ends a
+    frameless `__next__` built and unwound the exception through a full
+    call: when a `for` loop, `list()` or `next(it, default)` is the
+    catcher and nothing could see it (no store buffered, no tracer), the
+    step now reports the end itself. Ending a loop over a used-up
+    iterator went from 7,600 instructions to 1,700 (CPython 3,240), a
+    20-item loop over a fresh one from 1,424 an item to 1,082 (1,080),
+    and `list()` of it from 1,635 to 1,332 (1,107).
+  - The frozen `itertools` classes' `__next__` (`return
+    next(self._core)`) is now native, so `c.__next__()` of a `count`, as
+    `threading` names its threads, costs 850 instructions instead of
+    2,783 (CPython 554). Their `__iter__` returned the native core rather
+    than the object, so a subclass's own `__next__` was skipped by `for`
+    loops and `islice`; it returns the object now, as CPython's do.
   - Looked at and left: thread start-up (a started and joined thread
     costs about 470,000 instructions to CPython's 150,000; the main thread
     waits on the GIL hand-off and the kernel's thread teardown, and a
