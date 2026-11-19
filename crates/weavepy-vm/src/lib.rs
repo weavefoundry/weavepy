@@ -1082,6 +1082,11 @@ pub struct Interpreter {
     /// address, and the registry generation it looked under: a call path
     /// asks for the same builtin several times over.
     leaf_miss: std::cell::Cell<(usize, u64)>,
+    /// The `__next__` code and iterator (by address) of the frameless
+    /// step [`Interpreter::leaf_python_step`] is running: that evaluation
+    /// alone may end at a bare `raise StopIteration` as exhausted (see
+    /// `leaf_plan::Op::StopIter`).
+    pub(crate) leaf_stop: std::cell::Cell<(usize, usize)>,
     /// The last builtin [`Interpreter::leaf_call_kind`] found a leaf kind
     /// for, the registry generation it looked under, and the kind. The weak
     /// handle keeps the address from being reused while it is remembered.
@@ -1350,6 +1355,7 @@ impl Default for Interpreter {
                 LeafMisses::default(),
             )),
             leaf_miss: std::cell::Cell::new((0, 0)),
+            leaf_stop: std::cell::Cell::new((0, 0)),
             leaf_hit: std::cell::RefCell::new(None),
             core_next: ThreadCell::new(None),
             core_truth: ThreadCell::new(None),
@@ -1511,6 +1517,7 @@ impl Interpreter {
                 LeafMisses::default(),
             )),
             leaf_miss: std::cell::Cell::new((0, 0)),
+            leaf_stop: std::cell::Cell::new((0, 0)),
             leaf_hit: std::cell::RefCell::new(None),
             core_next: ThreadCell::new(None),
             core_truth: ThreadCell::new(None),
@@ -14653,16 +14660,47 @@ impl Interpreter {
                             obj @ Object::Instance(inst) => {
                                 let Some(step) = self.leaf_next_step(obj, inst) else {
                                     // A Python `__next__` that evaluates
-                                    // frameless (its end is the full arm's).
-                                    if let Some(v) = self.leaf_python_next(obj, inst) {
-                                        // SAFETY: `len < cap`.
-                                        unsafe { base.add(len).write(v) };
-                                        len += 1;
-                                        last = pc;
-                                        pc += 1;
-                                        continue;
+                                    // frameless, its bare `raise
+                                    // StopIteration` included (any other
+                                    // end is the full arm's).
+                                    match self.leaf_python_step(obj, inst) {
+                                        Some(Some(v)) => {
+                                            // SAFETY: `len < cap`.
+                                            unsafe { base.add(len).write(v) };
+                                            len += 1;
+                                            last = pc;
+                                            pc += 1;
+                                            continue;
+                                        }
+                                        // The iterator leaves the stack, and
+                                        // the loop exits past its
+                                        // `END_FOR`/`POP_ITER` pair (a
+                                        // finalizer its release queued runs
+                                        // before the next instruction).
+                                        Some(None) => {
+                                            len -= 1;
+                                            // SAFETY: the slot is initialized.
+                                            unsafe { drop_hot(base.add(len).read()) };
+                                            last = pc;
+                                            pc += 1 + ins.arg as usize;
+                                            let op_at = |pc: usize| {
+                                                // SAFETY: as the generator's exit.
+                                                Some(unsafe { (*instrs.add(pc)).op })
+                                            };
+                                            if op_at(pc) == Some(OpCode::EndFor) {
+                                                pc += 1;
+                                                if matches!(
+                                                    op_at(pc),
+                                                    Some(OpCode::PopIter | OpCode::PopTop)
+                                                ) {
+                                                    pc += 1;
+                                                }
+                                            }
+                                            after_release!();
+                                            continue;
+                                        }
+                                        None => break None,
                                     }
-                                    break None;
                                 };
                                 match step {
                                     Ok(v) => {
@@ -33818,10 +33856,16 @@ impl Interpreter {
     /// class's `__next__` is not a registered leaf.
     #[inline]
     /// `next(it)` of a plain iterator class's instance whose `__next__` is
-    /// a warm pure or effect leaf of `(self)` (`self.i += 1; return x`):
-    /// its value, the stores committed. `None` for anything else, a
-    /// `raise StopIteration` path among it, having done nothing.
-    pub(crate) fn leaf_python_next(&self, it: &Object, inst: &PyInstance) -> Option<Object> {
+    /// a warm pure or effect leaf of `(self)` (`self.i += 1; return x`),
+    /// for a caller that catches the end as `FOR_ITER` does: its value, the
+    /// stores committed, or `Some(None)` when it ended at a bare `raise
+    /// StopIteration` (the exception never built, as nothing could see
+    /// it). `None` for anything else, having done nothing.
+    pub(crate) fn leaf_python_step(
+        &self,
+        it: &Object,
+        inst: &PyInstance,
+    ) -> Option<Option<Object>> {
         use crate::types::{vm_key, AttrKey};
         let f = Self::instance_dunder_function(inst, AttrKey::vm(vm_key::NEXT_FN), "__next__")?;
         let code = f.code();
@@ -33836,13 +33880,26 @@ impl Interpreter {
         if depth >= crate::recursion::recursion_limit() {
             return None;
         }
-        self.pure_leaf_call(&code, &f, &[std::ptr::from_ref(it)], !pure, depth)
+        // (A tracer or monitor would see the raise: the step then declines
+        // at it, and the full call raises.)
+        let stop = if crate::trace::any_observers_active() {
+            (0, 0)
+        } else {
+            (Rc::as_ptr(&code) as usize, std::ptr::from_ref(it) as usize)
+        };
+        let saved = self.leaf_stop.replace(stop);
+        let r = self.pure_leaf_call(&code, &f, &[std::ptr::from_ref(it)], !pure, depth);
+        self.leaf_stop.set(saved);
+        match r {
+            Some(Object::Unbound) => Some(None),
+            r => r.map(Some),
+        }
     }
 
     /// `next(it)` or `next(it, default)` (the builtin's leaf operands) of
     /// an instance whose class's `__next__` is a registered native leaf or
     /// a warm frameless Python leaf, stepped as `FOR_ITER` steps it (see
-    /// [`Self::leaf_next_step`], [`Self::leaf_python_next`]). `None` for
+    /// [`Self::leaf_next_step`], [`Self::leaf_python_step`]). `None` for
     /// anything else, having done nothing.
     pub(crate) fn leaf_next_instance(
         &self,
@@ -33863,7 +33920,12 @@ impl Interpreter {
             Some(r) => return Some(r),
             None => {}
         }
-        self.leaf_python_next(it, inst).map(Ok)
+        match self.leaf_python_step(it, inst)? {
+            Some(v) => Some(Ok(v)),
+            // (Without a default, the full call raises the exception
+            // `__next__` raises, traceback and all.)
+            None => default.cloned().map(Ok),
+        }
     }
 
     fn leaf_next_step(
@@ -51317,6 +51379,15 @@ impl Interpreter {
             Object::LazyIter(l) => self.lazy_iter_next(l, globals),
             // (Its end builds no `StopIteration` just to catch it.)
             Object::Generator(g) => self.gen_drain_next(g, None, false),
+            // A frameless Python `__next__`, its bare `raise StopIteration`
+            // an end with no exception built (`list(it)`'s drain).
+            Object::Instance(inst) => match self.leaf_python_step(iter, inst) {
+                Some(r) => Ok(r),
+                None => match self.iter_step(iter, globals) {
+                    Err(e) if crate::seqiter::is_stop_iteration(&e) => Ok(None),
+                    r => r,
+                },
+            },
             _ => match self.iter_step(iter, globals) {
                 Err(e) if crate::seqiter::is_stop_iteration(&e) => Ok(None),
                 r => r,

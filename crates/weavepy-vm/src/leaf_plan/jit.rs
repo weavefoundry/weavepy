@@ -52,7 +52,12 @@ const T_B: u64 = 6;
 const T_N: u64 = 7;
 
 /// A compiled plan: `(ctx, argument words) -> status`, where `0` returned
-/// (the result's words in `ctx.out`) and anything else declined.
+/// (the result's words in `ctx.out`), [`STOPPED`] ended an iterator step
+/// as exhausted, and anything else declined.
+/// The status of a frameless iterator step that ended at a bare `raise
+/// StopIteration` (see `Op::StopIter`).
+const STOPPED: u32 = 2;
+
 type NativeFn = unsafe extern "C" fn(*mut Ctx<'static>, *const u64) -> u32;
 
 /// A plan's native code and what it was compiled against.
@@ -373,6 +378,11 @@ fn enter<const EFFECT: bool>(
         )
     };
     if status != 0 {
+        // A frameless iterator step's bare `raise StopIteration` (see
+        // `Op::StopIter`): nothing buffered, nothing to finish.
+        if status == STOPPED {
+            return Some(Some(LeafRet::Owned(Object::Unbound)));
+        }
         return Some(None);
     }
     let v = value(ctx.out[0], ctx.out[1]);
@@ -397,6 +407,19 @@ unsafe fn cx<'a>(ctx: *mut Ctx<'static>) -> &'a mut Ctx<'a> {
 #[inline(always)]
 fn stamps(ext: &CodeConstObjects) -> crate::Sites<'_, crate::StampSlot> {
     ext.stamp_sites()
+}
+
+/// `Op::StopIter`: `0` when the raise of the value in words `(t, p)`
+/// ends the evaluation as an exhausted iterator step (see
+/// `stop_ends_step`), with no store buffered; `1` to decline.
+unsafe extern "C" fn h_stop_iter(ctx: *mut Ctx<'static>, t: u64, p: u64) -> u32 {
+    // SAFETY: called by native code with its context.
+    let c = unsafe { cx(ctx) };
+    // SAFETY: the evaluation's own frame is live.
+    let (code, _, _) = unsafe { c.top.parts() };
+    u32::from(
+        !(c.pend.n == 0 && super::stop_ends_step(c.interp, code, c.nest, c.args, value(t, p))),
+    )
 }
 
 unsafe extern "C" fn h_global(
@@ -2388,6 +2411,20 @@ impl Lower<'_> {
             }
             Op::Decline => {
                 self.b.ins().jump(self.decline, &[]);
+                return Some(false);
+            }
+            Op::StopIter { src } => {
+                // (An in-line callee's raise declines: only the step's own
+                // frame may end it.)
+                if fl.ret.is_some() {
+                    self.b.ins().jump(self.decline, &[]);
+                    return Some(false);
+                }
+                let (t, p) = self.get(fl, src);
+                let st = self.call(h_stop_iter as *const () as usize, &[self.ctx, t, p]);
+                self.check(st);
+                let two = self.b.ins().iconst(types::I32, i64::from(STOPPED));
+                self.b.ins().return_(&[two]);
                 return Some(false);
             }
             Op::StoreAttr {

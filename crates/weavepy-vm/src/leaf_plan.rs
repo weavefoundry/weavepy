@@ -251,6 +251,12 @@ enum Op {
     /// Abandon the evaluation: the path reached an instruction the plan
     /// can't run.
     Decline,
+    /// `raise X` (`RAISE_VARARGS 1`): declines, unless this is the step
+    /// `Interpreter::leaf_python_step` asked for (see [`stop_ends_step`]),
+    /// where a bare `raise StopIteration` ends it as exhausted.
+    StopIter {
+        src: u8,
+    },
     /// An effect leaf's buffered `recv.name = val`.
     StoreAttr {
         recv: u8,
@@ -700,6 +706,11 @@ impl Builder<'_> {
                 self.ops.push(Op::Return { src });
                 return Some(false);
             }
+            OpCode::RaiseVarargs if arg == 1 => {
+                let src = self.pop()?;
+                self.ops.push(Op::StopIter { src });
+                return Some(false);
+            }
             OpCode::StoreAttr => {
                 let recv = self.pop()?;
                 let val = self.pop()?;
@@ -999,6 +1010,35 @@ pub(crate) enum LeafRet {
     Owned(Object),
 }
 
+/// Whether a `raise` of `v` at the top of an evaluation of `code` (at
+/// call nesting `nest`, on `args`) ends the frameless iterator step
+/// [`Interpreter::leaf_python_step`] is running as exhausted: `v` is the
+/// builtin `StopIteration` class, and the evaluation is that step's own.
+/// Its caller then answers as the exception's catcher would, the
+/// exception never built (nothing could observe it: the step is
+/// frameless, and no store is buffered).
+pub(super) fn stop_ends_step(
+    interp: &Interpreter,
+    code: &CodeObject,
+    nest: u8,
+    args: &[*const Object],
+    v: V,
+) -> bool {
+    let (want_code, want_it) = interp.leaf_stop.get();
+    if nest != 0
+        || want_code != std::ptr::from_ref(code) as usize
+        || args.first().map(|&a| a as usize) != Some(want_it)
+    {
+        return false;
+    }
+    let V::R(p) = v else {
+        return false;
+    };
+    // SAFETY: as `norm`.
+    matches!(unsafe { &*p }, Object::Type(t)
+        if t.flags.is_builtin && t.name.as_str() == "StopIteration")
+}
+
 /// The value of `f`'s closure cell `idx`, borrowed: nothing an evaluation
 /// runs can rebind a cell (a leaf has no `STORE_DEREF`), and the function
 /// holds its closure. `None` for an empty cell (the read raises).
@@ -1248,6 +1288,16 @@ impl Interpreter {
                 Op::Jump { target } => ip = usize::from(target),
                 Op::New { dst, dict } => set!(dst, new_container(&mut owned, dict)?),
                 Op::Decline => return None,
+                Op::StopIter { src } => {
+                    if depth == 0
+                        && !FRESH
+                        && pend.n == 0
+                        && stop_ends_step(self, code, nest, args, get!(src))
+                    {
+                        return Some(LeafRet::Owned(Object::Unbound));
+                    }
+                    return None;
+                }
                 Op::Call { at, argc, pc } => {
                     // A pure-leaf callee, evaluated in place: only while
                     // no store is buffered (it would not see one).
