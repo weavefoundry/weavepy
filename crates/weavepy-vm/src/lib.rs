@@ -2754,28 +2754,31 @@ impl Interpreter {
 
     fn maybe_donate_tuple(&self, dropped: Object) {
         const PER_LEN_CAP: usize = 8;
-        let Object::Tuple(t) = dropped else { return };
-        if t.is_empty() || t.len() > 16 || ThinArc::strong_count(&t) != 1 {
+        let Object::Tuple(mut t) = dropped else {
+            return;
+        };
+        let n = t.len();
+        if n == 0 || n > 16 {
             return;
         }
-        let mut t = t;
-        if let Some(slots) = ThinArc::get_mut(&mut t) {
-            // (The last first, as CPython's tuple goes: `f(*args)`'s run
-            // through a leaf callee's locals this way.)
-            for s in slots.iter_mut().rev() {
-                let old = std::mem::replace(s, Object::Unbound);
-                // Scalars have no drop glue; skip the out-of-line call.
-                if matches!(
-                    old,
-                    Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
-                ) {
-                    std::mem::forget(old);
-                } else {
-                    drop(old);
-                }
+        let Some(slots) = ThinArc::get_mut(&mut t) else {
+            return;
+        };
+        // (The last first, as CPython's tuple goes: `f(*args)`'s run
+        // through a leaf callee's locals this way.)
+        for s in slots.iter_mut().rev() {
+            if matches!(
+                s,
+                Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
+            ) {
+                // SAFETY: a scalar has no drop glue, so it's overwritten.
+                unsafe { std::ptr::write(s, Object::Unbound) };
+            } else {
+                drop(std::mem::replace(s, Object::Unbound));
             }
-            let mut pool = self.tuple_pool.borrow_mut();
-            let bucket = &mut pool[t.len() - 1];
+        }
+        if let Ok(mut pool) = self.tuple_pool.try_borrow_mut() {
+            let bucket = &mut pool[n - 1];
             if bucket.len() < PER_LEN_CAP {
                 bucket.push(t);
             }
@@ -2809,18 +2812,24 @@ impl Interpreter {
     /// for small bytecode tuples. A miss needs only the final allocation.
     fn alloc_tuple_array<const N: usize>(&self, items: [Object; N]) -> Object {
         if N > 0 && N <= 16 {
-            let popped = self.tuple_pool.borrow_mut()[N - 1].pop();
+            let popped = match self.tuple_pool.try_borrow_mut() {
+                Ok(mut pool) => pool[N - 1].pop(),
+                Err(_) => None,
+            };
             if let Some(mut tuple) = popped {
-                if let Some(slots) = ThinArc::get_mut(&mut tuple) {
-                    for (slot, value) in slots.iter_mut().zip(items) {
-                        // SAFETY: a pooled tuple's slots were cleared to
-                        // `Unbound` (see `maybe_donate_tuple`), which has
-                        // no drop glue.
-                        debug_assert!(matches!(slot, Object::Unbound));
-                        unsafe { std::ptr::write(slot, value) };
-                    }
-                    return Object::Tuple(tuple);
+                // SAFETY: a parked tuple is its allocation's only owner, with
+                // `N` slots each `Unbound` (see `maybe_donate_tuple` and
+                // `park_tuple`), which has no drop glue: the items move in
+                // over them.
+                unsafe {
+                    let slots = ThinArc::get_mut_unchecked(&mut tuple);
+                    debug_assert!(
+                        slots.len() == N && slots.iter().all(|s| matches!(s, Object::Unbound))
+                    );
+                    std::ptr::copy_nonoverlapping(items.as_ptr(), slots.as_mut_ptr(), N);
                 }
+                std::mem::forget(items);
+                return Object::Tuple(tuple);
             }
         }
         Object::new_tuple_array(items)

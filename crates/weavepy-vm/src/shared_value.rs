@@ -146,6 +146,17 @@ impl<T: ?Sized + ThinPayload> ThinArc<T> {
         }
     }
 
+    /// The payload of a handle that is its allocation's only owner.
+    ///
+    /// # Safety
+    ///
+    /// No other strong or weak owner of the allocation exists.
+    #[inline]
+    pub(crate) unsafe fn get_mut_unchecked(this: &mut Self) -> &mut T {
+        // SAFETY: the caller's contract; this owner keeps it alive.
+        unsafe { &mut *this.raw().cast_mut() }
+    }
+
     pub fn get_mut(this: &mut Self) -> Option<&mut T> {
         if crate::rc::refcounts_biased() {
             // `Arc::get_mut` locks the weak count against another thread's

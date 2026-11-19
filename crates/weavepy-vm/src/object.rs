@@ -5283,6 +5283,12 @@ pub struct DictData {
     key_filter: std::sync::atomic::AtomicU64,
 }
 
+impl Drop for DictData {
+    fn drop(&mut self) {
+        self.map.clear_entries_inline();
+    }
+}
+
 impl Clone for DictData {
     fn clone(&self) -> Self {
         Self {
@@ -5516,8 +5522,8 @@ impl IntoIterator for DictData {
     type Item = (DictKey, Object);
     type IntoIter = crate::dictmap::IntoIter;
 
-    fn into_iter(self) -> Self::IntoIter {
-        self.map.into_iter()
+    fn into_iter(mut self) -> Self::IntoIter {
+        std::mem::take(&mut self.map).into_iter()
     }
 }
 

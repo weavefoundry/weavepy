@@ -1666,6 +1666,41 @@ impl<V> std::ops::Index<usize> for Table<V> {
 /// The table behind a `dict`.
 pub type DictMap = Table<Object>;
 
+impl Table<Object> {
+    /// Drop every entry, in order, without the out-of-line drop of a
+    /// scalar key or value (an `int` key, a `None` value): a dying dict's
+    /// release. The entry list keeps its allocation, now empty.
+    #[inline]
+    pub(crate) fn clear_entries_inline(&mut self) {
+        let n = self.entries.len();
+        let base = self.entries.as_mut_ptr();
+        /// Release `o` in place: nothing for a scalar, a plain decrement
+        /// for a shared value that isn't its last owner, else its drop.
+        #[inline(always)]
+        unsafe fn release(o: *mut Object) {
+            // SAFETY: per the caller, `o` is a live object dropped once.
+            unsafe {
+                if let Some(word) = (*o).strong_word() {
+                    if !crate::rc::try_release_word(word) {
+                        std::ptr::drop_in_place(o);
+                    }
+                }
+            }
+        }
+        // SAFETY: the length goes to zero first, so a drop that panics
+        // leaks the rest rather than dropping one twice; each entry is
+        // released once.
+        unsafe {
+            self.entries.set_len(0);
+            for i in 0..n {
+                let b = base.add(i);
+                release(&raw mut (*b).key.0);
+                release(&raw mut (*b).value);
+            }
+        }
+    }
+}
+
 /// The table behind a `set` or `frozenset`: [`Table`]'s entries without
 /// values (a key and its hash), with the set operations' names. Iteration
 /// is in insertion order; a removal moves the last entry into the freed

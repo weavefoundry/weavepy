@@ -642,9 +642,13 @@ impl<T: ?Sized + 'static> Rc<T> {
                 return;
             }
             if nesting_kind::<T>() {
-                // A list of scalars releases nothing through its items:
-                // they're forgotten, not dropped one call at a time, and
-                // the list frees without the trashcan.
+                // A list whose items all outlive it (scalars, and values
+                // other owners hold: a list of shared strings) releases them
+                // with plain decrements, not one drop call at a time, and
+                // frees without the trashcan. An item this release would
+                // free leaves the rest to the full release, the items
+                // released here already gone (none of them died, so the
+                // order of deaths is the full release's).
                 if std::any::TypeId::of::<T>()
                     == std::any::TypeId::of::<crate::sync::RefCell<Vec<crate::object::Object>>>()
                     && Arc::strong_count(&self.0) == 1
@@ -654,7 +658,18 @@ impl<T: ?Sized + 'static> Rc<T> {
                     // The last strong reference: nothing else reads the
                     // items while this release, which runs no code, does.
                     let items = &mut *(*cell).as_ptr();
-                    if items.iter().all(|o| o.strong_word().is_none()) {
+                    let mut dying = false;
+                    for o in items.iter_mut() {
+                        match o.strong_word() {
+                            None => {}
+                            // (Released: the slot becomes a scalar.)
+                            Some(word) if try_release_word(word) => {
+                                ptr::write(o, crate::object::Object::None)
+                            }
+                            Some(_) => dying = true,
+                        }
+                    }
+                    if !dying {
                         items.set_len(0);
                         drop_arc_in(&mut self.0);
                         return;
