@@ -78,7 +78,10 @@ class SwitchIntervalTests(unittest.TestCase):
         self.check(0.1)
 
     def test_short_interval(self):
-        self.check(0.01)
+        # (Not so short that one scheduling quantum, 10 ms on a saturated
+        # machine, reads as a second interval: the sleeper can be that late
+        # getting a processor before it even asks for the GIL.)
+        self.check(0.03)
 
     def test_a_busy_thread_alone_is_not_slowed(self):
         # With nobody waiting, the interval changes nothing a thread does.
