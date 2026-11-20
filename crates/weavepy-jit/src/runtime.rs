@@ -196,6 +196,10 @@ pub struct ObjLayout {
     pub guard_ver: i32,
     pub guard_split_idx: i32,
     pub guard_slot_layout: i32,
+    /// A guard's hint (a word): the pin that held the value its site last
+    /// read into the object, `str` or `bytes` lane. A read that finds the
+    /// same value in the field takes that pin again in line.
+    pub guard_last_pin: i32,
     /// Object tags (the first byte of a value); a word payload is at 8, a
     /// `bool`'s at 1.
     pub tag_instance: u8,
@@ -203,6 +207,8 @@ pub struct ObjLayout {
     pub tag_float: u8,
     pub tag_bool: u8,
     pub tag_none: u8,
+    pub tag_str: u8,
+    pub tag_bytes: u8,
     /// A class value's tag (its payload pointer is the class pointer).
     pub tag_type: u8,
     /// An instance value's payload pointer → the instance's class pointer,

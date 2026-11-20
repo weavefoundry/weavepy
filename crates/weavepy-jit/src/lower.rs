@@ -3485,6 +3485,63 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             _ => None,
         };
         let mut join = None;
+        // An object, `str` or `bytes` field that still holds the value
+        // the site read last: the pin that value got then, found again
+        // in line (the helper's own first answer, without the call). A
+        // field with another value, or of another type, takes the helper.
+        let pinned = match (runtime::obj_layout(), out) {
+            (Some(l), JitType::Obj) => Some((*l, l.tag_instance)),
+            (Some(l), JitType::Str) => Some((*l, l.tag_str)),
+            (Some(l), JitType::Bytes) => Some((*l, l.tag_bytes)),
+            _ => None,
+        };
+        if let Some((l, want)) = pinned {
+            let ptr = self.ptr_ty;
+            let miss = self.b.create_block();
+            let done = self.b.create_block();
+            self.b.append_block_param(done, Self::cl_ty(out));
+            let addr = self.split_field_addr(&l, pin, site, miss, true);
+            let tag = self.b.ins().uload8(types::I32, trusted, addr, 0);
+            let other = self.b.ins().icmp_imm(IntCC::NotEqual, tag, i64::from(want));
+            self.miss_if(other, miss);
+            let value = self.b.ins().load(types::I64, trusted, addr, 8);
+            // The guard's hint, and the pin it names.
+            let ctx = self.b.ins().load(ptr, trusted, self.frame_ptr, OFF_CTX);
+            let guards = self.b.ins().load(ptr, trusted, ctx, l.ctx_guards);
+            let gbuf = self.b.ins().load(ptr, trusted, guards, l.guards_buf);
+            let g = self
+                .b
+                .ins()
+                .iadd_imm(gbuf, i64::from(site) * i64::from(l.guard_size));
+            let hint = self.b.ins().load(types::I64, trusted, g, l.guard_last_pin);
+            let n = self.b.ins().load(types::I64, trusted, ctx, l.ctx_pins_len);
+            let gone = self
+                .b
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThanOrEqual, hint, n);
+            self.miss_if(gone, miss);
+            let buf = self.b.ins().load(ptr, trusted, ctx, l.ctx_pins_ptr);
+            let off = self.b.ins().imul_imm(hint, i64::from(l.pin_size));
+            let p = self.b.ins().iadd(buf, off);
+            let ptag = self.b.ins().uload8(types::I32, trusted, p, l.pin_tag);
+            let otag = self.b.ins().uload8(types::I32, trusted, p, l.pin_obj);
+            let held = self.b.ins().load(types::I64, trusted, p, l.pin_obj + 8);
+            let not_obj = self
+                .b
+                .ins()
+                .icmp_imm(IntCC::NotEqual, ptag, i64::from(l.pin_obj_tag));
+            let not_kind = self
+                .b
+                .ins()
+                .icmp_imm(IntCC::NotEqual, otag, i64::from(want));
+            let not_same = self.b.ins().icmp(IntCC::NotEqual, held, value);
+            let bad = self.b.ins().bor(not_obj, not_kind);
+            let bad = self.b.ins().bor(bad, not_same);
+            self.miss_if(bad, miss);
+            self.b.ins().jump(done, &[BlockArg::from(hint)]);
+            self.b.switch_to_block(miss);
+            join = Some(done);
+        }
         if let Some(l) = inline {
             let miss = self.b.create_block();
             let done = self.b.create_block();
