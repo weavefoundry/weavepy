@@ -16059,7 +16059,34 @@ fn set_result_like(receiver: Option<&Object>, body: crate::object::SetData) -> O
     }
 }
 
+/// `a.<method>(b)` for an exact set or frozenset and another, when the
+/// tables settle it without Python (see `setalg`): the result's table.
+fn set_pair_pure(
+    args: &[Object],
+    f: impl FnOnce(&crate::object::SetData, &crate::object::SetData) -> crate::object::SetData,
+) -> Option<crate::object::SetData> {
+    let [a, b] = args else {
+        return None;
+    };
+    crate::setalg::with_sets(a, b, |x, y| crate::setalg::pure(|| f(x, y)))?
+}
+
+/// The items of an exact tuple or list when every one hashes and
+/// compares natively (a set method's iterable argument, which then needs
+/// no set built from it and runs no Python).
+fn set_native_items(o: &Object) -> Option<Vec<Object>> {
+    let native = |xs: &[Object]| xs.iter().all(set_value_native).then(|| xs.to_vec());
+    match o {
+        Object::Tuple(t) => native(t),
+        Object::List(l) => native(&l.try_borrow().ok()?),
+        _ => None,
+    }
+}
+
 fn set_union(args: &[Object]) -> Result<Object, RuntimeError> {
+    if let Some(out) = set_pair_pure(args, crate::setalg::union) {
+        return Ok(set_result_like(args.first(), out));
+    }
     let mut out = crate::object::SetData::default();
     if let Some(first) = args.first() {
         for k in set_iter_items(first)? {
@@ -16075,6 +16102,30 @@ fn set_union(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn set_intersection(args: &[Object]) -> Result<Object, RuntimeError> {
+    if let Some(out) = set_pair_pure(args, crate::setalg::intersection) {
+        return Ok(set_result_like(args.first(), out));
+    }
+    // An iterable of native values: its items that the set holds, in its
+    // order (CPython's `set_intersection` adds the iterable's own item).
+    if let [a, other] = args {
+        if let Some(items) = set_native_items(other) {
+            let out = crate::setalg::with_set(a, |x| {
+                crate::setalg::pure(|| {
+                    let mut out = crate::object::SetData::new();
+                    for v in &items {
+                        let key = DictKey(v.clone());
+                        if x.contains(&key) {
+                            out.insert(key);
+                        }
+                    }
+                    out
+                })
+            });
+            if let Some(Some(out)) = out {
+                return Ok(set_result_like(args.first(), out));
+            }
+        }
+    }
     let mut acc = match args.first() {
         Some(first) => {
             let mut s = crate::object::SetData::default();
@@ -16093,6 +16144,9 @@ fn set_intersection(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn set_difference(args: &[Object]) -> Result<Object, RuntimeError> {
+    if let Some(out) = set_pair_pure(args, crate::setalg::difference) {
+        return Ok(set_result_like(args.first(), out));
+    }
     let mut acc = match args.first() {
         Some(first) => {
             let mut s = crate::object::SetData::default();
@@ -16111,6 +16165,9 @@ fn set_difference(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn set_symmetric_difference(args: &[Object]) -> Result<Object, RuntimeError> {
+    if let Some(out) = set_pair_pure(args, crate::setalg::symmetric_difference) {
+        return Ok(set_result_like(args.first(), out));
+    }
     let a: crate::object::SetData = match args.first() {
         Some(first) => set_iter_items(first)?.into_iter().collect(),
         None => return Ok(Object::new_set()),
@@ -16129,7 +16186,22 @@ fn set_symmetric_difference(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(set_result_like(args.first(), out))
 }
 
+/// `a <op> b` for an exact set or frozenset and another, when the tables
+/// settle it without Python.
+fn set_pair_test(
+    a: &Object,
+    b: &Object,
+    f: impl FnOnce(&crate::object::SetData, &crate::object::SetData) -> bool,
+) -> Option<bool> {
+    crate::setalg::with_sets(a, b, |x, y| crate::setalg::pure(|| f(x, y)))?
+}
+
 fn set_issubset(args: &[Object]) -> Result<Object, RuntimeError> {
+    if let [a, b] = args {
+        if let Some(r) = set_pair_test(a, b, crate::setalg::subset) {
+            return Ok(Object::Bool(r));
+        }
+    }
     let a = set_iter_items(args.first().unwrap())?;
     let b: crate::object::SetData = match args.get(1) {
         Some(o) => set_iter_items(o)?.into_iter().collect(),
@@ -16139,6 +16211,20 @@ fn set_issubset(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn set_issuperset(args: &[Object]) -> Result<Object, RuntimeError> {
+    if let [a, b] = args {
+        if let Some(r) = set_pair_test(b, a, crate::setalg::subset) {
+            return Ok(Object::Bool(r));
+        }
+        // An iterable of native values: each looked up in the set.
+        if let Some(items) = set_native_items(b) {
+            let r = crate::setalg::with_set(a, |x| {
+                crate::setalg::pure(|| items.iter().all(|v| x.contains(&DictKey(v.clone()))))
+            });
+            if let Some(Some(r)) = r {
+                return Ok(Object::Bool(r));
+            }
+        }
+    }
     let a: crate::object::SetData = set_iter_items(args.first().unwrap())?.into_iter().collect();
     let b = match args.get(1) {
         Some(o) => set_iter_items(o)?,
@@ -16167,6 +16253,9 @@ fn set_isdisjoint(args: &[Object]) -> Result<Object, RuntimeError> {
         Object::FrozenSet(s) => Some(s.len()),
         _ => None,
     };
+    if let Some(r) = set_pair_test(this, other, crate::setalg::disjoint) {
+        return Ok(Object::Bool(r));
+    }
     let Some(n) = len(this) else {
         // A subclass instance's receiver: both sides' items.
         let a: crate::object::SetData = set_iter_items(this)?.into_iter().collect();
@@ -16223,6 +16312,11 @@ fn set_intersection_update(args: &[Object]) -> Result<Object, RuntimeError> {
     if matches!(set_self(args)?, Object::FrozenSet(_)) {
         return Err(type_error("frozenset is immutable"));
     }
+    if let [a, b] = args {
+        if crate::setalg::update(a, b, weavepy_compiler::BinOpKind::BitAnd) {
+            return Ok(Object::None);
+        }
+    }
     if let Object::Set(s) = set_self(args)? {
         let mut keep: crate::object::SetData = s.borrow().clone();
         for other in args.iter().skip(1) {
@@ -16237,6 +16331,30 @@ fn set_intersection_update(args: &[Object]) -> Result<Object, RuntimeError> {
 fn set_difference_update(args: &[Object]) -> Result<Object, RuntimeError> {
     if matches!(set_self(args)?, Object::FrozenSet(_)) {
         return Err(type_error("frozenset is immutable"));
+    }
+    if let [a, b] = args {
+        if crate::setalg::update(a, b, weavepy_compiler::BinOpKind::Sub) {
+            return Ok(Object::None);
+        }
+        // An iterable of native values: each taken out of the set.
+        if let (Object::Set(cell), Some(items)) = (a, set_native_items(b)) {
+            if !set_ops_pending() {
+                let gone = crate::setalg::with_set(a, |x| {
+                    crate::setalg::pure(|| {
+                        items
+                            .iter()
+                            .filter_map(|v| x.get_index_of(&DictKey(v.clone())))
+                            .collect::<Vec<usize>>()
+                    })
+                });
+                if let (Some(Some(gone)), Ok(mut x)) = (gone, cell.try_borrow_mut()) {
+                    let out = crate::setalg::Plan::Remove(gone).apply(&mut x);
+                    drop(x);
+                    drop(out);
+                    return Ok(Object::None);
+                }
+            }
+        }
     }
     if let Object::Set(s) = set_self(args)? {
         // Compute on a snapshot so the element `__hash__`/`__eq__` we
@@ -16256,6 +16374,11 @@ fn set_difference_update(args: &[Object]) -> Result<Object, RuntimeError> {
 fn set_symmetric_difference_update(args: &[Object]) -> Result<Object, RuntimeError> {
     if matches!(set_self(args)?, Object::FrozenSet(_)) {
         return Err(type_error("frozenset is immutable"));
+    }
+    if let [a, b] = args {
+        if crate::setalg::update(a, b, weavepy_compiler::BinOpKind::BitXor) {
+            return Ok(Object::None);
+        }
     }
     if let Object::Set(s) = set_self(args)? {
         let b: crate::object::SetData = match args.get(1) {
@@ -20640,6 +20763,10 @@ fn view_isdisjoint(args: &[Object]) -> Result<Object, RuntimeError> {
         .get(1)
         .cloned()
         .ok_or_else(|| type_error("isdisjoint() expected an argument"))?;
+    // A keys view against a view or a set: on their tables.
+    if let Some(r) = crate::keys_disjoint(&args[0], &other) {
+        return Ok(Object::Bool(r));
+    }
     let mut other_iter = other.make_iter()?;
     // `DictKey` is hashable like CPython's dict keys; the inner Rcs are
     // borrowed read-only during hashing, so the mutable-key-type lint

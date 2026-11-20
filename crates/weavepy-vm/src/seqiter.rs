@@ -2860,7 +2860,10 @@ fn big_from_digits(text: &str, radix: u32) -> Option<Object> {
         Some(rest) => (true, rest),
         None => (false, t.strip_prefix('+').unwrap_or(t)),
     };
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_alphanumeric()) {
+    // (Digits of the radix, or the text is the full constructor's to
+    // reject: `int("x12")` in a `try` is an everyday test, and it is tried
+    // at each layer that reaches these arms.)
+    if digits.is_empty() || !digits.bytes().all(|b| (b as char).is_digit(radix)) {
         return None;
     }
     if !radix.is_power_of_two() {

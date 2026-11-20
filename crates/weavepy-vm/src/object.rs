@@ -12707,6 +12707,19 @@ impl Object {
             let r = rhs_native.as_ref().unwrap_or(other);
             return l.eq_value(r);
         }
+        // Two sets: on the sets themselves, with their stored hashes and
+        // any Python comparison deferred (see `setalg`); the arms below
+        // compare snapshots when that leaves it undecided.
+        if matches!(self, Object::Set(_) | Object::FrozenSet(_))
+            && matches!(other, Object::Set(_) | Object::FrozenSet(_))
+        {
+            let eq = crate::setalg::with_sets(self, other, |x, y| {
+                crate::setalg::pure(|| crate::setalg::equal(x, y))
+            });
+            if let Some(Some(eq)) = eq {
+                return eq;
+            }
+        }
         match (self, other) {
             (Object::None, Object::None) => true,
             (Object::Bool(a), Object::Bool(b)) => a == b,

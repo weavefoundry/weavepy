@@ -78,6 +78,7 @@ pub mod rare_events;
 pub mod rc;
 pub mod recursion;
 mod seqiter;
+mod setalg;
 pub mod shared_value;
 pub mod specialize;
 pub mod stdlib;
@@ -54827,6 +54828,11 @@ impl Interpreter {
                 Object::Set(_),
                 BinOpKind::BitOr | BinOpKind::BitAnd | BinOpKind::Sub | BinOpKind::BitXor,
             ) => {
+                // In place on the set itself, walking the side the
+                // operation needs (see `setalg::update`).
+                if matches!(b, Object::Set(_) | Object::FrozenSet(_)) && setalg::update(a, b, op) {
+                    return Ok(a.clone());
+                }
                 let r = self.dispatch_binary_op(a, b, op, globals)?;
                 if let (Object::Set(dst), Object::Set(src)) = (a, &r) {
                     let new_items = src.borrow().clone();
@@ -55305,6 +55311,10 @@ impl Interpreter {
             op,
             BinOpKind::BitOr | BinOpKind::BitAnd | BinOpKind::Sub | BinOpKind::BitXor
         ) {
+            // A keys view against a view or a set: on their tables.
+            if let Some(v) = keys_view_algebra(a, b, op) {
+                return Ok(v);
+            }
             let a_elems = dict_view_set_elems(a);
             let b_elems = dict_view_set_elems(b);
             if op == BinOpKind::BitAnd && (a_elems.is_some() || b_elems.is_some()) {
@@ -81258,131 +81268,159 @@ pub(crate) fn dict_union_plain(a: &Object, b: &Object) -> Option<Object> {
     Some(out)
 }
 
-/// `keys_view <op> s` for a dict's keys view and an exact set or frozenset
-/// (CPython's `dictviews_or`, `_and`, `_sub` and `_xor`), whose keys hash
-/// and compare natively: a `set`. An intersection keeps the smaller
-/// operand's elements, the view's on a tie (`set.intersection(view)`), so
-/// it is taken only against a `set`.
-pub(crate) fn keys_view_algebra(a: &Object, b: &Object, op: BinOpKind) -> Option<Object> {
-    let Object::DictView(v) = a else {
-        return None;
-    };
-    if v.kind != crate::object::DictViewKind::Keys
-        || !matches!(b, Object::Set(_) | Object::FrozenSet(_))
-        || (op == BinOpKind::BitAnd && !matches!(b, Object::Set(_)))
-    {
-        return None;
+/// One operand of a keys view's set operation: a dict's keys or a set's,
+/// each with its stored hash.
+enum KeySide<'a> {
+    Dict(&'a crate::object::DictMap),
+    Set(&'a crate::object::SetData),
+}
+
+impl KeySide<'_> {
+    fn len(&self) -> usize {
+        match self {
+            KeySide::Dict(d) => d.len(),
+            KeySide::Set(s) => s.len(),
+        }
     }
-    let keys = {
-        let d = v.dict.try_borrow().ok()?;
-        if d.keys()
-            .any(|key| crate::object::dict_key_is_reentrant(&key.0))
-        {
-            return None;
+
+    fn has(&self, hash: i64, key: &DictKey) -> bool {
+        match self {
+            KeySide::Dict(d) => d.contains_hashed(hash, key),
+            KeySide::Set(s) => s.contains_hashed(hash, key),
         }
-        let mut keys = crate::object::SetData::with_capacity(d.len());
-        for (hash, key) in d.hashed_keys() {
-            keys.insert_hashed(hash, key.clone());
+    }
+
+    fn each(&self, mut f: impl FnMut(i64, &DictKey)) {
+        match self {
+            KeySide::Dict(d) => d.hashed_keys().for_each(|(h, k)| f(h, k)),
+            KeySide::Set(s) => s.as_entries().iter().for_each(|e| f(e.hash, &e.key)),
         }
-        keys
-    };
-    let keys = Object::Set(Rc::new(RefCell::new(keys)));
-    match op {
-        BinOpKind::BitAnd => set_algebra_fast(b, &keys, op),
-        _ => set_algebra_fast(&keys, b, op),
+    }
+
+    fn all(&self, mut f: impl FnMut(i64, &DictKey) -> bool) -> bool {
+        match self {
+            KeySide::Dict(d) => d.hashed_keys().all(|(h, k)| f(h, k)),
+            KeySide::Set(s) => s.as_entries().iter().all(|e| f(e.hash, &e.key)),
+        }
     }
 }
 
-pub(crate) fn set_algebra_fast(a: &Object, b: &Object, op: BinOpKind) -> Option<Object> {
-    // Whether every key of `o` hashes and compares natively.
-    fn plain(o: &Object) -> bool {
-        let check = |s: &crate::object::SetData| {
-            !s.iter().any(|k| crate::object::dict_key_is_reentrant(&k.0))
-        };
-        match o {
-            Object::Set(s) => s.try_borrow().is_ok_and(|s| check(&s)),
-            Object::FrozenSet(s) => check(s),
-            _ => false,
+/// `f` on the keys of a dict's keys view, a `set` or a `frozenset`, held
+/// for the call (a shared borrow: `f` runs no code and changes neither);
+/// `None` for anything else, or an operand that is being changed.
+fn key_side<R>(o: &Object, f: impl FnOnce(KeySide<'_>) -> Option<R>) -> Option<R> {
+    match o {
+        Object::DictView(v) if v.kind == crate::object::DictViewKind::Keys => {
+            let d = v.dict.try_borrow().ok()?;
+            f(KeySide::Dict(&d))
         }
-    }
-    fn len(o: &Object) -> Option<usize> {
-        match o {
-            Object::Set(s) => s.try_borrow().ok().map(|s| s.len()),
-            Object::FrozenSet(s) => Some(s.len()),
-            _ => None,
+        Object::Set(s) => {
+            let s = s.try_borrow().ok()?;
+            f(KeySide::Set(&s))
         }
+        Object::FrozenSet(s) => f(KeySide::Set(s)),
+        _ => None,
     }
-    // Only the keys the operation hashes need checking: those it walks
-    // (see `set_algebra_plain`). The other operand's keys are only
-    // compared against, which defers below.
-    let walked_plain = match op {
-        BinOpKind::BitOr => plain(b),
-        BinOpKind::BitAnd => {
-            if len(b)? > len(a)? {
-                plain(a)
+}
+
+/// Whether a dict's keys view and another, a `set` or a `frozenset` share
+/// no key: the smaller side's keys looked up in the larger. `None` when a
+/// pair needs a Python comparison, or for other operands.
+pub(crate) fn keys_disjoint(a: &Object, b: &Object) -> Option<bool> {
+    key_side(a, |x| {
+        key_side(b, |y| {
+            let (small, big) = if x.len() <= y.len() {
+                (&x, &y)
             } else {
-                plain(b)
-            }
-        }
-        BinOpKind::Sub => plain(a),
-        _ => plain(a) && plain(b),
-    };
-    if !walked_plain {
-        return None;
-    }
-    let (out, deferred) = crate::object::with_key_eq_deferred(|| set_algebra_plain(a, b, op));
-    (!deferred).then_some(out)
+                (&y, &x)
+            };
+            setalg::pure(|| small.all(|hash, key| !big.has(hash, key)))
+        })
+    })
 }
 
-/// `a op b` for `set`/`frozenset` operands that [`set_algebra_fast`]
-/// admitted, with CPython's iteration order and element choice: a union
-/// copies the left and adds the right; an intersection walks the smaller
-/// operand (the right one on a tie) and keeps its elements; a difference
-/// walks the left. The result kind follows the left operand.
-fn set_algebra_plain(a: &Object, b: &Object, op: BinOpKind) -> Object {
-    use crate::object::SetData;
-    fn with<R>(o: &Object, f: impl FnOnce(&SetData) -> R) -> R {
-        match o {
-            Object::Set(s) => f(&s.borrow()),
-            Object::FrozenSet(s) => f(s),
-            _ => unreachable!("checked by set_algebra_fast"),
-        }
+/// `a <op> b` where one operand is a dict's keys view and the other a keys
+/// view, a `set` or a `frozenset` (CPython's `dictviews_or`, `_and`,
+/// `_sub` and `_xor`, which also serve the reflected operators): a `set`,
+/// made from the operands' tables with their stored hashes, so no key is
+/// hashed and neither side is first copied into a set. `None` (nothing
+/// done) when a pair of keys needs a Python comparison, and for the
+/// shapes the general path decides.
+///
+/// An intersection walks the smaller operand and keeps its elements
+/// (`_PyDictView_Intersect`): against a view, the right one on a tie;
+/// against a `set`, the view when it is no longer than the set; a
+/// `frozenset` is always the one walked.
+pub(crate) fn keys_view_algebra(a: &Object, b: &Object, op: BinOpKind) -> Option<Object> {
+    use crate::object::DictViewKind::Keys;
+    let keys_view = |o: &Object| matches!(o, Object::DictView(v) if v.kind == Keys);
+    let set_like = |o: &Object| matches!(o, Object::Set(_) | Object::FrozenSet(_));
+    if !(keys_view(a) && (keys_view(b) || set_like(b)) || set_like(a) && keys_view(b)) {
+        return None;
     }
-    let out = with(a, |x| {
-        with(b, |y| match op {
-            BinOpKind::BitOr => {
-                let mut out = x.clone();
-                out.reserve(y.len());
-                for k in y {
-                    out.insert(k.clone());
-                }
-                out
-            }
-            BinOpKind::BitAnd => {
-                let (small, big) = if y.len() > x.len() { (x, y) } else { (y, x) };
-                let mut out = SetData::with_capacity_and_hasher(
-                    small.len().min(big.len()),
-                    crate::fasthash::FxBuildHasher,
-                );
-                for k in small {
-                    if big.contains(k) {
-                        out.insert(k.clone());
+    let out = key_side(a, |x| {
+        key_side(b, |y| {
+            setalg::pure(|| {
+                let mut out = crate::object::SetData::new();
+                // (One operand's keys are distinct, and so are the two
+                // halves of a symmetric difference: no key taken here is
+                // compared with those already taken.)
+                let mut take = |walk: &KeySide<'_>, probe: &KeySide<'_>, keep: bool| {
+                    walk.each(|hash, key| {
+                        if probe.has(hash, key) == keep {
+                            out.insert_unique_hashed(hash, key.clone());
+                        }
+                    });
+                };
+                match op {
+                    BinOpKind::BitAnd => {
+                        // Which side is walked (see the function docs).
+                        let walk_left = match (a, b) {
+                            (Object::DictView(_), Object::DictView(_)) => y.len() > x.len(),
+                            (Object::DictView(_), Object::Set(_)) => x.len() <= y.len(),
+                            (Object::Set(_), Object::DictView(_)) => y.len() > x.len(),
+                            (Object::DictView(_), _) => false,
+                            _ => true,
+                        };
+                        if walk_left {
+                            take(&x, &y, true);
+                        } else {
+                            take(&y, &x, true);
+                        }
+                    }
+                    BinOpKind::Sub => {
+                        take(&x, &y, false);
+                    }
+                    BinOpKind::BitOr => {
+                        out.reserve(x.len());
+                        x.each(|hash, key| {
+                            out.insert_unique_hashed(hash, key.clone());
+                        });
+                        y.each(|hash, key| {
+                            out.insert_hashed(hash, key.clone());
+                        });
+                    }
+                    _ => {
+                        take(&x, &y, false);
+                        take(&y, &x, false);
                     }
                 }
                 out
-            }
-            BinOpKind::Sub => x.iter().filter(|k| !y.contains(*k)).cloned().collect(),
-            _ => {
-                let mut out: SetData = x.iter().filter(|k| !y.contains(*k)).cloned().collect();
-                out.extend(y.iter().filter(|k| !x.contains(*k)).cloned());
-                out
-            }
+            })
         })
-    });
-    match a {
+    })?;
+    Some(Object::Set(Rc::new(RefCell::new(out))))
+}
+
+pub(crate) fn set_algebra_fast(a: &Object, b: &Object, op: BinOpKind) -> Option<Object> {
+    // On the operands' own tables, with their stored hashes (see
+    // `setalg`): no key is hashed, and a pair that needs a Python
+    // comparison leaves the operation to the caller's general path.
+    let out = setalg::with_sets(a, b, |x, y| setalg::pure(|| setalg::algebra(x, y, op)))???;
+    Some(match a {
         Object::FrozenSet(_) => Object::FrozenSet(Rc::new(crate::object::FrozenSetObj::new(out))),
         _ => Object::Set(Rc::new(RefCell::new(out))),
-    }
+    })
 }
 
 fn union_sets(a: &crate::object::SetData, b: &crate::object::SetData) -> Object {
@@ -93512,15 +93550,10 @@ fn native_set_compare(a: &Object, b: &Object, op: CompareKind) -> Option<bool> {
             _ => None,
         }
     }
-    let reentrant = |d: &SetData| d.iter().any(|k| crate::object::dict_key_is_reentrant(&k.0));
+    // (Stored hashes: no key is hashed, so only a comparison could run
+    // Python, and that defers.)
     with(a, |x| {
-        with(b, |y| {
-            if reentrant(x) || reentrant(y) {
-                return None;
-            }
-            let (r, deferred) = crate::object::with_key_eq_deferred(|| compare_sets(x, y, op));
-            (!deferred).then_some(r)
-        })
+        with(b, |y| setalg::pure(|| setalg::compare(x, y, op)))
     })
 }
 
@@ -93530,72 +93563,30 @@ fn native_set_compare(a: &Object, b: &Object, op: CompareKind) -> Option<bool> {
 /// compares natively. `None` for an items or values view, or a key that
 /// might run Python.
 fn native_keys_compare(a: &Object, b: &Object, op: CompareKind) -> Option<bool> {
-    use crate::object::{DictKey, SetData};
-    enum Side<'a> {
-        Keys(crate::sync::Ref<'a, DictData>),
-        Set(crate::sync::Ref<'a, SetData>),
-        Frozen(&'a SetData),
-    }
-    impl Side<'_> {
-        fn len(&self) -> usize {
-            match self {
-                Side::Keys(d) => d.len(),
-                Side::Set(s) => s.len(),
-                Side::Frozen(s) => s.len(),
-            }
-        }
-        fn has(&self, k: &DictKey) -> bool {
-            match self {
-                Side::Keys(d) => d.contains_key(k),
-                Side::Set(s) => s.contains(k),
-                Side::Frozen(s) => s.contains(k),
-            }
-        }
-        fn any(&self, mut f: impl FnMut(&DictKey) -> bool) -> bool {
-            match self {
-                Side::Keys(d) => d.keys().any(f),
-                Side::Set(s) => s.iter().any(&mut f),
-                Side::Frozen(s) => s.iter().any(f),
-            }
-        }
-    }
-    fn side(o: &Object) -> Option<Side<'_>> {
-        Some(match o {
-            Object::DictView(v) if v.kind == crate::object::DictViewKind::Keys => {
-                Side::Keys(v.dict.try_borrow().ok()?)
-            }
-            Object::Set(s) => Side::Set(s.try_borrow().ok()?),
-            Object::FrozenSet(s) => Side::Frozen(s),
-            _ => return None,
+    // (Each side's keys with their stored hashes: nothing is hashed, and
+    // a comparison that needs Python leaves it undecided.)
+    key_side(a, |x| {
+        key_side(b, |y| {
+            let (m, n) = (x.len(), y.len());
+            let len_ok = match op {
+                CompareKind::Eq | CompareKind::NotEq => m == n,
+                CompareKind::Lt => m < n,
+                CompareKind::LtE => m <= n,
+                CompareKind::Gt => m > n,
+                CompareKind::GtE => m >= n,
+            };
+            // (`>` and `>=` test that `b`'s elements are all in `a`.)
+            let (inner, outer) = match op {
+                CompareKind::Gt | CompareKind::GtE => (&y, &x),
+                _ => (&x, &y),
+            };
+            let contained = setalg::pure(|| len_ok && inner.all(|hash, key| outer.has(hash, key)))?;
+            Some(if op == CompareKind::NotEq {
+                !contained
+            } else {
+                contained
+            })
         })
-    }
-    let (x, y) = (side(a)?, side(b)?);
-    let reentrant = |k: &DictKey| crate::object::dict_key_is_reentrant(&k.0);
-    if x.any(reentrant) || y.any(reentrant) {
-        return None;
-    }
-    let (m, n) = (x.len(), y.len());
-    let len_ok = match op {
-        CompareKind::Eq | CompareKind::NotEq => m == n,
-        CompareKind::Lt => m < n,
-        CompareKind::LtE => m <= n,
-        CompareKind::Gt => m > n,
-        CompareKind::GtE => m >= n,
-    };
-    // (`>` and `>=` test that `b`'s elements are all in `a`.)
-    let (inner, outer) = match op {
-        CompareKind::Gt | CompareKind::GtE => (&y, &x),
-        _ => (&x, &y),
-    };
-    let (contained, deferred) =
-        crate::object::with_key_eq_deferred(|| len_ok && !inner.any(|k| !outer.has(k)));
-    if deferred {
-        return None;
-    }
-    Some(if op == CompareKind::NotEq {
-        !contained
-    } else {
-        contained
     })
 }
 
@@ -93675,6 +93666,14 @@ pub(crate) fn compare_op(a: &Object, b: &Object, op: CompareKind) -> Result<bool
     // CPython lifts ``<``, ``<=``, ``>``, ``>=`` to subset/superset
     // tests on the set family. They are *not* total orderings, so we
     // intercept this before falling through to ``Object::cmp``.
+    let set_like = |o: &Object| matches!(o, Object::Set(_) | Object::FrozenSet(_));
+    if set_like(a) && set_like(b) {
+        // On the sets themselves when no comparison needs Python (the
+        // lengths settle most unequal pairs at once); else on snapshots.
+        if let Some(r) = native_set_compare(a, b, op) {
+            return Ok(r);
+        }
+    }
     if let (Some(lhs), Some(rhs)) = (set_view(a), set_view(b)) {
         return Ok(compare_sets(&lhs, &rhs, op));
     }

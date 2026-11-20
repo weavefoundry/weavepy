@@ -1775,6 +1775,63 @@ branch and pull request.
     instructions an insertion and expiry against CPython's 7,900, spread
     over the weak reference class's Python-level `__new__`, `__init__`
     and callback) are what is left of this group.
+  - A scaling sweep (about 110 container and string operations timed at
+    n and 8n keys under both interpreters, flagging a cost per operation
+    that grows where CPython's doesn't) found more of the dict removal's
+    kind, each an everyday idiom:
+    Set operations copied their operands. A comparison (`a <= b`,
+    `a == b`) took a snapshot of both sets first, so sets of different
+    sizes took time in proportion to the larger to be told apart; the
+    methods (`intersection`, `difference`, `issubset`, `issuperset`,
+    the three `_update`s) built a new set from each operand, hashing
+    every key again; and `a -= b`, `a &= b` and `a ^= b` computed
+    `a - b` whole and copied it back into `a`. At 32,000 keys against
+    three: `small <= big` 19.9 µs (CPython 57 ns), `big -= small` 1.56
+    ms (243 ns), `big.intersection(small)` 1.46 ms (244 ns),
+    `small.issubset(big)` 875 µs (103 ns), `big == other` of another
+    size 37 µs (36 ns). The algebra now runs on the tables themselves
+    (`setalg`): a stored key carries its hash, so nothing is hashed
+    again and no `__hash__` runs; a pair of keys that needs a Python
+    `__eq__` defers, which leaves the operation to the old path with
+    nothing changed; and each operation walks the side it has to, the
+    smaller one for an intersection, a subset test or a disjointness
+    test, the right one for an in-place difference (planned with both
+    sets only read, then applied by position). The same figures: 83 ns,
+    331 ns, 162 ns, 111 ns and 61 ns, on a quick build. The method
+    forms now keep the elements CPython keeps where equal keys differ
+    (`{1, 2}.intersection({1.0, 2.0})` is `{1.0, 2.0}`, as the operator
+    already gave).
+    A dict's keys view did the same against a set: `small & d.keys()`
+    built the 32,000 keys as a set first (1.18 ms; CPython 242 ns; now
+    456 ns), as did `d.keys() >= small` and `isdisjoint`; they probe the
+    dict's table with the set's stored hashes. `small - d.keys()`, which
+    CPython answers by walking the dict (375 µs), takes 416 ns.
+    A string built by `s += piece` in a loop copied itself at every
+    append once the loop was compiled: the core loop grew a `str` local
+    in place when nothing else held it, but the compiled binary
+    operation didn't know its result was about to be stored back into
+    its left operand's local. Its site now carries that local, and the
+    helper lets the local go and appends where the string is (649 ns an
+    append at 32,000 appends, growing with the length, to 50 ns flat;
+    CPython 104 to 118). A concatenation whose left operand is a
+    temporary nothing else holds (`a + b + c`'s second `+`) grows that
+    one too.
+    A function with n parameters took n² to parse and to compile: both
+    duplicate-parameter checks scanned a vector, and every use of a
+    local searched the names for its index. CPython's own
+    `test_collections` makes a 150,000-field `namedtuple`, whose
+    constructor is such a function: 117 s, now 1.5 s (CPython 1.9).
+    And `int("x12")` in a `try`, the everyday test for a number, ran the
+    big-integer parser at each of the three layers that reach the
+    constructor's quick arms before the full constructor rejected it
+    (the arms had started building big values a few commits back): the
+    arms decline text that isn't digits at its first byte, 4% of the
+    `exceptions` workload's instructions.
+    Still on the sweep's list: `del buf[:k]` on a `bytearray` moves the
+    rest each time (CPython keeps a start offset: 60 times its time on a
+    long buffer), and constant factors of two to five on
+    `deque.extendleft`, `memoryview` slices, `hash(tuple)`, `str.count`
+    and `list.pop(0)`.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

@@ -2325,6 +2325,57 @@ pub(crate) struct BinopSite {
     direct: *mut DirectSite,
     /// Whether to try a comparison method.
     dunder: bool,
+    /// For `x = x + t` (or `x += t`) of a local `x` whose store comes
+    /// next: `x`'s index, so that a `str` nothing else holds grows in
+    /// place (see [`str_grow_local`]); `NO_GROW` otherwise.
+    grow_local: u32,
+}
+
+/// No local grows in place at a [`BinopSite`].
+const NO_GROW: u32 = u32::MAX;
+
+/// `x = x + t` at a site whose operands are on the stack and whose next
+/// instruction stores into the local `x` the left operand came from: when
+/// both are `str`s and the left one is `x`'s own string, `x` lets go of it
+/// and it grows in place if nothing else holds it (CPython's
+/// `BINARY_OP_INPLACE_ADD_UNICODE`, and the core loop's arm), which makes
+/// a string built by appending in a loop cost its length once instead of
+/// once per append. `true` with the grown string in the left operand's
+/// slot, the right one released and `x` left unbound for the store that
+/// follows; `false` with everything as it was.
+///
+/// # Safety
+///
+/// The state is live, the site's two slots hold its operands, and
+/// `grow_local` is one of the frame's locals.
+#[inline]
+unsafe fn str_grow_local(st: *mut State, s: &BinopSite) -> bool {
+    use crate::shared_value::SharedStr;
+    // SAFETY: the caller's contract.
+    unsafe {
+        let at = (*st).stack.add(s.slot as usize);
+        let local = (*st).locals.add(s.grow_local as usize);
+        if !matches!(
+            (&*local, &*at, &*at.add(1)),
+            (Object::Str(x), Object::Str(a), Object::Str(_)) if SharedStr::ptr_eq(x, a)
+        ) {
+            return false;
+        }
+        // (The operand holds the string too: a plain decrement.)
+        crate::drop_hot(std::ptr::replace(local, Object::Unbound));
+        let grown = match (&mut *at, &*at.add(1)) {
+            (Object::Str(a), Object::Str(t)) => SharedStr::try_append(a, t),
+            _ => false,
+        };
+        if grown {
+            crate::drop_hot_at(at.add(1));
+            return true;
+        }
+        // Held elsewhere: `x` takes it back, and the ordinary
+        // concatenation runs.
+        local.write(crate::clone_hot(&*at));
+        false
+    }
 }
 
 /// `BINARY_OP` at `site` through [`h_binop`], then an operator method that
@@ -2337,6 +2388,9 @@ unsafe extern "C" fn h_binop_site(st: *mut State, site: *const BinopSite) -> u32
         let s = &*site;
         if !s.copies.is_empty() {
             h_copies(st, s.copies.as_ptr(), s.copies.len() as u64);
+        }
+        if s.grow_local != NO_GROW && str_grow_local(st, s) {
+            return 0;
         }
         if h_binop((*st).stack.add(s.slot as usize), s.arg) == 0 {
             return 0;
@@ -6673,6 +6727,17 @@ unsafe extern "C" fn h_binop(at: *mut Object, kind: u32) -> u32 {
     // SAFETY: the code passes two initialized stack slots, and a kind the
     // compiler emitted (`BinOpKind` is `repr(u8)`).
     unsafe {
+        // `s + t` whose left operand nothing else holds (the result of
+        // the concatenation before it, in `a + b + c`): it grows in place
+        // rather than being copied into a new string and freed.
+        if kind as u8 == BinOpKind::Add as u8 {
+            if let (Object::Str(x), Object::Str(t)) = (&mut *at, &*at.add(1)) {
+                if crate::shared_value::SharedStr::try_append(x, t) {
+                    crate::drop_hot_at(at.add(1));
+                    return 0;
+                }
+            }
+        }
         let (a, b) = (&*at, &*at.add(1));
         // Two numbers (the core loop's in-line arm), a `bool` as its int
         // value (but `bool & bool` and its kin stay a `bool`: the core
@@ -21768,6 +21833,20 @@ impl<'a> Lower<'a> {
     /// the values in registers written there here, the helper copying the
     /// rest. `arg` is the helper's operation.
     fn operand_site(&mut self, pc: usize, arg: u32, ai: Item, bi: Item, dunder: bool) -> Value {
+        self.operand_site_growing(pc, arg, ai, bi, dunder, NO_GROW)
+    }
+
+    /// [`Self::operand_site`], with the local a `BINARY_OP`'s result is
+    /// stored into next (see [`BinopSite::grow_local`]).
+    fn operand_site_growing(
+        &mut self,
+        pc: usize,
+        arg: u32,
+        ai: Item,
+        bi: Item,
+        dunder: bool,
+        grow_local: u32,
+    ) -> Value {
         let slot = self.depth;
         let mut copies = Vec::new();
         // (No method runs in an inlined body, whose locals aren't in the
@@ -21817,6 +21896,8 @@ impl<'a> Lower<'a> {
             last: self.last_pc.map_or(NO_LAST, |l| l as u32),
             direct,
             dunder,
+            // (An inlined body's locals aren't in the state's array.)
+            grow_local: if in_line { NO_GROW } else { grow_local },
         });
         let c = self
             .b
@@ -21829,7 +21910,24 @@ impl<'a> Lower<'a> {
     /// [`Self::operand_site`] for a `BINARY_OP`.
     fn binop_site(&mut self, pc: usize, kind: u8, ai: Item, bi: Item) -> Value {
         let flag = self.code.instructions[pc].arg & weavepy_compiler::BINARY_OP_INPLACE_FLAG;
-        self.operand_site(pc, u32::from(kind) | flag, ai, bi, true)
+        // `x = x + t` with the store next: `x` may grow in place. (Not
+        // when a load of `x` further down the stack is still to be made:
+        // it must see the old value.)
+        let grow = match self.code.instructions.get(pc + 1) {
+            Some(next)
+                if kind == BinOpKind::Add as u8
+                    && next.op == OpCode::StoreFast
+                    && (next.arg as usize) < self.nlocals
+                    && !self
+                        .vs
+                        .iter()
+                        .any(|i| matches!(i, Item::Local(x) if *x == next.arg)) =>
+            {
+                next.arg
+            }
+            _ => NO_GROW,
+        };
+        self.operand_site_growing(pc, u32::from(kind) | flag, ai, bi, true, grow)
     }
 
     /// The other shapes of a `BINARY_OP` whose in-line arithmetic declined

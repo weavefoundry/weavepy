@@ -249,6 +249,7 @@ impl Validator<'_> {
             self.visit_annotation(r)?;
         }
         let mut params: Vec<(&str, Span)> = Vec::new();
+        let mut names: crate::fxhash::HashSet<&str> = crate::fxhash::HashSet::default();
         for a in args
             .posonlyargs
             .iter()
@@ -271,7 +272,7 @@ impl Validator<'_> {
                     a.span,
                 ));
             }
-            if params.iter().any(|(n, _)| *n == a.name) {
+            if !names.insert(a.name.as_str()) {
                 return Err(CompileError::spanned(
                     format!("duplicate argument '{}' in function definition", a.name),
                     a.span,

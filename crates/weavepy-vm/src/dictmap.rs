@@ -1426,6 +1426,21 @@ impl<V> Table<V> {
         self.find(key).is_some()
     }
 
+    /// Whether a key equal to `key`, whose Python hash is `hash`, is
+    /// present (no hash is computed).
+    #[inline]
+    pub fn contains_hashed(&self, hash: i64, key: &DictKey) -> bool {
+        self.find_hashed(hash, key).is_ok()
+    }
+
+    /// The position of the key equal to `key`, whose Python hash is
+    /// `hash` (no hash is computed).
+    #[inline]
+    pub fn index_hashed(&self, hash: i64, key: &DictKey) -> Option<usize> {
+        let p = self.find_hashed(hash, key).ok()?;
+        Some(self.position_of(p))
+    }
+
     /// The position of the first entry with Python hash `hash` that `eq`
     /// accepts; `eq` sees only keys of that exact hash.
     pub fn find_by_hash(&self, hash: i64, mut eq: impl FnMut(&DictKey) -> bool) -> Option<usize> {
@@ -2663,6 +2678,18 @@ impl SetMap {
     #[inline(always)]
     pub fn find_object_native(&self, key: &Object) -> Option<(i64, Result<usize, usize>)> {
         self.0.find_object_native(key)
+    }
+
+    /// [`Table::contains_hashed`] over the set's keys.
+    #[inline]
+    pub fn contains_hashed(&self, hash: i64, key: &DictKey) -> bool {
+        self.0.contains_hashed(hash, key)
+    }
+
+    /// [`Table::index_hashed`] over the set's keys.
+    #[inline]
+    pub fn index_hashed(&self, hash: i64, key: &DictKey) -> Option<usize> {
+        self.0.index_hashed(hash, key)
     }
 
     /// [`Table::find_object_hashing`] over the set's keys.

@@ -2651,6 +2651,10 @@ struct Compiler {
     co: CodeObject,
     constant_index: intern::InternIndex,
     name_index: intern::InternIndex,
+    /// The same for `co.varnames`: a function with many locals (generated
+    /// code, a `namedtuple`'s constructor of a few thousand fields) looks
+    /// each one up by name at every use.
+    var_index: intern::InternIndex,
     kind: CodeKind,
     /// Which comprehension form this scope lowers (`None` outside
     /// comprehensions). Drives CPython's "'yield' inside list
@@ -3107,6 +3111,7 @@ impl Compiler {
             co,
             constant_index: intern::InternIndex::default(),
             name_index: intern::InternIndex::default(),
+            var_index: intern::InternIndex::default(),
             kind,
             comp_kind: None,
             bindings: IndexMap::default(),
@@ -9978,11 +9983,7 @@ impl Compiler {
     }
 
     fn var_index_or_add(&mut self, name: &str) -> u32 {
-        if let Some(i) = self.co.varnames.iter().position(|n| n == name) {
-            return i as u32;
-        }
-        self.co.varnames.push(Name::from(name.to_owned()));
-        (self.co.varnames.len() - 1) as u32
+        self.var_index.intern_name(&mut self.co.varnames, name)
     }
 
     fn classify_for_store(&mut self, name: &str) -> Binding {
