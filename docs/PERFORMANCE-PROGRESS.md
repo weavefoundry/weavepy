@@ -1447,6 +1447,23 @@ branch and pull request.
     the slow path tries for an instance (an entry is for a class version
     at which the name resolved to the instance, so nothing ahead of it
     would answer otherwise): 1.908M instructions an iteration to 1.796M.
+  - `getattr(cls, name[, default])`, which `inspect`, `typing`, `functools`
+    and `dataclasses` call on every object they handle, cost three to
+    four times CPython's instructions whenever the answer wasn't a plain
+    hit: a missing name with a default (`getattr(cls, "__wrapped__",
+    None)`) 1,761 against 579, `getattr(cls, "__name__")` 2,444 against
+    558. Each call classified the name against two lists of dunders by
+    comparing strings (some forty comparisons), asked `type` itself for
+    the name, walked the class's MRO three more times, and for
+    `__name__` gave up and took the full call. Now the two lists are one
+    hashed table, `type`'s answer is remembered by name, `__name__` and
+    `__qualname__` are read where they live, and the whole answer is
+    kept for a class under plain `type` by its attribute version and the
+    name object. The memo owns only scalars and builtin functions; any
+    other value it borrows from the Python class whose dictionary holds
+    it, so a value a class drops dies when it does. All six shapes
+    measured now cost 610 to 630 instructions (CPython 560 to 600); in
+    the `inspect_typing_ops` case this helper was 6% of the instructions.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
