@@ -599,7 +599,8 @@ impl Interpreter {
         if stack.capacity() < want {
             stack.reserve(want - stack.len());
         }
-        let (base, cap) = (stack.as_mut_ptr(), stack.capacity());
+        #[cfg_attr(not(feature = "jit"), allow(unused_mut))]
+        let (mut base, mut cap) = (stack.as_mut_ptr(), stack.capacity());
         let mut len = stack.len();
         let mut pc = frame.pc as usize;
         if pc >= ninstrs {
@@ -839,6 +840,20 @@ impl Interpreter {
                         ext.frame_jit
                             .warm(code, ext, nlocals, crate::frame_jit::Heat::Step);
                         native = ext.frame_jit.get(nlocals);
+                        // The native form arrived in the middle of the
+                        // step, whose stack was sized without it: it grows
+                        // now, as the next step's would (no view of it is
+                        // built yet). Left small, every entry of a fold
+                        // that drains the body in this one step would get
+                        // nowhere, and the entries would be given up.
+                        if let Some(n) = native.filter(|n| cap < n.need()) {
+                            // SAFETY: the first `len` slots are initialized,
+                            // as at the step's end.
+                            unsafe { frame.stack.set_len(len) };
+                            frame.stack.reserve(n.need() - len);
+                            base = frame.stack.as_mut_ptr();
+                            cap = frame.stack.capacity();
+                        }
                     }
                 }
                 // `iter()` of an iterator or a generator is itself.

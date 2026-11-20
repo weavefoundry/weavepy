@@ -559,7 +559,7 @@ impl Native {
     #[cold]
     #[inline(never)]
     fn ran(&self, st: &State, from: usize, len: usize, cap: usize, last: usize, status: u32) {
-        if status == INTERP && st.pc == from && st.last == last {
+        if status == INTERP && st.pc == from && st.last == last && cap >= self.need {
             self.note_fail(from);
         }
         if stats::enabled() {
@@ -589,7 +589,9 @@ impl Native {
         let (from, len, cap, last) = (st.pc, st.len, st.cap, st.last);
         // SAFETY: the caller's contract.
         let status = unsafe { self.call(st) };
-        if status == INTERP && st.pc == from && st.last == last {
+        // (An entry a stack too small for the code turned away says
+        // nothing of the entry: the caller's next run has the room.)
+        if status == INTERP && st.pc == from && st.last == last && cap >= self.need {
             self.note_fail(from);
         }
         if stats::enabled() {
