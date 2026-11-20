@@ -2763,9 +2763,9 @@ thread_local! {
     /// result at runtime — so staleness (e.g. the callee's own globals
     /// changing what its analysis would say) costs a deopt, never
     /// correctness.
-    static RET_LANE_CACHE: RefCell<
+    static RET_LANE_CACHE: crate::gil::ReleaseUnderGil<RefCell<
         CodeMap<(Option<JitType>, bool, crate::sync::Weak<CodeObject>)>,
-    > = RefCell::new(CodeMap::default());
+    >> = crate::gil::ReleaseUnderGil::new(RefCell::new(CodeMap::default()));
 }
 
 /// Infer a candidate callee's return typing — its stable scalar return

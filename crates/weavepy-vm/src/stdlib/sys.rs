@@ -1479,8 +1479,7 @@ pub(crate) fn intern_shared(text: &SharedStr) -> SharedStr {
 pub(crate) fn intern_shared_memo(text: &SharedStr) -> SharedStr {
     const N: usize = 64;
     thread_local! {
-        static MEMO: std::cell::RefCell<[Option<(SharedStr, SharedStr)>; N]> =
-            const { std::cell::RefCell::new([const { None }; N]) };
+        static MEMO: crate::gil::ReleaseUnderGil<std::cell::RefCell<[Option<(SharedStr, SharedStr)>; N]>> = const { crate::gil::ReleaseUnderGil::new(std::cell::RefCell::new([const { None }; N])) };
     }
     let slot = (text.as_ptr() as usize >> 4) % N;
     let hit = MEMO
@@ -2928,8 +2927,7 @@ fn sys_set_coroutine_origin_tracking_depth(args: &[Object]) -> Result<Object, Ru
 thread_local! {
     /// PEP 525 `sys.set_asyncgen_hooks` — `(firstiter, finalizer)`.
     /// Per-thread in CPython (a `PyThreadState` field).
-    static ASYNCGEN_HOOKS: std::cell::RefCell<(Object, Object)> =
-        const { std::cell::RefCell::new((Object::None, Object::None)) };
+    static ASYNCGEN_HOOKS: crate::gil::ReleaseUnderGil<std::cell::RefCell<(Object, Object)>> = const { crate::gil::ReleaseUnderGil::new(std::cell::RefCell::new((Object::None, Object::None))) };
 }
 
 /// The currently-installed `(firstiter, finalizer)` asyncgen hooks.

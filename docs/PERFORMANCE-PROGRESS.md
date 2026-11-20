@@ -1523,9 +1523,21 @@ branch and pull request.
     (its frame and exception stacks) and its interned names are now
     released by the worker while it still holds the GIL, and the
     docstring cache, the static-string table, the empty tuple and the
-    `getattr` memo take the GIL to drop. About sixty more thread-local
-    caches hold objects or strings; they need the same before counts
-    can stay plain, with a test job running the audit to keep it so.
+    `getattr` memo take the GIL to drop. The sixty-odd other
+    thread-local caches that hold objects or strings (class handles,
+    key tables, registries, memos) now take it too, and the command
+    line's run holds the GIL from before the interpreter is built until
+    it is released. With that, the audit over 24 groups of CPython's
+    tests (threads, queues, futures, asyncio, sockets, subprocesses,
+    multiprocessing, the C API) records no update outside the GIL by
+    any thread while it lives, and none at a worker's exit; what is
+    left is the main thread's last steps after the run (reading the
+    exit status off the exception, its own destructors at process exit)
+    and a fatal-error dump from a foreign thread. Still to do before
+    counts can stay plain with several threads: those last steps, the
+    same audit on Linux and Windows (their blocking calls differ), a
+    flag of its own for "other threads exist" (the shared-counts flag
+    stands in for it in two places), and a test job that runs the audit.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

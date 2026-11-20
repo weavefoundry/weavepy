@@ -318,7 +318,7 @@ unsafe impl Sync for SemInner {}
 
 #[cfg(unix)]
 thread_local! {
-    static SEMLOCK_TYPE: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
+    static SEMLOCK_TYPE: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
 }
 
 /// The `_multiprocessing.SemLock` type. Built lazily so
@@ -997,7 +997,7 @@ impl Drop for NtSemInner {
 
 #[cfg(windows)]
 thread_local! {
-    static NT_SEMLOCK_TYPE: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
+    static NT_SEMLOCK_TYPE: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
 }
 
 /// The `_multiprocessing.SemLock` type (NT arm). Built lazily so

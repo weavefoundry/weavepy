@@ -2809,8 +2809,7 @@ fn stat_fields_finish(inst: &crate::types::PyInstance, fields: StatFields) {
     }
     let _ = inst.native.set(Object::new_tuple(seq));
     thread_local! {
-        static KEYS: std::cell::RefCell<Vec<(usize, i64, DictKey)>> =
-            const { std::cell::RefCell::new(Vec::new()) };
+        static KEYS: crate::gil::ReleaseUnderGil<std::cell::RefCell<Vec<(usize, i64, DictKey)>>> = const { crate::gil::ReleaseUnderGil::new(std::cell::RefCell::new(Vec::new())) };
     }
     let n = fields.0.len();
     let mut values = fields.0.into_iter();
@@ -3525,8 +3524,7 @@ fn os_access(args: &[Object], _kwargs: &[(String, Object)]) -> Result<Object, Ru
 
 thread_local! {
     /// The `posix.ScandirIterator` class, made on first use.
-    static SCANDIR_CLS: RefCell<Option<Rc<crate::types::TypeObject>>> =
-        const { RefCell::new(None) };
+    static SCANDIR_CLS: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<crate::types::TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
 }
 
 /// `next(it)` of a `ScandirIterator` (`os.walk`'s loop), as its
@@ -3716,7 +3714,7 @@ fn dir_entry_follow(kwargs: &[(String, Object)]) -> bool {
 pub(crate) fn dir_entry_type() -> Rc<crate::types::TypeObject> {
     use crate::types::TypeObject;
     thread_local! {
-        static CLS: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
+        static CLS: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
     }
     CLS.with(|slot| {
         if let Some(c) = slot.borrow().as_ref() {
@@ -6606,7 +6604,7 @@ fn added_dll_directory_type() -> Rc<crate::types::TypeObject> {
     use crate::object::BuiltinFn;
     use crate::types::TypeObject;
     thread_local! {
-        static CLS: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
+        static CLS: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
     }
     fn self_dict(args: &[Object]) -> Option<Rc<RefCell<DictData>>> {
         match args.first() {
@@ -7156,12 +7154,12 @@ impl StructSeqLayout {
 thread_local! {
     /// name → (memoised type, leaked layout). Memoisation keeps type
     /// identity stable across module rebuilds so `isinstance` holds.
-    static STRUCT_SEQ_REGISTRY: RefCell<
+    static STRUCT_SEQ_REGISTRY: crate::gil::ReleaseUnderGil<RefCell<
         std::collections::HashMap<
             &'static str,
             (Rc<crate::types::TypeObject>, &'static StructSeqLayout),
         >,
-    > = RefCell::new(std::collections::HashMap::new());
+    >> = crate::gil::ReleaseUnderGil::new(RefCell::new(std::collections::HashMap::new()));
 }
 
 thread_local! {
@@ -7220,7 +7218,7 @@ fn struct_seq_layout_of(cls: &crate::types::TypeObject) -> Option<&'static Struc
 /// are named), made once per thread.
 fn struct_seq_layout_keys(layout: &'static StructSeqLayout) -> std::rc::Rc<[DictKey]> {
     thread_local! {
-        static KEYS: RefCell<Vec<(usize, std::rc::Rc<[DictKey]>)>> = const { RefCell::new(Vec::new()) };
+        static KEYS: crate::gil::ReleaseUnderGil<RefCell<Vec<(usize, std::rc::Rc<[DictKey]>)>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(Vec::new())) };
     }
     let at = std::ptr::from_ref(layout) as usize;
     KEYS.with(|k| {
@@ -8066,8 +8064,7 @@ pub(crate) fn struct_seq_instance_keyed(
 /// once per instance.
 pub(crate) fn static_name_keys(fields: &'static [&'static str]) -> std::rc::Rc<[DictKey]> {
     thread_local! {
-        static KEYS: RefCell<std::collections::HashMap<(usize, usize), std::rc::Rc<[DictKey]>, crate::fasthash::FxBuildHasher>> =
-            RefCell::new(std::collections::HashMap::default());
+        static KEYS: crate::gil::ReleaseUnderGil<RefCell<std::collections::HashMap<(usize, usize), std::rc::Rc<[DictKey]>, crate::fasthash::FxBuildHasher>>> = crate::gil::ReleaseUnderGil::new(RefCell::new(std::collections::HashMap::default()));
     }
     let id = (fields.as_ptr() as usize, fields.len());
     if let Some(keys) = KEYS.with(|k| k.borrow().get(&id).cloned()) {
@@ -8084,8 +8081,7 @@ pub(crate) fn static_name_keys(fields: &'static [&'static str]) -> std::rc::Rc<[
 /// their names each time.
 pub(crate) fn static_name_key(name: &'static str) -> DictKey {
     thread_local! {
-        static KEYS: RefCell<std::collections::HashMap<(usize, usize), Object, crate::fasthash::FxBuildHasher>> =
-            RefCell::new(std::collections::HashMap::default());
+        static KEYS: crate::gil::ReleaseUnderGil<RefCell<std::collections::HashMap<(usize, usize), Object, crate::fasthash::FxBuildHasher>>> = crate::gil::ReleaseUnderGil::new(RefCell::new(std::collections::HashMap::default()));
     }
     KEYS.with(|keys| {
         let mut keys = keys.borrow_mut();

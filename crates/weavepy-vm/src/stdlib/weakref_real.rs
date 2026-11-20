@@ -42,12 +42,12 @@ use crate::weakref_registry::{
 };
 
 thread_local! {
-    static REF_TYPE: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
+    static REF_TYPE: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
     /// [`REF_TYPE`]'s address once built (`0` before): a type call's one
     /// compare (see [`is_ref_type`]).
     static REF_TYPE_ADDR: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static PROXY_TYPE: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
-    static CALLABLE_PROXY_TYPE: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
+    static PROXY_TYPE: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
+    static CALLABLE_PROXY_TYPE: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
 }
 
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {

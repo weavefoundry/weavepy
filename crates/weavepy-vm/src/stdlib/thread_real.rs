@@ -46,14 +46,14 @@ use crate::types::{PyInstance, TypeFlags, TypeObject};
 thread_local! {
     /// Cached "lock" type built once per interpreter so
     /// `type(lock).__name__` returns `"lock"` consistently.
-    static LOCK_TYPE: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
+    static LOCK_TYPE: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
     /// Cached "RLock" type.
-    static RLOCK_TYPE: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
+    static RLOCK_TYPE: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
     /// Per-thread "sentinel" lock returned by `_set_sentinel`.
     /// Auto-released on thread exit so `Thread.join` works.
-    static SENTINEL_LOCK: RefCell<Option<Rc<RealLock>>> = const { RefCell::new(None) };
+    static SENTINEL_LOCK: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<RealLock>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
     /// Cached `_ThreadHandle` type (RFC 0039).
-    static THREAD_HANDLE_TYPE: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
+    static THREAD_HANDLE_TYPE: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
 }
 
 /// Process-wide counter for synthesised thread idents (used by

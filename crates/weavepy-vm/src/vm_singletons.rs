@@ -43,12 +43,11 @@ thread_local! {
     /// Pending `__del__` finalizer invocations queued by the cycle
     /// GC. Drained at the next eval-loop tick by the interpreter.
     /// See [`crate::gc_trace::run_finalizer`] for the producer side.
-    pub(crate) static PENDING_FINALIZERS: RefCell<Vec<Object>> = const { RefCell::new(Vec::new()) };
+    pub(crate) static PENDING_FINALIZERS: crate::gil::ReleaseUnderGil<RefCell<Vec<Object>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(Vec::new())) };
     /// Pending weakref-callback invocations `(callback, weakref_obj)`
     /// queued when a referent dies (cycle GC, refcount reap, registry
     /// sweep). Drained alongside the finalizer queue.
-    pub(crate) static PENDING_WEAKREF_CALLBACKS: RefCell<Vec<(Object, Object)>> =
-        const { RefCell::new(Vec::new()) };
+    pub(crate) static PENDING_WEAKREF_CALLBACKS: crate::gil::ReleaseUnderGil<RefCell<Vec<(Object, Object)>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(Vec::new())) };
 }
 
 /// Process-wide count of parked `__del__` requests and weakref callbacks
@@ -998,7 +997,7 @@ thread_local! {
     /// here instead; the eval loop reaps it at the next
     /// between-bytecodes safe point — before any subsequent Python-level
     /// weakref read can observe the stale referent.
-    static PENDING_CEXT_DROPS: RefCell<Vec<Object>> = const { RefCell::new(Vec::new()) };
+    static PENDING_CEXT_DROPS: crate::gil::ReleaseUnderGil<RefCell<Vec<Object>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(Vec::new())) };
     /// Cheap "is this thread's C-drop queue non-empty?" probe for the
     /// eval-loop safe point. Thread-local (unlike `PENDING_RW_FLAG`)
     /// because the queues are: a global flag cleared by whichever thread

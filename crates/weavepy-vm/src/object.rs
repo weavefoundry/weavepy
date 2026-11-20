@@ -5022,8 +5022,8 @@ impl DictWatches {
 }
 
 thread_local! {
-    static DICT_WATCHES: std::cell::RefCell<DictWatches> =
-        std::cell::RefCell::new(DictWatches::default());
+    static DICT_WATCHES: crate::gil::ReleaseUnderGil<std::cell::RefCell<DictWatches>> =
+        crate::gil::ReleaseUnderGil::new(std::cell::RefCell::new(DictWatches::default()));
     /// Number of entries in `DICT_WATCHES` (fast gate for mutators).
     static DICT_WATCH_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }

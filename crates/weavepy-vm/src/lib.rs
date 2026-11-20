@@ -77859,8 +77859,7 @@ thread_local! {
     /// (see `generator_send_fold`).
     static GEN_RAW_RETURN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The value a raw resume's generator returned.
-    static GEN_RETURN_VALUE: std::cell::RefCell<Option<Object>> =
-        const { std::cell::RefCell::new(None) };
+    static GEN_RETURN_VALUE: crate::gil::ReleaseUnderGil<std::cell::RefCell<Option<Object>>> = const { crate::gil::ReleaseUnderGil::new(std::cell::RefCell::new(None)) };
 }
 
 enum GenStep {
@@ -78577,8 +78576,7 @@ enum QuietShell<'a> {
 thread_local! {
     /// The `**kwargs` dictionary of the last keyword leaf call, emptied,
     /// when nothing kept it (see [`recycle_kw_dict`]).
-    static SPARE_KW_DICT: std::cell::Cell<Option<Rc<RefCell<DictData>>>> =
-        const { std::cell::Cell::new(None) };
+    static SPARE_KW_DICT: crate::gil::ReleaseUnderGil<std::cell::Cell<Option<Rc<RefCell<DictData>>>>> = const { crate::gil::ReleaseUnderGil::new(std::cell::Cell::new(None)) };
 }
 
 /// An empty `**kwargs` dictionary with room for `n` keys: the spare one,
@@ -78638,7 +78636,7 @@ fn varkw_stays_local(code: &CodeObject) -> bool {
 
 fn spare_kw_dict(n: usize) -> Rc<RefCell<DictData>> {
     SPARE_KW_DICT
-        .try_with(std::cell::Cell::take)
+        .try_with(|c| c.take())
         .ok()
         .flatten()
         .unwrap_or_else(|| {
@@ -80022,9 +80020,9 @@ thread_local! {
     /// `builtin_type_dunder` results (misses included) by built-in type
     /// address, then name.
     #[allow(clippy::type_complexity)]
-    static SLOT_WRAPPER_CACHE: std::cell::RefCell<
+    static SLOT_WRAPPER_CACHE: crate::gil::ReleaseUnderGil<std::cell::RefCell<
         crate::fasthash::FxHashMap<usize, crate::fasthash::FxHashMap<Box<str>, Option<Object>>>,
-    > = std::cell::RefCell::new(crate::fasthash::FxHashMap::default());
+    >> = crate::gil::ReleaseUnderGil::new(std::cell::RefCell::new(crate::fasthash::FxHashMap::default()));
 }
 
 /// The built-in class whose attributes are all of `obj`'s: a value of a
@@ -80746,7 +80744,7 @@ fn make_gen_method(name: &str, receiver: &Object) -> Object {
 thread_local! {
     /// Lazily-created `coroutine_wrapper` type (CPython's
     /// `_PyCoroWrapper_Type`) — the iterator `coro.__await__()` returns.
-    static COROUTINE_WRAPPER_TYPE: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
+    static COROUTINE_WRAPPER_TYPE: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
 }
 
 /// Build the `coroutine_wrapper` iterator for `coro.__await__()`.

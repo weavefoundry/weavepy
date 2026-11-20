@@ -195,7 +195,7 @@ pub(crate) fn with_partial_call<R>(
 
 thread_local! {
     /// The interned names of a partial's first four slots.
-    static PARTIAL_KEYS: [crate::shared_value::SharedStr; 4] = PARTIAL_SLOTS[..4]
+    static PARTIAL_KEYS: crate::gil::ReleaseUnderGil<[crate::shared_value::SharedStr; 4]> = crate::gil::ReleaseUnderGil::new(PARTIAL_SLOTS[..4]
         .iter()
         .map(|name| match crate::stdlib::sys::intern_name(name) {
             Object::Str(s) => s,
@@ -203,7 +203,7 @@ thread_local! {
         })
         .collect::<Vec<_>>()
         .try_into()
-        .unwrap_or_else(|_| unreachable!("four names"));
+        .unwrap_or_else(|_| unreachable!("four names")));
 }
 
 /// `f` over a partial instance's `_func`, `_args`, `_keywords`, and
@@ -517,8 +517,7 @@ static LRU_TYPE_ADDR: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomic
 
 fn lru_type() -> Rc<crate::types::TypeObject> {
     thread_local! {
-        static LRU_TYPE: RefCell<Option<Rc<crate::types::TypeObject>>> =
-            const { RefCell::new(None) };
+        static LRU_TYPE: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<crate::types::TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
     }
     LRU_TYPE.with(|slot| {
         if let Some(t) = slot.borrow().as_ref() {

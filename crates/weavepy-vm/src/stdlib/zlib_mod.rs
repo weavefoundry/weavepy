@@ -364,16 +364,13 @@ struct ZlibDecompressorState {
 }
 
 thread_local! {
-    static COMPRESS_REG: RefCell<HashMap<i64, Rc<RefCell<CompressState>>>> =
-        RefCell::new(HashMap::new());
-    static DECOMPRESS_REG: RefCell<HashMap<i64, Rc<RefCell<DecompressState>>>> =
-        RefCell::new(HashMap::new());
-    static ZDECOMP_REG: RefCell<HashMap<i64, Rc<RefCell<ZlibDecompressorState>>>> =
-        RefCell::new(HashMap::new());
+    static COMPRESS_REG: crate::gil::ReleaseUnderGil<RefCell<HashMap<i64, Rc<RefCell<CompressState>>>>> = crate::gil::ReleaseUnderGil::new(RefCell::new(HashMap::new()));
+    static DECOMPRESS_REG: crate::gil::ReleaseUnderGil<RefCell<HashMap<i64, Rc<RefCell<DecompressState>>>>> = crate::gil::ReleaseUnderGil::new(RefCell::new(HashMap::new()));
+    static ZDECOMP_REG: crate::gil::ReleaseUnderGil<RefCell<HashMap<i64, Rc<RefCell<ZlibDecompressorState>>>>> = crate::gil::ReleaseUnderGil::new(RefCell::new(HashMap::new()));
     static NEXT_ID: RefCell<i64> = const { RefCell::new(1) };
-    static COMPRESS_CLASS: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
-    static DECOMPRESS_CLASS: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
-    static ZDECOMP_CLASS: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
+    static COMPRESS_CLASS: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
+    static DECOMPRESS_CLASS: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
+    static ZDECOMP_CLASS: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
 }
 
 fn next_id() -> i64 {

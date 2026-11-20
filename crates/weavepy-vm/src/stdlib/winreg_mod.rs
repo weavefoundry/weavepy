@@ -468,7 +468,7 @@ fn opt_ptr(buf: Option<&Vec<u16>>) -> *const u16 {
 // ---------------------------------------------------------------------------
 
 thread_local! {
-    static HKEY_CLASS: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
+    static HKEY_CLASS: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
 }
 
 /// The `PyHKEY` type object, built once per thread (poll-object

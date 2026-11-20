@@ -63,7 +63,7 @@ const WRAPPER_NAMES: [&str; 5] = [
 ];
 
 thread_local! {
-    static WRAPPER_KEYS: [DictKey; 5] = WRAPPER_NAMES.map(|name| DictKey(Object::from_static(name)));
+    static WRAPPER_KEYS: crate::gil::ReleaseUnderGil<[DictKey; 5]> = crate::gil::ReleaseUnderGil::new(WRAPPER_NAMES.map(|name| DictKey(Object::from_static(name))));
 }
 
 impl WrapperKey {

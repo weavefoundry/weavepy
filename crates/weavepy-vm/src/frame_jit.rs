@@ -1792,7 +1792,8 @@ fn in_loop(code: &CodeObject, pc: usize) -> bool {
     }
     type Entry = (usize, usize, Rc<[bool]>);
     thread_local! {
-        static MEMO: std::cell::RefCell<Vec<Entry>> = const { std::cell::RefCell::new(Vec::new()) };
+        static MEMO: crate::gil::ReleaseUnderGil<std::cell::RefCell<Vec<Entry>>> =
+            const { crate::gil::ReleaseUnderGil::new(std::cell::RefCell::new(Vec::new())) };
     }
     let key = (std::ptr::from_ref(code) as usize, code.instructions.len());
     MEMO.with(|m| {

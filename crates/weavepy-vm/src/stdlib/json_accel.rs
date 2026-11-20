@@ -226,8 +226,7 @@ thread_local! {
     /// without memoisation each call re-decodes the whole document to code
     /// points — O(n) per call, O(n^2) over a parse. Keyed on the string's
     /// heap identity (holding the object so the pointer can't be reused).
-    static SCANSTRING_CACHE: std::cell::RefCell<Option<(usize, Object, Rc<Vec<u32>>)>> =
-        const { std::cell::RefCell::new(None) };
+    static SCANSTRING_CACHE: crate::gil::ReleaseUnderGil<std::cell::RefCell<Option<(usize, Object, Rc<Vec<u32>>)>>> = const { crate::gil::ReleaseUnderGil::new(std::cell::RefCell::new(None)) };
 }
 
 /// Code points of `o`, reusing the thread-local cache when the same

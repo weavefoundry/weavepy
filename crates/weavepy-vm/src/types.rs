@@ -4827,8 +4827,7 @@ pub struct PyInstance {
 const INSTANCE_POOL_CAP: usize = 128;
 
 thread_local! {
-    static INSTANCE_POOL: std::cell::RefCell<Vec<Rc<PyInstance>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    static INSTANCE_POOL: crate::gil::ReleaseUnderGil<std::cell::RefCell<Vec<Rc<PyInstance>>>> = const { crate::gil::ReleaseUnderGil::new(std::cell::RefCell::new(Vec::new())) };
 }
 
 impl PyInstance {

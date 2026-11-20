@@ -293,8 +293,7 @@ fn struct_time_type() -> Rc<crate::types::TypeObject> {
     // (The registry memoises the type per thread too; this skips building
     // the layout and the name lookup for every `localtime`.)
     thread_local! {
-        static TYPE: std::cell::OnceCell<Rc<crate::types::TypeObject>> =
-            const { std::cell::OnceCell::new() };
+        static TYPE: crate::gil::ReleaseUnderGil<std::cell::OnceCell<Rc<crate::types::TypeObject>>> = const { crate::gil::ReleaseUnderGil::new(std::cell::OnceCell::new()) };
     }
     TYPE.with(|t| {
         t.get_or_init(|| {
@@ -321,8 +320,7 @@ fn make_struct_time(values: Vec<Object>) -> Object {
 /// `tm_gmtoff` and `tm_zone` (the order `with_tz_extras` stores them in).
 fn struct_time_keys() -> std::rc::Rc<[DictKey]> {
     thread_local! {
-        static KEYS: std::cell::OnceCell<std::rc::Rc<[DictKey]>> =
-            const { std::cell::OnceCell::new() };
+        static KEYS: crate::gil::ReleaseUnderGil<std::cell::OnceCell<std::rc::Rc<[DictKey]>>> = const { crate::gil::ReleaseUnderGil::new(std::cell::OnceCell::new()) };
     }
     KEYS.with(|k| {
         k.get_or_init(|| {
@@ -353,8 +351,7 @@ fn make_struct_time_tz(values: Vec<Object>, gmtoff: i64, zone: Object) -> Object
 #[cfg(unix)]
 fn zone_str(bytes: &[u8]) -> Object {
     thread_local! {
-        static LAST: std::cell::RefCell<Option<(Vec<u8>, Object)>> =
-            const { std::cell::RefCell::new(None) };
+        static LAST: crate::gil::ReleaseUnderGil<std::cell::RefCell<Option<(Vec<u8>, Object)>>> = const { crate::gil::ReleaseUnderGil::new(std::cell::RefCell::new(None)) };
     }
     LAST.with(|last| {
         if let Some((b, z)) = &*last.borrow() {
@@ -429,8 +426,7 @@ fn time_get_clock_info(args: &[Object]) -> Result<Object, RuntimeError> {
         other => return Err(crate::error::value_error(format!("unknown clock: {other}"))),
     };
     thread_local! {
-        static CLOCK_INFO_TYPE: RefCell<Option<Rc<crate::types::TypeObject>>> =
-            const { RefCell::new(None) };
+        static CLOCK_INFO_TYPE: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<crate::types::TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
     }
     let cls = CLOCK_INFO_TYPE.with(|slot| {
         if let Some(c) = slot.borrow().as_ref() {

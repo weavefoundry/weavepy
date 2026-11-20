@@ -968,8 +968,7 @@ fn register(
 thread_local! {
     /// Compiled formats by their text (CPython's `_struct` cache, flushed
     /// by `_clearcache` and bounded as CPython bounds its own).
-    static FORMATS: std::cell::RefCell<std::collections::HashMap<String, std::rc::Rc<CompiledFormat>>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+    static FORMATS: std::cell::RefCell<std::collections::HashMap<String, std::rc::Rc<CompiledFormat>>> = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// How many compiled formats [`FORMATS`] keeps before starting over.
@@ -1006,8 +1005,7 @@ thread_local! {
     /// Compiled formats by the identity of a `Struct`'s format string
     /// (each held here, so an address names one string), most recent
     /// first: a `Struct` hands its methods the same string every call.
-    static BY_STRING: std::cell::RefCell<Vec<(crate::shared_value::SharedStr, std::rc::Rc<CompiledFormat>)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    static BY_STRING: crate::gil::ReleaseUnderGil<std::cell::RefCell<Vec<(crate::shared_value::SharedStr, std::rc::Rc<CompiledFormat>)>>> = const { crate::gil::ReleaseUnderGil::new(std::cell::RefCell::new(Vec::new())) };
 }
 
 /// How many format strings [`BY_STRING`] remembers.

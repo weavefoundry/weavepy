@@ -104,10 +104,9 @@ struct MacRegEntry {
 }
 
 thread_local! {
-    static MAC_REGISTRY: RefCell<HashMap<i64, Rc<MacRegEntry>>> =
-        RefCell::new(HashMap::new());
+    static MAC_REGISTRY: crate::gil::ReleaseUnderGil<RefCell<HashMap<i64, Rc<MacRegEntry>>>> = crate::gil::ReleaseUnderGil::new(RefCell::new(HashMap::new()));
     static MAC_NEXT_ID: RefCell<i64> = const { RefCell::new(1) };
-    static MAC_CLASS: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
+    static MAC_CLASS: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
 }
 
 fn register_mac(state: AnyMac, key: Vec<u8>, digest_name: String) -> i64 {

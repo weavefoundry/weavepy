@@ -2653,8 +2653,7 @@ thread_local! {
     /// identity (and holding the source object so its pointer can't be
     /// reused) makes repeated matches on one immutable subject O(1) after the
     /// first decode.
-    static SUBJECT_CACHE: std::cell::RefCell<Option<(usize, Object, Rc<Vec<u32>>)>> =
-        const { std::cell::RefCell::new(None) };
+    static SUBJECT_CACHE: crate::gil::ReleaseUnderGil<std::cell::RefCell<Option<(usize, Object, Rc<Vec<u32>>)>>> = const { crate::gil::ReleaseUnderGil::new(std::cell::RefCell::new(None)) };
 }
 
 /// Stable heap-identity key for an immutable subject. Returns `None` for

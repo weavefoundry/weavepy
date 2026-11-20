@@ -1407,10 +1407,8 @@ impl BuiltinTypes {
 thread_local! {
     // The registry handles are local to this thread; only the referenced
     // type objects are shared. Borrowing a handle needs no object lock.
-    static BUILTIN_TYPES: std::cell::RefCell<Option<Rc<BuiltinTypes>>> =
-        const { std::cell::RefCell::new(None) };
-    static PROPERTY_CLASS: std::cell::RefCell<Option<Rc<TypeObject>>> =
-        const { std::cell::RefCell::new(None) };
+    static BUILTIN_TYPES: crate::gil::ReleaseUnderGil<std::cell::RefCell<Option<Rc<BuiltinTypes>>>> = const { crate::gil::ReleaseUnderGil::new(std::cell::RefCell::new(None)) };
+    static PROPERTY_CLASS: crate::gil::ReleaseUnderGil<std::cell::RefCell<Option<Rc<TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(std::cell::RefCell::new(None)) };
     /// The adopted registry behind [`builtin_types`]'s fast path.
     static BUILTIN_TYPES_PTR: std::cell::Cell<*const BuiltinTypes> =
         const { std::cell::Cell::new(std::ptr::null()) };

@@ -62,8 +62,7 @@ pub(crate) fn builtin_type_constructor(name: &str) -> Option<Rc<BuiltinFn>> {
         /// The constructors built so far, by type name: a type call that
         /// reaches here (`reversed(s)`, `int(x, 16)`) reuses one instead
         /// of allocating it and releasing it again.
-        static CTORS: std::cell::RefCell<Vec<(&'static str, Rc<BuiltinFn>)>> =
-            const { std::cell::RefCell::new(Vec::new()) };
+        static CTORS: crate::gil::ReleaseUnderGil<std::cell::RefCell<Vec<(&'static str, Rc<BuiltinFn>)>>> = const { crate::gil::ReleaseUnderGil::new(std::cell::RefCell::new(Vec::new())) };
     }
     if let Some(hit) = CTORS.with(|c| {
         c.borrow()
@@ -509,8 +508,7 @@ const RECENT_METHODS: usize = 64;
 std::thread_local! {
     /// The last few `(receiver kind, name)` answers of [`lookup_method`],
     /// direct-mapped by the name's address.
-    static RECENT_METHOD: std::cell::UnsafeCell<[(u8, Box<str>, Option<Object>); RECENT_METHODS]> =
-        std::cell::UnsafeCell::new(std::array::from_fn(|_| (u8::MAX, Box::from(""), None)));
+    static RECENT_METHOD: crate::gil::ReleaseUnderGil<std::cell::UnsafeCell<[(u8, Box<str>, Option<Object>); RECENT_METHODS]>> = crate::gil::ReleaseUnderGil::new(std::cell::UnsafeCell::new(std::array::from_fn(|_| (u8::MAX, Box::from(""), None))));
 }
 
 /// [`lookup_method`] through the per-kind memo.
@@ -2282,15 +2280,15 @@ pub fn builtin_classmethod(type_name: &str, attr: &str) -> Option<Object> {
     // `int_from_bytes_fast`), rather than a fresh one each read.
     if (type_name, attr) == ("int", "from_bytes") {
         thread_local! {
-            static FROM_BYTES: Object = {
+            static FROM_BYTES: crate::gil::ReleaseUnderGil<Object> = crate::gil::ReleaseUnderGil::new({
                 let mut f = method_kw("from_bytes", int_from_bytes_method);
                 f.binds_instance = false;
                 let b = Rc::new(f);
                 crate::leaf_builtins::register_fast(&b, int_from_bytes_fast);
                 Object::Builtin(b)
-            };
+            });
         }
-        if let Ok(f) = FROM_BYTES.try_with(Object::clone) {
+        if let Ok(f) = FROM_BYTES.try_with(|f| Object::clone(f)) {
             return Some(f);
         }
     }
@@ -2655,9 +2653,9 @@ pub fn builtin_type_dunder(base_name: &str, name: &str) -> Option<Object> {
     // `Enum.__format__`, which only works when `int.__format__` is one
     // stable object rather than a fresh wrapper per access.
     thread_local! {
-        static DUNDER_CACHE: std::cell::RefCell<
+        static DUNDER_CACHE: crate::gil::ReleaseUnderGil<std::cell::RefCell<
             std::collections::HashMap<String, Option<Object>>,
-        > = std::cell::RefCell::new(std::collections::HashMap::new());
+        >> = crate::gil::ReleaseUnderGil::new(std::cell::RefCell::new(std::collections::HashMap::new()));
     }
     let key = format!("{base_name}.{name}");
     if let Some(hit) = DUNDER_CACHE.with(|c| c.borrow().get(&key).cloned()) {
@@ -9139,11 +9137,11 @@ pub(crate) fn build_super_proxy(
     thread_local! {
         /// The proxy's keys, in the order its dict holds them, with their
         /// hashes.
-        static KEYS: [(i64, DictKey); 3] = ["__self__", "__thisclass__", "__self_class__"]
+        static KEYS: crate::gil::ReleaseUnderGil<[(i64, DictKey); 3]> = crate::gil::ReleaseUnderGil::new(["__self__", "__thisclass__", "__self_class__"]
             .map(|name| {
                 let key = DictKey(Object::from_static(name));
                 (crate::object::dict_key_hash(&key.0), key)
-            });
+            }));
     }
     // `__self_class__` is CPython's `su->obj_type` — the class whose MRO is
     // walked, passed as `owner` to descriptor `__get__`s. Also used to
@@ -10555,7 +10553,7 @@ pub fn vm_intrinsic(name: &str) -> Option<Object> {
         t
     }
     thread_local! {
-        static TABLE: Table = build();
+        static TABLE: crate::gil::ReleaseUnderGil<Table> = crate::gil::ReleaseUnderGil::new(build());
     }
     TABLE.with(|t| t.get(name).cloned())
 }

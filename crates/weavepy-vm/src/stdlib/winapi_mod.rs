@@ -1497,8 +1497,7 @@ fn overlapped_registry() -> &'static Mutex<HashMap<i64, OverlappedState>> {
 static NEXT_OVERLAPPED_ID: AtomicI64 = AtomicI64::new(1);
 
 thread_local! {
-    static OVERLAPPED_CLASS: RefCell<Option<Rc<crate::types::TypeObject>>> =
-        const { RefCell::new(None) };
+    static OVERLAPPED_CLASS: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<crate::types::TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
 }
 
 /// A live handle to a registry entry, used only during construction of
