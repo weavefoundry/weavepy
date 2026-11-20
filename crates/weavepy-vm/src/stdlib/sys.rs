@@ -1418,8 +1418,24 @@ fn sys_setrecursionlimit(args: &[Object]) -> Result<Object, RuntimeError> {
 thread_local! {
     // (Fx-hashed: interning runs for every name of every code object a
     // module loads, and SipHash showed in import profiles.)
-    static INTERN_POOL: RefCell<std::collections::HashSet<SharedStr, crate::fasthash::FxBuildHasher>> =
-        const { RefCell::new(std::collections::HashSet::with_hasher(crate::fasthash::FxBuildHasher)) };
+    // (Released under the GIL at its thread's exit: it holds strings.)
+    static INTERN_POOL: crate::gil::ReleaseUnderGil<
+        RefCell<std::collections::HashSet<SharedStr, crate::fasthash::FxBuildHasher>>,
+    > = const {
+        crate::gil::ReleaseUnderGil::new(RefCell::new(std::collections::HashSet::with_hasher(
+            crate::fasthash::FxBuildHasher,
+        )))
+    };
+}
+
+/// Empty the calling thread's intern pool: a worker's last act while it
+/// still holds the GIL (see [`crate::vm_singletons::clear_thread_python_tls`]).
+pub(crate) fn forget_thread_interns() {
+    let _ = INTERN_POOL.try_with(|pool| {
+        if let Ok(mut pool) = pool.try_borrow_mut() {
+            pool.clear();
+        }
+    });
 }
 
 /// Canonicalize `name` through the interpreter's intern pool, seeding it

@@ -16395,8 +16395,10 @@ impl Object {
             }
         }
         thread_local! {
-            static STATICS: std::cell::RefCell<Statics> =
-                const { std::cell::RefCell::new(Statics(None)) };
+            // (Released under the GIL at its thread's exit: a table the
+            // pool has no room for drops its strings.)
+            static STATICS: crate::gil::ReleaseUnderGil<std::cell::RefCell<Statics>> =
+                const { crate::gil::ReleaseUnderGil::new(std::cell::RefCell::new(Statics(None))) };
         }
         if s.len() <= 2 {
             return Object::Str(SharedStr::from(s));
@@ -16435,9 +16437,12 @@ impl Object {
             // `functools.update_wrapper` asserts identity on copied
             // `__type_params__` and similar empty-tuple attributes.
             thread_local! {
-                static EMPTY_TUPLE: crate::object::SharedTuple = TupleStorage::from_array([]);
+                // (Released under the GIL at its thread's exit, as any
+                // other reference to it is.)
+                static EMPTY_TUPLE: crate::gil::ReleaseUnderGil<crate::object::SharedTuple> =
+                    crate::gil::ReleaseUnderGil::new(TupleStorage::from_array([]));
             }
-            return Object::Tuple(EMPTY_TUPLE.with(Clone::clone));
+            return Object::Tuple(EMPTY_TUPLE.with(|t| crate::object::SharedTuple::clone(t)));
         }
         Object::Tuple(TupleStorage::from_vec(items))
     }

@@ -550,6 +550,16 @@ pub fn clear_thread_python_tls() {
     }
     crate::builtin_types::clear_thread_type_registry();
     crate::stdlib::local_native::forget_thread();
+    // The thread's entry in the traceback dumper's registry (its frame
+    // and exception stacks) and its interned names: objects, released
+    // here, where the caller still holds the GIL, not by the thread's
+    // destructors after it has given the GIL back.
+    let _ = FAULTHANDLER_REG.try_with(|slot| {
+        if let Ok(mut slot) = slot.try_borrow_mut() {
+            slot.take();
+        }
+    });
+    crate::stdlib::sys::forget_thread_interns();
 }
 
 /// Look up the worker thread id for the currently-running OS thread,

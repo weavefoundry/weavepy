@@ -2564,13 +2564,9 @@ impl Interpreter {
         // `_CallItem.__dict__` corruption under ProcessPoolExecutor).
         // Guarded so re-entrant `run_module` calls (REPL lines, the
         // in-process conformance runner) don't stack redundant guards.
-        let engaged_gil = if crate::gil::current_thread_holds_gil() {
-            false
-        } else {
-            crate::gil::push_gil_guard(crate::gil::global_gil().acquire());
-            crate::gil::note_gil_acquired();
-            true
-        };
+        // (Declared first, so released last: the frame, the code and the
+        // thread handles below are objects, released while it is held.)
+        let _gil = crate::gil::hold_gil();
         let _interp_guard =
             crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
         let _handles = self.activate_thread_handles();
@@ -2641,9 +2637,6 @@ impl Interpreter {
         // failure must not change the program's overall exit
         // status.
         self.run_pending_finalizers();
-        if engaged_gil {
-            drop(crate::gil::pop_gil_guard());
-        }
         result
     }
 
@@ -3162,6 +3155,11 @@ impl Interpreter {
     /// alive), so non-daemon threads have finished and atexit output is
     /// produced before the interpreter tears down.
     pub fn run_interpreter_shutdown(&mut self) {
+        // The shutdown runs Python (`threading._shutdown`, exit handlers)
+        // and releases objects while other threads may still run: under
+        // the GIL, as the program's body ran (a join inside gives it up
+        // while it waits, as any blocking call does).
+        let _gil = crate::gil::hold_gil();
         let _interp_guard =
             crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
         // (1) threading._shutdown() — only when threading was imported,
@@ -3329,6 +3327,9 @@ impl Interpreter {
     /// lets a finalizer that resurrects/creates new finalizable objects
     /// settle without risking an unbounded loop at exit.
     pub fn run_shutdown_finalizers(&mut self) {
+        // (Under the GIL, as `run_interpreter_shutdown`: daemon threads
+        // may still be running.)
+        let _gil = crate::gil::hold_gil();
         let _interp_guard =
             crate::vm_singletons::publish_interpreter_ptr(std::ptr::from_mut::<Self>(self));
         // From here on the interpreter is finalizing: fresh imports
@@ -34484,8 +34485,11 @@ impl Interpreter {
     ) -> Option<Object> {
         const SLOTS: usize = 128;
         thread_local! {
-            static MEMO: RefCell<Vec<(u64, Option<SharedStr>, TypeGetattrKept)>> =
-                const { RefCell::new(Vec::new()) };
+            // (Released under the GIL at its thread's exit: it holds
+            // names and values.)
+            static MEMO: crate::gil::ReleaseUnderGil<
+                RefCell<Vec<(u64, Option<SharedStr>, TypeGetattrKept)>>,
+            > = const { crate::gil::ReleaseUnderGil::new(RefCell::new(Vec::new())) };
         }
         let ver = cls.attr_version.get();
         // (A metaclass's attributes move with its own version, and a

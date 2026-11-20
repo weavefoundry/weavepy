@@ -5452,8 +5452,10 @@ thread_local! {
     /// repeated `f.__doc__` reads return the *same* `str` object (CPython
     /// stores the docstring once on the function; `update_wrapper` tests
     /// `assertIs(wrapper.__doc__, wrapped.__doc__)`).
-    static DOCSTRING_CACHE: std::cell::RefCell<std::collections::HashMap<usize, Object>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+    /// (Released under the GIL at its thread's exit: it holds objects.)
+    static DOCSTRING_CACHE: crate::gil::ReleaseUnderGil<
+        std::cell::RefCell<std::collections::HashMap<usize, Object>>,
+    > = crate::gil::ReleaseUnderGil::new(std::cell::RefCell::new(std::collections::HashMap::new()));
 }
 
 /// Return a function code object's docstring: CPython 3.14's
