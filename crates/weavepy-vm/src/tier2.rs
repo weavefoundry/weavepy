@@ -566,6 +566,11 @@ struct CacheEntry {
     native_entries: u32,
     /// Compile attempts that failed (saturating): see [`gave_up_often`].
     failed_compiles: u8,
+    /// The analysis work the attempts on this code have done, and the
+    /// least budget its next attempt needs: twice that of one that ran
+    /// out, for code that waits (see [`analysis_due_at`]).
+    analysis_spent: u64,
+    analysis_floor: u64,
     /// OSR entries this code made (saturating), and requests at its region
     /// roots turned down as too short (see [`note_short_region`]).
     osr_runs: u32,
@@ -619,6 +624,8 @@ impl CacheEntry {
         CacheEntry {
             counter: 0,
             tier: Tier::Cold,
+            analysis_spent: 0,
+            analysis_floor: 0,
             defer_osr: false,
             osr_failures: 0,
             backedges: 0,
@@ -965,14 +972,15 @@ pub(crate) fn note_frameless_calls(code: &CodeObject, n: u32) -> Option<bool> {
             return None;
         }
         let threshold = st.threshold;
-        let sized = if st.range_budget {
-            size_budget(code)
-        } else {
-            0
-        };
+        let range_budget = st.range_budget;
         match st.cache.get_mut(&std::ptr::from_ref(code)) {
             None => Some(true),
             Some(entry) if matches!(entry.tier, Tier::Cold) => {
+                let sized = if range_budget {
+                    size_budget(code).max(analysis_due_at(entry, code))
+                } else {
+                    0
+                };
                 entry.counter = entry.counter.saturating_add(n);
                 let next = entry.counter.saturating_add(1);
                 let due = next >= threshold.max(sized) && compile_allowed(next, threshold);
@@ -1126,6 +1134,87 @@ fn size_budget(code: &CodeObject) -> u32 {
     u32::try_from(over)
         .unwrap_or(u32::MAX)
         .saturating_mul(WORK_PER_INSTRUCTION)
+}
+
+/// A tuning knob of the analysis budget, read once from the environment.
+fn analysis_knob(cell: &'static std::sync::OnceLock<u64>, var: &str, default: u64) -> u64 {
+    *cell.get_or_init(|| {
+        std::env::var(var)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default)
+    })
+}
+
+/// Analysis work (see [`weavepy_jit::with_work_budget`]) a code object of
+/// `len` instructions may have done on it before its own work has paid
+/// for any: a base, which covers the callees a short driver types, and a
+/// number of passes over the code itself.
+fn analysis_free(len: usize) -> u64 {
+    static BASE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static PASSES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    analysis_knob(&BASE, "WEAVEPY_T2_FREE", 1024)
+        .saturating_add(analysis_knob(&PASSES, "WEAVEPY_T2_PASSES", 8).saturating_mul(len as u64))
+}
+
+/// The work (calls and loop iterations) of a code object that pays for
+/// one unit of analysis work on it.
+fn work_per_analysis_unit() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    analysis_knob(&V, "WEAVEPY_T2_WPP", 8).max(1)
+}
+
+/// The analysis work an attempt on `entry`'s code may do: the free
+/// allowance, and what the code's own work has paid for beyond the work
+/// already done on it.
+fn analysis_allowance(entry: &CacheEntry, code: &CodeObject) -> u64 {
+    analysis_free(code.instructions.len()).saturating_add(
+        (u64::from(entry.counter) / work_per_analysis_unit()).saturating_sub(entry.analysis_spent),
+    )
+}
+
+/// The counter `entry`'s code needs before tier 2 analyzes it again, for
+/// code waiting on an attempt that ran out of budget (zero otherwise).
+/// An analysis costs time in proportion to the code's length and to the
+/// passes it takes (one for each loop it carves out, each retry with
+/// other assumptions, each callee it types), all of it on the thread
+/// that runs the program, and most code is rejected: `argparse` building
+/// and running a parser 180 times spent 44 of its 200 ms analyzing 104
+/// functions to compile 12 trivial ones, 11 of them on two 160-pass
+/// attempts at one function. A kernel compiles in a few passes (the
+/// costliest among the benchmark fixtures takes seven, and a
+/// 29-instruction driver 950 units with its callees), so every attempt
+/// gets that much (see [`analysis_free`]) and what the code's own work
+/// has paid for. An attempt that runs out stands as a rejection, unless
+/// the code's calls run long loops (see [`BUDGET_WAIT_ITERATIONS`]): that
+/// waits, interpreted, until its work pays for twice the budget.
+fn analysis_due_at(entry: &CacheEntry, code: &CodeObject) -> u32 {
+    if entry.analysis_floor == 0 {
+        return 0;
+    }
+    let need = entry
+        .analysis_spent
+        .saturating_add(entry.analysis_floor)
+        .saturating_sub(analysis_free(code.instructions.len()));
+    u32::try_from(need.saturating_mul(work_per_analysis_unit())).unwrap_or(u32::MAX)
+}
+
+/// Loop iterations a call of a code object runs, on average, from which
+/// the code waits, interpreted, for its work to pay for another analysis
+/// after one ran out of budget (see [`analysis_due_at`]): a loop long
+/// enough to matter soon does. For any other the verdict stands, as it
+/// would for a shape tier 2 doesn't compile: waiting would keep the code
+/// from the frame JIT meanwhile.
+const BUDGET_WAIT_ITERATIONS: u32 = 16;
+
+/// Whether `entry`'s calls of `code` run loops long enough to wait for an
+/// analysis budget (see [`BUDGET_WAIT_ITERATIONS`]).
+fn waits_for_budget(entry: &CacheEntry, code: &CodeObject) -> bool {
+    let calls = entry
+        .calls
+        .wrapping_add(code.jit_hint.lean_entries())
+        .max(1);
+    entry.backedges / calls >= BUDGET_WAIT_ITERATIONS
 }
 
 /// [`compile_allowed`] for the frame compiler (see `frame_jit`), which
@@ -1287,6 +1376,8 @@ impl JitState {
         // a native entry to pay for the general call, and how many.
         let long_calls;
         let iters_per_call;
+        // The analysis work this attempt may do (see [`analysis_due_at`]).
+        let budget;
         let mut carved = weavepy_jit::Carved::default();
         // A recompile's predecessor, put back if the recompile fails: the
         // frame it compiled still serves the entries it has.
@@ -1353,7 +1444,8 @@ impl JitState {
                     if entry.counter < self.threshold
                         || !compile_allowed(entry.counter, self.threshold)
                         || entry.counter < import_size_budget(code, admit_at(self.threshold))
-                        || (self.range_budget && entry.counter < size_budget(code))
+                        || (self.range_budget
+                            && entry.counter < size_budget(code).max(analysis_due_at(entry, code)))
                     {
                         return None;
                     }
@@ -1382,6 +1474,13 @@ impl JitState {
                 .max(1);
             iters_per_call = entry.backedges / calls;
             long_calls = iters_per_call >= LOOP_CALL_ITERATIONS;
+            // (A recompile comes with a frame that works: it gets at least
+            // what a first attempt needs.)
+            budget = if self.range_budget {
+                analysis_allowance(entry, code).max(entry.analysis_floor)
+            } else {
+                u64::MAX
+            };
         }
         // Threshold reached: compile (engine + cache borrowed disjointly).
         // The engine is built once an analysis admits some code (see
@@ -1526,11 +1625,18 @@ impl JitState {
             // A `RefCell` because the direct-method lookup below reads the
             // table while `probe_method` (a sibling `&mut` closure) grows it.
             let methods: std::cell::RefCell<MethodTable> = std::cell::RefCell::new(Vec::new());
-            let mut method_tokens: HashMap<(u32, Vec<String>, String), u32> = HashMap::new();
+            // A triple that didn't resolve is remembered too: the probe
+            // reads the requesting frame and the receiver's class, which
+            // an analysis doesn't change, and resolving one types the
+            // method's body, a whole analysis of its own, which the
+            // analyzer would repeat for every pass over every such site.
+            let mut method_tokens: HashMap<(u32, Vec<String>, String), Option<u32>> =
+                HashMap::new();
             let mut probe_method =
                 |slot: u32, path: &[String], name: &str| -> Option<MethodResolution> {
-                    if let Some(&token) = method_tokens.get(&(slot, path.to_vec(), name.to_owned()))
-                    {
+                    let key = (slot, path.to_vec(), name.to_owned());
+                    if let Some(&known) = method_tokens.get(&key) {
+                        let token = known?;
                         let methods = methods.borrow();
                         let e = &methods[token as usize];
                         return Some(MethodResolution {
@@ -1543,10 +1649,17 @@ impl JitState {
                                 if crate::stdlib::collections_native::op_returns_element(op)),
                         });
                     }
-                    let e = method(slot, path, name)?;
+                    let Some(e) = method(slot, path, name) else {
+                        // (Not one cut short by the work budget, which
+                        // ends the attempt anyway.)
+                        if !weavepy_jit::work_short() {
+                            method_tokens.insert(key, None);
+                        }
+                        return None;
+                    };
                     let mut methods = methods.borrow_mut();
                     let token = methods.len() as u32;
-                    method_tokens.insert((slot, path.to_vec(), name.to_owned()), token);
+                    method_tokens.insert(key, Some(token));
                     let res = MethodResolution {
                         token,
                         arg_count: e.arg_count,
@@ -1756,16 +1869,48 @@ impl JitState {
             let obj_names = obj_names.into_inner().into_iter().map(|(n, _)| n).collect();
             (r, callees.into_inner(), methods.into_inner(), obj_names)
         };
-        let (res, callees, methods, obj_names) = {
-            let first = run(false);
-            if matches!(
-                first.0,
-                Err(weavepy_jit::JitVerdict::TypeUnknown | weavepy_jit::JitVerdict::ProbeMiss(_))
-            ) {
-                run(true)
-            } else {
-                first
+        let ((res, callees, methods, obj_names), spent, short) =
+            weavepy_jit::with_work_budget(budget, || {
+                let first = run(false);
+                if matches!(
+                    first.0,
+                    Err(weavepy_jit::JitVerdict::TypeUnknown
+                        | weavepy_jit::JitVerdict::ProbeMiss(_))
+                ) {
+                    run(true)
+                } else {
+                    first
+                }
+            });
+        if crate::hot_gates::env_flags::jit_trace() {
+            eprintln!(
+                "jit analysis {:?}: {spent} of {budget} work units over {} instructions{}",
+                code.name,
+                code.instructions.len(),
+                if short { ", ran out" } else { "" }
+            );
+        }
+        if let Some(e) = self.cache.get_mut(&key) {
+            e.analysis_spent = e.analysis_spent.saturating_add(spent);
+            // Out of budget: code whose calls run long loops waits until
+            // its work pays for twice as much (the carving found so far
+            // is kept); for any other the verdict stands (see
+            // `analysis_due_at`).
+            if short && res.is_err() && waits_for_budget(e, code) {
+                e.analysis_floor = budget.saturating_mul(2);
+                e.carved = carved;
+                if let Some(prev) = predecessor {
+                    e.tier = prev;
+                }
+                return None;
             }
+        }
+        let res = if short && res.is_err() {
+            Err(weavepy_jit::JitVerdict::UnsupportedOpcode(
+                weavepy_jit::OVER_BUDGET,
+            ))
+        } else {
+            res
         };
         if res.is_err() {
             if let Some(e) = self.cache.get_mut(&key) {
@@ -2226,7 +2371,8 @@ impl JitState {
                 }
                 entry.counter = entry.counter.saturating_add(stride);
                 entry.counter >= self.threshold
-                    && (!self.range_budget || entry.counter >= size_budget(code))
+                    && (!self.range_budget
+                        || entry.counter >= size_budget(code).max(analysis_due_at(entry, code)))
             }
             Tier::Compiled(..) => {
                 if entry.osr_failures < OSR_FAILURE_BUDGET {
@@ -2675,10 +2821,13 @@ fn callee_ret_info(
             (None, weavepy_jit::returns_none_syntactically(fcode))
         }
     };
-    RET_LANE_CACHE.with(|c| {
-        c.borrow_mut()
-            .insert(key, (lane, ret_none, Rc::downgrade(fcode)))
-    });
+    // (An analysis that ran out of work budget says nothing of the code.)
+    if !weavepy_jit::work_short() {
+        RET_LANE_CACHE.with(|c| {
+            c.borrow_mut()
+                .insert(key, (lane, ret_none, Rc::downgrade(fcode)))
+        });
+    }
     (lane, ret_none)
 }
 
@@ -4474,7 +4623,7 @@ pub(crate) fn warm_compile(interp: &mut super::Interpreter, frame: &mut super::F
             // afterwards, even when pure-leaf calls skip frames).
             let interval = lean_warm_at();
             let sized = if st.range_budget {
-                size_budget(&frame.code)
+                size_budget(&frame.code).max(analysis_due_at(entry, &frame.code))
             } else {
                 0
             };

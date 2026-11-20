@@ -1099,6 +1099,11 @@ fn analyze_admitted(
     slot_member: &mut dyn FnMut(&AttrSiteMeta) -> bool,
 ) -> Result<TFunc, JitVerdict> {
     let mut tfunc = crate::analyze::analyze_frame(code, resolve, probes)?;
+    // A callee's analysis ran out of work budget: what this one made of
+    // the callee (an untyped call) reflects the budget, not the code.
+    if crate::analyze::work_short() {
+        return Err(JitVerdict::ProbeMiss(crate::analyze::OVER_BUDGET));
+    }
     if calls_dynamically(&tfunc) {
         return Err(JitVerdict::UnsupportedOpcode("dynamic call (loop-free)"));
     }

@@ -698,6 +698,53 @@ thread_local! {
     /// The instruction the last failed inference/emission step stopped
     /// at (see `carve_step`).
     static FAIL_PC: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// The analysis work this thread may still do (see [`with_work_budget`]).
+    static WORK_LEFT: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+    /// Whether an analysis stopped for want of work budget since the
+    /// budget was set (see [`with_work_budget`]).
+    static WORK_SHORT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The [`JitVerdict::ProbeMiss`] reason of an analysis that ran out of
+/// its work budget (see [`with_work_budget`]).
+pub const OVER_BUDGET: &str = "analysis budget";
+
+/// Run `f` with at most `budget` units of analysis work: one unit is one
+/// instruction of a code object passed over once, and an analysis passes
+/// over its code once for each attempt (each carving step, each retry
+/// with other assumptions) and over each callee it types the same way.
+/// An analysis that would exceed the budget fails as a
+/// [`JitVerdict::ProbeMiss`] of [`OVER_BUDGET`], as does every analysis
+/// after it. Returns `f`'s result, the work done, and whether any
+/// analysis stopped short: a result reached after one did (a callee left
+/// untyped, say) reflects the budget, not the code, so the embedder
+/// treats the whole attempt as out of budget.
+pub fn with_work_budget<R>(budget: u64, f: impl FnOnce() -> R) -> (R, u64, bool) {
+    let prev = (WORK_LEFT.replace(budget), WORK_SHORT.replace(false));
+    let r = f();
+    let left = WORK_LEFT.replace(prev.0);
+    let short = WORK_SHORT.replace(prev.1);
+    (r, budget - left, short)
+}
+
+/// Whether an analysis has stopped for want of work budget since the
+/// budget was set (see [`with_work_budget`]).
+pub fn work_short() -> bool {
+    WORK_SHORT.get()
+}
+
+/// Charge one pass over `code` to the work budget; `false` when the
+/// budget doesn't cover it (see [`with_work_budget`]).
+fn charge_pass(code: &CodeObject) -> bool {
+    let cost = code.instructions.len() as u64;
+    let left = WORK_LEFT.get();
+    if left < cost {
+        WORK_LEFT.set(0);
+        WORK_SHORT.set(true);
+        return false;
+    }
+    WORK_LEFT.set(left - cost);
+    true
 }
 
 /// One loop of a code object's (structured) loop nest.
@@ -1040,6 +1087,9 @@ fn analyze_impl(
     let mut num_slots = numeric_slots(code);
     let mut backoffs = 0usize;
     loop {
+        if !charge_pass(code) {
+            return Err(JitVerdict::ProbeMiss(OVER_BUDGET));
+        }
         FAIL_PC.with(|c| c.set(None));
         let mut in_plan = false;
         match analyze_once(
@@ -2049,6 +2099,36 @@ fn merge_entry(
     Ok(())
 }
 
+/// The jump-landing pcs of a code object ([`plan_rewrite`]'s), as a
+/// bitmap: the planner asks about a few pcs around each candidate site,
+/// once per analysis of every code tier 2 looks at.
+struct JumpTargets(Vec<bool>);
+
+impl JumpTargets {
+    fn new(n: usize) -> Self {
+        Self(vec![false; n + 1])
+    }
+
+    /// (A target past the code's end lands on nothing the planner asks
+    /// about.)
+    fn insert(&mut self, pc: usize) {
+        if let Some(slot) = self.0.get_mut(pc) {
+            *slot = true;
+        }
+    }
+
+    fn contains(&self, pc: usize) -> bool {
+        self.0.get(pc).copied().unwrap_or(false)
+    }
+
+    /// Whether some target lies in `lo..=hi`, `except` aside (none when
+    /// `lo` wrapped below zero: the site is too near the code's start).
+    fn any_in(&self, lo: usize, hi: usize, except: usize) -> bool {
+        let hi = hi.min(self.0.len().saturating_sub(1));
+        (lo..=hi).any(|pc| pc != except && self.0[pc])
+    }
+}
+
 /// Recognize every `FOR_ITER` as the canonical counted `range` loop and
 /// build the rewrite [`Plan`]. Any `FOR_ITER` that doesn't match the
 /// shape disqualifies the whole frame (there is no generic iterator
@@ -2070,7 +2150,7 @@ fn plan_rewrite(
 
     // All jump-landing pcs, to reject jumps into the middle of a
     // recognized `range(...)` prefix.
-    let mut targets: HashSet<usize> = HashSet::default();
+    let mut targets = JumpTargets::new(n);
     for (i, item) in ins.iter().enumerate() {
         match item.op {
             OpCode::PopJumpIfFalse
@@ -2163,7 +2243,7 @@ fn plan_rewrite(
             && matches!(ins[i + 2].op, OpCode::StoreFast)
             && matches!(ins[i + 3].op, OpCode::StoreFast)
         {
-            if targets.iter().any(|&t| i - 1 <= t && t <= i + 3 && t != i) {
+            if targets.any_in(i.wrapping_sub(1), i + 3, i) {
                 return Err(bail());
             }
             let seq_slot = n_real + plan.n_synth;
@@ -2275,7 +2355,7 @@ fn plan_rewrite(
         if i >= 1 && matches!(ins[i - 1].op, OpCode::GetIter) {
             // No jump may land on the `GET_ITER` or the fused store —
             // the header itself is the only allowed landing point.
-            if targets.iter().any(|&t| i - 1 <= t && t <= i + 1 && t != i) {
+            if targets.any_in(i.wrapping_sub(1), i + 1, i) {
                 return Err(bail());
             }
             let seq_slot = n_real + plan.n_synth;
@@ -2341,9 +2421,8 @@ fn plan_rewrite(
             // prologue, and nothing may land in the erased epilogue
             // (the `FOR_ITER`'s own exit target lands on `END_FOR`,
             // which starts a block of pure no-ops).
-            if targets
-                .iter()
-                .any(|&t| (i - 5 <= t && t <= i + 1 && t != i) || (exit < t && t <= exit + 3))
+            if targets.any_in(i.wrapping_sub(5), i + 1, i)
+                || targets.any_in(exit + 1, exit + 3, usize::MAX)
             {
                 return Err(bail());
             }
@@ -2512,8 +2591,8 @@ fn plan_rewrite(
             || !matches!(ins[i + 1].op, OpCode::LoadConst)
             || !matches!(ins[i + 2].op, OpCode::ListExtend)
             || ins[i + 2].arg != 1
-            || targets.contains(&(i + 1))
-            || targets.contains(&(i + 2))
+            || targets.contains(i + 1)
+            || targets.contains(i + 2)
         {
             continue;
         }
@@ -2559,7 +2638,7 @@ fn plan_rewrite(
                         && !plan.const_list.contains_key(&(i - 1))
                         && !plan.nop.contains(&(i - 1))
                         && !plan.nop.contains(&i)
-                        && !targets.contains(&i);
+                        && !targets.contains(i);
                     if lit {
                         sites.entry(ins[i].arg).or_default().push(i - 1);
                     } else {
@@ -2642,7 +2721,7 @@ fn plan_rewrite(
         }
         // Nothing may land inside the erased window (the list load
         // itself starts the expression and may be a landing point).
-        if targets.iter().any(|&t| list_load < t && t <= c)
+        if targets.any_in(list_load + 1, c, usize::MAX)
             || (list_load..c).any(|p| plan.nop.contains(&p))
         {
             continue;
@@ -2743,8 +2822,8 @@ fn plan_rewrite(
     for i in 1..n {
         if !matches!(ins[i].op, OpCode::CallKw)
             || !matches!(ins[i - 1].op, OpCode::LoadConst)
-            || targets.contains(&i)
-            || targets.contains(&(i - 1))
+            || targets.contains(i)
+            || targets.contains(i - 1)
         {
             continue;
         }
@@ -2772,7 +2851,7 @@ fn plan_rewrite(
 fn range_prefix(
     code: &CodeObject,
     plan: &Plan,
-    targets: &HashSet<usize>,
+    targets: &JumpTargets,
     i: usize,
 ) -> Option<(usize, usize, Option<usize>, u8)> {
     let ins = &code.instructions;
@@ -2843,7 +2922,7 @@ fn range_prefix(
     // No jump may land inside the prefix or on the fused store — the
     // header itself (a JUMP_BACKWARD target) is the only allowed
     // landing point.
-    if targets.iter().any(|&t| callee < t && t <= i + 1 && t != i) {
+    if targets.any_in(callee + 1, i + 1, i) {
         return None;
     }
     Some((callee, push_null, step_nop, pops))
