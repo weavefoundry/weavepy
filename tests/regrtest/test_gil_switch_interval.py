@@ -12,15 +12,18 @@ import time
 import unittest
 
 
-def waits_behind_a_busy_thread(interval, samples):
-    """The shortest of several `time.sleep` calls' returns, a busy thread running.
+def waits_behind_a_busy_thread(interval, wanted=3, tries=60):
+    """How long `time.sleep` calls took to come back while a busy thread ran.
 
-    (The shortest: a loaded machine can only make a thread wait longer for
-    its turn, never less than the interval the busy thread is owed.)
+    Only the calls during which the busy thread got to run count: on a
+    loaded machine it may not be scheduled before the sleeper is back, and
+    the sleeper then finds the GIL free. A call it did run through waits at
+    least the interval the busy thread is owed; load can only add to that.
     """
     before = sys.getswitchinterval()
     sys.setswitchinterval(interval)
     stop = False
+    spins = [0]
 
     def spin():
         xs = []
@@ -28,20 +31,26 @@ def waits_behind_a_busy_thread(interval, samples):
             xs.append(1)
             if len(xs) > 100:
                 del xs[:50]
+            spins[0] += 1
 
     t = threading.Thread(target=spin)
     t.start()
     try:
         took = []
-        for _ in range(samples):
+        for _ in range(tries):
+            seen = spins[0]
             t0 = time.perf_counter()
             time.sleep(0.0002)
-            took.append(time.perf_counter() - t0)
+            wait = time.perf_counter() - t0
+            if spins[0] != seen:
+                took.append(wait)
+                if len(took) >= wanted:
+                    break
     finally:
         stop = True
         t.join()
         sys.setswitchinterval(before)
-    return min(took)
+    return took
 
 
 class SwitchIntervalTests(unittest.TestCase):
@@ -54,20 +63,22 @@ class SwitchIntervalTests(unittest.TestCase):
         finally:
             sys.setswitchinterval(before)
 
-    def test_shorter_interval_shorter_wait(self):
-        long = waits_behind_a_busy_thread(0.1, 5)
-        short = waits_behind_a_busy_thread(0.002, 40)
-        # The waits track the interval (about 100 ms and about 2 ms here).
-        self.assertLess(short, long / 3, (short, long))
-        self.assertGreater(long, 0.05, long)
+    def check(self, interval):
+        waits = waits_behind_a_busy_thread(interval)
+        if not waits:
+            self.skipTest("the busy thread never got to run")
+        # The busy thread keeps the GIL for the interval the program set...
+        self.assertGreater(min(waits), interval * 0.5, waits)
+        # ...counted once, from when the other thread started to wait:
+        # one interval, not two (the shortest wait is the one the load
+        # stretched least).
+        self.assertLess(min(waits), interval * 1.6, waits)
 
-    def test_one_interval_not_two(self):
-        # The busy thread's turn and the waiter's wait run side by side:
-        # a wait is one interval, not two.
-        interval = 0.1
-        wait = waits_behind_a_busy_thread(interval, 6)
-        self.assertGreater(wait, interval * 0.5, wait)
-        self.assertLess(wait, interval * 1.6, wait)
+    def test_long_interval(self):
+        self.check(0.1)
+
+    def test_short_interval(self):
+        self.check(0.01)
 
     def test_a_busy_thread_alone_is_not_slowed(self):
         # With nobody waiting, the interval changes nothing a thread does.
