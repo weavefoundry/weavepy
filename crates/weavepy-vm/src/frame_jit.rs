@@ -9971,6 +9971,18 @@ unsafe extern "C" fn attr_local_slow(st: *mut State, site: *const AttrSite) -> u
                         return 0;
                     }
                 }
+                // A polymorphic site's third class and on: the instance's
+                // own field at the position the site's table holds for the
+                // class version, at which the class resolved the name to
+                // the instance (no data descriptor, the default
+                // `__getattribute__`), so nothing below would answer
+                // otherwise. Reached only after the whole miss chain, such
+                // a read cost about a thousand instructions (a site reading
+                // `action.dest` over three action classes).
+                if let Some(v) = field_hit_slow(site, inst) {
+                    (*st).stack.add(slot).write(crate::clone_hot(v));
+                    return 0;
+                }
                 // `inst.__dict__`, as the site answered it before.
                 if let Some(v) = inst_dict_known(site, inst) {
                     (*st).stack.add(slot).write(v);
@@ -10823,6 +10835,16 @@ unsafe extern "C" fn attr_stack_slow(st: *mut State, site: *const AttrSite) -> u
             }
             // (A class attribute the site has read before.)
             Object::Instance(inst) => {
+                // A polymorphic site's third class and on, as
+                // `attr_local_slow` reads it first (a receiver whose
+                // release could run code takes the lanes below).
+                if droppable(&*at) {
+                    if let Some(v) = field_hit_slow(site, inst) {
+                        let v = crate::clone_hot(v);
+                        crate::drop_hot(std::mem::replace(&mut *at, v));
+                        return 0;
+                    }
+                }
                 // A plain class value the site memoized for the class (no
                 // descriptor or native method shares its version), or a
                 // named tuple's field, as the local read's path finds them
