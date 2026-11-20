@@ -1492,6 +1492,23 @@ branch and pull request.
     with the GIL released, and a thread's start and its thread-local
     state's teardown run outside it), so it is the next piece of work
     of its size rather than a change to make in passing.
+  - First steps toward plain counts with several threads. An audit build
+    (a check, in the shared-count paths, that the updating thread holds
+    the GIL) run over the thread tests found no update outside the GIL
+    while a program runs, and two places at its edges. The main thread
+    gave the GIL back when the main module returned and ran
+    `threading._shutdown`, the exit handlers and the finalizers without
+    it, beside daemon threads that still held it: it now holds the GIL
+    from the main module through shutdown, as CPython's finalization
+    does (a join inside gives it up while it waits). And a thread's
+    thread-local caches were dropped by its destructors after it had
+    given the GIL back: its entry in the traceback dumper's registry
+    (its frame and exception stacks) and its interned names are now
+    released by the worker while it still holds the GIL, and the
+    docstring cache, the static-string table, the empty tuple and the
+    `getattr` memo take the GIL to drop. About sixty more thread-local
+    caches hold objects or strings; they need the same before counts
+    can stay plain, with a test job running the audit to keep it so.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
