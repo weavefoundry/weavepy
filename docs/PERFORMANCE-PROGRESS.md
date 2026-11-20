@@ -34,7 +34,10 @@ day's work moves is outside the battery: a program with a second thread
 (under 1% slower than without one, from 13% to 55%), a thread back from a
 blocking call (the GIL after one switch interval, not two), a contended lock
 (handed to its waiter after 5 ms), and attribute-heavy loops in tier 2 (the
-`attr_access` fixture at 0.66 of its instructions).
+`attr_access` fixture at 0.66 of its instructions), and dicts that lose keys
+from the front or the middle (an LRU cache, a queue of pending work: one to
+two orders of magnitude slower than CPython before, level to twice its time
+now).
 
 Measured on November 15, 2026, at `83efee9b` (PR #112), a PGO build
 against CPython 3.14.8 on a host that wasn't idle (load averages between
@@ -1681,7 +1684,8 @@ branch and pull request.
     overflow, and the full constructor's layers each try it again
     before the big value is built; the arms now build it themselves
     (2,800, 602 ns to 218; CPython 160 ns), as they do for long decimal
-    text (456 ns to 207; CPython 143).
+    text (456 ns to 207; CPython 143). Hex text is then tried before the
+    general parse and read through a digit table (218 ns to 124).
     Arithmetic of a big value with a machine int promoted both sides,
     copying the big one: sums, differences, products, right shifts and
     masks now read it in place (`big + 1` 977 instructions to 664).
@@ -1693,6 +1697,54 @@ branch and pull request.
     lists, dicts, sets and strs only: the site now keeps the method for
     the receiver's kind, as it did for streams
     (`big.bit_length()` 804 instructions to 589).
+  - Removing a key from a dict cost time in proportion to the keys behind
+    it. The table keeps positions dense (the i-th key is entry i, which
+    the iterators and the position caches rely on), so a removal moved
+    every later entry down and renumbered the slot table: a cache that
+    evicts its oldest key, a table of pending requests, an LRU touch
+    (`v = d.pop(k); d[k] = v`), `OrderedDict.popitem(last=False)` and
+    `move_to_end` were all quadratic. At 20,000 live keys, in ns an
+    operation (CPython's in brackets): `OrderedDict` LRU 77,900 (195),
+    `move_to_end` 87,100 (87), pop and re-insert 41,000 (155), add and pop
+    the oldest 40,000 (107), a `WeakValueDictionary` window 45,600 (829).
+    The removals a program makes in bulk (`del d[k]`, `d.pop(k)`, an
+    `OrderedDict`'s, a dead weak value's) now leave a tombstone in the
+    entry list, and positions stay dense through a rank index over the
+    tombstones: a bitmap, a Fenwick tree over it that is built only once
+    a tombstone sits past the front run (a queue's tombstones are all at
+    the front, where a position is its entry less the run), and the last
+    translation, which a walk by position continues from. The table
+    closes the gaps in one pass when its entry list fills or tombstones
+    outnumber keys, so each removal pays a constant share. Removals
+    elsewhere (a namespace's `del`, a class's attribute) still shift, so
+    a table that never takes a bulk removal has no tombstone and pays one
+    test per positional access; the bench fixtures read 1.000 of their
+    instructions. The same operations now: 378, 158, 143, 129 and 4,560
+    ns, flat from 1,000 keys to 20,000 (`dict` FIFO by `next(iter(d))`
+    282 ns, where CPython's own scan past its tombstones takes 6,400).
+    A table grew from 48 to 56 bytes for the index's pointer, which costs
+    16 bytes a dict in the allocator's size classes (a million two-key
+    dicts 262 MB to 277 MB): to be won back by deriving the slot count
+    from the shift.
+  - What is left on those loops is the call, not the dict. Tier 2 ran a
+    method call on a builtin value as two generic helpers: a load that
+    allocated a bound method and pinned it for the rest of the
+    activation, and a call that looked the builtin's kind up again
+    (`d[i] = i; d.pop(i - 1000)` 2,088 instructions an iteration against
+    the frame JIT's 1,247 and CPython's 1,248, and 169 ns against 108).
+    A builtin value's method table never changes and its lookup runs no
+    code, so for a method the core loop's leaf lane runs in place the
+    load now leaves the receiver where the bound method would go and the
+    call runs the builtin on it; an exit between the two rebuilds the
+    bound method the interpreter expects. 1,384 instructions (119 to 129
+    ns). The frame JIT still runs such a loop in 1,118: the two helper
+    calls cost about 270 more than its method site, and a loop of
+    container calls has no typed work for tier 2 to win that back with,
+    so the next step is the admission rule, not the helpers.
+    `OrderedDict` calls (3,515 instructions an iteration of add and
+    `popitem(last=False)` against CPython's 2,201) and weak-value
+    dictionaries (five times CPython's time, in the weak references, not
+    the dict) are the other two.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

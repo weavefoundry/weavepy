@@ -4985,6 +4985,9 @@ struct CallCtx {
     /// activation shell the inspection found (a framed activation's are
     /// its frame's own).
     inspected_locals: std::cell::RefCell<Option<Rc<GilRefCell<Vec<Object>>>>>,
+    /// The state of the activation's method calls on builtin values (see
+    /// [`BoundLane`]).
+    bound: BoundLane,
     /// A frameless activation's frame object, made for its activation
     /// shell while a call ran (`sys._getframe()`): the interpreter
     /// continuation adopts it (see [`call_with_activation_shell`]).
@@ -5094,6 +5097,67 @@ pub(crate) fn sync_native_locals(locals: &Rc<GilRefCell<Vec<Object>>>) {
         }
     });
 }
+
+/// One method-form load of a builtin value's method (`d.pop` of
+/// `d.pop(k)`) that tier 2 answers without building the bound method.
+///
+/// Tier 2 runs such a call as two operations, the load and the call. A
+/// builtin value's method table never changes and its lookup runs no
+/// code, so when the method is one the core loop's leaf lane runs in
+/// place, the load leaves the receiver where the bound method would go
+/// and arms this record, and the call at `call_pc` runs the builtin on
+/// the receiver and its arguments. An exit between the two rebuilds the
+/// bound method the interpreter expects there (see `rebuild_stack`).
+struct BoundSite {
+    /// The load's pc and its call's.
+    load_pc: u32,
+    call_pc: u32,
+    /// Whether the load's last run left its receiver for the call. Every
+    /// run of the load sets it, so it is exact whenever the call (which
+    /// only that load reaches) or an exit inside the pair reads it.
+    armed: bool,
+    /// The receiver kind (`builtins::method_memo_tag`) the rest is for.
+    tag: u8,
+    /// The leaf registry's generation `kind` was read at.
+    gen: u64,
+    builtin: Rc<crate::object::BuiltinFn>,
+    kind: super::LeafKind,
+}
+
+/// What an activation keeps for its method calls on builtin values.
+struct BoundLane {
+    /// The activation's deferred method loads (a handful at most).
+    sites: Vec<BoundSite>,
+    /// The builtin the last bound-method call ran as a leaf, with the
+    /// leaf registry's generation and its kind.
+    kind: Option<(Rc<crate::object::BuiltinFn>, u64, super::LeafKind)>,
+}
+
+impl BoundLane {
+    fn new() -> Self {
+        Self {
+            sites: Vec::new(),
+            kind: None,
+        }
+    }
+
+    /// The armed record of the load whose call is at `call_pc`.
+    #[inline(always)]
+    fn armed_call(&self, call_pc: u32) -> Option<&BoundSite> {
+        if self.sites.is_empty() {
+            return None;
+        }
+        self.sites.iter().find(|s| s.call_pc == call_pc && s.armed)
+    }
+
+    /// The armed record of the load at `load_pc`.
+    fn armed_load(&self, load_pc: u32) -> Option<&BoundSite> {
+        self.sites.iter().find(|s| s.load_pc == load_pc && s.armed)
+    }
+}
+
+/// The most deferred method loads an activation records.
+const BOUND_SITES_MAX: usize = 16;
 
 /// The size of [`CallCtx::pin_memo`]: sets of [`PIN_MEMO_WAYS`] slots.
 const PIN_MEMO: usize = 64;
@@ -6572,6 +6636,10 @@ unsafe fn try_native_call(
         };
     }
     child.entry_pin_count = child.pins.len();
+    // (Another code object's pcs.)
+    if !child.bound.sites.is_empty() {
+        child.bound.sites.clear();
+    }
     child.interp = ctx.interp;
     let nctx: &mut CallCtx = &mut child;
     let mut njf = JitFrame {
@@ -6836,6 +6904,7 @@ fn fresh_child(ctx: &CallCtx, nc: &NativeCallee, callee_key: *const CodeObject) 
         pin_memo: [u32::MAX; PIN_MEMO],
         introspected: Cell::new(false),
         inspected_locals: std::cell::RefCell::new(None),
+        bound: BoundLane::new(),
         inspected_frame: std::cell::RefCell::new(None),
         cell_list_pins: Vec::new(),
     })
@@ -7295,7 +7364,16 @@ fn finish_deopted(
         nctx.parked.take()
     };
     rebuild_stack(
-        interp, &mut frame, entry, locals_buf, spill, tags, njf, &nctx.pins, parked,
+        interp,
+        &mut frame,
+        entry,
+        locals_buf,
+        spill,
+        tags,
+        njf,
+        &nctx.pins,
+        &nctx.bound,
+        parked,
     );
     if raised.is_some() {
         // As though the raising CALL just executed: pc points past it
@@ -12457,7 +12535,53 @@ unsafe fn call_dyn_impl(
     // SAFETY: the `&mut Interpreter` that entered native code is
     // dormant while the helper runs.
     let interp = unsafe { &mut *ctx.interp };
-    let retry_python = if kwc == 0 {
+    // A builtin value's method whose load left the receiver in the bound
+    // method's place (see `BoundSite`): the builtin runs on the receiver
+    // and the arguments as the core loop's leaf lane runs it. A call the
+    // lane declines (keywords, an argument that needs Python) goes on
+    // below with the bound method the load would have made.
+    let mut deferred = None;
+    if let Some(site) = ctx.bound.armed_call(jf.deopt_pc) {
+        let (b, kind) = (Rc::as_ptr(&site.builtin), site.kind);
+        // SAFETY: the record keeps the builtin alive, and nothing changes
+        // the records before the leaf call below returns (it runs no
+        // Python and enters no helper).
+        let b = unsafe { &*b };
+        let Some(recv) = ctx.pins.get(callee_pin as usize).map(Pin::to_object) else {
+            return CallStatus::Reject as i64;
+        };
+        let mut staged = [const { Object::None }; 4];
+        staged[0] = recv;
+        if kwc == 0 && argc < 4 {
+            for j in 0..argc as usize {
+                // SAFETY: native code wrote `argc` entries.
+                let (bits, tag) = unsafe { (*jf.call_args.add(j), *jf.call_tags.add(j)) };
+                staged[j + 1] = unpack_pins(bits, tag, &ctx.pins);
+            }
+            match interp.leaf_builtin_call(kind, b, &staged[..=(argc as usize)]) {
+                Some(Ok(v)) => return dyn_leaf_result(jf, ctx, v, int_result),
+                Some(Err(e)) => {
+                    ctx.raised = Some(e);
+                    return CallStatus::Raised as i64;
+                }
+                None => {}
+            }
+        }
+        let [recv, ..] = staged;
+        let builtin = ctx
+            .bound
+            .armed_call(jf.deopt_pc)
+            .map(|site| site.builtin.clone());
+        deferred = builtin.map(|b| {
+            Object::BoundMethod(Rc::new(crate::object::BoundMethod::new(
+                recv,
+                Object::Builtin(b),
+            )))
+        });
+    }
+    let retry_python = if deferred.is_some() {
+        false
+    } else if kwc == 0 {
         // SAFETY: the same live buffers; the borrowed path releases every
         // borrow before this code updates the result or enters Python.
         match unsafe { try_borrowed_dyn_scalar(jf, ctx, interp, callee_pin, argc) } {
@@ -12484,19 +12608,30 @@ unsafe fn call_dyn_impl(
     };
     // The callee rode a pinned lane; `-1` is the nullable `None`
     // (calling `None` raises) — both misses re-execute generically.
-    let callee = match ctx.pins.get(callee_pin as usize) {
-        Some(p) => p.to_object(),
-        None => return CallStatus::Reject as i64,
+    let was_deferred = deferred.is_some();
+    let callee = match deferred {
+        Some(bound) => bound,
+        None => match ctx.pins.get(callee_pin as usize) {
+            Some(p) => p.to_object(),
+            None => return CallStatus::Reject as i64,
+        },
     };
     // A native method bound to its exact builtin receiver whose call the
     // core loop's leaf lane runs (`groups[k].append(x)`, `s.strip()`):
     // run as the lane runs it, with no bound-method call or activation
     // shell. (Only the kinds whose releases can't finalize anything.)
-    if kwc == 0 && argc < 4 {
-        if let Object::BoundMethod(bm) = &callee {
-            if let Some(status) = dyn_bound_leaf(jf, ctx, interp, bm, argc, int_result) {
-                return status;
+    if kwc == 0 && argc < 4 && !was_deferred {
+        let ran = match &callee {
+            Object::BoundMethod(bm) => dyn_bound_leaf(jf, ctx, interp, bm, argc),
+            _ => None,
+        };
+        match ran {
+            Some(Ok(v)) => return dyn_leaf_result(jf, ctx, v, int_result),
+            Some(Err(e)) => {
+                ctx.raised = Some(e);
+                return CallStatus::Raised as i64;
             }
+            None => {}
         }
     }
     // RFC 0076 WS7 — the per-kind fast path: a compiled Python callee
@@ -12849,15 +12984,14 @@ unsafe fn dyn_kw_pure_leaf(
 /// [`call_dyn_impl`]'s call of a native method `bm` bound to its exact
 /// builtin receiver, over the `argc` marshaled arguments, when the core
 /// loop's leaf lane runs it in place (see `LeafKind::runs_in_core`): the
-/// call's status, or `None` (nothing done) for the general call.
+/// call's outcome, or `None` (nothing done) for the general call.
 fn dyn_bound_leaf(
-    jf: &mut JitFrame,
+    jf: &JitFrame,
     ctx: &mut CallCtx,
     interp: &super::Interpreter,
     bm: &crate::object::BoundMethod,
     argc: u32,
-    int_result: bool,
-) -> Option<i64> {
+) -> Option<Result<Object, RuntimeError>> {
     let Object::Builtin(b) = &bm.function else {
         return None;
     };
@@ -12867,7 +13001,17 @@ fn dyn_bound_leaf(
     {
         return None;
     }
-    let kind = interp.leaf_call_kind(b).filter(|k| k.runs_in_core())?;
+    // The builtin's kind, remembered from the site's last call (the
+    // remembered builtin is kept alive, so its address is its identity).
+    let gen = super::leaf_builtins::generation();
+    let kind = match &ctx.bound.kind {
+        Some((last, g, kind)) if Rc::ptr_eq(last, b) && *g == gen => *kind,
+        _ => {
+            let kind = interp.leaf_call_kind(b).filter(|k| k.runs_in_core())?;
+            ctx.bound.kind = Some((b.clone(), gen, kind));
+            kind
+        }
+    };
     let mut staged = [const { Object::None }; 4];
     staged[0] = bm.receiver.clone();
     for j in 0..argc as usize {
@@ -12875,13 +13019,7 @@ fn dyn_bound_leaf(
         let (bits, tag) = unsafe { (*jf.call_args.add(j), *jf.call_tags.add(j)) };
         staged[j + 1] = unpack_pins(bits, tag, &ctx.pins);
     }
-    match interp.leaf_builtin_call(kind, b, &staged[..=(argc as usize)])? {
-        Ok(v) => Some(dyn_leaf_result(jf, ctx, v, int_result)),
-        Err(e) => {
-            ctx.raised = Some(e);
-            Some(CallStatus::Raised as i64)
-        }
-    }
+    interp.leaf_builtin_call(kind, b, &staged[..=(argc as usize)])
 }
 
 fn dyn_leaf_result(jf: &mut JitFrame, ctx: &mut CallCtx, v: Object, int_result: bool) -> i64 {
@@ -13101,6 +13239,32 @@ unsafe extern "C" fn wpjit_dyn_attr_get(frame: *mut JitFrame, pin: i64, name: i6
     };
     // SAFETY: the activation retains the code object until native return.
     let code = unsafe { &*ctx.code_ptr };
+    // This run of the load decides anew whether its call finds the
+    // receiver in the bound method's place (see `BoundSite`): at once
+    // for a receiver of the kind the site saw last.
+    let site = if ctx.bound.sites.is_empty() {
+        None
+    } else {
+        ctx.bound
+            .sites
+            .iter()
+            .position(|s| s.load_pc == jf.deopt_pc)
+    };
+    if let Some(at) = site {
+        let s = &mut ctx.bound.sites[at];
+        s.armed = crate::builtins::method_memo_tag(receiver) == Some(s.tag)
+            && s.gen == super::leaf_builtins::generation();
+        if s.armed {
+            jf.ret_bits = pin as u64;
+            #[cfg(test)]
+            DYN_ATTR_NATIVE_READS.with(|reads| {
+                let mut counts = reads.get();
+                counts[3] += 1;
+                reads.set(counts);
+            });
+            return 0;
+        }
+    }
     let (value, kind) = match receiver {
         Object::Instance(inst) if inst.cls_raw().native_kind.get() == 0 => {
             // The site's split-layout shortcut first (the interpreter's
@@ -13171,10 +13335,46 @@ unsafe extern "C" fn wpjit_dyn_attr_get(frame: *mut JitFrame, pin: i64, name: i6
         | Object::Bool(_)
         | Object::Float(_)
         | Object::Complex(_) => {
+            // A method the call can run on the receiver directly: the
+            // receiver stays where it is (see `BoundSite`).
+            let tag = crate::builtins::method_memo_tag(receiver);
+            let gen = super::leaf_builtins::generation();
             let Some(name) = code.names.get(name_idx as usize) else {
                 return 3;
             };
-            let method = crate::builtins::lookup_method(receiver, name).map(|method| {
+            let method = crate::builtins::lookup_method(receiver, name);
+            if let (Some(tag), Some(Object::Builtin(b))) = (tag, &method) {
+                // SAFETY: the entering interpreter is dormant, and the
+                // lookup below neither calls Python nor changes it.
+                let interp = unsafe { &*ctx.interp };
+                let deferred = (site.is_some() || ctx.bound.sites.len() < BOUND_SITES_MAX)
+                    .then(|| defer_method_load(ctx, interp, code, jf.deopt_pc, b))
+                    .flatten();
+                if let Some((call_pc, kind)) = deferred {
+                    let record = BoundSite {
+                        load_pc: jf.deopt_pc,
+                        call_pc,
+                        armed: true,
+                        tag,
+                        gen,
+                        builtin: b.clone(),
+                        kind,
+                    };
+                    match site {
+                        Some(at) => ctx.bound.sites[at] = record,
+                        None => ctx.bound.sites.push(record),
+                    }
+                    jf.ret_bits = pin as u64;
+                    #[cfg(test)]
+                    DYN_ATTR_NATIVE_READS.with(|reads| {
+                        let mut counts = reads.get();
+                        counts[3] += 1;
+                        reads.set(counts);
+                    });
+                    return 0;
+                }
+            }
+            let method = method.map(|method| {
                 if matches!(&method, Object::Builtin(b) if !b.binds_instance) {
                     method
                 } else {
@@ -13231,6 +13431,37 @@ unsafe extern "C" fn wpjit_dyn_attr_get(frame: *mut JitFrame, pin: i64, name: i6
     #[cfg(not(test))]
     let _ = kind;
     0
+}
+
+/// Whether the method-form load at `load_pc` of the builtin value's
+/// method `b` can leave its receiver for the call (see [`BoundSite`]):
+/// the call's pc and the kind of leaf `b` is, when the load is the
+/// method form, its call is a dynamic call this activation compiled (the
+/// one whose marker span opens at the load), and `b` binds its receiver
+/// and runs as a leaf in place.
+fn defer_method_load(
+    ctx: &CallCtx,
+    interp: &super::Interpreter,
+    code: &CodeObject,
+    load_pc: u32,
+    b: &Rc<crate::object::BuiltinFn>,
+) -> Option<(u32, super::LeafKind)> {
+    if !b.binds_instance || ctx.cf.is_null() {
+        return None;
+    }
+    let method_form = code
+        .instructions
+        .get(load_pc as usize)
+        .is_some_and(|i| i.op == weavepy_compiler::OpCode::LoadMethodAttr);
+    if !method_form {
+        return None;
+    }
+    // SAFETY: the activation's compiled frame outlives it (see the field).
+    let cf = unsafe { &*ctx.cf };
+    let span = cf.null_spans.iter().find(|s| s.live_from == load_pc)?;
+    let call_pc = span.live_to.checked_sub(1)?;
+    let kind = interp.leaf_call_kind(b).filter(|k| k.runs_in_core())?;
+    Some((call_pc, kind))
 }
 
 /// The `wpjit_dyn_attr_set` helper (RFC 0074 WS4): the interpreter's
@@ -14988,6 +15219,7 @@ pub(crate) fn try_call_native_direct(
         pin_memo: [u32::MAX; PIN_MEMO],
         introspected: Cell::new(false),
         inspected_locals: std::cell::RefCell::new(None),
+        bound: BoundLane::new(),
         inspected_frame: std::cell::RefCell::new(None),
         cell_list_pins: Vec::new(),
     };
@@ -16058,6 +16290,7 @@ fn enter_compiled(
         pin_memo: [u32::MAX; PIN_MEMO],
         introspected: Cell::new(false),
         inspected_locals: std::cell::RefCell::new(None),
+        bound: BoundLane::new(),
         inspected_frame: std::cell::RefCell::new(None),
         cell_list_pins: Vec::new(),
     };
@@ -16327,7 +16560,7 @@ fn native_exit_writeback(
     // after the call.
     let parked = if raised { None } else { ctx.parked.take() };
     rebuild_stack(
-        interp, frame, entry, locals_buf, spill, tags, jf, &ctx.pins, parked,
+        interp, frame, entry, locals_buf, spill, tags, jf, &ctx.pins, &ctx.bound, parked,
     );
     if raised {
         // As though the CALL instruction just executed and
@@ -16362,6 +16595,7 @@ fn rebuild_stack(
     tags: &[u32],
     jf: &JitFrame,
     pins: &PinTable,
+    lane: &BoundLane,
     parked: Option<Object>,
 ) {
     let cf = &entry.cf;
@@ -16475,6 +16709,21 @@ fn rebuild_stack(
     {
         inserts.push((s.interp_depth, Object::Unbound));
     }
+    // A builtin value's method load that left its receiver for the call
+    // (see `BoundSite`), open here: the interpreter holds the bound
+    // method one below the span's marker.
+    let deferred: Vec<(usize, &BoundSite)> = if lane.sites.is_empty() {
+        Vec::new()
+    } else {
+        cf.null_spans
+            .iter()
+            .filter(|s| s.live_from < jf.deopt_pc && jf.deopt_pc < s.live_to)
+            .filter_map(|s| {
+                let site = lane.armed_load(s.live_from)?;
+                Some(((s.interp_depth as usize).checked_sub(1)?, site))
+            })
+            .collect()
+    };
     inserts.sort_unstable_by_key(|(depth, _)| *depth);
     // Open method spans: the spilled entry at `native_index` must
     // rebuild as the bound method, not the bare pin — via a fresh
@@ -16543,6 +16792,15 @@ fn rebuild_stack(
             // table is immutable); `None` is an unreachable defensive
             // fallback.
             v = interp.load_attr_public(&v, name).unwrap_or(Object::None);
+        }
+        if let Some((_, site)) = deferred
+            .iter()
+            .find(|(depth, _)| *depth == frame.stack.len())
+        {
+            v = Object::BoundMethod(Rc::new(crate::object::BoundMethod::new(
+                v,
+                Object::Builtin(site.builtin.clone()),
+            )));
         }
         frame.stack.push(v);
         if rebound.is_some() {
@@ -16996,6 +17254,7 @@ fn resume_parked(interp: &mut super::Interpreter, frame: &mut super::Frame) -> J
         pin_memo: [u32::MAX; PIN_MEMO],
         introspected: Cell::new(false),
         inspected_locals: std::cell::RefCell::new(None),
+        bound: BoundLane::new(),
         inspected_frame: std::cell::RefCell::new(None),
         cell_list_pins: Vec::new(),
     };
