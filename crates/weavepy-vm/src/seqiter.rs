@@ -2317,7 +2317,9 @@ pub(crate) fn builtin_ctor_arms(cls: &Rc<TypeObject>, args: &[Object]) -> Option
             [Object::Bool(b)] => Some(Object::Int(i64::from(*b))),
             // Truncated toward zero, inside the machine range.
             [Object::Float(f)] if f.is_finite() && f.abs() < 9.0e18 => Some(Object::Int(*f as i64)),
-            [Object::Str(text)] => decimal_i64(text).map(Object::Int),
+            [Object::Str(text)] => decimal_i64(text)
+                .map(Object::Int)
+                .or_else(|| big_from_digits(text, 10)),
             // `int('ff', 16)`: plain digits of the base, an optional sign
             // and surrounding ASCII whitespace, inside the machine range
             // (a prefix, an underscore or anything malformed is the full
@@ -2328,7 +2330,17 @@ pub(crate) fn builtin_ctor_arms(cls: &Rc<TypeObject>, args: &[Object]) -> Option
                 if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_alphanumeric()) {
                     return None;
                 }
-                i64::from_str_radix(t, *base as u32).ok().map(Object::Int)
+                // (Digits enough to pass 64 bits skip the machine parse,
+                // which would read them all to find that out.)
+                let radix = *base as u32;
+                let machine = if digits.len() as u32 * radix.ilog2() > 64 {
+                    None
+                } else {
+                    i64::from_str_radix(t, radix).ok()
+                };
+                machine
+                    .map(Object::Int)
+                    .or_else(|| big_from_digits(text, radix))
             }
             _ => None,
         };
@@ -2826,6 +2838,38 @@ fn min_max_integers(items: &[Object], want_max: bool) -> Option<Object> {
         }
     }
     Some(best.0.clone())
+}
+
+/// `int(text, radix)` for plain digits of the radix (an optional sign,
+/// surrounding ASCII whitespace) whose value is past a machine int: the
+/// big value, built here once. The full constructor, which the arms above
+/// otherwise leave such text to, tries the machine parse again at each of
+/// its layers before it builds the same value (a UUID's 32 hex digits
+/// cost 7,300 instructions that way). `None` for anything malformed, and
+/// for decimal-like text past the conversion limit, which the full
+/// constructor reports.
+fn big_from_digits(text: &str, radix: u32) -> Option<Object> {
+    let t = text.trim_matches(|c: char| c.is_ascii_whitespace());
+    let (negative, digits) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return None;
+    }
+    if !radix.is_power_of_two() {
+        let max = crate::stdlib::sys::int_max_str_digits();
+        if max > 0 && digits.len() > max as usize {
+            return None;
+        }
+    }
+    if radix == 16 && !negative {
+        if let Some(v) = crate::builtins::int_from_plain_hex(digits.as_bytes()) {
+            return Some(v);
+        }
+    }
+    let big = num_bigint::BigInt::parse_bytes(digits.as_bytes(), radix)?;
+    Some(Object::int_from_bigint(if negative { -big } else { big }))
 }
 
 /// `int(text)` for plain decimal text (ASCII digits, an optional sign,

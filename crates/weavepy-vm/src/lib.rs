@@ -92153,6 +92153,36 @@ fn bignum_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
         }
     }
 
+    // A big value with a machine int beside it, added, subtracted,
+    // multiplied, shifted right or masked: the big one read in place and
+    // the machine int as a scalar, where promoting both copied the big
+    // value and built a second one (two allocations of the four a
+    // `big + 1` made).
+    match (a, b, op) {
+        (Object::Long(x), Object::Int(y), B::Add) => return Ok(Object::int_from_bigint(&**x + *y)),
+        (Object::Int(x), Object::Long(y), B::Add) => return Ok(Object::int_from_bigint(&**y + *x)),
+        (Object::Long(x), Object::Int(y), B::Sub) => return Ok(Object::int_from_bigint(&**x - *y)),
+        (Object::Long(x), Object::Int(y), B::Mult) => {
+            return Ok(Object::int_from_bigint(&**x * *y))
+        }
+        (Object::Int(x), Object::Long(y), B::Mult) => {
+            return Ok(Object::int_from_bigint(&**y * *x))
+        }
+        // (A field cut out of a wide value: `(n >> 64) & 0xffff`.)
+        (Object::Long(x), Object::Int(y), B::RShift) if *y >= 0 => {
+            return Ok(Object::int_from_bigint(&**x >> (*y as usize)))
+        }
+        (Object::Long(x), Object::Int(y), B::BitAnd) if *y >= 0 && !x.is_negative() => {
+            let low = x.iter_u64_digits().next().unwrap_or(0);
+            return Ok(Object::Int((low & *y as u64) as i64));
+        }
+        (Object::Int(y), Object::Long(x), B::BitAnd) if *y >= 0 && !x.is_negative() => {
+            let low = x.iter_u64_digits().next().unwrap_or(0);
+            return Ok(Object::Int((low & *y as u64) as i64));
+        }
+        _ => {}
+    }
+
     // Slow path: promote both sides to BigInt.
     let x = a.as_bigint().expect("int-like");
     let y = b.as_bigint().expect("int-like");

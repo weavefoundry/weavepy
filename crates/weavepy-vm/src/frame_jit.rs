@@ -8229,10 +8229,11 @@ pub(crate) struct MethodSite {
     desc: Option<(u64, bool, Object)>,
     /// The class version whose attribute the site found isn't one.
     desc_miss: u64,
-    /// A native stream's method the site loaded last (`out.write`): the
-    /// stream's kind, as `builtins::method_memo_tag` keys it (its methods
-    /// follow from the kind alone while it has no attributes of its own),
-    /// and the method.
+    /// A native stream's method the site loaded last (`out.write`), or a
+    /// builtin value's of a kind the first cache doesn't hold: the kind,
+    /// as `builtins::method_memo_tag` keys it (a stream's methods follow
+    /// from the kind alone while it has no attributes of its own), and
+    /// the method.
     stream: Option<(u8, Object)>,
     /// A class receiver the site loaded an attribute of
     /// (`object.__setattr__(self, ...)`, `dict.fromkeys(...)`, a user
@@ -8343,9 +8344,22 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
             }
         }
         // A native stream's method of the kind the site loaded it for, the
-        // stream in the self slot.
+        // stream in the self slot. Likewise a builtin value's of a kind the
+        // site's first cache doesn't hold (a big `int`'s `to_bytes`, a
+        // float's, a tuple's, a `bytes` object's): the kind and the site's
+        // name decide the method.
         let stream_tag = match &*top {
-            Object::File(_) => crate::builtins::method_memo_tag(&*top),
+            Object::File(_)
+            | Object::Long(_)
+            | Object::Int(_)
+            | Object::Bool(_)
+            | Object::Float(_)
+            | Object::Complex(_)
+            | Object::Tuple(_)
+            | Object::Bytes(_)
+            | Object::ByteArray(_)
+            | Object::FrozenSet(_)
+            | Object::Range(_) => crate::builtins::method_memo_tag(&*top),
             _ => None,
         };
         if let (Some(t), Some((want, f))) = (stream_tag, &s.stream) {
@@ -8497,8 +8511,10 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
                 &*(*st).stack.add(s.len as usize - 1),
                 &*(*st).stack.add(s.len as usize),
             );
-            if let (Object::Builtin(b), Object::File(_)) = (callable, self_slot) {
-                if b.binds_instance {
+            if let Object::Builtin(b) = callable {
+                // (The receiver itself in the self slot: the method as
+                // the kind's unbound builtin.)
+                if b.binds_instance && crate::builtins::method_memo_tag(self_slot) == Some(t) {
                     s.stream = Some((t, callable.clone()));
                 }
             }

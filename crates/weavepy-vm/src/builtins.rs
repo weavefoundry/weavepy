@@ -5723,6 +5723,15 @@ fn parse_int_string(
         ))
     };
 
+    // Plain hexadecimal digits and nothing else (a UUID's or a digest's
+    // text, base 16 given): the value straight from the digits, with no
+    // normalising pass, staging string or general radix parse.
+    if base == 16 {
+        if let Some(v) = int_from_plain_hex(raw.as_bytes()) {
+            return Ok(v);
+        }
+    }
+
     // Normalise Unicode decimal digits / whitespace to ASCII, then strip the
     // surrounding whitespace CPython ignores.
     let transformed = transform_decimal_and_space(raw);
@@ -5823,6 +5832,55 @@ fn parse_int_string(
     Ok(Object::int_from_bigint(big))
 }
 
+/// The integer `digits` spell in base 16 when they are ASCII hex digits
+/// and nothing else (no sign, prefix, underscore or space; at least one
+/// digit, at most 128): `None` leaves anything else to the general
+/// parser.
+pub(crate) fn int_from_plain_hex(digits: &[u8]) -> Option<Object> {
+    const MAX: usize = 128;
+    if digits.is_empty() || digits.len() > MAX {
+        return None;
+    }
+    let nibble = |c: u8| -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    };
+    if digits.len() <= 15 {
+        let mut v = 0i64;
+        for &c in digits {
+            v = (v << 4) | i64::from(nibble(c)?);
+        }
+        return Some(Object::Int(v));
+    }
+    // Sixteen digits a 64-bit limb, the least significant last.
+    let mut limbs = [0u64; MAX / 16];
+    let n = digits.len().div_ceil(16);
+    for (k, chunk) in digits.rchunks(16).enumerate() {
+        let mut v = 0u64;
+        for &c in chunk {
+            v = (v << 4) | u64::from(nibble(c)?);
+        }
+        limbs[k] = v;
+    }
+    if n == 1 || limbs[1..n].iter().all(|&l| l == 0) {
+        if let Ok(v) = i64::try_from(limbs[0]) {
+            return Some(Object::Int(v));
+        }
+    }
+    let mut words = Vec::with_capacity(2 * n);
+    for &l in &limbs[..n] {
+        words.push(l as u32);
+        words.push((l >> 32) as u32);
+    }
+    Some(Object::int_from_bigint(BigInt::from(
+        num_bigint::BigUint::new(words),
+    )))
+}
+
 // ---------- int methods (RFC 0019) ----------
 
 fn int_bit_length(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -5834,6 +5892,8 @@ fn int_bit_length(args: &[Object]) -> Result<Object, RuntimeError> {
             )))
         }
         Object::Bool(b) => return Ok(Object::Int(i64::from(*b))),
+        // (Read in place: no copy of the value to count its bits.)
+        Object::Long(n) => return Ok(Object::Int(n.bits() as i64)),
         _ => {}
     }
     let n = v.as_bigint().ok_or_else(|| {
@@ -5901,15 +5961,13 @@ fn int_to_bytes(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
     let n_obj = args
         .first()
         .ok_or_else(|| type_error("to_bytes() requires self"))?;
-    // (A machine int converts only if its fast path below declines.)
-    let big = match n_obj {
-        Object::Int(_) => None,
-        other => Some(
-            other
-                .as_bigint()
-                .ok_or_else(|| type_error("to_bytes(): self is not an integer"))?,
-        ),
-    };
+    // (Converted to a big integer only if the direct paths below
+    // decline.)
+    if !matches!(n_obj, Object::Int(_) | Object::Long(_) | Object::Bool(_))
+        && n_obj.as_bigint().is_none()
+    {
+        return Err(type_error("to_bytes(): self is not an integer"));
+    }
     let length = match arg_or_kw(args, 1, kwargs, "length") {
         Some(Object::Int(i)) if *i >= 0 => *i as usize,
         Some(Object::Bool(b)) => usize::from(*b),
@@ -5923,13 +5981,35 @@ fn int_to_bytes(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
             ))
         }
     };
-    let byteorder = match arg_or_kw(args, 2, kwargs, "byteorder") {
-        Some(o) => byteorder_str(o)?,
-        None => "big".to_owned(),
-    };
+    let order_arg = arg_or_kw(args, 2, kwargs, "byteorder");
     let signed = match arg_or_kw(args, 3, kwargs, "signed") {
         Some(o) => o.is_truthy(),
         None => false,
+    };
+    // A non-negative value in an unsigned buffer of any length, in either
+    // plain byte order (a UUID's sixteen bytes, a digest's thirty-two):
+    // its magnitude's bytes written once into the result, with no byte
+    // order string, big-integer copy or staging vector. An overflow, a
+    // negative value and any other order take the general path below.
+    if !signed {
+        let little = match order_arg {
+            None => Some(false),
+            Some(Object::Str(o)) => match o.as_bytes() {
+                b"big" => Some(false),
+                b"little" => Some(true),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(little) = little {
+            if let Some(out) = unsigned_to_bytes(n_obj, length, little) {
+                return Ok(Object::new_bytes(out));
+            }
+        }
+    }
+    let byteorder = match order_arg {
+        Some(o) => byteorder_str(o)?,
+        None => "big".to_owned(),
     };
     // A machine int that fits the length: its two's-complement bytes,
     // without the big-integer conversion (anything else, an overflow
@@ -5951,10 +6031,9 @@ fn int_to_bytes(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
             return Ok(Object::new_bytes(out));
         }
     }
-    let n = match big {
-        Some(n) => n,
-        None => n_obj.as_bigint().expect("a machine int"),
-    };
+    let n = n_obj
+        .as_bigint()
+        .ok_or_else(|| type_error("to_bytes(): self is not an integer"))?;
     let bytes = bigint_to_bytes(&n, length, &byteorder, signed)?;
     Ok(Object::new_bytes(bytes))
 }
@@ -6056,6 +6135,47 @@ fn byteorder_str(o: &Object) -> Result<String, RuntimeError> {
         },
         _ => Err(type_error("byteorder must be a string")),
     }
+}
+
+/// A non-negative `int`'s magnitude as `length` bytes in the given order,
+/// zero-padded; `None` for a negative value, one that doesn't fit, or a
+/// value that isn't a plain `int`.
+fn unsigned_to_bytes(n: &Object, length: usize, little: bool) -> Option<Vec<u8>> {
+    let mut out = vec![0u8; length];
+    // Least significant byte first, then turned for big-endian.
+    let mut put = |k: usize, byte: u8| -> bool {
+        if byte == 0 {
+            return true;
+        }
+        if k >= length {
+            return false;
+        }
+        out[k] = byte;
+        true
+    };
+    match n {
+        Object::Int(v) if *v >= 0 => {
+            for (k, byte) in v.to_le_bytes().into_iter().enumerate() {
+                if !put(k, byte) {
+                    return None;
+                }
+            }
+        }
+        Object::Long(b) if !b.is_negative() => {
+            for (d, digit) in b.iter_u64_digits().enumerate() {
+                for (k, byte) in digit.to_le_bytes().into_iter().enumerate() {
+                    if !put(8 * d + k, byte) {
+                        return None;
+                    }
+                }
+            }
+        }
+        _ => return None,
+    }
+    if !little {
+        out.reverse();
+    }
+    Some(out)
 }
 
 fn bigint_to_bytes(

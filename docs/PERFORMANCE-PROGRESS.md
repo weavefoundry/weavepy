@@ -24,6 +24,18 @@ the suite in 0.990 of the older one's warm time. The published 1.13 for
 peak RSS doesn't reproduce with either build today: CPython's own figure
 moves between sessions.
 
+Measured on November 20, 2026, at `f96980aa` (PR #112), a PGO build beside
+the `c69d14ad` one in the same runs: the battery in 0.996 of that build's
+time (best of three runs a case), `threading_queue_ops` at 1.9 times
+CPython's time where it was 2.2. Against CPython this session read both
+builds about a tenth slower than the day before's (1.04 to 1.12 a run for
+each), so the 0.97 above stands as the last quiet-machine figure. What the
+day's work moves is outside the battery: a program with a second thread
+(under 1% slower than without one, from 13% to 55%), a thread back from a
+blocking call (the GIL after one switch interval, not two), a contended lock
+(handed to its waiter after 5 ms), and attribute-heavy loops in tier 2 (the
+`attr_access` fixture at 0.66 of its instructions).
+
 Measured on November 15, 2026, at `83efee9b` (PR #112), a PGO build
 against CPython 3.14.8 on a host that wasn't idle (load averages between
 2 and 9). The everyday battery: 1.258 times CPython's time over three runs
@@ -1661,6 +1673,26 @@ branch and pull request.
     made): 874 to 786. Cycles went 348 to 228 an iteration; the frame
     JIT ran this loop at 1,333 instructions and about 400 cycles, and
     CPython runs it at 3,329 and 1,115.
+  - Integers past 64 bits. The battery's `uuid_secrets_ops` (1.6 times
+    CPython's time) spends its time making and reading 128-bit values,
+    and each step cost two to four times CPython's:
+    `int(text, 16)` of 32 digits took 7,300 instructions, because the
+    constructor's quick arms try a machine-int parse, decline on its
+    overflow, and the full constructor's layers each try it again
+    before the big value is built; the arms now build it themselves
+    (2,800, 602 ns to 218; CPython 160 ns), as they do for long decimal
+    text (456 ns to 207; CPython 143).
+    Arithmetic of a big value with a machine int promoted both sides,
+    copying the big one: sums, differences, products, right shifts and
+    masks now read it in place (`big + 1` 977 instructions to 664).
+    `to_bytes` built a byte-order string and a copy of the value before
+    looking at its arguments; a non-negative value now goes straight
+    into the result, at any length. And a method called on a big
+    `int`, a float, a tuple or a `bytes` object went through the method
+    memo at every call from compiled code, whose per-site cache held
+    lists, dicts, sets and strs only: the site now keeps the method for
+    the receiver's kind, as it did for streams
+    (`big.bit_length()` 804 instructions to 589).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
