@@ -10815,6 +10815,36 @@ unsafe fn module_attr_note(site: &AttrSite, m: &crate::object::PyModule) {
     }
 }
 
+/// Put the value `v` a read found in its stack receiver's slot `at`,
+/// releasing the receiver: by a plain decrement where another owner keeps
+/// it and nothing observes releases, else as the core loop releases an
+/// operand (which runs no code). `false`, with `v` dropped and the
+/// receiver in place, when neither applies. The second form matters once
+/// reference counts are shared between threads, where a plain decrement
+/// is never allowed: every such read then went on through the whole miss
+/// chain (`Condition.__exit__`'s `self._lock.__exit__`, twice for every
+/// item a queue hands over).
+///
+/// # Safety
+///
+/// `at` is an initialized stack slot the caller owns.
+#[inline(always)]
+unsafe fn receiver_leaves(at: *mut Object, v: Object) -> bool {
+    // SAFETY: the caller's contract.
+    unsafe {
+        if plain_release(&*at) {
+            at.write(v);
+            return true;
+        }
+        if droppable(&*at) {
+            crate::drop_hot(std::mem::replace(&mut *at, v));
+            return true;
+        }
+    }
+    drop(v);
+    false
+}
+
 /// [`h_attr_stack`] past its commonest shape.
 #[inline(never)]
 unsafe extern "C" fn attr_stack_slow(st: *mut State, site: *const AttrSite) -> u32 {
@@ -10826,11 +10856,9 @@ unsafe extern "C" fn attr_stack_slow(st: *mut State, site: *const AttrSite) -> u
         match &*at {
             Object::Frame(_) | Object::Code(_) => {
                 if let Some(v) = frame_code_attr(st, site, &*at) {
-                    if plain_release(&*at) {
-                        at.write(v);
+                    if receiver_leaves(at, v) {
                         return 0;
                     }
-                    drop(v);
                 }
             }
             // (A class attribute the site has read before.)
@@ -10854,20 +10882,16 @@ unsafe extern "C" fn attr_stack_slow(st: *mut State, site: *const AttrSite) -> u
                         .stamp_slot(site.pc as usize)
                         .and_then(|s| crate::tuple_field_hit(s, inst))
                 }) {
-                    if plain_release(&*at) {
-                        at.write(v);
+                    if receiver_leaves(at, v) {
                         return 0;
                     }
-                    drop(v);
                 }
                 if let Some(v) =
                     inst_dict_known(site, inst).or_else(|| inst_builtin_bound(site, inst, &*at))
                 {
-                    if plain_release(&*at) {
-                        at.write(v);
+                    if receiver_leaves(at, v) {
                         return 0;
                     }
-                    drop(v);
                 }
                 if site_property_leaf(&mut *st, site, at, false) {
                     return 0;
@@ -10881,21 +10905,17 @@ unsafe extern "C" fn attr_stack_slow(st: *mut State, site: *const AttrSite) -> u
                         })?
                     });
                 if let Some(v) = v {
-                    if plain_release(&*at) {
-                        at.write(v);
+                    if receiver_leaves(at, v) {
                         return 0;
                     }
-                    drop(v);
                 }
             }
             // (A class's name, as the site read it before.)
             Object::Type(cls) => {
                 if let Some(v) = type_attr_memo(site, cls) {
-                    if plain_release(&*at) {
-                        at.write(v);
+                    if receiver_leaves(at, v) {
                         return 0;
                     }
-                    drop(v);
                 }
             }
             Object::Module(m) => module_attr_note(site, m),
