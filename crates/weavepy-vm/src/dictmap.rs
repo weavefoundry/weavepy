@@ -615,13 +615,52 @@ impl<V> Default for Table<V> {
     }
 }
 
-impl<V: Clone> Clone for Table<V> {
+/// A copy of `entries` with room for `extra` more. A dict's or a set's
+/// entries are copied whole and their keys' and values' counts then taken
+/// in a second pass (a `Bucket` cloned field by field moves each object by
+/// way of the stack, at several times the instructions).
+fn clone_entries<V: Clone + 'static>(entries: &[Bucket<V>], extra: usize) -> Vec<Bucket<V>> {
+    use std::any::TypeId;
+    let mut out = Vec::with_capacity(entries.len() + extra);
+    let valued = TypeId::of::<V>() == TypeId::of::<Object>();
+    if !valued && TypeId::of::<V>() != TypeId::of::<()>() {
+        out.extend_from_slice(entries);
+        return out;
+    }
+    // SAFETY: the copy fills `entries.len()` reserved slots, and each
+    // object copied (a key, and a value where `V` is `Object`: checked
+    // above) has its count taken before the length covers it; nothing here
+    // runs code or unwinds, and the bias can't change hands meanwhile.
+    unsafe {
+        std::ptr::copy_nonoverlapping(entries.as_ptr(), out.as_mut_ptr(), entries.len());
+        let biased = crate::rc::refcounts_biased();
+        let retain = |o: &Object| {
+            if let Some(word) = o.strong_word() {
+                if biased {
+                    crate::rc::plain_increment(word);
+                } else {
+                    crate::rc::increment_word(word);
+                }
+            }
+        };
+        for b in entries {
+            retain(&b.key.0);
+            if valued {
+                retain(&*std::ptr::from_ref(&b.value).cast::<Object>());
+            }
+        }
+        out.set_len(entries.len());
+    }
+    out
+}
+
+impl<V: Clone + 'static> Clone for Table<V> {
     fn clone(&self) -> Self {
         if self.dead != 0 {
             return self.clone_keys(0);
         }
         Self {
-            entries: self.entries.clone(),
+            entries: clone_entries(&self.entries, 0),
             slots: self.clone_slots(),
             shift: self.shift,
             dead: 0,
@@ -630,17 +669,15 @@ impl<V: Clone> Clone for Table<V> {
     }
 }
 
-impl<V: Clone> Table<V> {
+impl<V: Clone + 'static> Table<V> {
     /// A copy whose entry list has room for `extra` more entries (a
     /// union's), allocated once.
     pub fn clone_with_room(&self, extra: usize) -> Self {
         if self.dead != 0 {
             return self.clone_keys(extra);
         }
-        let mut entries = Vec::with_capacity(self.entries.len() + extra);
-        entries.extend_from_slice(&self.entries);
         Self {
-            entries,
+            entries: clone_entries(&self.entries, extra),
             slots: self.clone_slots(),
             shift: self.shift,
             dead: 0,

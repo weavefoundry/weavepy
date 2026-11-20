@@ -1579,8 +1579,8 @@ fn seq_getitem(args: &[Object]) -> Result<Object, RuntimeError> {
         .ok_or_else(|| type_error("__getitem__() takes exactly one argument (0 given)"))?;
     let as_seq = |v: &Object| -> Vec<Object> {
         match v {
-            Object::List(items) => items.borrow().clone(),
-            Object::Tuple(items) => items.to_vec(),
+            Object::List(items) => crate::object::cloned_vec(&items.borrow()),
+            Object::Tuple(items) => crate::object::cloned_vec(items),
             Object::Str(s) => s.chars().map(|c| Object::from_str(c.to_string())).collect(),
             Object::Bytes(b) => b.iter().map(|x| Object::Int(i64::from(*x))).collect(),
             Object::ByteArray(b) => b
@@ -4381,7 +4381,7 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
                     if f.defaults.is_empty() {
                         Some(Object::None)
                     } else {
-                        Some(Object::new_tuple(f.defaults.to_vec()))
+                        Some(Object::tuple_from_slice(&f.defaults))
                     }
                 }
                 "__kwdefaults__" => {
@@ -4399,7 +4399,7 @@ fn attr_get(obj: &Object, name: &str) -> Option<Object> {
                     if f.closure.is_empty() {
                         Some(Object::None)
                     } else {
-                        Some(Object::new_tuple(f.closure.to_vec()))
+                        Some(Object::tuple_from_slice(&f.closure))
                     }
                 }
                 _ => None,
@@ -7578,6 +7578,79 @@ fn b_tuple(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::new_tuple(out))
 }
 
+/// The key and value of an exact two-item tuple or list, read in place (as
+/// CPython's `PySequence_Fast` reads a pair of `dict.update`'s).
+pub(crate) fn exact_pair(pair: &Object) -> Option<(Object, Object)> {
+    match pair {
+        Object::Tuple(t) if t.len() == 2 => Some((t[0].clone(), t[1].clone())),
+        Object::List(l) => match l.try_borrow().ok()?.as_slice() {
+            [k, v] => Some((k.clone(), v.clone())),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `m[key] = value` for a key that settles by native equality (see
+/// [`dict_insert_exact`]), with no notification: whether a stored value
+/// was replaced by a different object, or the key and value handed back.
+fn table_store_exact(
+    m: &mut DictData,
+    key: Object,
+    value: Object,
+) -> Result<bool, (Object, Object)> {
+    let Some(probe) = crate::object::LeafProbe::new(&key) else {
+        return Err((key, value));
+    };
+    let vacancy = match m.probe_entry(&probe) {
+        crate::dictmap::ProbeEntry::Occupied(e) => {
+            let slot = e.into_mut();
+            let changed = !slot.is_same(&value);
+            *slot = value;
+            return Ok(changed);
+        }
+        crate::dictmap::ProbeEntry::Vacant(e) => e,
+    };
+    if !probe.miss_is_exact() {
+        return Err((key, value));
+    }
+    vacancy.insert(DictKey(key), value);
+    Ok(false)
+}
+
+/// The pairs at the front of `pairs` stored into `m` (with no
+/// notification), while each is an exact two-item tuple or list whose key
+/// settles natively: how many were stored, and whether a stored value was
+/// replaced by a different object.
+pub(crate) fn table_store_pairs(m: &mut DictData, pairs: &[Object]) -> (usize, bool) {
+    // An empty table is sized once for the pairs (up to a bound), and
+    // trimmed afterwards if the pairs mostly repeated their keys.
+    const ROOM_MAX: usize = 4096;
+    let room = if m.is_empty() {
+        pairs.len().min(ROOM_MAX)
+    } else {
+        0
+    };
+    if room > 8 {
+        m.reserve(room);
+    }
+    let (mut stored, mut changed) = (0, false);
+    for pair in pairs {
+        let Some((k, v)) = exact_pair(pair) else {
+            break;
+        };
+        match table_store_exact(m, k, v) {
+            Ok(replaced) => changed |= replaced,
+            Err(_) => break,
+        }
+        stored += 1;
+    }
+    if room > 64 && m.len() * 4 < room {
+        m.shrink_to_fit();
+    }
+    (stored, changed)
+}
+
 pub(crate) fn b_dict(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.is_empty() {
         let obj = Object::new_dict();
@@ -7603,10 +7676,50 @@ pub(crate) fn b_dict(args: &[Object]) -> Result<Object, RuntimeError> {
     // Mapping path for user-defined classes (`__keys__` style) is
     // handled by the VM before dispatching here — see
     // `Vm::do_dict_call`. Anything left over is an iterable of pairs.
-    let mut it = args[0].make_iter()?;
+    // (An items view of a dict holds that dict's entries: its table, hashes
+    // and all.)
+    if let Object::DictView(view) = &args[0] {
+        if matches!(view.kind, crate::object::DictViewKind::Items) {
+            let d = view.dict.borrow().clone();
+            let obj = Object::Dict(Rc::new(RefCell::new(d)));
+            crate::gc_trace::track(&obj);
+            return Ok(obj);
+        }
+    }
     let mut d = DictData::default();
+    // A list's or tuple's leading pairs are walked in place (see
+    // `table_store_pairs`); the iterator below passes over them.
+    let (walked, all) = match &args[0] {
+        Object::Tuple(t) => (table_store_pairs(&mut d, t).0, t.len()),
+        Object::List(l) => l.try_borrow().map_or((0, usize::MAX), |l| {
+            (table_store_pairs(&mut d, &l).0, l.len())
+        }),
+        _ => (0, usize::MAX),
+    };
+    if walked == all {
+        let obj = Object::Dict(Rc::new(RefCell::new(d)));
+        crate::gc_trace::track(&obj);
+        return Ok(obj);
+    }
+    let mut it = args[0].make_iter()?;
     let mut i = 0usize;
+    while i < walked {
+        if it.next_value().is_none() {
+            break;
+        }
+        i += 1;
+    }
     while let Some(pair) = it.next_value() {
+        // An exact two-item tuple or list is read in place, and a key that
+        // settles natively stored with one probe.
+        if let Some((key, value)) = exact_pair(&pair) {
+            if let Err((key, value)) = table_store_exact(&mut d, key, value) {
+                ensure_dict_key(&key)?;
+                crate::object::key_cmp_scope(|| d.insert(DictKey(key), value))?;
+            }
+            i += 1;
+            continue;
+        }
         // CPython `PyDict_MergeFromSeq2`: each element must itself be a
         // sequence of exactly two items (a 2-char string works too).
         // User instances iterate through the live interpreter (their
@@ -12431,7 +12544,11 @@ pub(crate) fn substr_find(hay: &str, needle: &str) -> Option<usize> {
         // hit is a character boundary: scan the bytes directly (no char
         // searcher) and compare the short rest inline (no `memcmp` call).
         let mut i = 0;
-        let mut budget = h.len() / n.len() + 32;
+        // (A first byte that keeps turning up without the rest, `"ab"`s
+        // searched for `"abd"`: each restart of the byte scan costs more
+        // than the bytes it skips, so the substring searcher, which looks
+        // for the needle's rarest bytes, takes the rest.)
+        let mut budget = 8;
         while i <= last_start {
             let at = i + memchr::memchr(n[0], &h[i..=last_start])?;
             if short_bytes_eq(&h[at + 1..at + n.len()], &n[1..]) {
@@ -12439,7 +12556,7 @@ pub(crate) fn substr_find(hay: &str, needle: &str) -> Option<usize> {
             }
             budget -= 1;
             if budget == 0 {
-                return hay[at + 1..].find(needle).map(|k| k + at + 1);
+                return memchr::memmem::find(&h[at + 1..], n).map(|k| k + at + 1);
             }
             i = at + 1;
         }
@@ -12544,16 +12661,30 @@ pub(crate) fn substr_count(hay: &str, needle: &str) -> usize {
     if n.is_empty() || n.len() > 16 || h.len() < n.len() {
         return hay.matches(needle).count();
     }
+    // One byte: counted a vector at a time (a call of the byte scan per
+    // hit cost ten times CPython's count in text full of the character).
+    if let [byte] = *n {
+        return memchr::memchr_iter(byte, h).count();
+    }
     let last_start = h.len() - n.len();
     if n[0].is_ascii() {
-        // As `substr_find`'s ASCII scan (every hit is a boundary).
+        // As `substr_find`'s ASCII scan (every hit is a boundary). The
+        // next candidate is looked for a byte at a time first: where the
+        // first byte is frequent (`"ab"` in text full of it), restarting
+        // the vector scan at each one costs several times the bytes it
+        // skips.
         let mut count = 0;
         let mut i = 0;
         while i <= last_start {
-            let Some(off) = memchr::memchr(n[0], &h[i..=last_start]) else {
-                break;
+            let near = (i + 16).min(last_start + 1);
+            let at = match h[i..near].iter().position(|c| *c == n[0]) {
+                Some(off) => i + off,
+                None if near > last_start => break,
+                None => match memchr::memchr(n[0], &h[near..=last_start]) {
+                    Some(off) => near + off,
+                    None => break,
+                },
             };
-            let at = i + off;
             if short_bytes_eq(&h[at + 1..at + n.len()], &n[1..]) {
                 count += 1;
                 i = at + n.len();
@@ -13988,13 +14119,12 @@ fn list_extend(args: &[Object]) -> Result<Object, RuntimeError> {
     // instead grow without bound (a hang that the OOM killer ends).
     match &args[1] {
         Object::List(src) => {
-            let items: Vec<Object> = src.borrow().clone();
+            let items: Vec<Object> = crate::object::cloned_vec(&src.borrow());
             l.borrow_mut().extend(items);
             return Ok(Object::None);
         }
         Object::Tuple(src) => {
-            let items: Vec<Object> = src.iter().cloned().collect();
-            l.borrow_mut().extend(items);
+            crate::object::extend_cloned(&mut l.borrow_mut(), src);
             return Ok(Object::None);
         }
         _ => {}
@@ -14445,7 +14575,7 @@ fn list_copy(args: &[Object]) -> Result<Object, RuntimeError> {
         return Err(type_error("copy() takes no arguments (1 given)"));
     }
     let l = list_self(args)?;
-    let v = l.borrow().clone();
+    let v = crate::object::cloned_vec(&l.borrow());
     let out = Object::new_list(v);
     crate::gc_trace::track_built(&out);
     Ok(out)
@@ -14937,8 +15067,8 @@ pub(crate) fn dict_fromkeys_leaf(args: &[Object]) -> Option<Result<Object, Runti
         _ => return None,
     };
     let keys: Vec<Object> = match keys {
-        Object::List(l) => l.try_borrow().ok()?.clone(),
-        Object::Tuple(t) => t.to_vec(),
+        Object::List(l) => crate::object::cloned_vec(&l.try_borrow().ok()?),
+        Object::Tuple(t) => crate::object::cloned_vec(t),
         // An ASCII string's characters (`dict.fromkeys("abc")`), the
         // shared one-character strings.
         Object::Str(s) if s.is_ascii() && s.len() <= 64 => s
@@ -15260,7 +15390,12 @@ fn dict_update_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let [Object::Dict(d), Object::Dict(src)] = args else {
         return None;
     };
-    if Rc::ptr_eq(d, src) || crate::capi_watchers::dicts_active() {
+    // (A dict updated from itself is left as it is, as CPython's
+    // `dict_merge` leaves it.)
+    if Rc::ptr_eq(d, src) {
+        return Some(Ok(Object::None));
+    }
+    if crate::capi_watchers::dicts_active() {
         return None;
     }
     crate::Interpreter::dict_merge_plain(d, src).then_some(Ok(Object::None))
@@ -17506,8 +17641,8 @@ fn bytes_join(args: &[Object]) -> Result<Object, RuntimeError> {
     // Iterate through the interpreter so user iterables / generators
     // work, not just native containers.
     let items: Vec<Object> = match it {
-        Object::List(l) => l.borrow().clone(),
-        Object::Tuple(t) => t.to_vec(),
+        Object::List(l) => crate::object::cloned_vec(&l.borrow()),
+        Object::Tuple(t) => crate::object::cloned_vec(t),
         other => {
             if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
                 // SAFETY: published by an enclosing VM frame still live on

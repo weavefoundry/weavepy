@@ -311,7 +311,7 @@ fn build_partial(
     crate::gc_trace::track(&keywords);
     let values = [
         func.clone(),
-        Object::new_tuple(rest.to_vec()),
+        Object::tuple_from_slice(rest),
         keywords,
         Object::Int(0),
         Object::None,
@@ -1347,7 +1347,7 @@ pub(crate) fn lru_probe(inst: &crate::types::PyInstance, args: &[Object]) -> Opt
         // without building it unless the call misses.
         [_, ..] if args.len() <= LRU_ARGS_MAX => {
             lru_probe_with::<_, true>(inst, &ArgsProbe::new(args, &[], &[])?, || {
-                Object::new_tuple(args.to_vec())
+                Object::tuple_from_slice(args)
             })
         }
         _ => None,

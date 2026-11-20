@@ -423,7 +423,7 @@ fn fast_call_soon(
     let handle = new_handle(
         &hs,
         cb.clone(),
-        Object::new_tuple(cb_args.to_vec()),
+        Object::tuple_from_slice(cb_args),
         loop_.clone(),
         ctx,
     );

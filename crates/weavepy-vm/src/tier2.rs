@@ -10260,9 +10260,10 @@ fn builtin_seq_step(cell: &Rc<GilRefCell<crate::object::PyIterator>>) -> Option<
     // SAFETY: the view ends with the step, which runs no code.
     let it = unsafe { cell.peek_mut() }?;
     match it {
-        PyIterator::List { .. } | PyIterator::Tuple { .. } | PyIterator::Range { .. } => {
-            Some(it.next_value())
-        }
+        PyIterator::List { .. }
+        | PyIterator::Tuple { .. }
+        | PyIterator::Range { .. }
+        | PyIterator::Reversed { .. } => Some(it.next_value()),
         // A set's next element while it keeps its size (a change, and the
         // end, are the general step's to report).
         PyIterator::Set { set, len, index } => {
@@ -10313,6 +10314,15 @@ fn seq_scalar_step(cell: &Rc<GilRefCell<PyIterator>>, elem_tag: i64) -> Option<u
             // SAFETY: as above.
             let bits = pack(unsafe { items.peek()? }.get(*index)?, lane)?;
             *index += 1;
+            Some(bits)
+        }
+        // A reversed list's (its end, and a list that shrank under it, are
+        // the general step's).
+        PyIterator::Reversed { items, index, .. } => {
+            let at = usize::try_from(*index).ok()?;
+            // SAFETY: as above.
+            let bits = pack(unsafe { items.peek()? }.get(at)?, lane)?;
+            *index -= 1;
             Some(bits)
         }
         _ => None,

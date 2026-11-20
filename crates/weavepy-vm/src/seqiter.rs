@@ -2465,9 +2465,7 @@ pub(crate) fn builtin_ctor_arms(cls: &Rc<TypeObject>, args: &[Object]) -> Option
                 Object::Tuple(_) => Some(src.clone()),
                 // SAFETY: a read between two instructions (cloning runs no
                 // code).
-                Object::List(l) => Some(Object::tuple_from_exact(
-                    unsafe { l.peek() }?.iter().map(crate::clone_hot),
-                )),
+                Object::List(l) => Some(Object::tuple_from_slice(unsafe { l.peek() }?)),
                 _ => None,
             };
         }
@@ -2477,9 +2475,9 @@ pub(crate) fn builtin_ctor_arms(cls: &Rc<TypeObject>, args: &[Object]) -> Option
                 return None;
             }
             let items = match src {
-                Object::Tuple(t) => t.to_vec(),
+                Object::Tuple(t) => crate::object::cloned_vec(t),
                 // SAFETY: as above.
-                Object::List(l) => unsafe { l.peek() }?.clone(),
+                Object::List(l) => crate::object::cloned_vec(unsafe { l.peek() }?),
                 _ => return None,
             };
             let obj = Object::new_list(items);
@@ -2739,8 +2737,8 @@ pub(crate) fn iter_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>>
 /// arguments, or a single list or tuple argument's items.
 fn scan_items(args: &[Object], multi: bool) -> Option<Vec<Object>> {
     match args {
-        [Object::Tuple(t)] => Some(t.to_vec()),
-        [Object::List(l)] => Some(l.try_borrow().ok()?.clone()),
+        [Object::Tuple(t)] => Some(crate::object::cloned_vec(t)),
+        [Object::List(l)] => Some(crate::object::cloned_vec(&l.try_borrow().ok()?)),
         [_] => None,
         _ if multi && args.len() > 1 => Some(args.to_vec()),
         _ => None,
@@ -2980,7 +2978,21 @@ pub(crate) fn plain_hashable(x: &Object, depth: u32) -> bool {
     match x {
         Object::Int(_) | Object::Bool(_) | Object::None | Object::Str(_) | Object::Bytes(_) => true,
         Object::Float(f) => !f.is_nan(),
-        Object::Tuple(t) => depth < 4 && t.iter().all(|e| plain_hashable(e, depth + 1)),
+        // (An element that's a scalar or a string is settled here: only a
+        // nested tuple or a float costs a call.)
+        Object::Tuple(t) => {
+            depth < 4
+                && t.iter().all(|e| {
+                    matches!(
+                        e,
+                        Object::Int(_)
+                            | Object::Bool(_)
+                            | Object::None
+                            | Object::Str(_)
+                            | Object::Bytes(_)
+                    ) || plain_hashable(e, depth + 1)
+                })
+        }
         _ => false,
     }
 }

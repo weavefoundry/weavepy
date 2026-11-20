@@ -653,7 +653,7 @@ impl<T: ?Sized + 'static> Rc<T> {
                 // other owners hold: a list of shared strings) releases them
                 // with plain decrements, not one drop call at a time, and
                 // frees without the trashcan. An item this release would
-                // free leaves the rest to the full release, the items
+                // free leaves it and the rest to the full release, the items
                 // released here already gone (none of them died, so the
                 // order of deaths is the full release's).
                 if std::any::TypeId::of::<T>()
@@ -665,21 +665,26 @@ impl<T: ?Sized + 'static> Rc<T> {
                     // The last strong reference: nothing else reads the
                     // items while this release, which runs no code, does.
                     let items = &mut *(*cell).as_ptr();
-                    let mut dying = false;
-                    for o in items.iter_mut() {
+                    // (Up to the first item that would die: the usual list
+                    // has none, and then no slot needs rewriting.)
+                    let biased = refcounts_biased();
+                    let mut released = 0;
+                    for o in items.iter() {
                         match o.strong_word() {
                             None => {}
-                            // (Released: the slot becomes a scalar.)
-                            Some(word) if try_release_word(word) => {
-                                ptr::write(o, crate::object::Object::None)
-                            }
-                            Some(_) => dying = true,
+                            Some(word) if biased && plain_release(word) => {}
+                            Some(_) => break,
                         }
+                        released += 1;
                     }
-                    if !dying {
+                    if released == items.len() {
                         items.set_len(0);
                         drop_arc_in(&mut self.0);
                         return;
+                    }
+                    // (Released: those slots become scalars.)
+                    for o in &mut items[..released] {
+                        ptr::write(o, crate::object::Object::None);
                     }
                 }
                 release_nested(LastOwner(ManuallyDrop::new(ManuallyDrop::take(

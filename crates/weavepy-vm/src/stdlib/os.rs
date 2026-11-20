@@ -7741,7 +7741,7 @@ fn struct_seq_init(
     }
     let _ = inst
         .native
-        .set(Object::new_tuple(values[..layout.n_sequence].to_vec()));
+        .set(Object::tuple_from_slice(&values[..layout.n_sequence]));
     // posixmodule's `statresult_new`: a stat_result initialized from a bare
     // tuple leaves the float `st_?time` members `None`; backfill them from
     // the integer-seconds sequence slots so `os.stat_result(range(10)).st_atime`
@@ -7822,7 +7822,7 @@ fn struct_seq_replace(
     }
     let _ = new_inst
         .native
-        .set(Object::new_tuple(vals[..layout.n_sequence].to_vec()));
+        .set(Object::tuple_from_slice(&vals[..layout.n_sequence]));
     let obj = Object::Instance(Rc::new(new_inst));
     // CPython allocates the copy through the GC heap, so it is tracked from
     // birth (test_structseq.test_replace_gc_tracked builds a cycle out of it).

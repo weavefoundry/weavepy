@@ -12427,6 +12427,59 @@ const PAYLOAD_OFFSET: usize = 16;
 /// collector tracks them by (`Str`, `WStr`, `Bytes`), by tag.
 const TEXT_TAGS: u64 = 1 << 7 | 1 << 8 | 1 << 27;
 
+/// Clones of `src`'s elements written to the `src.len()` slots at `dst`:
+/// the elements copied whole, then their counts taken in a second pass.
+/// (A clone moved through an iterator or `Vec::clone` goes by way of the
+/// stack in two unaligned halves, about twenty instructions an element.)
+///
+/// # Safety
+///
+/// `dst` is valid for `src.len()` writes and doesn't overlap `src`; the
+/// slots hold nothing that needs dropping.
+#[inline]
+pub(crate) unsafe fn clone_objects_into(src: &[Object], dst: *mut Object) {
+    // SAFETY: per the caller; each copied element's count is taken before
+    // anything can release the copy (nothing here runs code or unwinds,
+    // and the bias can't change hands meanwhile).
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
+        if crate::rc::refcounts_biased() {
+            for item in src {
+                if let Some(word) = item.strong_word() {
+                    crate::rc::plain_increment(word);
+                }
+            }
+        } else {
+            for item in src {
+                if let Some(word) = item.strong_word() {
+                    crate::rc::increment_word(word);
+                }
+            }
+        }
+    }
+}
+
+/// Clones of `src`'s elements appended to `dst` (see
+/// [`clone_objects_into`]).
+#[inline]
+pub(crate) fn extend_cloned(dst: &mut Vec<Object>, src: &[Object]) {
+    dst.reserve(src.len());
+    // SAFETY: the reservation leaves room for `src.len()` more elements,
+    // all of them written before the length covers them.
+    unsafe {
+        clone_objects_into(src, dst.as_mut_ptr().add(dst.len()));
+        dst.set_len(dst.len() + src.len());
+    }
+}
+
+/// A vector of clones of `src`'s elements (see [`clone_objects_into`]).
+#[inline]
+pub(crate) fn cloned_vec(src: &[Object]) -> Vec<Object> {
+    let mut items = Vec::with_capacity(src.len());
+    extend_cloned(&mut items, src);
+    items
+}
+
 impl Clone for Object {
     /// A new owner: the strong count (if any) bumped in place and the two
     /// words copied, with no per-variant dispatch.
@@ -14955,6 +15008,10 @@ pub(crate) fn py_hash_long_i64(n: i64) -> i64 {
     // the high bits onto the low ones instead of dividing: `|n| < 2**64`
     // leaves at most one subtraction.
     const MOD: u64 = (1u64 << PY_HASH_BITS) - 1;
+    // (A non-negative int below the modulus is its own hash.)
+    if (n as u64) < MOD {
+        return n;
+    }
     let a = n.unsigned_abs();
     let mut r = (a & MOD) + (a >> PY_HASH_BITS);
     if r >= MOD {
@@ -15728,18 +15785,21 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
             }
             // Ints and strings (the usual composite key): their hashes can
             // neither fail nor run code, so no error scope is needed.
-            if items
-                .iter()
-                .all(|x| matches!(x, Object::Int(_) | Object::Str(_)))
-            {
-                let mut hash = TupleHasher::new();
-                for item in items.iter() {
-                    hash.push(match item {
-                        Object::Int(i) => py_hash_long_i64(*i),
-                        Object::Str(s) => SharedStr::hash_cached(s),
-                        _ => unreachable!("matched above"),
-                    });
-                }
+            // (One pass: anything else ends it, and the general walk below
+            // starts over.)
+            let mut hash = TupleHasher::new();
+            let mut plain = true;
+            for item in items.iter() {
+                hash.push(match item {
+                    Object::Int(i) => py_hash_long_i64(*i),
+                    Object::Str(s) => SharedStr::hash_cached(s),
+                    _ => {
+                        plain = false;
+                        break;
+                    }
+                });
+            }
+            if plain {
                 let hash = hash.finish(items.len());
                 items.store_hash(hash);
                 return Some(hash);
@@ -16468,6 +16528,15 @@ impl Object {
             return Self::new_tuple(Vec::new());
         }
         Object::Tuple(TupleStorage::from_exact_iter(items))
+    }
+
+    /// A tuple of clones of `items`, copied into its storage in one pass
+    /// (the empty tuple is the interned one).
+    pub fn tuple_from_slice(items: &[Object]) -> Self {
+        if items.is_empty() {
+            return Self::new_tuple(Vec::new());
+        }
+        Object::Tuple(TupleStorage::from_cloned_slice(items))
     }
 
     /// Build a fixed-size tuple directly in reference-counted storage,

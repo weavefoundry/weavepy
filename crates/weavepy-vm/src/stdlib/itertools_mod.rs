@@ -721,7 +721,7 @@ pub(crate) fn native_new(
     let core = match kind {
         K_CHAIN => {
             let source = Object::Iter(Rc::new(RefCell::new(
-                Object::new_tuple(args.to_vec()).make_iter().ok()?,
+                Object::tuple_from_slice(args).make_iter().ok()?,
             )));
             chain_core(&[source, Object::None])
         }

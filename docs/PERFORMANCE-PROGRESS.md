@@ -1827,11 +1827,69 @@ branch and pull request.
     (the arms had started building big values a few commits back): the
     arms decline text that isn't digits at its first byte, 4% of the
     `exceptions` workload's instructions.
-    Still on the sweep's list: `del buf[:k]` on a `bytearray` moves the
-    rest each time (CPython keeps a start offset: 60 times its time on a
-    long buffer), and constant factors of two to five on
-    `deque.extendleft`, `memoryview` slices, `hash(tuple)`, `str.count`
-    and `list.pop(0)`.
+  - The sweep's constant factors, and two more cliffs found beside them.
+    Copying a sequence's items moved each one through an iterator: an
+    object returned by value travels as a tag byte and fifteen more,
+    stored and reloaded unaligned, about twenty instructions an item.
+    `tuple(xs)`, `a + b`, `t * n`, `(*xs,)`, slices, `list(xs)`,
+    `xs.copy()`, `extend` and the snapshots `min`, `max` and `sorted`
+    take now copy the items whole and take their counts in a second
+    pass, and a vector that becomes a tuple hands its items over in one
+    copy. At 1,000 ints: `tuple(xs)` 8.0 µs to 1.0 (CPython 1.9),
+    `t + t` 10.1 to 1.9 (2.8), `t * 2` 9.9 to 2.4 (2.6), `(*xs,)` 6.4
+    to 1.5 (3.6), `t[::-1]` 5.1 to 1.6 (1.6). A dict's or a set's
+    entries copy the same way (`dict(d)` and `d.copy()` 5.6 µs to 3.7;
+    CPython 3.2), and a list whose items all outlive it is released
+    without rewriting its slots.
+    `for x in reversed(xs)` in a loop tier 2 compiled stepped its
+    iterator through the interpreter's general `next`, 41 ns an item
+    (the same loop over the list itself 3.5): the reversed list's
+    iterator steps in place, as a list's does (7 ns; CPython 22).
+    A tuple's hash walked its items twice and reduced each int modulo
+    the hash prime, and `hash()` first checked each item's hashability
+    through a call: one pass, an int below the prime is its own hash,
+    and scalars are checked in line (34 instructions an item to 13;
+    `hash(t + (i,))` of 1,000 ints 9.0 µs to 2.8, CPython 3.4).
+    A `memoryview` slice left compiled code for the interpreter and
+    built four vectors on the way to a view that needs none (3,530
+    instructions to 1,536; 283 ns to 152, CPython 72: the view's own
+    copy, with its format string, is most of what is left).
+    `str.count` of one character ran the substring search per
+    occurrence (29 µs to 1.8 on a 33,600-character text, CPython 11.9).
+    The first cliff: `b[i:j] = data` on a `bytearray` rebuilt the whole
+    buffer as a list of int objects, spliced that, and wrote every byte
+    back, whatever the slice's size, and `del b[i:j]` removed the
+    slice's bytes one at a time, moving the tail for each. On a 1 MB
+    buffer a four-byte store took 9.1 ms (CPython 171 ns) and
+    `del b[:16]` 388 µs (72 ns). Both work on the bytes now: a store of
+    the same length writes in place, any other moves the tail once, and
+    an extended slice is stored or closed up in one pass (237 ns, and
+    23 µs for the delete, which still moves the megabyte: CPython keeps
+    a start offset, and that is what is left here).
+    The second: merging dicts. `d.update(other)` gave up its one-pass
+    merge when `d` held more than 32 keys (checking them for Python
+    `__eq__` was thought too dear) and then stored key by key through a
+    snapshot of `other`; `d.update(d)` did all of that to change
+    nothing; `dict(pairs)` and `d.update(pairs)` made an iterator and a
+    vector for every pair; and an items view was read as pairs like any
+    iterable. The merge now probes with each key's stored kind and
+    stops only at a key that needs Python (the keys before it are in,
+    and the general path merges them again harmlessly), a dict merged
+    into itself returns at once, a list or tuple of exact pairs is
+    walked in place under one borrow, `zip` of two plain sequences
+    builds its dict first, and an items view merges as its dict. At
+    1,000 keys: `d.update(other)` with half the keys shared 68 µs to 27
+    (CPython 34), `d |= other` the same, `d.update(d)` 46 µs to 66 ns
+    (63), `dict(pairs)` 110 µs to 33 (31), `d.update(pairs)` 74 to 26
+    (31), `d.update(other.items())` 103 to 4.0 (36), `dict(d.items())`
+    131 to 4.4 (36), `d.update(zip(ks, vs))` 92 to 24 (40).
+    Left: a generator of pairs (`d.update((k, v) for ...)` 136 µs
+    against 63, the generator's resumption from native code),
+    `dict(d, **kw)` (the keyword-spread call's own machinery, about
+    6,000 instructions), small-dict merges at 1.3 to 2 times CPython
+    (the new container's tracking and release), `list.pop(0)` and
+    `xs * 2` (16-byte items against 8), and the `bytearray` start
+    offset.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

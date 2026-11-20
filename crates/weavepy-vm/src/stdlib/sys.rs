@@ -1912,7 +1912,7 @@ pub fn audit_event(event: &str, args: &[Object]) -> Result<(), RuntimeError> {
     // interpreter mutably. Mutation from this thread is exclusive
     // because the VM holds the GIL across the whole audit event.
     let interp = unsafe { &mut *ptr };
-    let arg_tuple = Object::new_tuple(args.to_vec());
+    let arg_tuple = Object::tuple_from_slice(args);
     let outer = interp.builtins_dict();
     // `PyThreadState_EnterTracing`: hooks run untraced by default.
     let _suppress = crate::trace::TracingSuppressGuard::enter();

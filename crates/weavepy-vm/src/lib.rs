@@ -20453,8 +20453,8 @@ impl Interpreter {
                 // The interned empty tuple.
                 Object::new_tuple(Vec::new())
             } else if direct >= skip {
-                Object::Tuple(crate::tuple_storage::TupleStorage::from_exact_iter(
-                    rest[direct - skip..].iter().cloned(),
+                Object::Tuple(crate::tuple_storage::TupleStorage::from_cloned_slice(
+                    &rest[direct - skip..],
                 ))
             } else {
                 // (Some of `head` is surplus too.)
@@ -21943,9 +21943,7 @@ impl Interpreter {
                         return Some(Object::new_tuple(Vec::new()));
                     }
                     return Some(Object::Tuple(
-                        crate::tuple_storage::TupleStorage::from_exact_iter(
-                            items[lo..hi].iter().cloned(),
-                        ),
+                        crate::tuple_storage::TupleStorage::from_cloned_slice(&items[lo..hi]),
                     ));
                 }
                 Some(Object::new_tuple(slice_seq(&items[..], sl).ok()?))
@@ -21958,6 +21956,19 @@ impl Interpreter {
                     return Some(Object::Bytes(SharedSlice::from(&b[lo..hi.max(lo)])));
                 }
                 Some(Object::new_bytes(slice_seq(&b[..], sl).ok()?))
+            }
+            // A live view's sub-view, when another owner holds the view (its
+            // release here then frees nothing) and tracking the sub-view
+            // starts no collection.
+            Object::MemoryView(mv)
+                if Rc::strong_count(mv) > 1
+                    && !mv.released.get()
+                    && !mv.restricted.get()
+                    && !mv.zero_dim.get()
+                    && !crate::stdlib::tracemalloc_real::is_tracking()
+                    && !gc_trace::auto_collect_due() =>
+            {
+                mv_slice_subview(mv, sl).ok()
             }
             // A contiguous slice of a `bytearray`: a new one over the range.
             Object::ByteArray(b) if matches!(sl.step, Object::None | Object::Int(1)) => {
@@ -22064,8 +22075,8 @@ impl Interpreter {
                 if x.is_empty() {
                     return Some(b.clone());
                 }
-                Some(Object::new_tuple(
-                    x.iter().chain(y.iter()).cloned().collect(),
+                Some(Object::Tuple(
+                    crate::tuple_storage::TupleStorage::from_cloned_pair(x, y),
                 ))
             }
             (Object::List(x), Object::List(y)) => {
@@ -22074,8 +22085,8 @@ impl Interpreter {
                 }
                 let (x, y) = (x.try_borrow().ok()?, y.try_borrow().ok()?);
                 let mut items = Vec::with_capacity(x.len() + y.len());
-                items.extend(x.iter().cloned());
-                items.extend(y.iter().cloned());
+                crate::object::extend_cloned(&mut items, &x);
+                crate::object::extend_cloned(&mut items, &y);
                 let obj = Object::new_list(items);
                 gc_trace::track_built(&obj);
                 Some(obj)
@@ -22106,12 +22117,16 @@ impl Interpreter {
                 if n == 1 {
                     return Some(seq.clone());
                 }
-                if x.len().checked_mul(times)? > Self::CORE_REPEAT_MAX {
+                let total = x.len().checked_mul(times)?;
+                if total > Self::CORE_REPEAT_MAX {
                     return None;
                 }
-                let mut out = Vec::new();
-                repeat_objects(x, times, &mut out);
-                Some(Object::new_tuple(out))
+                if total == 0 {
+                    return Some(Object::new_tuple(Vec::new()));
+                }
+                Some(Object::Tuple(
+                    crate::tuple_storage::TupleStorage::from_repeated_slice(x, times),
+                ))
             }
             Object::List(x) => {
                 if crate::stdlib::tracemalloc_real::is_tracking() || gc_trace::auto_collect_due() {
@@ -22964,7 +22979,10 @@ impl Interpreter {
                         | Object::MappingProxy(_)
                 ) || matches!(
                     (c, k),
-                    (Object::ByteArray(_) | Object::Instance(_), Object::Slice(_))
+                    (
+                        Object::ByteArray(_) | Object::Instance(_) | Object::MemoryView(_),
+                        Object::Slice(_)
+                    )
                 )) || !Self::core_droppable(c)
                 {
                     return None;
@@ -23046,6 +23064,7 @@ impl Interpreter {
                         | Object::Str(_)
                         | Object::Bytes(_)
                         | Object::ByteArray(_)
+                        | Object::MemoryView(_)
                         | Object::Instance(_),
                         Object::Slice(sl),
                     ) if [&sl.start, &sl.stop, &sl.step]
@@ -23089,6 +23108,7 @@ impl Interpreter {
                         | Object::Str(_)
                         | Object::Bytes(_)
                         | Object::ByteArray(_)
+                        | Object::MemoryView(_)
                         | Object::Instance(_)
                 ) || !Self::core_droppable(c)
                     || !matches!(a, Object::None | Object::Int(_))
@@ -23363,7 +23383,7 @@ impl Interpreter {
                     return None;
                 }
                 let items: Vec<Object> = match value {
-                    Object::Tuple(t) => t.to_vec(),
+                    Object::Tuple(t) => crate::object::cloned_vec(t),
                     Object::List(l) if !Rc::ptr_eq(l, dst) => l.try_borrow().ok()?.clone(),
                     _ => return None,
                 };
@@ -23627,12 +23647,12 @@ impl Interpreter {
                     Object::Tuple(t) => {
                         // SAFETY: a store between two instructions; growing
                         // the list runs no code.
-                        unsafe { lst.peek_mut() }?.extend(t.iter().cloned());
+                        crate::object::extend_cloned(unsafe { lst.peek_mut() }?, t);
                     }
                     Object::List(l) if !Rc::ptr_eq(l, lst) => {
                         // SAFETY: as above; two distinct lists.
-                        let items = unsafe { l.peek() }?.clone();
-                        unsafe { lst.peek_mut() }?.extend(items);
+                        let items = unsafe { l.peek() }?;
+                        crate::object::extend_cloned(unsafe { lst.peek_mut() }?, items);
                     }
                     _ => return None,
                 }
@@ -30750,7 +30770,7 @@ impl Interpreter {
                         break;
                     };
                     let items: Vec<Object> = match &stack[n - 4] {
-                        Object::Tuple(t) => t.to_vec(),
+                        Object::Tuple(t) => crate::object::cloned_vec(t),
                         Object::List(l) => match l.try_borrow() {
                             Ok(l) => l.clone(),
                             Err(_) => break,
@@ -30862,7 +30882,7 @@ impl Interpreter {
                         break;
                     };
                     let items: Vec<Object> = match src {
-                        Object::Tuple(t) => t.to_vec(),
+                        Object::Tuple(t) => crate::object::cloned_vec(t),
                         Object::List(l) if !Rc::ptr_eq(l, dst) => match l.try_borrow() {
                             Ok(l) => l.clone(),
                             Err(_) => break,
@@ -33833,8 +33853,8 @@ impl Interpreter {
                     }
                     v
                 }
-                [Object::List(l)] => l.try_borrow().ok()?.clone(),
-                [Object::Tuple(t)] => t.to_vec(),
+                [Object::List(l)] => crate::object::cloned_vec(&l.try_borrow().ok()?),
+                [Object::Tuple(t)] => crate::object::cloned_vec(t),
                 // An exact dict's keys, in order (`list(dict.fromkeys(xs))`).
                 [Object::Dict(d)] => d.try_borrow().ok()?.keys().map(|k| k.0.clone()).collect(),
                 _ => return None,
@@ -35389,7 +35409,7 @@ impl Interpreter {
             // signature reads them).
             return match name {
                 "__defaults__" if f.defaults.is_empty() => Some(Object::None),
-                "__defaults__" => Some(Object::new_tuple(f.defaults.to_vec())),
+                "__defaults__" => Some(Object::tuple_from_slice(&f.defaults)),
                 "__kwdefaults__" if f.kw_defaults.is_empty() => Some(Object::None),
                 "__kwdefaults__" => {
                     let mut d = DictData::default();
@@ -38826,7 +38846,7 @@ impl Interpreter {
                 }
                 let mut pos_args: Vec<Object> = match &args_obj {
                     Object::Tuple(items) => items.iter().cloned().collect(),
-                    Object::List(items) => items.borrow().clone(),
+                    Object::List(items) => crate::object::cloned_vec(&items.borrow()),
                     other => {
                         // A single `f(*x)` splat pushes `x` raw; CPython's
                         // `do_call` converts via `PySequence_Tuple` and
@@ -39619,7 +39639,7 @@ impl Interpreter {
                 let v = frame.pop()?;
                 let items: Vec<Object> = match v {
                     Object::Tuple(items) => items.iter().cloned().collect(),
-                    Object::List(items) => items.borrow().clone(),
+                    Object::List(items) => crate::object::cloned_vec(&items.borrow()),
                     Object::Str(s) => s.chars().map(|c| Object::from_str(c.to_string())).collect(),
                     Object::Bytes(b) => b.iter().map(|x| Object::Int(i64::from(*x))).collect(),
                     Object::ByteArray(b) => b
@@ -40177,8 +40197,8 @@ impl Interpreter {
                 let excs = frame.pop()?;
                 let orig = frame.pop()?;
                 let items: Vec<Object> = match &excs {
-                    Object::List(l) => l.borrow().clone(),
-                    Object::Tuple(t) => t.to_vec(),
+                    Object::List(l) => crate::object::cloned_vec(&l.borrow()),
+                    Object::Tuple(t) => crate::object::cloned_vec(t),
                     other => {
                         return Err(RuntimeError::Internal(format!(
                             "PREP_RERAISE_STAR expects a list, got {}",
@@ -42950,7 +42970,7 @@ impl Interpreter {
                         if f.defaults.is_empty() {
                             return Ok(Object::None);
                         }
-                        return Ok(Object::new_tuple(f.defaults.to_vec()));
+                        return Ok(Object::tuple_from_slice(&f.defaults));
                     }
                     "__kwdefaults__" => {
                         if f.kw_defaults.is_empty() {
@@ -42966,7 +42986,7 @@ impl Interpreter {
                         if f.closure.is_empty() {
                             return Ok(Object::None);
                         }
-                        return Ok(Object::new_tuple(f.closure.to_vec()));
+                        return Ok(Object::tuple_from_slice(&f.closure));
                     }
                     "__annotations__" => {
                         // PEP 649 (`function___annotations___get_impl`):
@@ -48196,8 +48216,8 @@ impl Interpreter {
             }
         }
         match v {
-            Object::List(items) => Ok(items.borrow().clone()),
-            Object::Tuple(items) => Ok(items.to_vec()),
+            Object::List(items) => Ok(crate::object::cloned_vec(&items.borrow())),
+            Object::Tuple(items) => Ok(crate::object::cloned_vec(items)),
             Object::Set(s) => Ok(s.borrow().iter().map(|k| k.0.clone()).collect()),
             Object::FrozenSet(s) => Ok(s.iter().map(|k| k.0.clone()).collect()),
             // A dict's keys, as its iterator would give them (cloning them
@@ -49583,39 +49603,48 @@ impl Interpreter {
     }
 
     /// [`Self::dict_merge_from`]'s plain case: merge `src` into `dst`
-    /// (distinct dicts) when no key on either side can run Python code to
-    /// hash or compare (see [`crate::object::dict_key_is_reentrant`]), with
-    /// the same effects as one insert per key. `false` touches nothing.
+    /// (distinct dicts) while each key settles by native equality (one
+    /// probe finds its entry or proves no stored key could equal it, see
+    /// [`crate::object::LeafProbe`]), with the same effects as one insert
+    /// per key. `false` when a key needs more than that: the keys before it
+    /// are merged, and merging them again changes nothing (each already
+    /// holds its value).
     pub(crate) fn dict_merge_plain(
         dst: &Rc<RefCell<DictData>>,
         src: &Rc<RefCell<DictData>>,
     ) -> bool {
-        // A destination this large is merged key by key: checking its keys
-        // could cost more than the merge saves.
-        const DST_CHECK_CAP: usize = 32;
         let (Ok(s), Ok(mut d)) = (src.try_borrow(), dst.try_borrow_mut()) else {
             return false;
         };
         let was = d.len();
-        // (An empty destination takes the source's table, hashes and all:
-        // no key is hashed or compared, so none needs checking.)
-        if was != 0
-            && (s.keys().any(|k| crate::object::dict_key_is_reentrant(&k.0))
-                || was > DST_CHECK_CAP
-                || d.keys().any(|k| crate::object::dict_key_is_reentrant(&k.0)))
-        {
-            return false;
-        }
-        let mut changed = false;
+        let (mut changed, mut whole) = (false, true);
         if was == 0 {
             // The source's table, hashes and all (through `DerefMut`, which
-            // stamps the dict and tracks a deferred owner).
+            // stamps the dict and tracks a deferred owner): no key is hashed
+            // or compared.
             **d = crate::object::DictMap::clone(&s);
         } else {
-            d.reserve(s.len());
             for (k, v) in s.iter() {
-                if let Some(old) = d.insert(k.clone(), v.clone()) {
-                    changed |= !old.is_same(v);
+                let Some(probe) = crate::object::LeafProbe::new(&k.0) else {
+                    whole = false;
+                    break;
+                };
+                match d.probe_entry(&probe) {
+                    crate::dictmap::ProbeEntry::Occupied(e) => {
+                        let slot = e.into_mut();
+                        // (Re-storing the identical object is no change.)
+                        if !slot.is_same(v) {
+                            changed = true;
+                            *slot = v.clone();
+                        }
+                    }
+                    crate::dictmap::ProbeEntry::Vacant(e) => {
+                        if !probe.miss_is_exact() {
+                            whole = false;
+                            break;
+                        }
+                        e.insert(k.clone(), v.clone());
+                    }
                 }
             }
         }
@@ -49630,7 +49659,35 @@ impl Interpreter {
         if added || changed {
             crate::object::dict_mutation_event(dst);
         }
-        true
+        whole
+    }
+
+    /// The pairs at the front of the list or tuple `pairs` stored into
+    /// `dst` under one borrow of each, while each is an exact two-item
+    /// tuple or list whose key settles natively: how many were stored (the
+    /// rest are the caller's), with what one insert per pair reports.
+    fn dict_store_pairs(dst: &Rc<RefCell<DictData>>, pairs: &Object) -> usize {
+        let Ok(mut m) = dst.try_borrow_mut() else {
+            return 0;
+        };
+        let was = m.len();
+        let (stored, changed) = match pairs {
+            Object::Tuple(t) => crate::builtins::table_store_pairs(&mut m, t),
+            Object::List(l) => match l.try_borrow() {
+                Ok(l) => crate::builtins::table_store_pairs(&mut m, &l),
+                Err(_) => (0, false),
+            },
+            _ => (0, false),
+        };
+        let added = m.len() != was;
+        drop(m);
+        if added {
+            crate::object::dict_watch_bump(dst);
+        }
+        if added || changed {
+            crate::object::dict_mutation_event(dst);
+        }
+        stored
     }
 
     pub(crate) fn dict_merge_from(
@@ -49700,8 +49757,50 @@ impl Interpreter {
             }
             return Ok(());
         }
+        // Pairs from sources that run no code. An items view of a dict
+        // merges as that dict does (a partial merge is finished, harmlessly
+        // again, by the walk below); `zip` of two plain sequences with
+        // simple keys builds its dict first; a list or tuple of pairs is
+        // walked in place while each pair is an exact one whose key settles
+        // natively.
+        let mut walked = 0;
+        if let Object::Dict(dd) = dst {
+            if !crate::capi_watchers::dicts_active() {
+                match other {
+                    Object::DictView(view)
+                        if matches!(view.kind, crate::object::DictViewKind::Items) =>
+                    {
+                        if Rc::ptr_eq(dd, &view.dict) || Self::dict_merge_plain(dd, &view.dict) {
+                            return Ok(());
+                        }
+                    }
+                    Object::LazyIter(l) => {
+                        if let Some(built) = crate::seqiter::dict_from_zip_pure(l) {
+                            let built = Object::Dict(Rc::new(RefCell::new(built)));
+                            return self.dict_merge_from(dst, &built, globals);
+                        }
+                    }
+                    Object::List(_) | Object::Tuple(_) => {
+                        walked = Self::dict_store_pairs(dd, other);
+                        let all = match other {
+                            Object::Tuple(t) => t.len(),
+                            Object::List(l) => l.try_borrow().map_or(usize::MAX, |l| l.len()),
+                            _ => usize::MAX,
+                        };
+                        if walked == all {
+                            return Ok(());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         // Mapping protocol: `if hasattr(other, "keys")`.
-        let keys_fn = self.load_attr(other, "keys").ok();
+        let keys_fn = if matches!(other, Object::List(_) | Object::Tuple(_)) {
+            None
+        } else {
+            self.load_attr(other, "keys").ok()
+        };
         if let Some(keys_fn) = keys_fn {
             let keys = self.call(&keys_fn, &[], &[], globals)?;
             let it = self.make_iter(&keys, globals)?;
@@ -49723,7 +49822,29 @@ impl Interpreter {
             }
         })?;
         let mut idx: usize = 0;
+        // (The pairs already stored are passed over: reading them again runs
+        // nothing.)
+        while idx < walked {
+            if self.iter_next(&it, globals)?.is_none() {
+                return Ok(());
+            }
+            idx += 1;
+        }
         while let Some(pair) = self.iter_next(&it, globals)? {
+            // An exact two-item tuple or list is read in place (CPython's
+            // `PySequence_Fast` takes it as it is), and a key that settles
+            // natively is stored with one probe.
+            if let Some((k, v)) = crate::builtins::exact_pair(&pair) {
+                let rest = match dst {
+                    Object::Dict(dd) => crate::builtins::dict_insert_exact(dd, k, v).err(),
+                    _ => Some((k, v)),
+                };
+                if let Some((k, v)) = rest {
+                    self.store_subscr(dst, &k, v, globals)?;
+                }
+                idx += 1;
+                continue;
+            }
             let inner = self
                 .make_iter(&pair, globals)
                 .map_err(|e| crate::builtins::dict_update_element_error(e, idx))?;
@@ -52299,7 +52420,7 @@ impl Interpreter {
                     return Ok(None);
                 };
                 let call_args: Vec<Object> = match &item {
-                    Object::Tuple(items) => items.to_vec(),
+                    Object::Tuple(items) => crate::object::cloned_vec(items),
                     other => self.collect_iterable(other, globals)?,
                 };
                 if let Object::Function(f) = &func {
@@ -53763,7 +53884,7 @@ impl Interpreter {
         let bt = crate::builtin_types::builtin_types();
         let call_args: Vec<Object> = match val {
             Object::None => vec![],
-            Object::Tuple(items) => items.to_vec(),
+            Object::Tuple(items) => crate::object::cloned_vec(items),
             other => vec![other.clone()],
         };
         let globals = self.builtins.clone();
@@ -54738,6 +54859,16 @@ impl Interpreter {
                 }
             }
             (Object::Dict(dst), BinOpKind::BitOr) => {
+                // A plain dict's entries go in under one borrow of each
+                // dict while their keys settle natively (and a dict merged
+                // into itself is left as it is).
+                if let Object::Dict(s) = b {
+                    if Rc::ptr_eq(dst, s)
+                        || (!crate::capi_watchers::dicts_active() && Self::dict_merge_plain(dst, s))
+                    {
+                        return Ok(a.clone());
+                    }
+                }
                 let src: Vec<(DictKey, Object)> = match b {
                     Object::Dict(s) => s
                         .borrow()
@@ -60590,7 +60721,8 @@ impl Interpreter {
                         "operation forbidden on released memoryview object",
                     ));
                 }
-                if mv.shape_dims().is_empty() {
+                // (No dimensions exactly when the view is a scalar one.)
+                if mv.zero_dim.get() {
                     return Err(type_error("invalid indexing of 0-dim memory"));
                 }
                 // `mv[i:j:k]` is a *sub-view* sharing the same buffer, not a
@@ -60763,7 +60895,7 @@ impl Interpreter {
                 // full VM iteration protocol so objects that are only
                 // legacy-iterable (`__getitem__`, no `__iter__`) work.
                 let replacement = match &value {
-                    Object::List(l) => l.borrow().clone(),
+                    Object::List(l) => crate::object::cloned_vec(&l.borrow()),
                     Object::Tuple(t) => t.iter().cloned().collect::<Vec<_>>(),
                     Object::Str(txt) => txt
                         .chars()
@@ -60827,54 +60959,43 @@ impl Interpreter {
                     }
                 };
                 let mut data = b.borrow_mut();
-                // CPython (`bytearray_ass_subscript`): assigning an *empty*
-                // buffer to an extended slice is a deletion — and the
-                // resizability check runs before the no-op early-out, so an
-                // exported bytearray raises BufferError even for zero-width
-                // slices.
-                let step = match &s.step {
-                    Object::Int(k) => *k,
-                    _ => 1,
-                };
-                if replacement.is_empty() && step != 1 {
-                    crate::object::bytearray_check_resizable(b)?;
-                    let mut indices = slice_indices(data.len(), s)?;
-                    indices.sort_unstable();
-                    for idx in indices.into_iter().rev() {
-                        data.remove(idx);
+                let (start, stop, step, count) = adjust_slice(data.len() as i64, s)?;
+                // A plain slice is spliced in the bytes themselves: one move
+                // of the tail when the length changes, none when it doesn't
+                // (the buffer's address then stays what ctypes handed out,
+                // see `_ctypes_native::addressof_buffer`).
+                if step == 1 {
+                    let start = start as usize;
+                    let stop = (stop as usize).max(start);
+                    if replacement.len() == stop - start {
+                        data[start..stop].copy_from_slice(&replacement);
+                    } else {
+                        crate::object::bytearray_check_resizable(b)?;
+                        data.splice(start..stop, replacement);
                     }
                     return Ok(());
                 }
-                let mut objs: Vec<Object> = data
-                    .iter()
-                    .map(|byte| Object::Int(i64::from(*byte)))
-                    .collect();
-                let repl_objs: Vec<Object> = replacement
-                    .iter()
-                    .map(|byte| Object::Int(i64::from(*byte)))
-                    .collect();
-                apply_slice_assignment(&mut objs, s, repl_objs)?;
-                if objs.len() == data.len() {
-                    // Same-length write: mutate in place so the backing
-                    // buffer's data pointer stays stable. ctypes
-                    // (`_ctypes_native::addressof_buffer`) hands out raw
-                    // addresses into bytearray storage that must survive
-                    // subsequent same-size writes.
-                    for (dst, o) in data.iter_mut().zip(objs) {
-                        *dst = match o {
-                            Object::Int(v) => v as u8,
-                            _ => unreachable!("bytearray slice splice produced non-int"),
-                        };
-                    }
-                } else {
+                // CPython (`bytearray_ass_subscript`): assigning an *empty*
+                // buffer to an extended slice is a deletion, and the
+                // resizability check runs before the no-op early-out, so an
+                // exported bytearray raises BufferError even for zero-width
+                // slices.
+                if replacement.is_empty() {
                     crate::object::bytearray_check_resizable(b)?;
-                    *data = objs
-                        .into_iter()
-                        .map(|o| match o {
-                            Object::Int(v) => v as u8,
-                            _ => unreachable!("bytearray slice splice produced non-int"),
-                        })
-                        .collect();
+                    bytes_delete_strided(&mut data, start, step, count);
+                    return Ok(());
+                }
+                if replacement.len() as i64 != count {
+                    return Err(value_error(format!(
+                        "attempt to assign bytes of size {} to extended slice of size {}",
+                        replacement.len(),
+                        count
+                    )));
+                }
+                let mut at = start;
+                for byte in replacement {
+                    data[at as usize] = byte;
+                    at += step;
                 }
                 Ok(())
             }
@@ -61212,18 +61333,19 @@ impl Interpreter {
             }
             (Object::ByteArray(b), Object::Slice(s)) => {
                 let mut data = b.borrow_mut();
-                let mut indices = slice_indices(data.len(), s)?;
-                indices.sort_unstable();
-                indices.dedup();
+                let (start, stop, step, count) = adjust_slice(data.len() as i64, s)?;
                 // CPython checks resizability before the zero-width early-out
                 // on the extended-slice path, so `del exported[1:1:2]` raises
                 // BufferError even though nothing would be removed.
-                let extended = !matches!(&s.step, Object::None | Object::Int(1));
-                if extended || !indices.is_empty() {
+                if step != 1 || count > 0 {
                     crate::object::bytearray_check_resizable(b)?;
                 }
-                for idx in indices.into_iter().rev() {
-                    data.remove(idx);
+                // One move of what follows the run (a `remove` per byte moved
+                // the tail once for each byte deleted).
+                if step != 1 {
+                    bytes_delete_strided(&mut data, start, step, count);
+                } else if count > 0 {
+                    data.drain(start as usize..stop as usize);
                 }
                 Ok(())
             }
@@ -64233,7 +64355,7 @@ impl Interpreter {
         };
         let ns_obj: Option<Object> = match prep {
             Some(p) => {
-                let bases_tuple = Object::new_tuple(bases.to_vec());
+                let bases_tuple = Object::tuple_from_slice(bases);
                 let result = self.call(
                     &p,
                     &[Object::from_str(name), bases_tuple],
@@ -64308,7 +64430,7 @@ impl Interpreter {
         // the metaclass (typing's `_generic_init_subclass` relies on
         // it to tell `Generic[T]` from plain `Generic`).
         if let Some(ob) = orig_bases {
-            let ob_tuple = Object::new_tuple(ob.to_vec());
+            let ob_tuple = Object::tuple_from_slice(ob);
             if let Some(obj) = &ns_obj {
                 let g = body_fn.globals.clone();
                 self.class_ns_store(obj, "__orig_bases__", ob_tuple, &g)?;
@@ -64326,7 +64448,7 @@ impl Interpreter {
         };
         let call_args = vec![
             Object::from_str(name),
-            Object::new_tuple(bases.to_vec()),
+            Object::tuple_from_slice(bases),
             ns_for_call,
         ];
         let result = self.call(&meta, &call_args, subclass_kwargs, &body_fn.globals)?;
@@ -66756,7 +66878,7 @@ impl Interpreter {
                 // (test_exceptions NaiveException).
                 if plan.seeds_exception_args {
                     if let Object::Instance(i) = &inst {
-                        i.slot_set("args", Object::new_tuple(args.to_vec()));
+                        i.slot_set("args", Object::tuple_from_slice(args));
                     }
                 }
                 // RFC 0024: auto-track every fresh user instance with
@@ -66982,7 +67104,7 @@ impl Interpreter {
         // family shapes construction, so `args` is the only slot, built
         // in place without the per-slot probes below.
         if families & !(EXC_CUSTOM_INIT | EXC_FAM_GROUP) == 0 {
-            let args_tuple = Object::tuple_from_exact(args.iter().cloned());
+            let args_tuple = Object::tuple_from_slice(args);
             let inst =
                 PyInstance::with_slots(cls, crate::types::SlotStorage::exception(args_tuple, []));
             let obj = Object::Instance(Rc::new(inst));
@@ -67000,7 +67122,7 @@ impl Interpreter {
             && !args.iter().any(|a| matches!(a, Object::None))
             && cls.fresh_slots().is_empty_default()
         {
-            let args_tuple = Object::new_tuple(args[..2].to_vec());
+            let args_tuple = Object::tuple_from_slice(&args[..2]);
             let (e, s) = (args[0].clone(), args[1].clone());
             let slots = match args.get(2) {
                 Some(f) => crate::types::SlotStorage::exception(
@@ -67033,9 +67155,9 @@ impl Interpreter {
             && args.len() == 3
             && matches!(args[2], Object::Int(_) | Object::Long(_));
         let args_tuple = if is_os_error && !written_from_filename && (2..=5).contains(&args.len()) {
-            Object::new_tuple(args[..2].to_vec())
+            Object::tuple_from_slice(&args[..2])
         } else {
-            Object::new_tuple(args.to_vec())
+            Object::tuple_from_slice(args)
         };
         // (No `message` mirror: CPython has none, and `str()` and the Rust
         // display derive the text from `args`.)
@@ -67067,7 +67189,7 @@ impl Interpreter {
             let code = match args.len() {
                 0 => Object::None,
                 1 => args[0].clone(),
-                _ => Object::new_tuple(args.to_vec()),
+                _ => Object::tuple_from_slice(args),
             };
             inst.slot_set("code", code);
         }
@@ -67115,8 +67237,8 @@ impl Interpreter {
             }
             if args.len() == 2 {
                 let info: Vec<Object> = match &args[1] {
-                    Object::Tuple(t) => t.to_vec(),
-                    Object::List(l) => l.borrow().clone(),
+                    Object::Tuple(t) => crate::object::cloned_vec(t),
+                    Object::List(l) => crate::object::cloned_vec(&l.borrow()),
                     _ => Vec::new(),
                 };
                 if info.len() == 4 || info.len() == 6 {
@@ -69910,7 +70032,7 @@ impl Interpreter {
             // takes the parameters spread.
             intr::SUBSCRIPT_GENERIC => {
                 let params = match &value {
-                    Object::Tuple(t) => t.to_vec(),
+                    Object::Tuple(t) => crate::object::cloned_vec(t),
                     other => {
                         return Err(RuntimeError::Internal(format!(
                             "INTRINSIC_SUBSCRIPT_GENERIC expects a tuple, got {}",
@@ -72288,7 +72410,7 @@ impl Interpreter {
         // any iterable from direct `__import__(..., fromlist=…)` calls
         // (import_.test_fromlist passes lists, tuples, and iterators).
         let fromlist_items: Option<Vec<Object>> = match fromlist {
-            Object::Tuple(t) => Some(t.to_vec()),
+            Object::Tuple(t) => Some(crate::object::cloned_vec(t)),
             Object::List(l) => Some(l.borrow().to_vec()),
             _ => Some(self.collect_iterable(fromlist, current_globals)?),
         };
@@ -72841,8 +72963,8 @@ impl Interpreter {
             other => self.load_attr(other, "__path__").ok(),
         }?;
         let entries = match &path_obj {
-            Object::List(l) => l.borrow().clone(),
-            Object::Tuple(t) => t.to_vec(),
+            Object::List(l) => crate::object::cloned_vec(&l.borrow()),
+            Object::Tuple(t) => crate::object::cloned_vec(t),
             other => {
                 let globals = self.builtins.clone();
                 self.collect_iterable(other, &globals).ok()?
@@ -76357,11 +76479,32 @@ fn mv_slice_subview(
     mv: &Rc<crate::object::PyMemoryView>,
     slc: &PySlice,
 ) -> Result<Object, RuntimeError> {
+    let itemsize = mv.itemsize.get();
+    // A one-dimensional view in its derived layout (no stored shape or
+    // strides), sliced with step 1: the sub-view's layout is derived too,
+    // from its own start and length, with no vectors built.
+    if itemsize > 0
+        && !mv.zero_dim.get()
+        && mv.shape.borrow().is_empty()
+        && mv.strides.borrow().is_empty()
+    {
+        let n = (mv.len.get() / itemsize) as i64;
+        let (start_i, _stop, step, slicelen) = adjust_slice(n, slc)?;
+        if step == 1 {
+            let count = slicelen.max(0) as usize;
+            let sub = mv.shallow_clone();
+            sub.released.set(false);
+            if count > 0 {
+                sub.start.set(mv.start.get() + start_i as usize * itemsize);
+            }
+            sub.len.set(count * itemsize);
+            return Ok(mv_tracked_subview(sub));
+        }
+    }
     let shape = mv.shape_dims();
     let strides = mv.stride_bytes();
     let n = shape[0] as i64;
     let (start_i, _stop, step, slicelen) = adjust_slice(n, slc)?;
-    let itemsize = mv.itemsize.get();
     let stride0 = strides[0];
     let base = mv.start.get() as isize;
     let new_start = if slicelen > 0 {
@@ -76380,15 +76523,47 @@ fn mv_slice_subview(
     sub.len.set(nbytes);
     *sub.shape.borrow_mut() = new_shape;
     *sub.strides.borrow_mut() = new_strides;
-    let exporter = sub.exporter.borrow().clone();
+    Ok(mv_tracked_subview(sub))
+}
+
+/// The sub-view `sub` as an object. It inherits the exporter edge, so it
+/// can close the same cycles the parent can (test_memoryview.test_gc
+/// slices a view of a bytes-subclass and cycles it through an attribute).
+fn mv_tracked_subview(sub: crate::object::PyMemoryView) -> Object {
     let obj = Object::MemoryView(Rc::new(sub));
-    // The sub-view inherits the exporter edge, so it can close the same
-    // cycles the parent can (test_memoryview.test_gc slices a view of a
-    // bytes-subclass and cycles it through an attribute).
-    if let Some(exp) = &exporter {
-        crate::gc_trace::track_memoryview_exporter(&obj, exp);
+    if let Object::MemoryView(view) = &obj {
+        if let Some(exp) = &*view.exporter.borrow() {
+            crate::gc_trace::track_memoryview_exporter(&obj, exp);
+        }
     }
-    Ok(obj)
+    obj
+}
+
+/// Delete from `data` the `count` bytes an extended slice names, from
+/// `start` by `step` (as [`adjust_slice`] reports them), closing the gaps
+/// in one pass.
+fn bytes_delete_strided(data: &mut Vec<u8>, start: i64, step: i64, count: i64) {
+    if count <= 0 {
+        return;
+    }
+    // (A descending slice names the same bytes as an ascending one.)
+    let (first, step) = if step < 0 {
+        (start + step * (count - 1), -step)
+    } else {
+        (start, step)
+    };
+    let (first, step) = (first as usize, step as usize);
+    let (mut next, mut left, mut to) = (first, count as usize, first);
+    for from in first..data.len() {
+        if left > 0 && from == next {
+            left -= 1;
+            next += step;
+        } else {
+            data[to] = data[from];
+            to += 1;
+        }
+    }
+    data.truncate(to);
 }
 
 fn adjust_slice(len: i64, s: &PySlice) -> Result<(i64, i64, i64, i64), RuntimeError> {
@@ -76660,7 +76835,29 @@ pub(crate) fn str_subscript_slice(s: &SharedStr, slc: &PySlice) -> Result<Object
 /// The elements of `seq` that slice `s` selects, in order: CPython's
 /// `PySlice_Unpack` + `PySlice_AdjustIndices` over any element type (a
 /// list's objects, a `bytes` buffer, a string's code points).
-pub(crate) fn slice_seq<T: Clone>(seq: &[T], s: &PySlice) -> Result<Vec<T>, RuntimeError> {
+/// A vector of clones of `run`: objects through their two-pass copy (see
+/// [`crate::object::clone_objects_into`]), anything else as `to_vec` does.
+fn clone_run<T: Clone + 'static>(run: &[T]) -> Vec<T> {
+    if std::any::TypeId::of::<T>() == std::any::TypeId::of::<Object>() {
+        // SAFETY: `T` is `Object` (the same type under both names).
+        let run = unsafe { &*(std::ptr::from_ref(run) as *const [Object]) };
+        let mut items = std::mem::ManuallyDrop::new(crate::object::cloned_vec(run));
+        // SAFETY: as above; the vector's parts change hands whole.
+        return unsafe {
+            Vec::from_raw_parts(
+                items.as_mut_ptr().cast::<T>(),
+                items.len(),
+                items.capacity(),
+            )
+        };
+    }
+    run.to_vec()
+}
+
+pub(crate) fn slice_seq<T: Clone + 'static>(
+    seq: &[T],
+    s: &PySlice,
+) -> Result<Vec<T>, RuntimeError> {
     let len = seq.len() as i64;
     let step = match &s.step {
         Object::None => 1i64,
@@ -76736,7 +76933,7 @@ pub(crate) fn slice_seq<T: Clone>(seq: &[T], s: &PySlice) -> Result<Vec<T>, Runt
     if step == 1 {
         // Both bounds are within `0..=len` here: one contiguous copy.
         return Ok(if start < stop {
-            seq[start as usize..stop as usize].to_vec()
+            clone_run(&seq[start as usize..stop as usize])
         } else {
             Vec::new()
         });
@@ -91031,7 +91228,7 @@ pub(crate) fn repeat_objects(unit: &[Object], times: usize, out: &mut Vec<Object
             out.resize(out.len() + times, one.clone());
         } else {
             for _ in 0..times {
-                out.extend(unit.iter().cloned());
+                crate::object::extend_cloned(out, unit);
             }
         }
         return;
@@ -91500,25 +91697,32 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
         }
 
         (O::List(x), O::List(y), B::Add) => {
-            let mut out = x.borrow().clone();
-            out.extend(y.borrow().iter().cloned());
+            let (x, y) = (x.borrow(), y.borrow());
+            let mut out = Vec::with_capacity(x.len() + y.len());
+            crate::object::extend_cloned(&mut out, &x);
+            crate::object::extend_cloned(&mut out, &y);
             let out = Object::new_list(out);
             gc_trace::track_built(&out);
             Ok(out)
         }
         (O::List(x), O::Int(n), B::Mult) | (O::Int(n), O::List(x), B::Mult) => {
-            let body = x.borrow().clone();
+            // (Read in place: nothing below runs code.)
+            let body = x.borrow();
             let times = checked_repeat_count(body.len(), *n, "list")?;
             let mut out = try_alloc_vec(body.len() * times)?;
             repeat_objects(&body, times, &mut out);
+            drop(body);
             let out = Object::new_list(out);
             gc_trace::track_built(&out);
             Ok(out)
         }
         (O::Tuple(x), O::Tuple(y), B::Add) => {
-            let mut out: Vec<Object> = x.iter().cloned().collect();
-            out.extend(y.iter().cloned());
-            Ok(Object::new_tuple(out))
+            if x.is_empty() && y.is_empty() {
+                return Ok(Object::new_tuple(Vec::new()));
+            }
+            Ok(Object::Tuple(
+                crate::tuple_storage::TupleStorage::from_cloned_pair(x, y),
+            ))
         }
         (O::Tuple(x), O::Int(n), B::Mult) | (O::Int(n), O::Tuple(x), B::Mult) => {
             // CPython `tuplerepeat`: `t * 1` returns the *same* (exact) tuple

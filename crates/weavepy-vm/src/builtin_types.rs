@@ -1988,7 +1988,7 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
         let inst = Rc::new(PyInstance::new(cls));
         inst.dict_cell().borrow_mut().insert(
             DictKey(Object::from_static("args")),
-            Object::new_tuple(new_args.to_vec()),
+            Object::tuple_from_slice(new_args),
         );
         let obj = Object::Instance(inst);
         crate::gc_trace::track(&obj);
@@ -4086,7 +4086,7 @@ fn install_import_error_init(import_error: &Rc<TypeObject>) {
                     }
                 }
             }
-            inst_rc.slot_set("args", Object::new_tuple(rest.to_vec()));
+            inst_rc.slot_set("args", Object::tuple_from_slice(rest));
             inst_rc.slot_set(
                 "msg",
                 if rest.len() == 1 {
@@ -4176,7 +4176,7 @@ fn install_os_error_init(os_error: &Rc<TypeObject>) {
                 .is_subclass_of(&builtin_types().blocking_io_error);
             if is_blocking && rest.len() == 3 && matches!(rest[2], Object::Int(_) | Object::Long(_))
             {
-                inst_rc.slot_set("args", Object::new_tuple(rest.to_vec()));
+                inst_rc.slot_set("args", Object::tuple_from_slice(rest));
                 inst_rc.slot_set("errno", rest[0].clone());
                 inst_rc.slot_set("strerror", rest[1].clone());
                 inst_rc.slot_set("characters_written", rest[2].clone());
@@ -4188,9 +4188,9 @@ fn install_os_error_init(os_error: &Rc<TypeObject>) {
             // tuple is stored and the fields stay None.
             let populated = (2..=5).contains(&rest.len());
             let args_tuple = if populated {
-                Object::new_tuple(rest[..2].to_vec())
+                Object::tuple_from_slice(&rest[..2])
             } else {
-                Object::new_tuple(rest.to_vec())
+                Object::tuple_from_slice(rest)
             };
             inst_rc.slot_set("args", args_tuple);
             let pick = |i: usize| {
@@ -4402,7 +4402,7 @@ fn install_unicode_error_dunders(ty: &Rc<TypeObject>, kind: UnicodeErrorKind) {
                 check(is_str(&rest[3]), 3, "str", &rest[3])?;
             }
         }
-        inst_rc.slot_set("args", Object::new_tuple(rest.to_vec()));
+        inst_rc.slot_set("args", Object::tuple_from_slice(rest));
         let mut i = 0;
         if kind != UnicodeErrorKind::Translate {
             inst_rc.slot_set("encoding", rest[i].clone());
@@ -4622,7 +4622,7 @@ fn install_syntax_error_dunders(syntax_error: &Rc<TypeObject>) {
             return Ok(Object::None);
         };
         let rest = if args.len() > 1 { &args[1..] } else { &[][..] };
-        inst_rc.slot_set("args", Object::new_tuple(rest.to_vec()));
+        inst_rc.slot_set("args", Object::tuple_from_slice(rest));
         // Defaults — CPython always defines these slots.
         for name in [
             "msg",
@@ -4800,7 +4800,7 @@ pub(crate) fn exc_init(args: &[Object]) -> Result<Object, RuntimeError> {
             let old = inst_rc
                 .slots
                 .borrow_mut()
-                .insert("args", Object::tuple_from_exact(rest.iter().cloned()));
+                .insert("args", Object::tuple_from_slice(rest));
             drop(old);
         }
         Ok(Object::None)
@@ -5273,7 +5273,7 @@ fn install_exception_group_init(base: &Rc<TypeObject>) {
             .first()
             .ok_or_else(|| crate::error::type_error("expected exception instance"))?;
         if let Object::Instance(inst_rc) = inst {
-            inst_rc.slot_set("args", Object::new_tuple(args[1..].to_vec()));
+            inst_rc.slot_set("args", Object::tuple_from_slice(&args[1..]));
         }
         Ok(Object::None)
     }
