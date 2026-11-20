@@ -2416,6 +2416,14 @@ pub(crate) fn builtin_ctor_arms(cls: &Rc<TypeObject>, args: &[Object]) -> Option
             [Object::Int(n)] if (0..=1 << 16).contains(n) => vec![0; *n as usize],
             // (An exact `bytes` is its own copy.)
             [Object::Bytes(_)] if bytes => return Some(args[0].clone()),
+            // (A `bytearray`'s bytes go straight into the new `bytes`.)
+            [Object::ByteArray(b)] if bytes => {
+                return Some(Object::new_bytes(&b.try_borrow().ok()?[..]));
+            }
+            // (Likewise a live contiguous view's.)
+            [Object::MemoryView(mv)] if bytes && !mv.released.get() && mv.is_c_contiguous() => {
+                return Some(mv.with_bytes(|run| Object::new_bytes(run)));
+            }
             [Object::Bytes(b)] => b.to_vec(),
             [Object::ByteArray(b)] => b.try_borrow().ok()?.clone(),
             _ => return None,
@@ -3005,7 +3013,9 @@ pub(crate) fn plain_hashable(x: &Object, depth: u32) -> bool {
 /// when finishing a source would free its list (which could run code).
 pub(crate) fn dict_from_zip_pure(l: &PyLazyIter) -> Option<crate::object::DictData> {
     use crate::object::PyIterator;
-    const MAX_PAIRS: usize = 4096;
+    // (No more pairs than CPython's own loop would take without a look at
+    // anything else in a few tens of milliseconds.)
+    const MAX_PAIRS: usize = 1 << 20;
     // SAFETY: nothing below runs code; the views end with this call.
     let st = unsafe { l.state.peek_mut() }?;
     let LazyIterKind::Zip {
@@ -3059,6 +3069,10 @@ pub(crate) fn dict_from_zip_pure(l: &PyLazyIter) -> Option<crate::object::DictDa
     data.reserve(n);
     for (k, v) in keys.iter().zip(&ys[..n]) {
         data.insert(crate::object::DictKey(k.clone()), v.clone());
+    }
+    // (Keys that mostly repeated leave most of the room unused.)
+    if n > 64 && data.len() * 4 < n {
+        data.shrink_to_fit();
     }
     // (The general step takes the first source's next item before it
     // finds the second finished.)

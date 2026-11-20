@@ -128,7 +128,7 @@ unsafe fn build_py_params(argc: c_int, argv: *mut *mut ffi::sqlite3_value) -> Ve
                 if p.is_null() || n == 0 {
                     Object::new_bytes(Vec::new())
                 } else {
-                    Object::new_bytes(std::slice::from_raw_parts(p, n).to_vec())
+                    Object::new_bytes(std::slice::from_raw_parts(p, n))
                 }
             }
             _ => {

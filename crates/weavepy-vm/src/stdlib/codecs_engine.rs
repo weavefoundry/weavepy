@@ -630,6 +630,12 @@ fn utf8_decode_named(
     final_: bool,
     name: &str,
 ) -> Result<(Object, usize), RuntimeError> {
+    // Well-formed input, the usual case, is the text itself: no handler
+    // has anything to do, and nothing is left over. (The loop below builds
+    // code points and encodes them again, several times the work.)
+    if let Some(text) = well_formed_text(data) {
+        return Ok((text, data.len()));
+    }
     let mut ctx = DecCtx::new(name, errors, data);
     let mut out: Vec<u32> = Vec::with_capacity(data.len());
     let mut i = 0usize;
@@ -896,6 +902,11 @@ pub fn utf32_decode(
 // ---------------------------------------------------------------------------
 
 pub fn ascii_decode(data: &[u8], errors: &str) -> Result<(Object, usize), RuntimeError> {
+    if data.is_ascii() {
+        if let Some(text) = well_formed_text(data) {
+            return Ok((text, data.len()));
+        }
+    }
     let mut ctx = DecCtx::new("ascii", errors, data);
     let mut out: Vec<u32> = Vec::with_capacity(data.len());
     let mut i = 0usize;
@@ -912,7 +923,29 @@ pub fn ascii_decode(data: &[u8], errors: &str) -> Result<(Object, usize), Runtim
     Ok((Object::str_from_codepoints(out), consumed))
 }
 
+/// The `str` of bytes that are well-formed UTF-8 (ASCII text is born
+/// knowing its length in characters); `None` for any other bytes.
+fn well_formed_text(data: &[u8]) -> Option<Object> {
+    use crate::shared_value::SharedStr;
+    if data.is_ascii() {
+        // SAFETY: ASCII is UTF-8.
+        let text = unsafe { std::str::from_utf8_unchecked(data) };
+        return Some(Object::Str(if text.len() <= 2 {
+            SharedStr::from(text)
+        } else {
+            SharedStr::from_ascii(text)
+        }));
+    }
+    let text = std::str::from_utf8(data).ok()?;
+    Some(Object::Str(SharedStr::from(text)))
+}
+
 pub fn latin1_decode(data: &[u8], _errors: &str) -> Result<(Object, usize), RuntimeError> {
+    if data.is_ascii() {
+        if let Some(text) = well_formed_text(data) {
+            return Ok((text, data.len()));
+        }
+    }
     // Latin-1 decode can never fail: bytes are ordinals.
     let s: String = data.iter().map(|&b| b as char).collect();
     Ok((Object::from_str(s), data.len()))

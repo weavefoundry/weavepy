@@ -1890,6 +1890,54 @@ branch and pull request.
     (the new container's tracking and release), `list.pop(0)` and
     `xs * 2` (16-byte items against 8), and the `bytearray` start
     offset.
+  - Bytes-like values were copied whole before anything read them. A
+    second sweep, of 90 operations on 200,000-item buffers of each kind
+    (`bytes`, `bytearray`, `memoryview`, `array`, and the containers),
+    put `array[i]` at 870 times CPython's time, `struct.unpack_from` at
+    61 times and `bytearray.decode` at 33. One accessor was behind most
+    of it: the value's bytes as an owned vector, so a call that reads
+    four bytes of a buffer first copied the buffer; and `array` is a
+    Python class over a `bytearray`, each item read through
+    `struct.unpack_from`, so indexing a large array copied all of it per
+    item. The readers now borrow: `struct` reads and writes the buffer
+    where it is, with native halves for `unpack_from` and `pack_into`
+    (over a 200,000-byte `bytearray`: 5.1 µs to 109 ns, CPython 101;
+    706 ns to 76, CPython 105), hashing, `zlib`, the codecs' functions,
+    `int.from_bytes` and `str(b, encoding)` take a `bytes` object's own
+    bytes, a new `bytes` is built from a slice in one copy where it took
+    two (`a + b` and `bytes(bytearray)` at 200,000 bytes 11.2 µs to 4.6,
+    CPython 4.6), and the codec engine returns well-formed UTF-8, ASCII
+    and Latin-1 text as it is, where it decoded every byte to a code
+    point and encoded the lot again (`bytearray.decode()` of 200,000
+    bytes 636 µs to 15, CPython 26).
+    The `array` class's item methods are native for plain indexes and
+    values, as CPython's C type's are, each falling back to the Python
+    method it replaces for anything else (other index and value types,
+    every error): `a[i]` 26.7 µs to 61 ns on 200,000 ints (CPython 44),
+    `a[i] = x` 1.5 µs to 56 ns (49), `a.append(x)` 503 ns to 66 (76),
+    `a[i:j]` 3.4 µs to 526 ns (148), iteration 1.5 µs an item to 174 ns
+    (63), and `tolist`, `count`, `index`, `in` and `fromlist` unpack or
+    pack every item in one call.
+    A `memoryview`'s plain byte reads and writes skip the shape and
+    format machinery (`view[i]` 235 ns to 48, CPython 36; a run store
+    375 ns to 225). `frozenset(a_set)`, `set(a_frozenset)` and
+    `set(a_dict)` take the source's table with its stored hashes (11.9
+    ms to 1.3 for 200,000 keys, CPython 2.4); `dict(zip(xs, ys))` keeps
+    its direct build past 4,096 pairs (28 ms to 3.5 at 200,000, CPython
+    9.0); list and tuple comparison settles two machine ints in line
+    (425 µs to 211 for 200,000 items, CPython 192); `range(n)[k]` stays
+    at machine width when it can.
+    Two wrong answers came out of the new tests: `struct.unpack_from`
+    read a non-int offset (an object with `__index__`, or a `str`) as
+    zero, and unpacked from a released view; and a strided view is now
+    refused with `BufferError`, as CPython refuses it, not gathered.
+    Left: an array's slices and iteration (3.6 and 2.8 times CPython: a
+    slice of an instance leaves compiled code, and the iterator's step
+    goes through its slots), `view[i] = x` and `range(n)[k]` in compiled
+    code (4 and 2.9 times, the same exit), `bytearray` methods (no
+    native lane: `append` 130 ns against 41), SHA-256 itself (2 times:
+    the hash's throughput, not its argument), and about forty other
+    callers of the copying accessor (`io` has thirteen).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

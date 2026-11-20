@@ -1711,7 +1711,7 @@ pub fn make_unicode_decode_error(
         .unwrap_or_else(|| bt.value_error.clone());
     let inst = PyInstance::new(class);
     let enc = Object::from_str(encoding);
-    let obj = Object::new_bytes(object.to_vec());
+    let obj = Object::new_bytes(object);
     let start_o = Object::Int(start as i64);
     let end_o = Object::Int(end as i64);
     let reason_o = Object::from_str(reason);

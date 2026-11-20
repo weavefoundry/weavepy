@@ -120,6 +120,17 @@ def calcsize(format, /):
         raise error(str(e)) from None
 
 
+def _format_error(e, buffer):
+    """The `struct.error` for the core's `ValueError` `e`, unless `buffer`
+    is a released view: that refusal is the view's own `ValueError`."""
+    if isinstance(buffer, memoryview):
+        try:
+            buffer.nbytes
+        except ValueError:
+            return e
+    return error(str(e))
+
+
 def unpack(format, buffer, /):
     try:
         # (`bytes`, the common buffer, goes straight to the core.)
@@ -127,7 +138,7 @@ def unpack(format, buffer, /):
             return _impl.unpack(format, buffer)
         return _impl.unpack(format, _readable(buffer))
     except ValueError as e:
-        raise error(str(e)) from None
+        raise _format_error(e, buffer) from None
 
 
 def unpack_from(format, /, buffer, offset=0):
@@ -136,7 +147,7 @@ def unpack_from(format, /, buffer, offset=0):
             return _impl.unpack_from(format, buffer, offset)
         return _impl.unpack_from(format, _readable(buffer), offset)
     except ValueError as e:
-        raise error(str(e)) from None
+        raise _format_error(e, buffer) from None
 
 
 def pack(format, /, *v):
@@ -159,6 +170,10 @@ pack = _impl._native_pack(pack)
 # Likewise `unpack`: a `bytes` buffer is read natively; anything else
 # (another buffer, every error) goes through the function above.
 unpack = _impl._native_unpack(unpack)
+
+# And `unpack_from`: a `bytes`, `bytearray` or `memoryview` buffer with a
+# plain offset is read where its bytes are.
+unpack_from = _impl._native_unpack_from(unpack_from)
 
 
 def _writable(buffer):
@@ -203,6 +218,11 @@ def pack_into(format, buffer, offset, /, *v):
         return _impl.pack_into(format, target, offset, *v)
     except ValueError as e:
         raise error(str(e)) from None
+
+
+# `pack_into` writes plain numbers into a `bytearray` or a writable
+# `memoryview` natively; anything else goes through the function above.
+pack_into = _impl._native_pack_into(pack_into)
 
 
 class unpack_iterator:

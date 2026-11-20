@@ -2233,7 +2233,7 @@ fn rawiobase_read(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let n = n_i as usize;
     let bytes = buf.as_bytes_view().unwrap_or_default();
-    Ok(Object::new_bytes(bytes[..n.min(bytes.len())].to_vec()))
+    Ok(Object::new_bytes(&bytes[..n.min(bytes.len())]))
 }
 
 /// `RawIOBase.readall()` — read and return all bytes until EOF by repeatedly
@@ -2750,7 +2750,7 @@ fn raw_write(target: &RawTarget, data: &[u8]) -> Result<Option<usize>, RuntimeEr
     match target {
         RawTarget::Native(raw) => Ok(Some(raw.write_bytes(data)?)),
         RawTarget::Py(raw) => {
-            let res = py_call(raw, "write", &[Object::new_bytes(data.to_vec())])?;
+            let res = py_call(raw, "write", &[Object::new_bytes(data)])?;
             if matches!(res, Object::None) {
                 return Ok(None);
             }
@@ -3549,7 +3549,7 @@ fn tw_fill_chunk(inst: &Rc<crate::types::PyInstance>) -> Result<(), RuntimeError
     if is_wstr {
         tw_set(inst, "_dec_wstr", Object::Bool(true));
     }
-    tw_set(inst, "_dec_partial", Object::new_bytes(leftover.to_vec()));
+    tw_set(inst, "_dec_partial", Object::new_bytes(leftover));
     if eof {
         tw_set(inst, "_dec_done", Object::Bool(true));
     }

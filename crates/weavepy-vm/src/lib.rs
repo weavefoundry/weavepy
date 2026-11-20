@@ -14115,10 +14115,7 @@ impl Interpreter {
                                 }
                                 let r = match (a, b) {
                                     (Object::Bytes(x), Object::Bytes(y)) => {
-                                        let mut v = Vec::with_capacity(x.len() + y.len());
-                                        v.extend_from_slice(x);
-                                        v.extend_from_slice(y);
-                                        Object::new_bytes(v)
+                                        Object::bytes_concat(x, y)
                                     }
                                     (Object::ByteArray(x), Object::Bytes(y))
                                         if ins.arg & weavepy_compiler::BINARY_OP_INPLACE_FLAG
@@ -22982,7 +22979,7 @@ impl Interpreter {
                     (
                         Object::ByteArray(_) | Object::Instance(_) | Object::MemoryView(_),
                         Object::Slice(_)
-                    )
+                    ) | (Object::MemoryView(_), Object::Int(_))
                 )) || !Self::core_droppable(c)
                 {
                     return None;
@@ -23022,6 +23019,13 @@ impl Interpreter {
                             return None;
                         }
                         Object::Int(i64::from(b[i as usize]))
+                    }
+                    // A live, plain view of bytes another owner holds (its
+                    // release here frees nothing): the byte.
+                    (Object::MemoryView(mv), Object::Int(i))
+                        if Rc::strong_count(mv) > 1 && !mv.released.get() =>
+                    {
+                        Object::Int(i64::from(mv_plain_byte(mv, *i)?))
                     }
                     // (A tuple key's probe takes only ints and strings,
                     // which compare and drop without running code.)
@@ -60585,6 +60589,33 @@ impl Interpreter {
                 // (`range(-maxsize, maxsize)[maxsize + 1]`,
                 // `range(0, maxsize**10, 2*maxsize)[maxsize + 1]` —
                 // test_large_range).
+                // (A range and an index of machine ints whose item is one
+                // too: the same arithmetic at machine width, and anything
+                // that doesn't fit goes on below.)
+                if let (None, Object::Int(i)) = (&r.big, index) {
+                    let (start, stop, step) = (r.start, r.stop, r.step);
+                    let span = if step > 0 {
+                        stop.checked_sub(start)
+                    } else {
+                        start.checked_sub(stop)
+                    };
+                    let item = span.and_then(|span| {
+                        let len = if span > 0 {
+                            (span - 1) / step.abs() + 1
+                        } else {
+                            0
+                        };
+                        let idx = i128::from(*i) + if *i < 0 { len } else { 0 };
+                        if idx < 0 || idx >= len {
+                            return Some(Err(index_error("range object index out of range")));
+                        }
+                        let v = idx.checked_mul(step)?.checked_add(start)?;
+                        Some(Ok(Object::Int(i64::try_from(v).ok()?)))
+                    });
+                    if let Some(item) = item {
+                        return item;
+                    }
+                }
                 use num_bigint::BigInt;
                 let len = crate::object::range_len_bigint(r);
                 let i = match index {
@@ -60630,6 +60661,10 @@ impl Interpreter {
                     return Err(value_error(
                         "operation forbidden on released memoryview object",
                     ));
+                }
+                // (A plain view of bytes: the byte, read where it is.)
+                if let Some(byte) = mv_plain_byte(mv, *i) {
+                    return Ok(Object::Int(i64::from(byte)));
                 }
                 let shape = mv.shape_dims();
                 // CPython `memory_item`: integer indexing is 1-D only —
@@ -61012,6 +61047,21 @@ impl Interpreter {
                         "operation forbidden on released memoryview object",
                     ));
                 }
+                // (A byte stored into a plain writable view of bytes, where
+                // it lives.)
+                if let (false, Object::Int(v @ 0..=255)) = (mv.readonly.get(), &value) {
+                    if let Some(at) = mv_plain_bytes(mv).and_then(|(start, len)| {
+                        let at = if *i < 0 { *i + len as i64 } else { *i };
+                        (0..len as i64).contains(&at).then(|| start + at as usize)
+                    }) {
+                        let stored = mv
+                            .buffer
+                            .with_write(|all| all.get_mut(at).map(|slot| *slot = *v as u8));
+                        if stored.flatten().is_some() {
+                            return Ok(());
+                        }
+                    }
+                }
                 // CPython `memory_ass_sub` runs `adjust_fmt` *before* the
                 // read-only check: an unsupported format raises
                 // NotImplementedError even on a read-only view.
@@ -61106,6 +61156,19 @@ impl Interpreter {
                     return Err(value_error(
                         "memoryview assignment: lvalue and rvalue have different structures",
                     ));
+                }
+                // (A run of a plain view of bytes is written at once.)
+                if step == 1 && slicelen > 0 {
+                    if let Some((start, _)) = mv_plain_bytes(mv) {
+                        let at = start + start_i.max(0) as usize;
+                        let stored = mv.buffer.with_write(|all| {
+                            all.get_mut(at..at + src.len())
+                                .map(|run| run.copy_from_slice(&src))
+                        });
+                        if stored.flatten().is_some() {
+                            return Ok(());
+                        }
+                    }
                 }
                 for k in 0..slicelen {
                     let elem = (start_i + k * step).max(0) as usize;
@@ -76526,6 +76589,32 @@ fn mv_slice_subview(
     Ok(mv_tracked_subview(sub))
 }
 
+/// A one-dimensional view of unsigned bytes in its derived layout (no
+/// stored shape, strides or suboffsets): where its first byte is in the
+/// buffer, and how many it spans. (Whether the view is live is the
+/// caller's to check.)
+fn mv_plain_bytes(mv: &crate::object::PyMemoryView) -> Option<(usize, usize)> {
+    (mv.itemsize.get() == 1
+        && !mv.zero_dim.get()
+        && mv.shape.borrow().is_empty()
+        && mv.strides.borrow().is_empty()
+        && mv.suboffsets.borrow().is_empty()
+        && mv.format.borrow().as_str() == "B")
+        .then(|| (mv.start.get(), mv.len.get()))
+}
+
+/// `view[i]` of such a view ([`mv_plain_bytes`]): the byte, for an index
+/// in range (anything else is the full subscript's to answer or refuse).
+fn mv_plain_byte(mv: &crate::object::PyMemoryView, i: i64) -> Option<u8> {
+    let (start, len) = mv_plain_bytes(mv)?;
+    let at = if i < 0 { i + len as i64 } else { i };
+    if !(0..len as i64).contains(&at) {
+        return None;
+    }
+    mv.buffer
+        .with_read(|all| all.get(start + at as usize).copied())
+}
+
 /// The sub-view `sub` as an object. It inherits the exporter edge, so it
 /// can close the same cycles the parent can (test_memoryview.test_gc
 /// slices a view of a bytes-subclass and cycles it through an attribute).
@@ -76566,7 +76655,7 @@ fn bytes_delete_strided(data: &mut Vec<u8>, start: i64, step: i64, count: i64) {
     data.truncate(to);
 }
 
-fn adjust_slice(len: i64, s: &PySlice) -> Result<(i64, i64, i64, i64), RuntimeError> {
+pub(crate) fn adjust_slice(len: i64, s: &PySlice) -> Result<(i64, i64, i64, i64), RuntimeError> {
     let step = match &s.step {
         Object::None => 1i64,
         Object::Int(i) => *i,
@@ -91549,17 +91638,14 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             let out: Vec<u8> = rendered.chars().map(|c| c as u8).collect();
             Ok(Object::new_bytearray(out))
         }
-        (O::Bytes(x), O::Bytes(y), B::Add) => {
-            let mut out = Vec::with_capacity(x.len() + y.len());
-            out.extend_from_slice(x);
-            out.extend_from_slice(y);
-            Ok(Object::new_bytes(out))
-        }
+        (O::Bytes(x), O::Bytes(y), B::Add) => Ok(Object::bytes_concat(x, y)),
         // Mixed bytes/bytearray concatenation. CPython allows all four
         // combinations and the result type follows the *left* operand
         // (`bytearray + bytes -> bytearray`, `bytes + bytearray -> bytes`).
         (O::ByteArray(x), O::Bytes(y), B::Add) => {
-            let mut out = x.borrow().clone();
+            let x = x.borrow();
+            let mut out = Vec::with_capacity(x.len() + y.len());
+            out.extend_from_slice(&x);
             out.extend_from_slice(y);
             Ok(Object::new_bytearray(out))
         }
@@ -93829,9 +93915,19 @@ fn native_seq_compare(a: &Object, b: &Object, op: CompareKind, depth: u32) -> Op
         }
         _ => return None,
     };
+    // (Sequences of different lengths are unequal whatever they hold, as
+    // CPython's comparison answers before it looks at an item.)
+    if xs.len() != ys.len() && matches!(op, CompareKind::Eq | CompareKind::NotEq) {
+        return Some(op == CompareKind::NotEq);
+    }
     for (x, y) in xs.iter().zip(ys) {
-        // (Identity first, as CPython's element test.)
-        if x.is_same(y) {
+        // (Two machine ints, the commonest pair, are settled in line.)
+        if let (Object::Int(p), Object::Int(q)) = (x, y) {
+            if p == q {
+                continue;
+            }
+        } else if x.is_same(y) {
+            // (Identity first, as CPython's element test.)
             continue;
         }
         let eq = match native_scalar_compare(x, y, CompareKind::Eq) {

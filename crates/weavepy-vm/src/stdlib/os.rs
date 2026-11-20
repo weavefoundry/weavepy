@@ -8192,11 +8192,11 @@ fn path_splitroot_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> 
             let (root, tail) = b.split_at(n);
             Object::new_tuple_array([
                 Object::new_bytes(Vec::new()),
-                Object::new_bytes(root.to_vec()),
+                Object::new_bytes(root),
                 if n == 0 {
                     p.clone()
                 } else {
-                    Object::new_bytes(tail.to_vec())
+                    Object::new_bytes(tail)
                 },
             ])
         }

@@ -227,7 +227,7 @@ fn b_read_mem(args: &[Object]) -> Result<Object, RuntimeError> {
         return Err(value_error("read_mem: NULL pointer access"));
     }
     let slice = unsafe { std::slice::from_raw_parts(addr as *const u8, n) };
-    Ok(Object::new_bytes(slice.to_vec()))
+    Ok(Object::new_bytes(slice))
 }
 
 /// `write_mem(addr, data)` — copy `data` into raw memory.

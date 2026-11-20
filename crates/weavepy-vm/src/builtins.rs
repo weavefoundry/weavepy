@@ -3273,7 +3273,7 @@ fn b_str(args: &[Object]) -> Result<Object, RuntimeError> {
         };
         // Any buffer decodes (`str(memoryview(b'…'), 'utf-8')`,
         // test_str.test_constructor).
-        let data = match args[0].as_bytes_view() {
+        let data = match args[0].bytes_cow() {
             Some(v) => v,
             None => {
                 return Err(type_error(format!(
@@ -6066,7 +6066,7 @@ fn int_from_bytes_method(
     let data_obj = args
         .get(offset)
         .ok_or_else(|| type_error("from_bytes() missing data"))?;
-    let data = match data_obj.as_bytes_view() {
+    let data = match data_obj.bytes_cow() {
         Some(v) => v,
         // A str is iterable but is *not* an acceptable byte source
         // (int.from_bytes("", 'big') is a TypeError, test_long).
@@ -6096,7 +6096,7 @@ fn int_from_bytes_method(
                     }
                 }
             }
-            out
+            std::borrow::Cow::Owned(out)
         }
     };
     let byteorder = match arg_or_kw(args, offset + 1, kwargs, "byteorder") {
@@ -7810,7 +7810,9 @@ pub(crate) fn b_set(args: &[Object]) -> Result<Object, RuntimeError> {
 /// The set of a list's or tuple's items when every item is an `int`,
 /// `str`, `float`, `bool` or `None` (whose hashing and comparison run no
 /// Python and can't fail): sized once and filled without the per-insert
-/// error scope. `None` leaves the general path to it.
+/// error scope. Likewise the set of another set's or a frozenset's
+/// elements, or of a dict's keys, taken with their stored hashes. `None`
+/// leaves the general path to it.
 fn simple_key_set(src: &Object) -> Option<crate::object::SetData> {
     fn build(items: &[Object]) -> Option<crate::object::SetData> {
         let simple = |v: &Object| {
@@ -7834,6 +7836,22 @@ fn simple_key_set(src: &Object) -> Option<crate::object::SetData> {
     match src {
         Object::List(l) => build(&l.try_borrow().ok()?),
         Object::Tuple(t) => build(t),
+        // A set's or frozenset's own table, hashes and all; a dict's keys
+        // with their stored hashes (each differs from the rest, so none is
+        // hashed or compared).
+        Object::Set(s) => Some(crate::object::SetData::clone(&*s.try_borrow().ok()?)),
+        Object::FrozenSet(s) => Some(crate::object::SetData::clone(s)),
+        Object::Dict(d) => {
+            let d = d.try_borrow().ok()?;
+            let mut out = crate::object::SetData::with_capacity_and_hasher(
+                d.len(),
+                crate::fasthash::FxBuildHasher,
+            );
+            for (hash, key) in d.hashed_keys() {
+                out.insert_unique_hashed(hash, key.clone());
+            }
+            Some(out)
+        }
         _ => None,
     }
 }
@@ -7857,6 +7875,11 @@ pub(crate) fn b_frozenset(args: &[Object]) -> Result<Object, RuntimeError> {
     // frozenset.
     if let Object::FrozenSet(_) = &args[0] {
         return Ok(args[0].clone());
+    }
+    if let Some(out) = simple_key_set(&args[0]) {
+        return Ok(Object::FrozenSet(Rc::new(
+            crate::object::FrozenSetObj::new(out),
+        )));
     }
     let mut it = args[0].make_iter()?;
     let mut out = crate::object::SetData::default();
@@ -13595,7 +13618,7 @@ fn str_encode(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
             }
             && arg_or_kw(args, 2, kwargs, "errors").is_none_or(is_builtin_error_handler);
         if utf8 {
-            return Ok(Object::new_bytes(text.as_bytes().to_vec()));
+            return Ok(Object::new_bytes(text.as_bytes()));
         }
     }
     // The names accept any str-shaped object, not just `Object::Str`:
@@ -14981,12 +15004,21 @@ fn bytes_from_slice(data: &[u8]) -> Object {
 /// `b.decode([encoding])` with a plain codec, when the bytes decode (an
 /// undecodable one raises on the full path).
 pub(crate) fn bytes_decode_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
-    let (Object::Bytes(b), rest) = args.split_first()? else {
-        return None;
-    };
+    let (recv, rest) = args.split_first()?;
     if rest.len() > 1 && !(rest.len() == 2 && is_builtin_error_handler(&rest[1])) {
         return None;
     }
+    // (A `bytearray`'s bytes are read where they are: nothing below runs
+    // code.)
+    let held;
+    let b: &[u8] = match recv {
+        Object::Bytes(b) => b,
+        Object::ByteArray(b) => {
+            held = b.try_borrow().ok()?;
+            &held
+        }
+        _ => return None,
+    };
     // (ASCII text is copied once, straight into the result, which is born
     // knowing its length in characters.)
     let ascii = |b: &[u8]| {

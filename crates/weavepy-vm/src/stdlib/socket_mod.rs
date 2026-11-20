@@ -4894,7 +4894,7 @@ fn mod_inet_aton(args: &[Object]) -> Result<Object, RuntimeError> {
     let ip: Ipv4Addr = s
         .parse()
         .map_err(|_| os_error("illegal IP address string passed to inet_aton"))?;
-    Ok(Object::new_bytes(ip.octets().to_vec()))
+    Ok(Object::new_bytes(ip.octets()))
 }
 
 fn mod_inet_ntoa(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -4930,12 +4930,12 @@ fn mod_inet_pton(args: &[Object]) -> Result<Object, RuntimeError> {
         let ip: Ipv4Addr = s
             .parse()
             .map_err(|_| os_error("illegal IP address string passed to inet_pton"))?;
-        Ok(Object::new_bytes(ip.octets().to_vec()))
+        Ok(Object::new_bytes(ip.octets()))
     } else if family == libc_af_inet6() as i32 {
         let ip: Ipv6Addr = s
             .parse()
             .map_err(|_| os_error("illegal IP address string passed to inet_pton"))?;
-        Ok(Object::new_bytes(ip.octets().to_vec()))
+        Ok(Object::new_bytes(ip.octets()))
     } else {
         Err(os_error("inet_pton: unsupported family"))
     }

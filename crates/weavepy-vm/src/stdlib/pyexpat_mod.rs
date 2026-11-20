@@ -2022,7 +2022,7 @@ fn get_input_context_method(args: &[Object]) -> Result<Object, RuntimeError> {
             (size - offset) as usize,
         )
     };
-    Ok(Object::new_bytes(bytes.to_vec()))
+    Ok(Object::new_bytes(bytes))
 }
 
 fn set_param_entity_parsing_method(args: &[Object]) -> Result<Object, RuntimeError> {

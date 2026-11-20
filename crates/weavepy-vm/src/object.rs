@@ -2463,6 +2463,17 @@ impl PyMemoryView {
     /// fast `[start..start+nbytes]` path; strided/reversed views are gathered
     /// element-by-element following `strides`, exactly like CPython's
     /// `memoryview.tobytes()`.
+    /// `f` on the view's bytes: where they are for a C-contiguous view,
+    /// gathered first for any other (see [`Self::to_bytes`]).
+    pub fn with_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
+        if self.is_c_contiguous() {
+            let start = self.start.get();
+            let end = start + self.len.get();
+            return self.buffer.with_read(|all| f(&all[start..end]));
+        }
+        f(&self.to_bytes())
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let itemsize = self.itemsize.get().max(1);
         if self.is_c_contiguous() {
@@ -9097,7 +9108,7 @@ impl PyFile {
             while skip_bytes > 0 {
                 pf_call_method(&decoder, "setstate", &[make_state_tuple(&dec_flags_bi)])?;
                 let upto = &next_input[..skip_bytes as usize];
-                let dec = pf_call_method(&decoder, "decode", &[Object::new_bytes(upto.to_vec())])?;
+                let dec = pf_call_method(&decoder, "decode", &[Object::new_bytes(upto)])?;
                 let n = dec.to_str().chars().count();
                 if n <= chars_to_skip {
                     let st = pf_call_method(&decoder, "getstate", &[])?;
@@ -9133,11 +9144,8 @@ impl PyFile {
             let mut reached = false;
             for i in (skip_bytes as usize)..next_input.len() {
                 bytes_fed += 1;
-                let dec = pf_call_method(
-                    &decoder,
-                    "decode",
-                    &[Object::new_bytes(next_input[i..=i].to_vec())],
-                )?;
+                let dec =
+                    pf_call_method(&decoder, "decode", &[Object::new_bytes(&next_input[i..=i])])?;
                 chars_decoded += dec.to_str().chars().count();
                 let st = pf_call_method(&decoder, "getstate", &[])?;
                 let (b, d) = decoder_state_parts(&st)?;
@@ -12480,6 +12488,17 @@ pub(crate) fn cloned_vec(src: &[Object]) -> Vec<Object> {
     items
 }
 
+/// Whether two items of sequences being compared are equal: the same
+/// object, or equal values. (Two machine ints, the commonest pair, are
+/// settled in line, without the two calls.)
+#[inline(always)]
+fn items_equal(x: &Object, y: &Object) -> bool {
+    if let (Object::Int(a), Object::Int(b)) = (x, y) {
+        return a == b;
+    }
+    x.is_same(y) || x.eq_value(y)
+}
+
 impl Clone for Object {
     /// A new owner: the strong count (if any) bumped in place and the two
     /// words copied, with no per-variant dispatch.
@@ -12821,18 +12840,12 @@ impl Object {
             // Sequence comparison is element-wise `PyObject_RichCompareBool`,
             // which is identity-first — so `[nan] == [nan]` (same nan) is true.
             (Object::Tuple(a), Object::Tuple(b)) => {
-                a.len() == b.len()
-                    && a.iter()
-                        .zip(b.iter())
-                        .all(|(x, y)| x.is_same(y) || x.eq_value(y))
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| items_equal(x, y))
             }
             (Object::List(a), Object::List(b)) => {
                 let a = a.borrow();
                 let b = b.borrow();
-                a.len() == b.len()
-                    && a.iter()
-                        .zip(b.iter())
-                        .all(|(x, y)| x.is_same(y) || x.eq_value(y))
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| items_equal(x, y))
             }
             (Object::Dict(a), Object::Dict(b)) => {
                 let a = a.borrow();
@@ -16595,15 +16608,33 @@ impl Object {
         Object::FrozenSet(Rc::new(FrozenSetObj::new(s)))
     }
 
-    pub fn new_bytes(data: impl Into<Vec<u8>>) -> Self {
-        let v = data.into();
+    /// A `bytes` of `data`, copied once into its own allocation (a slice
+    /// isn't gathered into a vector first).
+    pub fn new_bytes(data: impl AsRef<[u8]>) -> Self {
+        let v = data.as_ref();
         if v.is_empty() {
             // CPython caches the empty bytes object (`b"" is b""` across
             // compiles — test_ast ConstantTests.test_singletons).
             static EMPTY: std::sync::OnceLock<SharedSlice<u8>> = std::sync::OnceLock::new();
             return Object::Bytes(EMPTY.get_or_init(|| SharedSlice::from(&[][..])).clone());
         }
-        Object::Bytes(SharedSlice::from(v.as_slice()))
+        Object::Bytes(SharedSlice::from(v))
+    }
+
+    /// The `bytes` of `head` followed by `tail`, each copied once into the
+    /// result's allocation.
+    pub fn bytes_concat(head: &[u8], tail: &[u8]) -> Self {
+        let len = head.len() + tail.len();
+        if len == 0 {
+            return Self::new_bytes([]);
+        }
+        // SAFETY: the two copies initialize all `len` bytes.
+        Object::Bytes(unsafe {
+            SharedSlice::build_uninit(len, |dst| {
+                std::ptr::copy_nonoverlapping(head.as_ptr(), dst, head.len());
+                std::ptr::copy_nonoverlapping(tail.as_ptr(), dst.add(head.len()), tail.len());
+            })
+        })
     }
 
     pub fn new_bytearray(data: impl Into<Vec<u8>>) -> Self {
@@ -16708,6 +16739,34 @@ impl Object {
         match self {
             Object::Complex(c) => Some((c.real, c.imag)),
             other => other.as_f64().map(|r| (r, 0.0)),
+        }
+    }
+
+    /// `f` on this value's bytes where they are (a `bytes`, a `bytearray`,
+    /// a contiguous `memoryview`; any other view's are gathered first), or
+    /// `None` for any other type. The buffer is borrowed while `f` runs:
+    /// it must not run Python code or touch the buffer's owner. (A caller
+    /// that needs a few bytes of a large buffer shouldn't pay for a copy of
+    /// all of it, which is what [`Self::as_bytes_view`] makes.)
+    pub fn with_bytes_view<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        match self {
+            Object::Bytes(b) => Some(f(b)),
+            Object::ByteArray(b) => Some(f(&b.borrow())),
+            Object::MemoryView(mv) => Some(mv.with_bytes(f)),
+            _ => None,
+        }
+    }
+
+    /// This value's bytes for a caller that only reads them: a `bytes`
+    /// object's own, borrowed; a copy of a `bytearray`'s or a
+    /// `memoryview`'s (which can change, or be borrowed, while the caller
+    /// works). `None` for any other type.
+    pub fn bytes_cow(&self) -> Option<std::borrow::Cow<'_, [u8]>> {
+        match self {
+            Object::Bytes(b) => Some(std::borrow::Cow::Borrowed(&b[..])),
+            Object::ByteArray(b) => Some(std::borrow::Cow::Owned(b.borrow().clone())),
+            Object::MemoryView(mv) => Some(std::borrow::Cow::Owned(mv.to_bytes())),
+            _ => None,
         }
     }
 

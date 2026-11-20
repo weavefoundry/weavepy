@@ -187,9 +187,10 @@ fn b_kw(
 /// Coerce a zlib data argument. Unlike a plain `str`, zlib requires a
 /// *bytes-like* object (buffer protocol); `str` and numbers raise
 /// `TypeError`, which `test_badargs` checks explicitly.
-fn bytes_of(arg: Option<&Object>) -> Result<Vec<u8>, RuntimeError> {
+fn bytes_of(arg: Option<&Object>) -> Result<std::borrow::Cow<'_, [u8]>, RuntimeError> {
     match arg {
-        Some(o) => o.as_bytes_view().ok_or_else(|| {
+        // (A `bytes` object's bytes are read where they are.)
+        Some(o) => o.bytes_cow().ok_or_else(|| {
             type_error(format!(
                 "a bytes-like object is required, not '{}'",
                 o.type_name()
@@ -767,11 +768,11 @@ fn store_decompress_attrs(args: &[Object], unused: &[u8], unconsumed: &[u8], eof
         let mut d = inst.dict_cell().borrow_mut();
         d.insert(
             DictKey(Object::from_static("unused_data")),
-            Object::new_bytes(unused.to_vec()),
+            Object::new_bytes(unused),
         );
         d.insert(
             DictKey(Object::from_static("unconsumed_tail")),
-            Object::new_bytes(unconsumed.to_vec()),
+            Object::new_bytes(unconsumed),
         );
         d.insert(DictKey(Object::from_static("eof")), Object::Bool(eof));
     }
@@ -898,7 +899,7 @@ fn zlib_adler32(args: &[Object]) -> Result<Object, RuntimeError> {
     let mut a = init & 0xFFFF;
     let mut b = (init >> 16) & 0xFFFF;
     const MOD_ADLER: u32 = 65521;
-    for &byte in &data {
+    for &byte in data.iter() {
         a = (a + u32::from(byte)) % MOD_ADLER;
         b = (b + a) % MOD_ADLER;
     }
@@ -943,7 +944,7 @@ fn store_zd_attrs(args: &[Object], unused: &[u8], eof: bool, needs_input: bool) 
         let mut d = inst.dict_cell().borrow_mut();
         d.insert(
             DictKey(Object::from_static("unused_data")),
-            Object::new_bytes(unused.to_vec()),
+            Object::new_bytes(unused),
         );
         d.insert(DictKey(Object::from_static("eof")), Object::Bool(eof));
         d.insert(
