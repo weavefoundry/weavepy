@@ -28845,10 +28845,19 @@ impl Interpreter {
         if bound[n..].iter().any(Option::is_some) || !Self::core_all_droppable(ops) {
             return None;
         }
-        let mut args = Vec::with_capacity(n + 1);
-        args.push(recv.clone());
-        args.extend(bound[..n].iter().map(|a| (*a).expect("prefix").clone()));
-        fast(&args)?.ok()
+        // Bitwise views of the receiver and the bound arguments, never
+        // dropped: the leaf half reads them (and clones what it keeps), and
+        // nothing it runs can reach the operands they alias.
+        let mut args = [const { std::mem::MaybeUninit::<Object>::uninit() }; 5];
+        // SAFETY: a borrowed copy of the live receiver.
+        args[0].write(unsafe { std::ptr::read(recv) });
+        for (slot, a) in args[1..].iter_mut().zip(&bound[..n]) {
+            // SAFETY: a borrowed copy of a live operand.
+            slot.write(unsafe { std::ptr::read(a.expect("prefix")) });
+        }
+        // SAFETY: the first `n + 1` entries were written.
+        let args = unsafe { std::slice::from_raw_parts(args.as_ptr().cast::<Object>(), n + 1) };
+        fast(args)?.ok()
     }
 
     /// A call of a `functools.lru_cache` wrapper settled natively (see
@@ -34993,6 +35002,16 @@ impl Interpreter {
             // dropping an element, or calling Python.
             K::SetPop => args.len() == 1 && matches!(args[0], O::Set(_)),
             K::SetRemove => {
+                // (An absent key raises through the body below.)
+                if Self::leaf_set_take(args) == Some(true) {
+                    #[cfg(test)]
+                    LEAF_SET_REMOVALS.with(|counts| {
+                        let mut values = counts.get();
+                        values[1] += 1;
+                        counts.set(values);
+                    });
+                    return Some(Ok(O::None));
+                }
                 if !(args.len() == 2
                     && matches!(args[0], O::Set(_))
                     && Self::leaf_hash_native(&args[1]))
@@ -35036,6 +35055,9 @@ impl Interpreter {
                 return Some(Ok(O::None));
             }
             K::SetDiscard => {
+                if Self::leaf_set_take(args).is_some() {
+                    return Some(Ok(O::None));
+                }
                 if !(args.len() == 2
                     && matches!(args[0], O::Set(_))
                     && Self::leaf_hash_native(&args[1]))
@@ -35173,6 +35195,34 @@ impl Interpreter {
             Some(ckw) => ckw(args, &[]),
             None => (b.call)(args),
         })
+    }
+
+    /// `s.discard(x)` or `s.remove(x)` of an exact set, for a key one
+    /// native probe settles (a `str`, a machine `int` or a finite `float`
+    /// met only by stored keys of its own kind, see
+    /// `Table::find_object_native`): `Some(true)` the key was there and is
+    /// removed, `Some(false)` it is exactly absent, `None` undecided with
+    /// nothing touched (another kind of key, a stored key that needs
+    /// Python to compare, a set that is borrowed or has operations
+    /// queued). The removed key is of the probe's own builtin kind, so its
+    /// release runs nothing.
+    #[inline]
+    fn leaf_set_take(args: &[Object]) -> Option<bool> {
+        let [Object::Set(st), item] = args else {
+            return None;
+        };
+        if crate::builtins::set_ops_pending() {
+            return None;
+        }
+        let mut m = st.try_borrow_mut().ok()?;
+        let (_, found) = m.find_object_hashing(item)?;
+        let Ok(at) = found else {
+            return Some(false);
+        };
+        let key = m.swap_remove_index(at);
+        drop(m);
+        drop(key);
+        Some(true)
     }
 
     /// The leaf half of `specialized_load_attr`: the value a warm

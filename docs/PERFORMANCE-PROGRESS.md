@@ -1762,10 +1762,19 @@ branch and pull request.
     1,594 instructions to 1,288, CPython 938; add and
     `popitem(last=False)` 3,515 to 3,039, CPython 2,201; with a plain
     key `move_to_end` is 1,050 against 941 and a store 824 against
-    1,120). Weak-value dictionaries (22,400 instructions an insertion
-    and expiry against CPython's 7,900, spread over the weak reference
-    class's Python-level `__new__`, `__init__` and callback) are what is
-    left of this group.
+    1,120). A keyword call of a native method (`popitem(last=False)`)
+    also built a vector of cloned arguments for the method's leaf half,
+    which now reads them in place (the add-and-pop loop 313 ns to 272;
+    CPython 190). And `set.discard` and `set.remove` probed the set
+    once to see whether the call could run without Python and then ran
+    the general body, which probes again inside a comparison scope and
+    replays the deferred-operation queue: a `str`, `int` or `float` key
+    that one native probe settles is now removed by that probe
+    (`s.discard(k); s.add(k)` 2,252 instructions to 1,348, 197 ns to
+    111; CPython 1,530 and 122). Weak-value dictionaries (22,400
+    instructions an insertion and expiry against CPython's 7,900, spread
+    over the weak reference class's Python-level `__new__`, `__init__`
+    and callback) are what is left of this group.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

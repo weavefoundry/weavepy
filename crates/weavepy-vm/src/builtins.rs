@@ -15939,7 +15939,7 @@ fn set_value_native(v: &Object) -> bool {
 /// Whether a re-entrant mutation of some set waits to be replayed (see
 /// `SET_DEFERRED_OPS`): the full method replays it first.
 #[inline]
-fn set_ops_pending() -> bool {
+pub(crate) fn set_ops_pending() -> bool {
     SET_DEFERRED_OPS.with(|q| q.try_borrow().map_or(true, |q| !q.is_empty()))
 }
 

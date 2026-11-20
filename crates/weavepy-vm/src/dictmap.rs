@@ -2665,6 +2665,12 @@ impl SetMap {
         self.0.find_object_native(key)
     }
 
+    /// [`Table::find_object_hashing`] over the set's keys.
+    #[inline]
+    pub fn find_object_hashing(&self, key: &Object) -> Option<(i64, Result<usize, usize>)> {
+        self.0.find_object_hashing(key)
+    }
+
     /// [`Table::find_type_native`] over the set's keys.
     #[inline(always)]
     pub fn find_type_native(
