@@ -1464,6 +1464,34 @@ branch and pull request.
     it, so a value a class drops dies when it does. All six shapes
     measured now cost 610 to 630 instructions (CPython 560 to 600); in
     the `inspect_typing_ops` case this helper was 6% of the instructions.
+  - Programs with a second thread. The battery's slowest case on a
+    profile-guided build is `threading_queue_ops` (2.6 times CPython's
+    time): a thread started and joined costs 180 microseconds against
+    60, and an item handed to a worker through a `queue.Queue` 20,900
+    instructions against 14,200. In the hand-off, `Condition.__exit__`'s
+    `self._lock.__exit__(*args)` read a native method off a temporary
+    and found the site's memo, then threw the answer away: the receiver
+    could only leave by a plain decrement, which is never allowed once
+    reference counts are shared between threads, so each read went on
+    through the whole miss chain (1,750 instructions, twice an item).
+    The read now releases the receiver as the core loop releases any
+    operand when the plain decrement doesn't apply: 22,200 instructions
+    an item to 19,300.
+  - What a second thread costs everything else, measured by running
+    single-threaded battery cases with one idle thread alive: 13% to 55%
+    more cycles (`list_dict_basics` 13%, `collections_ops` 26%,
+    `class_features` 34%, `enum_dataclass_ops` 55%), where CPython's
+    don't move. Keeping reference counts plain in an experiment took
+    back four fifths of it, the borrow counters' bias the rest: counts
+    go atomic for every thread as soon as a second one registers (a
+    locked increment or decrement costs about twenty cycles on x86), and
+    compiled code's in-line releases and clones, which test that flag,
+    call their helpers instead (5% to 20% more instructions). Under the
+    GIL the counts could stay plain if no thread ever touched one
+    without holding it; that isn't established today (118 blocks run
+    with the GIL released, and a thread's start and its thread-local
+    state's teardown run outside it), so it is the next piece of work
+    of its size rather than a change to make in passing.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
