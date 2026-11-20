@@ -600,7 +600,7 @@ impl JitEngine {
             &mut |_| None,
             &mut |_| None,
             &mut |_, _, _| None,
-            &mut |_| false,
+            &mut |_| (false, false),
         )
     }
 
@@ -614,7 +614,9 @@ impl JitEngine {
     /// arguments of those lanes, runs in line once its guard holds (see
     /// [`InlineMethod::of`]). `slot_member(site)` says whether an attribute
     /// site's receiver keeps the attribute in a laid-out member slot (see
-    /// [`AttrSiteMeta::slot_member`]).
+    /// [`AttrSiteMeta::slot_member`]), and whether the site has a position
+    /// compiled code reads or writes in line (see
+    /// [`AttrSiteMeta::in_line`]).
     #[allow(clippy::too_many_arguments)]
     pub fn compile_frame_direct(
         &mut self,
@@ -624,7 +626,7 @@ impl JitEngine {
         direct: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
         direct_method: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
         inline_method: &mut dyn FnMut(u32, &[JitType], u32) -> Option<InlineMethod>,
-        slot_member: &mut dyn FnMut(&AttrSiteMeta) -> bool,
+        slot_member: &mut dyn FnMut(&AttrSiteMeta) -> (bool, bool),
     ) -> Result<CompiledFrame, JitVerdict> {
         let tfunc = analyze_admitted(code, resolve, probes, slot_member)?;
         self.compile_tfunc_methods(&tfunc, direct, direct_method, inline_method)
@@ -644,7 +646,7 @@ impl JitEngine {
         direct: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
         direct_method: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
         inline_method: &mut dyn FnMut(u32, &[JitType], u32) -> Option<InlineMethod>,
-        slot_member: &mut dyn FnMut(&AttrSiteMeta) -> bool,
+        slot_member: &mut dyn FnMut(&AttrSiteMeta) -> (bool, bool),
     ) -> Result<CompiledFrame, JitVerdict> {
         let tfunc = analyze_admitted(code, resolve, probes, slot_member)?;
         if engine.is_none() {
@@ -1096,9 +1098,12 @@ fn analyze_admitted(
     code: &CodeObject,
     resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
     probes: &mut Probes<'_>,
-    slot_member: &mut dyn FnMut(&AttrSiteMeta) -> bool,
+    slot_member: &mut dyn FnMut(&AttrSiteMeta) -> (bool, bool),
 ) -> Result<TFunc, JitVerdict> {
     let mut tfunc = crate::analyze::analyze_frame(code, resolve, probes)?;
+    for site in &mut tfunc.attr_sites {
+        (site.slot_member, site.in_line) = slot_member(site);
+    }
     // A callee's analysis ran out of work budget: what this one made of
     // the callee (an untyped call) reflects the budget, not the code.
     if crate::analyze::work_short() {
@@ -1118,9 +1123,6 @@ fn analyze_admitted(
     }
     if unpacks_pairs(&tfunc) {
         return Err(JitVerdict::UnsupportedOpcode("tuple-target loop"));
-    }
-    for site in &mut tfunc.attr_sites {
-        site.slot_member = slot_member(site);
     }
     Ok(tfunc)
 }
@@ -1225,12 +1227,16 @@ fn loop_blocks(tfunc: &TFunc) -> impl Iterator<Item = &crate::ir::TBlock> {
 }
 
 /// Whether `tfunc`'s loops access attributes more often than they do
-/// typed arithmetic: each attribute read or write of a tier-2 loop goes
-/// through a helper that redoes its guards (about 50 host instructions),
-/// where the frame JIT reads or writes the field in line, so a loop of
-/// attribute traffic runs faster in the frame JIT unless typed work in
-/// registers repays it. (Calls don't count: a driver loop that calls
-/// compiled functions keeps them native-to-native in tier 2.)
+/// typed arithmetic: an attribute read or write of a tier-2 loop that
+/// has no in-line position goes through a helper that redoes its guards
+/// (about 50 host instructions), where the frame JIT reads or writes the
+/// field in line, so a loop of such attribute traffic runs faster in the
+/// frame JIT unless typed work in registers repays it. An access tier 2
+/// makes in line itself (a scalar field of a split-layout instance or a
+/// laid-out member slot, see [`AttrSiteMeta::in_line`]) doesn't count:
+/// a loop of those, and of the methods it then runs in line, took 1.45
+/// times as long in the frame JIT. (Calls don't count: a driver loop
+/// that calls compiled functions keeps them native-to-native in tier 2.)
 /// `WEAVEPY_T2_ATTRS=0` turns the rule off, a tuning aid.
 fn attr_bound(tfunc: &TFunc) -> bool {
     use crate::ir::TOp;
@@ -1245,6 +1251,11 @@ fn attr_bound(tfunc: &TFunc) -> bool {
     let (mut attrs, mut typed) = (0usize, 0usize);
     for st in loop_blocks(tfunc).flat_map(|b| &b.stmts) {
         match st.op {
+            TOp::AttrGet { site, .. } | TOp::AttrSet { site }
+                if tfunc
+                    .attr_sites
+                    .get(site as usize)
+                    .is_some_and(|s| s.in_line) => {}
             TOp::AttrGet { .. }
             | TOp::AttrSet { .. }
             | TOp::DynAttrGet { .. }

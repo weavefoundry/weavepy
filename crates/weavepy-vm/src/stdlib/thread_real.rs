@@ -909,7 +909,8 @@ fn lock_acquire_blocking(lock: &RealLock, me: u64) {
 /// lock as soon as it comes free instead (`take_waiting`, with the GIL
 /// released), as CPython's lock hands itself to a waiter of over a
 /// millisecond: a holder that always has the lock when it yields the GIL
-/// can't starve it. `deadline` bounds the whole acquire (`false` when it
+/// can't starve it, because a release with such a waiter keeps the lock
+/// for it (see `RealLock::release`). `deadline` bounds the whole acquire (`false` when it
 /// passes); `signals` waits in slices on the main thread, running pending
 /// signal handlers between them (CPython's `EINTR` retry loop), and a
 /// handler that raises abandons the acquire.
@@ -941,8 +942,21 @@ fn acquire_contended(
             }
         } else {
             let turn = Some(wait.map_or(HANDOFF_AFTER, |w| w.min(HANDOFF_AFTER)));
-            crate::gil::allow_threads_then(|| wait_free(turn));
-            if try_take() {
+            // (A turn that runs out goes on to take the lock in the same
+            // wait: coming back for the GIL in between cost the waiter a
+            // switch interval behind a busy holder.)
+            let taken = crate::gil::allow_threads_then(|| {
+                wait_free(turn);
+                if start.elapsed() < HANDOFF_AFTER {
+                    return false;
+                }
+                let mut left = deadline.map(|dl| dl.saturating_duration_since(Instant::now()));
+                if signals {
+                    left = Some(left.map_or(SIGNAL_POLL_SLICE, |w| w.min(SIGNAL_POLL_SLICE)));
+                }
+                take_waiting(left)
+            });
+            if taken || try_take() {
                 return Ok(true);
             }
         }

@@ -260,6 +260,10 @@ pub struct ObjLayout {
     pub method_upd_inc: i32,
     pub method_upd_code_at: i32,
     pub method_upd_code: i32,
+    /// The slot layout's word (a word) of an update whose field is a
+    /// `__slots__` member: its index then carries [`SLOT_FIELD`] and is
+    /// the member's position in that layout, as an attribute guard's.
+    pub method_upd_layout: i32,
     /// Words (or a byte, for `dict_watchers`) that are nonzero while a
     /// call can't be skipped: an observer may be active, a dict watcher
     /// is, or a class may hold an exotic key.
@@ -302,6 +306,14 @@ pub fn set_obj_layout(layout: ObjLayout) {
 #[must_use]
 pub(crate) fn obj_layout() -> Option<&'static ObjLayout> {
     OBJ_LAYOUT.get()
+}
+
+/// Whether an object layout is published, and if so whether it covers
+/// member slots (see [`ObjLayout::slots_ok`]): what an embedder needs to
+/// tell which attribute sites compiled code handles in line.
+#[must_use]
+pub fn obj_layout_published() -> Option<bool> {
+    OBJ_LAYOUT.get().map(|l| l.slots_ok)
 }
 
 /// The exchange buffer the VM passes to a compiled frame.

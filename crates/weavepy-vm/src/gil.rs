@@ -281,7 +281,9 @@ impl GilState {
         crate::sync::note_vm_thread(me);
         crate::sync::note_gil_thread(me);
         self.holder.store(me, Ordering::Release);
-        self.depth.fetch_add(1, Ordering::AcqRel);
+        if self.depth.fetch_add(1, Ordering::AcqRel) == 0 {
+            crate::sync::gil_taken();
+        }
         // We must hold the parking_lot guard for the lifetime
         // of the GilGuard. Stash a transmuted-lifetime guard
         // inside the result, paired with a clone of the Arc to
@@ -313,7 +315,9 @@ impl GilState {
         crate::sync::note_vm_thread(me);
         crate::sync::note_gil_thread(me);
         self.holder.store(me, Ordering::Release);
-        self.depth.fetch_add(1, Ordering::AcqRel);
+        if self.depth.fetch_add(1, Ordering::AcqRel) == 0 {
+            crate::sync::gil_taken();
+        }
         // SAFETY: as in `acquire`.
         let static_guard: parking_lot::ReentrantMutexGuard<'static, ()> =
             unsafe { std::mem::transmute(lock_guard) };
@@ -339,7 +343,9 @@ impl GilState {
         crate::sync::note_vm_thread(me);
         crate::sync::note_gil_thread(me);
         self.holder.store(me, Ordering::Release);
-        self.depth.fetch_add(1, Ordering::AcqRel);
+        if self.depth.fetch_add(1, Ordering::AcqRel) == 0 {
+            crate::sync::gil_taken();
+        }
         let static_guard: parking_lot::ReentrantMutexGuard<'static, ()> =
             unsafe { std::mem::transmute(lock_guard) };
         Some(GilGuard {
@@ -454,8 +460,10 @@ impl Drop for GilGuard {
             // Never touched holder/depth on acquire.
             return;
         }
-        self.state.depth.fetch_sub(1, Ordering::AcqRel);
-        if self.state.depth.load(Ordering::Acquire) == 0 {
+        // (Still under the lock: the field that releases it drops after
+        // this body.)
+        if self.state.depth.fetch_sub(1, Ordering::AcqRel) == 1 {
+            crate::sync::gil_given_up();
             self.state.holder.store(0, Ordering::Release);
         }
     }
@@ -717,6 +725,20 @@ pub(crate) fn arm_guard_stack() {
 /// thread doesn't hold the GIL through this stack.
 pub fn pop_gil_guard() -> Option<GilGuard> {
     GIL_GUARD_STACK.with(|cell| cell.borrow_mut().pop())
+}
+
+/// [`current_thread_holds_gil`] for a caller that may run in a
+/// thread-local destructor (`false` once the guard stack is gone).
+pub(crate) fn try_current_thread_holds_gil() -> bool {
+    GIL_GUARD_STACK
+        .try_with(|cell| cell.try_borrow().is_ok_and(|v| !v.is_empty()))
+        .unwrap_or(false)
+}
+
+/// Whether the calling thread owns the GIL's lock, through the guard
+/// stack or not (a thread-local destructor's own acquire, say).
+pub(crate) fn holds_gil_lock() -> bool {
+    global_gil_ref().lock.is_owned_by_current_thread()
 }
 
 /// `True` if the calling thread holds the GIL via this stack.

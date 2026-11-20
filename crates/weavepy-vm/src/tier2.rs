@@ -203,6 +203,10 @@ struct InlineUpdate {
     /// pointer it must equal.
     code_at: Cell<usize>,
     code: Cell<usize>,
+    /// For a field that is a `__slots__` member (its [`Self::idx`] then
+    /// carries [`weavepy_jit::SLOT_FIELD`]): the class's slot layout's
+    /// word, as [`AttrGuard::slot_layout`]. `0` for a split field.
+    layout: Cell<usize>,
 }
 
 impl InlineUpdate {
@@ -214,6 +218,7 @@ impl InlineUpdate {
             inc: Cell::new(0),
             code_at: Cell::new(0),
             code: Cell::new(0),
+            layout: Cell::new(0),
         }
     }
 }
@@ -1850,9 +1855,18 @@ impl JitState {
             };
             // An attribute site whose receiver keeps the attribute in a
             // laid-out member slot reads and writes it there in line.
-            let mut slot_member =
-                |site: &AttrSiteMeta| attr_guard_of(site).is_some_and(|g| g.slot_layout != 0);
+            // (And whether compiled code has a position to read or write
+            // the attribute at in line: a scalar lane's only.)
             ensure_obj_layout();
+            let layout = weavepy_jit::obj_layout_published();
+            let mut slot_member = |site: &AttrSiteMeta| {
+                let guard = attr_guard_of(site);
+                let member = guard.as_ref().is_some_and(|g| g.slot_layout != 0);
+                let in_line = matches!(layout, Some(slots_ok) if slots_ok || !member)
+                    && matches!(site.lane, JitType::Int | JitType::Float | JitType::Bool)
+                    && guard.is_some_and(|g| g.split_idx != u32::MAX);
+                (member, in_line)
+            };
             let r = JitEngine::compile_frame_lazily(
                 engine,
                 code,
@@ -3963,6 +3977,7 @@ fn obj_layout(obj: &Object, inst: &Rc<crate::types::PyInstance>) -> Option<weave
         method_upd_inc: i32_of(update + std::mem::offset_of!(InlineUpdate, inc))?,
         method_upd_code_at: i32_of(update + std::mem::offset_of!(InlineUpdate, code_at))?,
         method_upd_code: i32_of(update + std::mem::offset_of!(InlineUpdate, code))?,
+        method_upd_layout: i32_of(update + std::mem::offset_of!(InlineUpdate, layout))?,
         observers: crate::trace::observer_count_flag() as usize,
         dict_watchers: crate::capi_watchers::dicts_active_flag() as usize,
         exotic_keys: crate::object::exotic_str_keys_flag() as usize,
@@ -6032,7 +6047,9 @@ unsafe fn native_scalar_field_update(
 /// have just held, so what compiled code still checks per call (the
 /// receiver's class version and split names, the shadow bound, the code
 /// identity, the observer and key gates) is all that can change. A split
-/// field and the plain increments only; anything else stays unarmed.
+/// field, or a `__slots__` member of a class whose instances have no
+/// dictionary (so none can shadow the method's name), and the plain
+/// increments only; anything else stays unarmed.
 fn arm_update(entry: &MethodEntry, nc: &NativeCallee, receiver: &Object, argc: u32) {
     let Some(plan) = nc.scalar_update.as_deref() else {
         return;
@@ -6048,24 +6065,36 @@ fn arm_update(entry: &MethodEntry, nc: &NativeCallee, receiver: &Object, argc: u
         return;
     };
     let cls = inst.cls_raw();
-    let Some(keys) = cls.shared_keys.get() else {
-        return;
-    };
     let (from_arg, inc) = match (plan.increment, argc) {
         (Some(inc), 0) => (0, inc),
         (None, 1) => (1, 0),
         _ => return,
     };
-    if guard.split_idx == u32::MAX
-        || guard.ver != entry.ver
-        || cls.attr_version.get() != entry.ver
-        || !matches!(guard.storage, AttrStorage::Indexed(i) if i == guard.split_idx)
+    if guard.split_idx == u32::MAX || guard.ver != entry.ver || cls.attr_version.get() != entry.ver
     {
         return;
     }
-    let shadow = keys.names_before(&entry.name, entry.name_hash);
     let u = &entry.update;
-    u.shadow.set(u32::try_from(shadow).unwrap_or(0));
+    if guard.split_idx & weavepy_jit::SLOT_FIELD != 0 {
+        // A member slot, at its position in the class's layout.
+        if guard.slot_layout == 0
+            || !entry.no_dict
+            || !cls.forbids_dict
+            || !matches!(guard.storage, AttrStorage::Slot(_))
+        {
+            return;
+        }
+        u.layout.set(guard.slot_layout);
+    } else {
+        let Some(keys) = cls.shared_keys.get() else {
+            return;
+        };
+        if !matches!(guard.storage, AttrStorage::Indexed(i) if i == guard.split_idx) {
+            return;
+        }
+        let shadow = keys.names_before(&entry.name, entry.name_hash);
+        u.shadow.set(u32::try_from(shadow).unwrap_or(0));
+    }
     u.from_arg.set(from_arg);
     u.inc.set(inc);
     u.code_at.set(func.code.as_ptr() as usize);

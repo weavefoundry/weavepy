@@ -1586,6 +1586,61 @@ branch and pull request.
     in user space the cost is spread over the thread module's Python,
     a fresh allocator heap and interpreter for each thread, and their
     teardown).
+  - Cell borrows stay lock-free with several threads too. A borrow took
+    its cell's lock word (a compare-exchange, a thread-local read and a
+    release store) from the moment a second thread registered: 93,000
+    locked instructions a call of `collections_ops` with an idle thread
+    alive, all of them these. Under the GIL the lock word orders nothing
+    the GIL doesn't, and the borrow counter alone keeps a shared and an
+    exclusive borrow apart, across threads as within one, so borrows
+    now take the lock only once some thread may touch a cell without
+    the GIL (the cases that turn counts atomic). The count of live
+    lock-free guards, which decides whether a thread may hand the GIL
+    over at a checkpoint, is the GIL holder's: a thread's own leave it
+    when it really gives the GIL up and return with it. The lock word
+    was also a deadlock: a thread blocked inside a set's membership
+    test (its `__eq__` sleeping, writing or taking a lock) held the
+    set's word, and another thread adding to the set spun on it with
+    the GIL held, forever. Now the add waits for the first thread with
+    the GIL released and then happens (CPython lets it through at once;
+    the deferred-operation path that covers a nested mutation would
+    have dropped it). The audit build, which now checks the GIL at
+    every lock-free borrow as well, found none outside it over 45
+    groups of CPython's tests on macOS and the thread modules on Linux.
+    One idle thread no longer shows in the four cases: 0% to 0.6% more
+    instructions, cycles within the 2% the runs spread over (3% to 8%
+    more cycles before this, 13% to 55% two days ago).
+  - A lock's waiter is handed the lock. Past five milliseconds a
+    contended `Lock` or `RLock` acquire waited on the lock itself, GIL
+    released, and got it only by waking in the gap between the
+    holder's release and its next acquire. That gap is a few bytecodes,
+    and it shrank as threaded code got faster: the first acquire
+    against a holder that retakes the lock at once went from 10 to 40
+    ms to 80 to 450 ms, and the hand-off test started to fail one run
+    in three. A release now keeps the lock for a waiter that is past
+    its turn (nobody else can take it meanwhile), as CPython's lock
+    hands itself to a waiter of over a millisecond, and the waiter goes
+    from its grace period to that wait without coming back for the GIL:
+    5 ms for that first acquire (CPython 6 to 8).
+  - A method that adds to a `__slots__` member runs in line. Tier 2 ran
+    `self.a += 1; return self.a` in line only when `a` was an instance
+    dictionary field; for a slot member each call went through the
+    method helper (538 instructions against 128). The in-line form now
+    covers a member slot of a class whose instances have no dictionary:
+    126 instructions, a slotted `tick()` loop 4.2 times as fast.
+  - Tier 2 keeps loops whose attribute traffic it handles in line. Its
+    admission rule left any loop with more attribute operations than
+    typed ones to the frame JIT, on the grounds that each attribute
+    access costs tier 2 a helper call. Scalar fields of split-layout
+    instances and laid-out slot members have been read and written in
+    line for a while, so those accesses no longer count: the
+    `attr_access` fixture's loop runs 1,183 instructions an iteration
+    in tier 2 against 1,333 in the frame JIT (362 cycles against about
+    400; CPython 3,329 and 1,115), the fixture 0.885 of its
+    instructions. Both figures are still a hundred instructions an
+    attribute operation: each access redoes its receiver's guard chain
+    (about 60 instructions), and the two string field reads go through
+    a helper (172 each). Those are next.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

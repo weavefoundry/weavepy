@@ -1055,6 +1055,11 @@ pub struct AttrSiteMeta {
     /// and writes it there in line instead of in split values. Set by the
     /// embedder before lowering; the helpers decide any other shape.
     pub slot_member: bool,
+    /// Whether compiled code reads or writes the attribute in line (the
+    /// embedder's guard holds a position for it and the lane is a scalar
+    /// one), filled in beside [`Self::slot_member`]. An admission rule's
+    /// input only: the lowering decides per access.
+    pub in_line: bool,
 }
 
 /// RFC 0073 WS1 — where one canonical constructor field's value comes

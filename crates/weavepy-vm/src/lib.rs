@@ -94753,9 +94753,10 @@ assert loop(2000) == 1999000
                         assert_eq!(native, 0, "native entry requires JIT");
                         assert_eq!(attempts, 0, "interpreted calls use their ordinary path");
                         assert_eq!(armed, 0, "in-line updates require JIT");
-                    } else if matches!(kind, "parameter" | "constant") {
+                    } else if matches!(kind, "parameter" | "constant" | "slots") {
                         // The helper runs the update until it arms the
-                        // method entry; compiled code runs the rest in line.
+                        // method entry; compiled code runs the rest in line
+                        // (a `__slots__` member's too).
                         assert!(
                             native > 100 || (armed > 0 && native > 0),
                             "compiled {kind} native update coverage: {native} (armed {armed})"
@@ -94767,7 +94768,7 @@ assert loop(2000) == 1999000
                             native == 0 || (armed > 0 && native > 0),
                             "compiled {kind} native update coverage: {native} (armed {armed})"
                         );
-                    } else if matches!(kind, "default" | "slots" | "alias") {
+                    } else if matches!(kind, "default" | "alias") {
                         assert!(
                             native > 100,
                             "compiled {kind} native update coverage: {native}"

@@ -3163,12 +3163,35 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let ver = self.b.ins().load(types::I64, t, e, l.method_ver);
         let cls = self.b.ins().load(ptr, t, inst, l.inst_class);
         let cver = self.b.ins().load(types::I64, t, cls, l.type_attr_version);
-        let lazy = self.b.ins().load(ptr, t, inst, l.inst_dict_lazy);
         let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
         let shared = self.b.ins().uload8(types::I64, t, flag, 0);
+        let stale = self.b.ins().icmp(IntCC::NotEqual, cver, ver);
+        // A `__slots__` member (the index says which form the helper
+        // armed): the slot at its position in the entry's layout. Its
+        // class's instances have no dictionary to shadow the method in.
+        let field = self.b.create_block();
+        self.b.append_block_param(field, ptr);
+        if l.slots_ok {
+            let member = self.b.create_block();
+            let split = self.b.create_block();
+            let kind = self.b.ins().band_imm(idx, i64::from(runtime::SLOT_FIELD));
+            self.b.ins().brif(kind, member, &[], split, &[]);
+            self.b.switch_to_block(member);
+            let shared_now = self.b.ins().icmp_imm(IntCC::NotEqual, shared, 0);
+            let bad = self.b.ins().bor(stale, shared_now);
+            self.miss_if(bad, miss);
+            let layout = self.b.ins().load(ptr, t, e, l.method_upd_layout);
+            let (vals, bad) = self.laid_out_slots(l, inst, layout, false);
+            self.miss_if(bad, miss);
+            let i = self.b.ins().band_imm(idx, i64::from(!runtime::SLOT_FIELD));
+            let off = self.b.ins().ishl_imm(i, 4);
+            let at = self.b.ins().iadd(vals, off);
+            self.b.ins().jump(field, &[BlockArg::from(at)]);
+            self.b.switch_to_block(split);
+        }
+        let lazy = self.b.ins().load(ptr, t, inst, l.inst_dict_lazy);
         let borrow = self.b.ins().sload32(t, inst, l.inst_split_borrow);
         let block = self.b.ins().load(ptr, t, inst, l.inst_split_block);
-        let stale = self.b.ins().icmp(IntCC::NotEqual, cver, ver);
         let busy = self.b.ins().icmp_imm(IntCC::NotEqual, borrow, 0);
         let empty = self.b.ins().icmp_imm(IntCC::Equal, block, 0);
         let other = self.b.ins().bor(lazy, shared);
@@ -3194,6 +3217,9 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let off = self.b.ins().ishl_imm(idx, 4);
         let at = self.b.ins().iadd(block, off);
         let at = self.b.ins().iadd_imm(at, i64::from(l.split_values));
+        self.b.ins().jump(field, &[BlockArg::from(at)]);
+        self.b.switch_to_block(field);
+        let at = self.b.block_params(field)[0];
         // An `int` field, plus the increment without overflow.
         let tag = self.b.ins().uload8(types::I32, t, at, 0);
         let not_int = self

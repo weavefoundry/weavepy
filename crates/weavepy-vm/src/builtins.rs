@@ -15664,8 +15664,15 @@ fn take_deferred_set_ops(set: &Rc<RefCell<crate::object::SetData>>) -> Vec<SetIn
 fn set_apply_inplace(args: &[Object], op: SetInplaceOp) -> Result<Object, RuntimeError> {
     match set_self(args)? {
         Object::Set(s) => {
-            match s.try_borrow_mut() {
-                Ok(mut b) => {
+            // (Held by another thread, blocked in a call that one of its
+            // comparisons made: wait for it rather than defer to a frame
+            // that isn't this thread's.)
+            let held = s
+                .try_borrow_mut()
+                .ok()
+                .or_else(|| crate::sync::retry_past_parked(|| s.try_borrow_mut().ok()));
+            match held {
+                Some(mut b) => {
                     // Ops deferred while another operation held the set came
                     // first.
                     for op in take_deferred_set_ops(&s) {
@@ -15688,7 +15695,7 @@ fn set_apply_inplace(args: &[Object], op: SetInplaceOp) -> Result<Object, Runtim
                     }
                     Ok(Object::None)
                 }
-                Err(_) => {
+                None => {
                     // An outer frame holds the borrow (re-entrant mutation
                     // from a `__hash__`/`__eq__` callback). Defer; the outer
                     // frame replays once it finishes.
