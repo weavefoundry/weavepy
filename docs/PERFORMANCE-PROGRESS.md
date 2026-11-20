@@ -1382,6 +1382,64 @@ branch and pull request.
     2 had exposed; that limit still isn't adopted, since it now costs
     the `nbody` fixture 38% (tier 2 runs its boxed float arithmetic
     faster than the frame JIT does).
+  - Tier 2's analysis runs on the thread that runs the program, and a
+    trace of `argparse` building and running a parser 180 times
+    (`WEAVEPY_JIT_TRACE=1`, about 200 ms in all) showed 44 ms of it
+    there: 104 functions analyzed to compile 12 trivial ones. Three
+    things cut that to about 20 ms (5% of the battery case's
+    instructions, with the bench fixtures unchanged):
+    - A method site that doesn't resolve types the method's body, a
+      whole analysis of its own, and the answer wasn't kept: the analyzer
+      asked again on every pass over every such site (12 analyses of one
+      callee in a 22-instruction function). An attempt now remembers
+      the sites that didn't resolve, as it did those that did (44 ms to
+      32).
+    - An analysis starts over for each loop it carves out, each retry
+      with other assumptions and each callee it types, and nothing
+      bounded the product: `_parse_known_args2`, 169 instructions, took
+      160 passes an attempt, twice. Each attempt now has a work budget,
+      counted in instructions passed over: 1,024 units and eight passes
+      over the code itself, plus what the code's own calls and loop
+      iterations have paid for (one unit for every eight). The costliest
+      kernel among the bench fixtures uses half its allowance. An attempt
+      that runs out stands as a rejection, so the frame JIT takes the
+      code at once; code whose calls run long loops (16 iterations a
+      call) waits instead, interpreted, until its work pays for twice the
+      budget. `WEAVEPY_T2_FREE`, `WEAVEPY_T2_PASSES` and `WEAVEPY_T2_WPP`
+      set the three numbers.
+    - The plan's set of jump targets is a bitmap instead of a hash set
+      built on every pass (the hottest line of the analysis; 1.2% of the
+      case).
+    What's left is mostly the cost of running the analyzer cold: about
+    150 microseconds an attempt, most of it instruction-cache misses in
+    code that last ran thousands of calls ago, on 100 attempts that
+    reject. Cheaper rates were tried and cost the short numeric fixtures
+    too much (work alone paying for analysis: `spectral_norm` 2.1 times
+    slower, `nbody` 1.7), as did a budget summed over a function's
+    attempts (`difflib`'s `find_longest_match` compiles on its second
+    loop entry, after a first that fails).
+  - A field of a natively served value (`dt.hour`) has no site memo, so
+    every read takes the compiled site's slow path, where two lanes
+    added on this branch (a bound native method's memo, a property's
+    cached getter) had gone ahead of it: the `datetime_ops` fixture ran
+    4.7% more instructions than the merge base on Linux. The native
+    field is read first again (352.5M instructions to 340M).
+  - Why wall time trails instruction counts on the battery's worst
+    cases, from a cache and branch simulation of `argparse` in steady
+    state (cachegrind, iterations 1,500 to 2,500): an iteration takes
+    99,500 first-level instruction-cache misses to CPython's 28,600,
+    38,600 data misses to 16,700 and 47,500 mispredicted branches to
+    31,900, on 1.91M instructions to 1.27M. At 12 cycles an instruction
+    miss, 8 a data miss and 18 a misprediction that models the measured
+    cycles of both (3.2M and 1.5M an iteration): the instruction misses
+    are 40% of WeavePy's time and most of its distance from CPython. They
+    are spread over 1,400 functions, the largest (compiled code) 11%, at
+    about one miss every 19 instructions, which is every cache line the
+    program fetches: the working set of an iteration is far beyond the
+    32 KB cache, so what counts is how many instructions run, not which.
+    Compiling the runtime with a quarter of the inlining (LLVM's
+    threshold at 60) changed nothing (2.9% more instructions, 0.9% more
+    misses).
   - Looked at and left: thread start-up (a started and joined thread
     costs about 470,000 instructions to CPython's 150,000; the main thread
     waits on the GIL hand-off and the kernel's thread teardown, and a
