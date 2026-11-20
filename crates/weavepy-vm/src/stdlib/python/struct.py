@@ -254,6 +254,14 @@ class unpack_iterator:
         return (self._len - self._offset) // self._size
 
 
+# The iterator's step is native while it has a chunk left (CPython's is a
+# C type); its end, and anything unusual, is the method above.
+if hasattr(_impl, "_unpack_iterator_methods"):
+    for _owner, _name, _method in _impl._unpack_iterator_methods(unpack_iterator):
+        setattr(_owner, _name, _method)
+    del _owner, _name, _method
+
+
 def _make_unpack_iterator(fmt, buffer, size):
     # CPython validates the buffer length up front (a `struct.error` is
     # raised by `iter_unpack` itself, not lazily on the first `next()`),

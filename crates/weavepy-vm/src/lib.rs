@@ -22973,13 +22973,14 @@ impl Interpreter {
                         | Object::Dict(_)
                         | Object::Str(_)
                         | Object::Bytes(_)
+                        | Object::ByteArray(_)
                         | Object::MappingProxy(_)
                 ) || matches!(
                     (c, k),
                     (
-                        Object::ByteArray(_) | Object::Instance(_) | Object::MemoryView(_),
+                        Object::Instance(_) | Object::MemoryView(_),
                         Object::Slice(_)
-                    ) | (Object::MemoryView(_), Object::Int(_))
+                    ) | (Object::MemoryView(_) | Object::Range(_), Object::Int(_))
                 )) || !Self::core_droppable(c)
                 {
                     return None;
@@ -23019,6 +23020,38 @@ impl Interpreter {
                             return None;
                         }
                         Object::Int(i64::from(b[i as usize]))
+                    }
+                    (Object::ByteArray(b), Object::Int(i)) => {
+                        // SAFETY: a read between two instructions.
+                        let b = unsafe { b.peek() }?;
+                        let n = b.len() as i64;
+                        let i = if *i < 0 { *i + n } else { *i };
+                        if i < 0 || i >= n {
+                            return None;
+                        }
+                        Object::Int(i64::from(b[i as usize]))
+                    }
+                    // A machine-width range's item that is a machine int
+                    // (anything else, an index out of range included, is
+                    // the full subscript's).
+                    (Object::Range(r), Object::Int(i)) if r.big.is_none() => {
+                        let (start, stop, step) = (r.start, r.stop, r.step);
+                        let span = if step > 0 {
+                            stop.checked_sub(start)?
+                        } else {
+                            start.checked_sub(stop)?
+                        };
+                        let n = if span > 0 {
+                            (span - 1) / step.abs() + 1
+                        } else {
+                            0
+                        };
+                        let at = i128::from(*i) + if *i < 0 { n } else { 0 };
+                        if at < 0 || at >= n {
+                            return None;
+                        }
+                        let v = at.checked_mul(step)?.checked_add(start)?;
+                        Object::Int(i64::try_from(v).ok()?)
                     }
                     // A live, plain view of bytes another owner holds (its
                     // release here frees nothing): the byte.
@@ -23176,6 +23209,28 @@ impl Interpreter {
                             return None;
                         }
                         bs[i as usize] = byte;
+                        // SAFETY: the value slot (a scalar) leaves the stack.
+                        unsafe { base.add(len - 3).read() }
+                    }
+                    // `view[i] = n` through a live, writable, plain view of
+                    // bytes another owner holds (its release here frees
+                    // nothing), the value a byte.
+                    (Object::MemoryView(mv), Object::Int(i))
+                        if Rc::strong_count(mv) > 1 && !mv.released.get() && !mv.readonly.get() =>
+                    {
+                        // SAFETY: `len >= 3`.
+                        let byte = match unsafe { &*base.add(len - 3) } {
+                            Object::Int(v) if (0..=255).contains(v) => *v as u8,
+                            _ => return None,
+                        };
+                        let (start, n) = mv_plain_bytes(mv)?;
+                        let i = if *i < 0 { *i + n as i64 } else { *i };
+                        if i < 0 || i >= n as i64 {
+                            return None;
+                        }
+                        mv.buffer
+                            .with_write(|all| all.get_mut(start + i as usize).map(|at| *at = byte))
+                            .flatten()?;
                         // SAFETY: the value slot (a scalar) leaves the stack.
                         unsafe { base.add(len - 3).read() }
                     }
@@ -33485,7 +33540,7 @@ impl Interpreter {
                 calls.insert(Rc::as_ptr(&f) as usize, LeafKind::ObjectNew);
             }
             let mut methods = Vec::new();
-            let table: [(LeafRecv, Object, &[(&'static str, LeafKind)]); 6] = [
+            let table: [(LeafRecv, Object, &[(&'static str, LeafKind)]); 7] = [
                 (
                     LeafRecv::List,
                     Object::new_list(Vec::new()),
@@ -33608,6 +33663,23 @@ impl Interpreter {
                     LeafRecv::Bytes,
                     Object::new_bytes(Vec::new()),
                     &[("decode", LeafKind::Fast(crate::builtins::bytes_decode_leaf))],
+                ),
+                // A buffer built a byte or a chunk at a time, and read back.
+                (
+                    LeafRecv::ByteArray,
+                    Object::new_bytearray(Vec::new()),
+                    &[
+                        (
+                            "append",
+                            LeafKind::Fast(crate::builtins::bytearray_append_leaf),
+                        ),
+                        (
+                            "extend",
+                            LeafKind::Fast(crate::builtins::bytearray_extend_leaf),
+                        ),
+                        ("pop", LeafKind::Fast(crate::builtins::bytearray_pop_leaf)),
+                        ("decode", LeafKind::Fast(crate::builtins::bytes_decode_leaf)),
+                    ],
                 ),
             ];
             // `bytes.translate(table, delete=...)` (`shlex.quote`'s), whose
@@ -33893,6 +33965,7 @@ impl Interpreter {
             Object::Str(_) => LeafRecv::Str,
             Object::Int(_) => LeafRecv::Int,
             Object::Bytes(_) => LeafRecv::Bytes,
+            Object::ByteArray(_) => LeafRecv::ByteArray,
             _ => return None,
         };
         self.leaf_fns()
@@ -48222,6 +48295,14 @@ impl Interpreter {
         match v {
             Object::List(items) => Ok(crate::object::cloned_vec(&items.borrow())),
             Object::Tuple(items) => Ok(crate::object::cloned_vec(items)),
+            // (A byte string's or buffer's bytes, as the ints its iterator
+            // would give.)
+            Object::Bytes(b) => Ok(b.iter().map(|&x| Object::Int(i64::from(x))).collect()),
+            Object::ByteArray(b) => Ok(b
+                .borrow()
+                .iter()
+                .map(|&x| Object::Int(i64::from(x)))
+                .collect()),
             Object::Set(s) => Ok(s.borrow().iter().map(|k| k.0.clone()).collect()),
             Object::FrozenSet(s) => Ok(s.iter().map(|k| k.0.clone()).collect()),
             // A dict's keys, as its iterator would give them (cloning them
@@ -76914,6 +76995,25 @@ pub(crate) fn str_subscript_slice(s: &SharedStr, slc: &PySlice) -> Result<Object
             }));
         }
     }
+    // ASCII text with negative bounds or a step (`s[:-1]`, `s[::-1]`): its
+    // bytes are its characters, sliced as they are (the whole text is not
+    // spread into code points first).
+    if SharedStr::is_ascii(s) {
+        let piece = slice_seq(s.as_bytes(), slc)?;
+        if piece.len() == s.len() && step == 1 {
+            return Ok(Object::Str(s.clone()));
+        }
+        if piece.is_empty() {
+            return Ok(Object::from_static(""));
+        }
+        // SAFETY: bytes picked from ASCII text are ASCII.
+        let text = unsafe { std::str::from_utf8_unchecked(&piece) };
+        return Ok(Object::Str(if text.len() <= 2 {
+            SharedStr::from(text)
+        } else {
+            SharedStr::from_ascii(text)
+        }));
+    }
     // General path: negative bounds or non-unit step, over the code points.
     let chars: Vec<char> = s.chars().collect();
     Ok(Object::from_str(
@@ -77045,6 +77145,19 @@ pub(crate) fn slice_seq<T: Clone + 'static>(
         0
     };
     let mut out = Vec::with_capacity(usize::try_from(count).unwrap_or(0).min(seq.len()));
+    // (A forward stride inside the sequence: one bounds check for the run,
+    // not one per item.)
+    if step > 0 && 0 <= start && start < stop && stop <= len {
+        if let Ok(stride) = usize::try_from(step) {
+            out.extend(
+                seq[start as usize..stop as usize]
+                    .iter()
+                    .step_by(stride)
+                    .cloned(),
+            );
+            return Ok(out);
+        }
+    }
     if step > 0 {
         while i < stop {
             if (0..len).contains(&i) {
@@ -77687,6 +77800,7 @@ enum LeafRecv {
     Str,
     Int,
     Bytes,
+    ByteArray,
 }
 
 /// A builtin receiver's tag in a method site's slot (see
@@ -77701,7 +77815,8 @@ fn leaf_recv_tag(recv: &Object) -> Option<u64> {
         | Object::Set(_)
         | Object::Str(_)
         | Object::Int(_)
-        | Object::Bytes(_) => builtin_recv_tag(recv),
+        | Object::Bytes(_)
+        | Object::ByteArray(_) => builtin_recv_tag(recv),
         _ => None,
     }
 }

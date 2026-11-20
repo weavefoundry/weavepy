@@ -15096,6 +15096,8 @@ fn len_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
             [Object::Dict(d)] => d.peek()?.len(),
             [Object::Set(s)] => s.peek()?.len(),
             [Object::Bytes(b)] => b.len(),
+            [Object::ByteArray(b)] => b.peek()?.len(),
+            [Object::FrozenSet(s)] => s.len(),
             // A dict's keys, values or items view: the dict's size.
             [Object::DictView(v)] => v.dict.peek()?.len(),
             // A machine-word range's count.

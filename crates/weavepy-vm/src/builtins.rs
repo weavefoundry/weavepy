@@ -1693,6 +1693,24 @@ fn slice_indices_method(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(Object::Slice(s)) => s.clone(),
         _ => return Err(type_error("descriptor 'indices' requires a 'slice' object")),
     };
+    // Machine ints well inside the machine range (the usual slice): the
+    // same clamping at machine width.
+    const SMALL: std::ops::Range<i64> = -(1 << 62)..(1 << 62);
+    if let [_, Object::Int(length @ 0..)] = args {
+        let small = |o: &Object| match o {
+            Object::None => true,
+            Object::Int(v) => SMALL.contains(v),
+            _ => false,
+        };
+        if SMALL.contains(length) && small(&s.start) && small(&s.stop) && small(&s.step) {
+            let (start, stop, step, _) = crate::adjust_slice(*length, &s)?;
+            return Ok(Object::new_tuple(vec![
+                Object::Int(start),
+                Object::Int(stop),
+                Object::Int(step),
+            ]));
+        }
+    }
     // CPython's `_PySlice_GetLongIndices`: everything is arbitrary-
     // precision integer arithmetic — start/stop/step/length beyond
     // `sys.maxsize` clamp exactly, never overflow (issue #14794;
@@ -7919,7 +7937,31 @@ fn byte_item_value(o: &Object) -> Result<u8, RuntimeError> {
 /// `bytearray(x)` — CPython's `PyBytes_FromObject` /
 /// `bytearray_init` tail: index-sized count, buffer copy, or
 /// iterable of byte values.
+/// The bytes of a list or tuple whose items are all plain ints in
+/// `range(256)`, read in place; `None` for anything else (the general path
+/// converts or refuses each item, and reports the first it can't take).
+fn bytes_of_plain_ints(src: &Object) -> Option<Vec<u8>> {
+    fn pack(items: &[Object]) -> Option<Vec<u8>> {
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            match item {
+                Object::Int(v @ 0..=255) => out.push(*v as u8),
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+    match src {
+        Object::List(l) => pack(&l.try_borrow().ok()?),
+        Object::Tuple(t) => pack(t),
+        _ => None,
+    }
+}
+
 fn bytes_from_source_obj(src: &Object, type_name: &str) -> Result<Vec<u8>, RuntimeError> {
+    if let Some(bytes) = bytes_of_plain_ints(src) {
+        return Ok(bytes);
+    }
     let zero_fill = |n: i64| -> Result<Vec<u8>, RuntimeError> {
         if n < 0 {
             return Err(value_error("negative count"));
@@ -17838,16 +17880,28 @@ fn bytes_translate_kw(
         None => Vec::new(),
         Some(o) => bytes_argview(&o)?,
     };
-    let mut out = Vec::with_capacity(data.len());
-    for &b in data.iter() {
-        if delete.contains(&b) {
-            continue;
+    let out: Vec<u8> = match (&table, delete.is_empty()) {
+        // (Nothing deleted: every byte maps to one byte, in one pass.)
+        (Some(t), true) => data.iter().map(|&b| t[b as usize]).collect(),
+        (None, true) => data.to_vec(),
+        _ => {
+            // (The bytes to delete, as a table of their own.)
+            let mut gone = [false; 256];
+            for &b in &delete {
+                gone[b as usize] = true;
+            }
+            let mut out = Vec::with_capacity(data.len());
+            for &b in data.iter() {
+                if !gone[b as usize] {
+                    out.push(match &table {
+                        Some(t) => t[b as usize],
+                        None => b,
+                    });
+                }
+            }
+            out
         }
-        out.push(match &table {
-            Some(t) => t[b as usize],
-            None => b,
-        });
-    }
+    };
     if matches!(args.first(), Some(Object::ByteArray(_))) {
         Ok(Object::new_bytearray(out))
     } else {
@@ -18351,6 +18405,51 @@ pub(crate) fn bytearray_init_kw(
 
 pub(crate) fn bytearray_init(args: &[Object]) -> Result<Object, RuntimeError> {
     bytearray_init_kw(args, &[])
+}
+
+/// `b.append(n)` of a byte value onto a `bytearray` no view exports (a
+/// resize under one, like every other argument, is the full method's).
+pub(crate) fn bytearray_append_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::ByteArray(b), Object::Int(v @ 0..=255)] = args else {
+        return None;
+    };
+    if crate::object::bytearray_is_exported(b) {
+        return None;
+    }
+    b.try_borrow_mut().ok()?.push(*v as u8);
+    Some(Ok(Object::None))
+}
+
+/// `b.extend(data)` of a `bytes` or another `bytearray` onto a
+/// `bytearray` no view exports.
+pub(crate) fn bytearray_extend_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::ByteArray(b), data] = args else {
+        return None;
+    };
+    if crate::object::bytearray_is_exported(b) {
+        return None;
+    }
+    match data {
+        Object::Bytes(s) => b.try_borrow_mut().ok()?.extend_from_slice(s),
+        Object::ByteArray(s) if !Rc::ptr_eq(s, b) => {
+            let s = s.try_borrow().ok()?;
+            b.try_borrow_mut().ok()?.extend_from_slice(&s);
+        }
+        _ => return None,
+    }
+    Some(Ok(Object::None))
+}
+
+/// `b.pop()`: the last byte of a non-empty `bytearray` no view exports.
+pub(crate) fn bytearray_pop_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::ByteArray(b)] = args else {
+        return None;
+    };
+    if crate::object::bytearray_is_exported(b) {
+        return None;
+    }
+    let byte = b.try_borrow_mut().ok()?.pop()?;
+    Some(Ok(Object::Int(i64::from(byte))))
 }
 
 fn bytearray_append(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -20032,6 +20131,17 @@ fn memoryview_tolist(args: &[Object]) -> Result<Object, RuntimeError> {
     // (`'l'` → ints, `'d'` → floats, …), nesting one list per dimension.
     // Non-native / multi-member formats raise NotImplementedError
     // (`adjust_fmt` parity).
+    // (A contiguous one-dimensional view of unsigned bytes: its bytes, as
+    // ints, in one pass.)
+    if mv.itemsize.get() == 1
+        && !mv.zero_dim.get()
+        && mv.shape.borrow().is_empty()
+        && mv.format.borrow().as_str() == "B"
+        && mv.is_c_contiguous()
+    {
+        let items = mv.with_bytes(|run| run.iter().map(|&b| Object::Int(i64::from(b))).collect());
+        return Ok(Object::new_list(items));
+    }
     let shape = mv.shape_dims();
     let fmt = crate::mv_adjust_fmt(&mv.format.borrow())?;
     // Recurse one dimension per level, accumulating the multi-index;

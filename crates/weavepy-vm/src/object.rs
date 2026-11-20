@@ -11149,6 +11149,11 @@ pub enum LazyIterKind {
         /// take turns and no step allocates.
         spare: Option<SharedTuple>,
         held: Vec<Object>,
+        /// Whether no source is another's alias (the same iterator passed
+        /// twice), decided at the first native step: the sources never
+        /// change, and comparing every pair at every step made
+        /// `zip(*rows)` quadratic in its rows.
+        distinct: Option<bool>,
     },
     /// The builtin `enumerate(iterable, start)` over a source only the
     /// interpreter can step (a generator, a user iterator); a native
@@ -13219,6 +13224,18 @@ impl Object {
             }
             Object::Bytes(haystack) => bytes_membership(haystack, item),
             Object::ByteArray(haystack) => {
+                // (A plain needle converts without running code: the
+                // bytes are searched where they are.)
+                if matches!(
+                    item,
+                    Object::Int(_)
+                        | Object::Bool(_)
+                        | Object::Long(_)
+                        | Object::Bytes(_)
+                        | Object::ByteArray(_)
+                ) {
+                    return bytes_membership(&haystack.borrow(), item);
+                }
                 // Hold a buffer export: converting `item` can reenter
                 // Python (a user `__index__`/`__buffer__`) that tries to
                 // resize this bytearray; the resize then raises

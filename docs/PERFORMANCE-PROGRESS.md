@@ -1938,6 +1938,48 @@ branch and pull request.
     native lane: `append` 130 ns against 41), SHA-256 itself (2 times:
     the hash's throughput, not its argument), and about forty other
     callers of the copying accessor (`io` has thirteen).
+  - A third sweep, of 130 I/O, codec, text and library operations on
+    large inputs, found the same kinds of cost in more places.
+    `zip(*rows)` was quadratic in its rows: each step checked that no
+    source was another's alias by comparing every pair, and a transpose
+    has a source per row (20,000 rows of three: 404 ms, CPython 2.1).
+    The answer can't change, so the zip keeps it from its first native
+    step (sorted addresses when there are many sources): 2.3 ms. The
+    grouping idiom that passes one iterator several times
+    (`zip(*[it] * n)`) is the aliased case, and steps as before.
+    A string slice with a negative bound or a step spread the whole
+    string into a vector of code points first, so `line[-20:]` and
+    `text[:-1]` cost the string's length: on 226,000 ASCII characters,
+    `s[-20:]` 295 µs to 60 ns (CPython 63), `s[:-1]` 641 µs to 12 µs
+    (5.8), `s[::-1]` 651 µs to 15 µs (101). ASCII text is sliced by its
+    bytes.
+    UTF-16 and UTF-32 went through the general codec engine's code
+    point vectors even for well-formed text: a `str` is encoded straight
+    from its text, ASCII as a byte and its zeros, and well-formed input
+    is decoded in one pass (226,000 characters: encode 809 µs to 93,
+    CPython 75; decode 878 µs to 166, CPython 67). Results match
+    CPython's on 447 cases of well-formed and malformed input under
+    every error handler.
+    `x in a_bytearray` copied the buffer before searching it (5.2 µs
+    to 0.17 for a hit near the front of 200,000 bytes; CPython 1.5).
+    `list(b)`, `memoryview.tolist()`, `bytes(a_list)` and
+    `bytearray(a_list)` converted item by item through the general
+    protocols (5.5 ms, 10.7 ms and 1.5 ms for 200,000 bytes; now about
+    0.2 ms each, CPython 0.8 to 0.9). `struct.iter_unpack`'s iterator
+    steps natively (17.2 ms to 5.7 for 50,000 records, CPython 1.75).
+    `bytearray` has a native method lane for `append`, `extend`, `pop`
+    and `decode` (`append` 77 ns to 63, CPython 36), and compiled code
+    reads `b[i]` and `len(b)` and stores `view[i] = x` in line (`b[i]`
+    189 ns to 25, CPython 31; the store 204 to 48, CPython 42).
+    `range(n)[k]` in compiled code 210 ns to 40 (77), `slice.indices`
+    at machine width 252 ns to 104 (130), a forward stride slice of
+    bytes checks its bounds once (`b[::2]` 137 µs to 52, CPython 25),
+    and `bytes.translate` maps in one pass (173 µs to 121, CPython 70).
+    Left from this sweep: `BytesIO.getvalue()` copies the buffer each
+    call (CPython hands out its own bytes object until the next write),
+    `re` on a `bytearray` or `memoryview` widens the whole subject per
+    call, `BytesIO` reads and writes at 2 to 3 times CPython,
+    `iter_unpack` at 3 times, UTF-16 decoding at 2.5 times.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

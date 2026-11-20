@@ -388,6 +388,7 @@ impl Interpreter {
                     result: None,
                     spare: None,
                     held: Vec::new(),
+                    distinct: None,
                 })
             }
         })
@@ -478,6 +479,7 @@ impl Interpreter {
                     result: None,
                     spare: None,
                     held: Vec::new(),
+                    distinct: None,
                 }))
             }
         }
@@ -1203,15 +1205,28 @@ fn src_step(it: &Object) -> Option<Object> {
 
 /// Whether every source of a several-source adapter can step purely and
 /// none is another's alias (which one step could exhaust for the next).
-fn srcs_ready(iters: &[Object]) -> bool {
+fn srcs_ready(iters: &[Object], distinct: &mut Option<bool>) -> bool {
     iters.iter().all(|it| src_ready(it, true))
-        && iters.iter().enumerate().all(|(i, a)| {
-            iters[..i].iter().all(|b| match (a, b) {
-                (Object::Iter(a), Object::Iter(b)) => !Rc::ptr_eq(a, b),
-                (Object::LazyIter(a), Object::LazyIter(b)) => !Rc::ptr_eq(a, b),
-                _ => true,
-            })
-        })
+        && *distinct.get_or_insert_with(|| srcs_distinct(iters))
+}
+
+/// Whether no two of `iters` are the same iterator. (Sorted addresses for
+/// more than a few: `zip(*rows)` has a source per row.)
+fn srcs_distinct(iters: &[Object]) -> bool {
+    let addr = |it: &Object| match it {
+        Object::Iter(c) => Some(Rc::as_ptr(c) as usize),
+        Object::LazyIter(l) => Some(Rc::as_ptr(l) as usize),
+        _ => None,
+    };
+    if iters.len() <= 8 {
+        return iters.iter().enumerate().all(|(i, a)| {
+            let a = addr(a);
+            a.is_none() || iters[..i].iter().all(|b| addr(b) != a)
+        });
+    }
+    let mut addrs: Vec<usize> = iters.iter().filter_map(addr).collect();
+    addrs.sort_unstable();
+    addrs.windows(2).all(|w| w[0] != w[1])
 }
 
 /// One step of a native adapter that runs no code (the core loop's
@@ -1230,6 +1245,7 @@ pub(crate) fn lazy_pure_next(l: &PyLazyIter) -> Option<Option<Object>> {
         result,
         spare,
         held,
+        distinct,
     } = st
     else {
         return itertools_pure_next(l);
@@ -1284,7 +1300,7 @@ pub(crate) fn lazy_pure_next(l: &PyLazyIter) -> Option<Option<Object>> {
             return Some(Some(fresh_result(result, spare, t)));
         }
     }
-    if !srcs_ready(iters) {
+    if !srcs_ready(iters, distinct) {
         return None;
     }
     if iters.is_empty() {
@@ -1366,7 +1382,8 @@ pub(crate) fn lazy_pure_pair(l: &PyLazyIter) -> Option<(Object, Object)> {
     if let Some(pair) = cursor_pair(a, b) {
         return Some(pair);
     }
-    if !srcs_ready(iters) {
+    // (Two sources: compared outright, the state only being read here.)
+    if !srcs_ready(iters, &mut None) {
         return None;
     }
     Some((src_step(a)?, src_step(b)?))
@@ -1558,6 +1575,7 @@ pub(crate) fn lazy_stops_quietly(l: &Rc<PyLazyIter>) -> bool {
             result,
             spare,
             held,
+            distinct: _,
         } => {
             let Some(first) = iters.first() else {
                 return false;

@@ -1217,36 +1217,14 @@ fn encode_special(s: &str, encoding: &str, errors: &str) -> Result<Option<Vec<u8
         }
         "ascii" => Some(crate::stdlib::codecs_engine::ascii_encode(&cps(), errors)?),
         "latin1" | "iso88591" => Some(crate::stdlib::codecs_engine::latin1_encode(&cps(), errors)?),
-        "utf16" => Some(crate::stdlib::codecs_engine::utf16_encode(
-            &cps(),
-            errors,
-            0,
-        )?),
-        "utf16le" => Some(crate::stdlib::codecs_engine::utf16_encode(
-            &cps(),
-            errors,
-            -1,
-        )?),
-        "utf16be" => Some(crate::stdlib::codecs_engine::utf16_encode(
-            &cps(),
-            errors,
-            1,
-        )?),
-        "utf32" => Some(crate::stdlib::codecs_engine::utf32_encode(
-            &cps(),
-            errors,
-            0,
-        )?),
-        "utf32le" => Some(crate::stdlib::codecs_engine::utf32_encode(
-            &cps(),
-            errors,
-            -1,
-        )?),
-        "utf32be" => Some(crate::stdlib::codecs_engine::utf32_encode(
-            &cps(),
-            errors,
-            1,
-        )?),
+        // (A `str` has no lone surrogate, so nothing for a handler: its
+        // units are written straight from the text.)
+        "utf16" => Some(crate::stdlib::codecs_engine::utf16_encode_str(s, 0)),
+        "utf16le" => Some(crate::stdlib::codecs_engine::utf16_encode_str(s, -1)),
+        "utf16be" => Some(crate::stdlib::codecs_engine::utf16_encode_str(s, 1)),
+        "utf32" => Some(crate::stdlib::codecs_engine::utf32_encode_str(s, 0)),
+        "utf32le" => Some(crate::stdlib::codecs_engine::utf32_encode_str(s, -1)),
+        "utf32be" => Some(crate::stdlib::codecs_engine::utf32_encode_str(s, 1)),
         "rawunicodeescape" => Some(encode_raw_unicode_escape(s)),
         "unicodeescape" => Some(encode_unicode_escape(s)),
         "utf7" => Some(crate::stdlib::codecs_engine::utf7_encode(&cps(), errors)?),

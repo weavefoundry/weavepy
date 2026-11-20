@@ -942,6 +942,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             Object::Builtin(install),
         );
         register(&mut d, "_array_methods", array_methods);
+        register(&mut d, "_unpack_iterator_methods", unpack_iterator_methods);
     }
     Rc::new(PyModule {
         name: "_struct".to_owned(),
@@ -1468,6 +1469,75 @@ fn array_next_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
         .ok()?
         .get_hinted_mut(1, "_index")? = Object::Int(index + 1);
     Some(Ok(item))
+}
+
+/// An `unpack_iterator`'s next tuple while it has one (its end is the
+/// Python method's): the format's fields read at the iterator's offset,
+/// which then moves on by the format's size.
+fn unpack_iter_next_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Instance(it)] = args else {
+        return None;
+    };
+    let (fmt, buffer, offset) = {
+        let slots = it.slots.try_borrow().ok()?;
+        let (Object::Str(fmt), Object::Int(offset), Object::Int(len)) = (
+            slots.get_hinted(0, "_fmt")?,
+            slots.get_hinted(3, "_offset")?,
+            slots.get_hinted(4, "_len")?,
+        ) else {
+            return None;
+        };
+        if offset >= len {
+            return None;
+        }
+        (
+            fmt.clone(),
+            slots.get_hinted(1, "_buffer")?.clone(),
+            *offset,
+        )
+    };
+    let cf = compiled_for(&fmt)?;
+    let read = |buf: &[u8]| {
+        let off = usize::try_from(offset).ok()?;
+        if off.checked_add(cf.size)? > buf.len() {
+            return None;
+        }
+        cf.unpack_from_offset(buf, off).ok().map(|(vals, _)| vals)
+    };
+    let vals = match &buffer {
+        Object::Bytes(b) => read(b)?,
+        Object::ByteArray(b) => read(&b.try_borrow().ok()?)?,
+        Object::MemoryView(mv) if !mv.released.get() && mv.is_c_contiguous() => {
+            mv.with_bytes(read)?
+        }
+        _ => return None,
+    };
+    *it.slots
+        .try_borrow_mut()
+        .ok()?
+        .get_hinted_mut(3, "_offset")? = Object::Int(offset + cf.size as i64);
+    Some(Ok(Object::new_tuple(vals)))
+}
+
+/// `_unpack_iterator_methods(unpack_iterator)`: the iterator's native
+/// step, as `(class, name, method)` triples for the module to assign.
+fn unpack_iterator_methods(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Type(cls)] = args else {
+        return Err(type_error(
+            "_unpack_iterator_methods() expects the iterator class",
+        ));
+    };
+    let orig = cls
+        .dict
+        .borrow()
+        .get(&crate::object::StrKey("__next__"))
+        .cloned()
+        .ok_or_else(|| type_error("_unpack_iterator_methods(): no __next__ to replace"))?;
+    Ok(Object::new_list(vec![Object::new_tuple(vec![
+        Object::Type(cls.clone()),
+        Object::from_static("__next__"),
+        fast_method(cls, "__next__", unpack_iter_next_fast, orig, false),
+    ])]))
 }
 
 /// `_array_methods(array, array_iterator)`: the native item methods of
