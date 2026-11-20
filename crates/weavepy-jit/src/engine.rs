@@ -600,7 +600,7 @@ impl JitEngine {
             &mut |_| None,
             &mut |_| None,
             &mut |_, _, _| None,
-            &mut |_| (false, false),
+            &mut |_| SiteLayout::default(),
         )
     }
 
@@ -626,7 +626,7 @@ impl JitEngine {
         direct: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
         direct_method: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
         inline_method: &mut dyn FnMut(u32, &[JitType], u32) -> Option<InlineMethod>,
-        slot_member: &mut dyn FnMut(&AttrSiteMeta) -> (bool, bool),
+        slot_member: &mut dyn FnMut(&AttrSiteMeta) -> SiteLayout,
     ) -> Result<CompiledFrame, JitVerdict> {
         let tfunc = analyze_admitted(code, resolve, probes, slot_member)?;
         self.compile_tfunc_methods(&tfunc, direct, direct_method, inline_method)
@@ -646,7 +646,7 @@ impl JitEngine {
         direct: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
         direct_method: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
         inline_method: &mut dyn FnMut(u32, &[JitType], u32) -> Option<InlineMethod>,
-        slot_member: &mut dyn FnMut(&AttrSiteMeta) -> (bool, bool),
+        slot_member: &mut dyn FnMut(&AttrSiteMeta) -> SiteLayout,
     ) -> Result<CompiledFrame, JitVerdict> {
         let tfunc = analyze_admitted(code, resolve, probes, slot_member)?;
         if engine.is_none() {
@@ -1088,6 +1088,16 @@ fn calls_dynamically(tfunc: &TFunc) -> bool {
 /// through a helper that redoes the lookups the interpreter's caches
 /// remember, while each typed one saves only a dispatch. A loop-free
 /// body is left alone: other compiled code calls it directly.
+/// What the embedder knows of an attribute site's storage when its code
+/// is compiled (see [`AttrSiteMeta::slot_member`],
+/// [`AttrSiteMeta::in_line`] and [`AttrSiteMeta::position`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SiteLayout {
+    pub slot_member: bool,
+    pub in_line: bool,
+    pub position: Option<(u64, u32, usize)>,
+}
+
 /// The [`JitEngine::compile_frame_lazily`] verdict for a host the code
 /// generator can't target.
 pub const NO_HOST_ENGINE: &str = "no code generator for the host";
@@ -1098,11 +1108,14 @@ fn analyze_admitted(
     code: &CodeObject,
     resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
     probes: &mut Probes<'_>,
-    slot_member: &mut dyn FnMut(&AttrSiteMeta) -> (bool, bool),
+    slot_member: &mut dyn FnMut(&AttrSiteMeta) -> SiteLayout,
 ) -> Result<TFunc, JitVerdict> {
     let mut tfunc = crate::analyze::analyze_frame(code, resolve, probes)?;
     for site in &mut tfunc.attr_sites {
-        (site.slot_member, site.in_line) = slot_member(site);
+        let layout = slot_member(site);
+        site.slot_member = layout.slot_member;
+        site.in_line = layout.in_line;
+        site.position = layout.position;
     }
     // A callee's analysis ran out of work budget: what this one made of
     // the callee (an untyped call) reflects the budget, not the code.

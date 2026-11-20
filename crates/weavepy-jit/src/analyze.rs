@@ -8398,6 +8398,7 @@ fn emit_instr(
                 self_ctor: self_site,
                 slot_member: false,
                 in_line: false,
+                position: None,
             });
             push(TOp::AttrGet { site, out: lane }, Some(lane), stack, stmts);
             // RFC 0071 WS3 — extend the provenance chain on the result.
@@ -8634,6 +8635,7 @@ fn emit_instr(
                 self_ctor: self_site,
                 slot_member: false,
                 in_line: false,
+                position: None,
             });
             push(TOp::AttrGet { site, out: lane }, Some(lane), stack, stmts);
             // RFC 0071 WS3 — extend the provenance chain on the result.
@@ -8788,6 +8790,7 @@ fn emit_instr(
                 self_ctor: None,
                 slot_member: false,
                 in_line: false,
+                position: None,
             });
             // Native stack order matches the interpreter: value below,
             // receiver on top. Lowering pops receiver then value.

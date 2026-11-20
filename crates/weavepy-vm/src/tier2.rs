@@ -1862,10 +1862,18 @@ impl JitState {
             let mut slot_member = |site: &AttrSiteMeta| {
                 let guard = attr_guard_of(site);
                 let member = guard.as_ref().is_some_and(|g| g.slot_layout != 0);
+                let position = guard
+                    .as_ref()
+                    .filter(|g| g.split_idx != u32::MAX)
+                    .map(|g| (g.ver, g.split_idx, g.slot_layout));
                 let in_line = matches!(layout, Some(slots_ok) if slots_ok || !member)
                     && matches!(site.lane, JitType::Int | JitType::Float | JitType::Bool)
-                    && guard.is_some_and(|g| g.split_idx != u32::MAX);
-                (member, in_line)
+                    && position.is_some();
+                weavepy_jit::SiteLayout {
+                    slot_member: member,
+                    in_line,
+                    position,
+                }
             };
             let r = JitEngine::compile_frame_lazily(
                 engine,

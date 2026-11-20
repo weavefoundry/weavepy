@@ -1060,6 +1060,14 @@ pub struct AttrSiteMeta {
     /// one), filled in beside [`Self::slot_member`]. An admission rule's
     /// input only: the lowering decides per access.
     pub in_line: bool,
+    /// The embedder's guard for the site, where it holds a position: the
+    /// receiver's class version, the split-values index (or, marked
+    /// [`crate::runtime::SLOT_FIELD`], the member slot's position) and
+    /// the slot layout's word (`0` for a split field). A guard never
+    /// changes once made, so compiled code compares and indexes with
+    /// these as constants instead of loading them from the guard table
+    /// at each access.
+    pub position: Option<(u64, u32, usize)>,
 }
 
 /// RFC 0073 WS1 — where one canonical constructor field's value comes

@@ -1640,7 +1640,27 @@ branch and pull request.
     instructions. Both figures are still a hundred instructions an
     attribute operation: each access redoes its receiver's guard chain
     (about 60 instructions), and the two string field reads go through
-    a helper (172 each). Those are next.
+    a helper (172 each); the next entry takes those on.
+  - Tier 2's attribute accesses check less each time. Three cuts in
+    the in-line path, measured on the `attr_access` fixture's loop (two
+    scalar reads, two float fields read and rewritten, two `tick()`
+    updates, two string fields compared):
+    a string, bytes or object field that still holds the value its site
+    read last finds that value's pin again in line (the helper's own
+    first answer, 172 instructions each time before): 1,182 to 972
+    instructions an iteration;
+    an instance validated by one access of a local's field (an instance
+    pin with no published dictionary, its values split over its class's
+    names) stays validated for the accesses of that local that follow
+    in the block, through in-line stores and field updates too, until
+    something that can run code or reshape it (a helper's store, any
+    other call, the local's rebinding): 972 to 874, a field read then
+    written 161 to 118;
+    and a site's class version and index are constants in its code
+    instead of loads from the guard table (a guard never changes once
+    made): 874 to 786. Cycles went 348 to 228 an iteration; the frame
+    JIT ran this loop at 1,333 instructions and about 400 cycles, and
+    CPython runs it at 3,329 and 1,115.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
