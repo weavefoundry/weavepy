@@ -128,16 +128,19 @@ small fraction of CPython's instructions, while `zip`, `Enum` lookups, dict
 copies and calls through `*args` still take one and a half to two and a half
 times as many. The [progress note](docs/PERFORMANCE-PROGRESS.md) lists them.
 
-Ordinary library-heavy code is where WeavePy is behind. A battery of 54
-everyday operations (`tools/pybench/everyday.py`: file and directory work,
-text, data formats, classes, threads, common modules) runs at 1.23 times
-CPython's time on average (1.79 before the work that followed its first run,
-1.36 before the latest). WeavePy is ahead on 20 of the 54 and past twice
-CPython's time on 9, with `enum` and `dataclasses` and class-protocol code
-the two still past 3 times. File and stream
-I/O, which was far slower still (a line read took a system call per byte), is
-now level with CPython or ahead of it, as are `datetime`, `re` and `json`. The
-rest is the current work.
+Ordinary library-heavy code was where WeavePy was furthest behind, and is now
+about level. A battery of 54 everyday operations (`tools/pybench/everyday.py`:
+file and directory work, text, data formats, classes, threads, common modules)
+runs at 0.97 times CPython's time on average, measured on November 19, 2026, at
+`c69d14ad` (1.79 when the battery was first run, 1.26 four days earlier).
+WeavePy is ahead on 28 of the 54 and past one and a half times CPython's time
+on 5: `threading_queue_ops` (2.2), `argparse_ops` (1.9), `inspect_typing_ops`
+(1.7), `email_html_ops` (1.6) and `exceptions_ops` (1.5). Those are short runs
+of standard-library code that end before the JIT has warmed up, and threads:
+starting one costs three times what it does in CPython. File and stream I/O,
+which was far slower still (a line read took a system call per byte), is now
+level with CPython or ahead of it, as are `datetime`, `re` and `json`. The rest
+is the current work.
 
 Code that the JIT compiles fully can run far faster. The numeric loops in the
 [bench gate fixtures](docs/PERFORMANCE-CPYTHON-PARITY.md) took 5% to 8% of
@@ -165,6 +168,10 @@ measurements and the work behind them.
   code pages a program is done with once its imports are over; a plain
   release build does that only in processes that run for more than a tenth
   of a second.
+- **Threads.** Once a program starts a second thread, reference counts are
+  updated atomically and cell borrows take a lock, even while that thread is
+  idle. On x86 that costs object-heavy code 13% to 55% more time; CPython, under
+  its GIL, pays nothing comparable.
 - **Imports and warm-up.** Importing large parts of the standard library costs
   about 1.4 times CPython's instructions; a faster start-up hides most of it
   in short scripts. Cold time is a little under CPython's overall, but some

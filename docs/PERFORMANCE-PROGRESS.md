@@ -7,6 +7,23 @@ plan, what's done, and what's next, so a new session can pick up the work.
 
 ## Where WeavePy stands
 
+Measured on November 19, 2026, at `c69d14ad` (PR #112), a PGO build from a
+fresh training run against CPython 3.14.8 (load averages between 2 and 5).
+The everyday battery: 0.966 times CPython's time over three runs (0.956,
+0.957 and 0.984), against 1.258 at `83efee9b` four days earlier. WeavePy is
+ahead on 28 of the 54 cases, past one and a half times CPython's time on 5
+and past twice on one: `threading_queue_ops` 2.2, `argparse_ops` 1.9,
+`inspect_typing_ops` 1.7, `email_html_ops` 1.6, `exceptions_ops` 1.5. A plain
+release build of the same tree reads 1.18: the profile-guided layout is
+worth a fifth of the battery's time (see the instruction-cache figures
+under "Done"). The suite, with the `83efee9b` PGO build in the same run:
+warm time 0.843 (that build 0.851), cold time 0.957 (0.952), peak RSS 1.183
+(1.144) by the suite's runner and 1.172 (1.174) with footprint 1.252
+(1.269) by three runs a workload under `/usr/bin/time`; the new build runs
+the suite in 0.990 of the older one's warm time. The published 1.13 for
+peak RSS doesn't reproduce with either build today: CPython's own figure
+moves between sessions.
+
 Measured on November 15, 2026, at `83efee9b` (PR #112), a PGO build
 against CPython 3.14.8 on a host that wasn't idle (load averages between
 2 and 9). The everyday battery: 1.258 times CPython's time over three runs
