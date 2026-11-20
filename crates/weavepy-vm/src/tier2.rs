@@ -10263,7 +10263,16 @@ fn builtin_seq_step(cell: &Rc<GilRefCell<crate::object::PyIterator>>) -> Option<
         PyIterator::List { .. }
         | PyIterator::Tuple { .. }
         | PyIterator::Range { .. }
-        | PyIterator::Reversed { .. } => Some(it.next_value()),
+        | PyIterator::Reversed { .. }
+        | PyIterator::Bytes { .. } => Some(it.next_value()),
+        // A buffer's next byte while it has one (its end detaches the
+        // iterator, which is the general step's).
+        PyIterator::ByteArray { data, index } => {
+            // SAFETY: a read of a distinct cell, ended before anything runs.
+            let b = *unsafe { data.peek() }?.get(*index)?;
+            *index += 1;
+            Some(Some(Object::Int(i64::from(b))))
+        }
         // A set's next element while it keeps its size (a change, and the
         // end, are the general step's to report).
         PyIterator::Set { set, len, index } => {
@@ -10315,6 +10324,19 @@ fn seq_scalar_step(cell: &Rc<GilRefCell<PyIterator>>, elem_tag: i64) -> Option<u
             let bits = pack(unsafe { items.peek()? }.get(*index)?, lane)?;
             *index += 1;
             Some(bits)
+        }
+        // A byte string's or buffer's next byte, an int (the end is the
+        // general step's, which detaches a finished buffer's iterator).
+        PyIterator::Bytes { data, index } if lane == JitType::Int => {
+            let b = *data.get(*index)?;
+            *index += 1;
+            pack(&Object::Int(i64::from(b)), lane)
+        }
+        PyIterator::ByteArray { data, index } if lane == JitType::Int => {
+            // SAFETY: as above.
+            let b = *unsafe { data.peek()? }.get(*index)?;
+            *index += 1;
+            pack(&Object::Int(i64::from(b)), lane)
         }
         // A reversed list's (its end, and a list that shrank under it, are
         // the general step's).

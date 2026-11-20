@@ -2775,6 +2775,21 @@ fn scan_items(args: &[Object], multi: bool) -> Option<Vec<Object>> {
 /// (CPython's rich-comparison loop: a strict comparison keeps the first
 /// extremum).
 fn min_max_fast(args: &[Object], want_max: bool) -> Option<Result<Object, RuntimeError>> {
+    // (A non-empty byte string's or buffer's extreme byte; an empty one
+    // raises on the full path.)
+    let extreme = |b: &[u8]| {
+        let x = if want_max {
+            b.iter().max()
+        } else {
+            b.iter().min()
+        };
+        x.map(|&x| Ok(Object::Int(i64::from(x))))
+    };
+    match args {
+        [Object::Bytes(b)] => return extreme(b),
+        [Object::ByteArray(b)] => return extreme(&b.try_borrow().ok()?),
+        _ => {}
+    }
     let items = scan_items(args, true)?;
     let (first, rest) = items.split_first()?;
     // Ints, big ints and `int` subclasses that keep `int`'s ordering
@@ -3279,9 +3294,13 @@ pub(crate) fn sum_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> 
         total = total.checked_add(*i)?;
         Some(())
     };
+    // (A byte string's or buffer's bytes: their total can't overflow.)
+    let bytes_total = |b: &[u8]| b.iter().map(|&x| u64::from(x)).sum::<u64>() as i64;
     match args {
         [Object::Tuple(t)] => t.iter().try_for_each(&mut add)?,
         [Object::List(l)] => l.try_borrow().ok()?.iter().try_for_each(&mut add)?,
+        [Object::Bytes(b)] => return Some(Ok(Object::Int(bytes_total(b)))),
+        [Object::ByteArray(b)] => return Some(Ok(Object::Int(bytes_total(&b.try_borrow().ok()?)))),
         _ => return None,
     }
     Some(Ok(Object::Int(total)))

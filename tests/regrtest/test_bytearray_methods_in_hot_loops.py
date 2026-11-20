@@ -236,5 +236,62 @@ class ReadTests(unittest.TestCase):
             slice(1).indices("5")
 
 
+def byte_total(data):
+    total = 0
+    for b in data:
+        total += b
+    return total
+
+
+class IterationTests(unittest.TestCase):
+    def test_loops_over_bytes_and_buffers(self):
+        data = bytes(range(256)) * 20
+        want = sum(range(256)) * 20
+        for kind in (bytes, bytearray):
+            with self.subTest(kind=kind.__name__):
+                value = kind(data)
+                for _ in range(5):
+                    self.assertEqual(byte_total(value), want)
+                self.assertEqual(sum(value), want)
+                self.assertEqual(max(value), 255)
+                self.assertEqual(min(value), 0)
+                self.assertEqual(max(kind(b"q")), ord("q"))
+                with self.assertRaises(ValueError):
+                    max(kind())
+                with self.assertRaises(ValueError):
+                    min(kind())
+                self.assertEqual(sum(kind()), 0)
+                self.assertEqual(sum(kind(b"ab"), 1000), 1000 + 97 + 98)
+                self.assertEqual(max(kind(b"abc"), default=0), 99)
+                self.assertEqual(max(kind(), default=-1), -1)
+                self.assertEqual(min(kind(b"abc"), key=lambda b: -b), 99)
+                self.assertEqual(max(kind(b"ab"), kind(b"b")), kind(b"b"))
+                self.assertTrue(all(type(b) is int for b in kind(b"xy")))
+
+    def test_a_buffer_that_changes_during_the_loop(self):
+        buf = bytearray(range(100))
+        seen = []
+        for b in buf:
+            seen.append(b)
+            if b == 10:
+                del buf[20:]
+            if b == 15:
+                buf.extend(b"\xff\xfe")
+        self.assertEqual(seen, list(range(20)) + [255, 254])
+        buf = bytearray(b"abc")
+        it = iter(buf)
+        self.assertEqual(list(it), [97, 98, 99])
+        buf.extend(b"de")
+        self.assertEqual(list(it), [])
+        buf = bytearray(b"abc")
+        out = []
+        for i in range(ROUNDS):
+            for b in buf:
+                out.append(b)
+            if i == ROUNDS - 2:
+                buf.clear()
+        self.assertEqual(len(out), 3 * (ROUNDS - 1))
+
+
 if __name__ == "__main__":
     unittest.main()

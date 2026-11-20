@@ -2799,9 +2799,10 @@ unsafe extern "C" fn h_for_iter(st: *mut State, it: *mut Object, out: *mut Objec
                     // out of line, so this helper's frame stays what the
                     // steps above need (in line here, they cost a string's
                     // loop 11% more instructions an item).
-                    PyIterator::Reversed { .. } | PyIterator::DictKeys { .. } => {
-                        return h_for_iter_view(st, it, out, pc)
-                    }
+                    PyIterator::Reversed { .. }
+                    | PyIterator::DictKeys { .. }
+                    | PyIterator::Bytes { .. }
+                    | PyIterator::ByteArray { .. } => return h_for_iter_view(st, it, out, pc),
                     _ => return h_for_iter_rest(st, it, out, pc),
                 };
                 if let Object::Int(i) = *v {
@@ -2819,8 +2820,9 @@ unsafe extern "C" fn h_for_iter(st: *mut State, it: *mut Object, out: *mut Objec
     }
 }
 
-/// [`h_for_iter`] of a reversed list's iterator, or a dict's or dict
-/// view's: the next item, key or value read in place, as the general step
+/// [`h_for_iter`] of a reversed list's iterator, a byte string's or
+/// buffer's, or a dict's or dict view's: the next item, byte, key or value
+/// read in place, as the general step
 /// takes it (the end, a list that shrank and a dict that changed are that
 /// step's, through [`h_for_iter_rest`]).
 #[inline(never)]
@@ -2836,6 +2838,20 @@ unsafe extern "C" fn h_for_iter_view(
         if let Object::Iter(rc) = &*it {
             if let Some(iter) = rc.peek_mut() {
                 match iter {
+                    // A byte string's or buffer's next byte, an int (the end
+                    // is the general step's).
+                    PyIterator::Bytes { data, index } if *index < data.len() => {
+                        (*st).out = u64::from(data[*index]);
+                        *index += 1;
+                        return 0;
+                    }
+                    PyIterator::ByteArray { data, index } => {
+                        if let Some(&b) = data.peek().and_then(|d| d.get(*index)) {
+                            *index += 1;
+                            (*st).out = u64::from(b);
+                            return 0;
+                        }
+                    }
                     PyIterator::Reversed { items, index, .. } if *index >= 0 => {
                         if let Some(v) = items.peek().and_then(|xs| xs.get(*index as usize)) {
                             *index -= 1;

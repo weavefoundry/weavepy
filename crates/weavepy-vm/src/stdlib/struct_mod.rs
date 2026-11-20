@@ -1166,16 +1166,49 @@ fn install_fast_methods<const N: usize>(
 
 /// An `array.array` instance's typecode and buffer.
 fn array_parts(recv: &Object) -> Option<(u8, Rc<RefCell<Vec<u8>>>)> {
+    with_array(recv, |typecode, buf| Some((typecode, buf.clone())))
+}
+
+/// The slot layouts of the `array` class and its iterator class (their
+/// addresses), set when `_array_methods` serves them: an instance laid out
+/// over one of these has its slots at known places.
+static ARRAY_LAYOUT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ARRAY_ITER_LAYOUT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `inst`'s slot values when it is laid out over the layout `known` names.
+fn known_slots<'a>(
+    inst: &crate::types::PyInstance,
+    slots: &'a crate::types::SlotStorage,
+    known: &std::sync::atomic::AtomicUsize,
+) -> Option<&'a [Object]> {
+    let layout = inst.cls_raw().own_slot_layout()?;
+    if crate::shared_value::SharedSlice::word(layout)
+        != known.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return None;
+    }
+    slots.values_for_layout(layout)
+}
+
+/// `f` on an `array.array` instance's typecode and buffer, the slots read
+/// in place.
+fn with_array<R>(
+    recv: &Object,
+    f: impl FnOnce(u8, &Rc<RefCell<Vec<u8>>>) -> Option<R>,
+) -> Option<R> {
     let Object::Instance(inst) = recv else {
         return None;
     };
     let slots = inst.slots.try_borrow().ok()?;
-    let typecode = match slots.get_hinted(0, "_typecode")? {
-        Object::Str(s) if s.len() == 1 => s.as_bytes()[0],
-        _ => return None,
+    let (code, buf) = match known_slots(inst, &slots, &ARRAY_LAYOUT) {
+        Some(values) => (values.first()?, values.get(3)?),
+        None => (
+            slots.get_hinted(0, "_typecode")?,
+            slots.get_hinted(3, "_buf")?,
+        ),
     };
-    match slots.get_hinted(3, "_buf")? {
-        Object::ByteArray(b) => Some((typecode, b.clone())),
+    match (code, buf) {
+        (Object::Str(s), Object::ByteArray(b)) if s.len() == 1 => f(s.as_bytes()[0], b),
         _ => None,
     }
 }
@@ -1344,6 +1377,32 @@ fn array_slice_fast(recv: &Object, sl: &crate::object::PySlice) -> Option<Object
     Some(Object::Instance(Rc::new(out)))
 }
 
+/// The items of an instance of the `array` class itself (whose `__iter__`
+/// is its own), as iterating it would give them, for the containers that
+/// collect an iterable (`list(a)`, `tuple(a)`, `sorted(a)`).
+pub(crate) fn array_items(recv: &Object) -> Option<Vec<Object>> {
+    let Object::Instance(inst) = recv else {
+        return None;
+    };
+    if std::ptr::from_ref(inst.cls_raw()) as usize
+        != ARRAY_CLASS.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return None;
+    }
+    // (Its own `__iter__`, which nothing has replaced.)
+    match inst.cls_raw().lookup("__iter__") {
+        Some(Object::Function(f)) if f.code().qualname == "array.__iter__" => {}
+        _ => return None,
+    }
+    with_array(recv, |typecode, buf| {
+        let size = array_item_size(typecode)?;
+        let buf = buf.try_borrow().ok()?;
+        buf.chunks_exact(size)
+            .map(|raw| array_item_read(typecode, raw))
+            .collect()
+    })
+}
+
 /// `a[i]` for a plain index in range, and `a[i:j]` (see
 /// [`array_slice_fast`]).
 fn array_getitem_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
@@ -1450,24 +1509,36 @@ fn array_next_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let [Object::Instance(it)] = args else {
         return None;
     };
-    let (array, index) = {
-        let slots = it.slots.try_borrow().ok()?;
-        let Object::Int(index) = slots.get_hinted(1, "_index")? else {
+    let read = |array: &Object, index: i64| {
+        with_array(array, |typecode, buf| {
+            let size = array_item_size(typecode)?;
+            let buf = buf.try_borrow().ok()?;
+            let off = usize::try_from(index).ok()?.checked_mul(size)?;
+            array_item_read(typecode, buf.get(off..off + size)?)
+        })
+    };
+    let mut slots = it.slots.try_borrow_mut().ok()?;
+    // (Laid out as the class declares them: read and advanced in place.)
+    let layout = it.cls_raw().own_slot_layout()?;
+    if crate::shared_value::SharedSlice::word(layout)
+        == ARRAY_ITER_LAYOUT.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        let values = slots.values_for_layout_mut(layout)?;
+        let [array, index @ Object::Int(_), ..] = values else {
             return None;
         };
-        (slots.get_hinted(0, "_ao")?.clone(), *index)
+        let Object::Int(i) = *index else {
+            return None;
+        };
+        let item = read(array, i)?;
+        *index = Object::Int(i + 1);
+        return Some(Ok(item));
+    }
+    let Object::Int(i) = *slots.get_hinted(1, "_index")? else {
+        return None;
     };
-    let (typecode, buf) = array_parts(&array)?;
-    let size = array_item_size(typecode)?;
-    let item = {
-        let buf = buf.try_borrow().ok()?;
-        let off = usize::try_from(index).ok()?.checked_mul(size)?;
-        array_item_read(typecode, buf.get(off..off + size)?)?
-    };
-    *it.slots
-        .try_borrow_mut()
-        .ok()?
-        .get_hinted_mut(1, "_index")? = Object::Int(index + 1);
+    let item = read(slots.get_hinted(0, "_ao")?, i)?;
+    *slots.get_hinted_mut(1, "_index")? = Object::Int(i + 1);
     Some(Ok(item))
 }
 
@@ -1561,6 +1632,14 @@ fn array_methods(args: &[Object]) -> Result<Object, RuntimeError> {
         Rc::as_ptr(cls) as usize,
         std::sync::atomic::Ordering::Relaxed,
     );
+    for (owner, known) in [(cls, &ARRAY_LAYOUT), (iter_cls, &ARRAY_ITER_LAYOUT)] {
+        if let Some(layout) = owner.own_slot_layout() {
+            known.store(
+                crate::shared_value::SharedSlice::word(layout),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
     let mut out = Vec::with_capacity(table.len());
     for (owner, name, fast) in table {
         let orig = owner

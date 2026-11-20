@@ -48230,6 +48230,9 @@ impl Interpreter {
         if let Some(items) = crate::object::collect_small_int_range(v) {
             return items;
         }
+        if let Some(items) = crate::stdlib::struct_mod::array_items(v) {
+            return Ok(items);
+        }
         if let Object::LazyIter(l) = v {
             if let Some(items) = crate::seqiter::islice_collect(l) {
                 return Ok(items);
@@ -76999,10 +77002,24 @@ pub(crate) fn str_subscript_slice(s: &SharedStr, slc: &PySlice) -> Result<Object
     // bytes are its characters, sliced as they are (the whole text is not
     // spread into code points first).
     if SharedStr::is_ascii(s) {
-        let piece = slice_seq(s.as_bytes(), slc)?;
-        if piece.len() == s.len() && step == 1 {
-            return Ok(Object::Str(s.clone()));
+        // (A run, `s[:-1]` or `s[-20:]`, is copied once, from the text.)
+        if step == 1 {
+            let (start, stop, _, _) = adjust_slice(s.len() as i64, slc)?;
+            let (start, stop) = (start as usize, (stop as usize).max(start as usize));
+            if stop - start == s.len() {
+                return Ok(Object::Str(s.clone()));
+            }
+            if start == stop {
+                return Ok(Object::from_static(""));
+            }
+            let text = &s[start..stop];
+            return Ok(Object::Str(if text.len() <= 2 {
+                SharedStr::from(text)
+            } else {
+                SharedStr::from_ascii(text)
+            }));
         }
+        let piece = slice_seq(s.as_bytes(), slc)?;
         if piece.is_empty() {
             return Ok(Object::from_static(""));
         }

@@ -1986,6 +1986,18 @@ branch and pull request.
     so Pillow's `putdata(array(...))` refused the array. A natively
     served `__getitem__` on a class that declares itself a sequence
     counts too, as CPython's own `array` type does.
+  - Iterating byte strings and arrays. `for b in data` over a `bytes` or
+    `bytearray` left compiled code at every step for the interpreter's
+    general `next` (39 ns a byte, CPython 21); both tiers now step them
+    in place (8 ns). `sum`, `min` and `max` of one take its bytes
+    directly (`sum` 22 ns a byte to 0.2; CPython 5.3). The array
+    iterator's native step and the item methods read their instance's
+    slots where the class lays them out, not by name (`for x in a` 72 ns
+    an item to 42, CPython 35), and `list(a)`, `tuple(a)` and
+    `sorted(a)` unpack the array at once when its `__iter__` is its own
+    (91 ns an item to 21, CPython 15). An ASCII string's run with a
+    negative bound (`s[:-1]`) is copied once from the text, not through
+    a vector of bytes (14 µs to 6 for 226,000 characters, CPython 6.2).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
