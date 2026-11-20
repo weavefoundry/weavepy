@@ -1373,13 +1373,19 @@ fn spawn_python_worker(
     // deep recursion. A 64 MiB starting reserve keeps early-startup
     // segment churn low while letting hundreds of workers coexist.
     const WORKER_STACK_BYTES: usize = 64 * 1024 * 1024; // 64 MiB
-                                                        // The worker clones and drops objects before it first takes the GIL.
-    crate::rc::revoke_refcount_bias();
+
+    // The worker takes the GIL before its first touch of an object and
+    // keeps it through its last (its thread-local destructors included),
+    // so reference counts stay plain when the spawner holds it as well.
+    crate::sync::note_worker_spawn(crate::gil::current_thread_holds_gil());
     UNREAPED_WORKERS.fetch_add(1, Ordering::SeqCst);
     let spawned = std::thread::Builder::new()
         .name(format!("weavepy-worker-{}", synth_id))
         .stack_size(WORKER_STACK_BYTES)
         .spawn(move || {
+            // (First, so that it is this thread's last thread-local to
+            // go: see the end of this body.)
+            crate::gil::arm_guard_stack();
             crate::sync::note_vm_worker();
             crate::vm_singletons::install_worker_thread_id(synth_id);
             // RFC 0040 WS4: record this worker's pthread_t so
@@ -1499,14 +1505,14 @@ fn spawn_python_worker(
             // (test_threading.test_foreign_thread's `wait_threads_exit`).
             drop(worker_interp);
             crate::vm_singletons::clear_thread_python_tls();
-            // Drop the guard before marking finished so the parent's
-            // join (which blocks on the released join lock) sees the
-            // released GIL — without this the parent could re-acquire
-            // the GIL and find the worker still "running" even though
-            // its target has returned. Mark the handle done *before*
-            // releasing the lock so a thread waking from `join()`
-            // immediately observes `is_done()`.
-            let _ = crate::gil::pop_gil_guard();
+            // The guard stays on this thread's stack, and the GIL with
+            // it, until the thread's last thread-local is destroyed (the
+            // stack itself, armed first above): the caches its other
+            // thread-locals hold are objects, and their destructors run
+            // after this body returns. A joiner waits on the join lock
+            // with the GIL released and takes the GIL back once this
+            // thread is gone, so it finds the handle done either way:
+            // it is marked *before* the lock is released below.
             // A daemon thread that reaches this point during interpreter
             // finalization was forced out by the dispatch loop (CPython's
             // `tstate_must_exit`: it would hang forever in `take_gil` and

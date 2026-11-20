@@ -1305,9 +1305,10 @@ thread_local! {
     // limit on conversion, but `sys.get/set_int_max_str_digits` must round-trip
     // (test_int reads/sets it; many modules query it at import).
     static INT_MAX_STR_DIGITS: std::cell::Cell<i64> = const { std::cell::Cell::new(4300) };
-    // `sys.setswitchinterval` value: advisory for WeavePy's GIL (the
-    // holder yields on bytecode-count boundaries, not a timer), but the
-    // set/get pair must round-trip (test_sys test_switchinterval).
+    // `sys.setswitchinterval` value as it was given, for the set/get
+    // pair's round trip (test_sys test_switchinterval). The GIL's own
+    // copy (`EvalBreaker::switch_interval`) is what a busy holder's
+    // checkpoints time a hand-off against.
     static SWITCH_INTERVAL: std::cell::Cell<f64> = const { std::cell::Cell::new(0.005) };
 }
 
@@ -1335,6 +1336,13 @@ fn sys_setswitchinterval(args: &[Object]) -> Result<Object, RuntimeError> {
         ));
     }
     SWITCH_INTERVAL.with(|c| c.set(interval));
+    // (At least a microsecond, CPython's unit; at most what a duration
+    // holds.)
+    crate::gil::global_gil_ref()
+        .breaker
+        .set_switch_interval(std::time::Duration::from_secs_f64(
+            interval.clamp(1e-6, 1e9),
+        ));
     Ok(Object::None)
 }
 

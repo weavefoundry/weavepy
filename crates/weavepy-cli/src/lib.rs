@@ -2154,6 +2154,10 @@ fn run_source_with_options(source: &str, opts: &RunOptions) -> Result<()> {
         let repl = repl::Repl::new(interpreter, true, opts.flags.ignore_environment)?;
         return repl.run_inspect();
     }
+    // (The GIL, through the handling of the run's result: an exception
+    // it returns is an object, read and released below beside whatever
+    // threads the program left running.)
+    let _gil = weavepy::vm::gil::hold_gil();
     match weavepy::run_source_with_options(source, &opts) {
         Ok(()) => Ok(()),
         Err(err) => {

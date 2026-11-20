@@ -2,21 +2,28 @@
 //!
 //! [`Rc`] and [`Weak`] wrap [`std::sync::Arc`] and [`std::sync::Weak`]
 //! with the same API, but a strong-count increment or decrement is a plain
-//! load and store instead of a locked read-modify-write while one thread
-//! owns every object. That's the common case: a program that never starts a
-//! second thread, running under the GIL. A `lock xadd` pair costs about four
-//! times a plain pair on x86, and the interpreter performs roughly one pair
-//! per bytecode, so atomics were a leading cost of every workload.
+//! load and store instead of a locked read-modify-write while nothing
+//! updates a count concurrently. That's the common case: a program that
+//! never starts a second thread, and one whose threads all run under the
+//! GIL. A `lock xadd` pair costs about four times a plain pair on x86, and
+//! the interpreter performs roughly one pair per bytecode, so atomics were
+//! a leading cost of every workload, and of everything a program did once
+//! it had started a thread.
 //!
-//! The bias is the one [`crate::sync`] already maintains for cell borrows:
-//! it holds until a second thread registers to run VM code or free-threading
-//! starts, and it's never restored. The registering thread revokes the bias
-//! while holding the GIL; the previous owner released the GIL before that,
-//! and reacquires it before touching another object, so every plain update
-//! happens before the revocation and every later update is atomic. Threads
-//! that touch objects without the GIL announce themselves with
-//! [`crate::sync::mark_cells_shared`] before they begin, and code that
-//! spawns a thread which will run VM code revokes the bias first (see
+//! With one thread, that thread owns every count. With several, the GIL
+//! orders their updates: a thread the VM starts takes the GIL before its
+//! first touch of an object and keeps it through its thread-local
+//! destructors, a blocking call's GIL-released bracket touches no object,
+//! and a hand-off of the GIL is a synchronizing operation. Counts turn
+//! atomic, under the GIL, as soon as something will touch one outside it
+//! (see `gil_orders_counts` in [`crate::sync`]): free-threading, a thread
+//! the VM didn't start, a watcher that reads state without the GIL (it
+//! announces itself with [`crate::sync::mark_cells_shared`]), or a thread
+//! whose outermost GIL scope ends while others run. The thread that flips
+//! the flag holds the GIL, and every other thread acquires it before its
+//! next update, so every plain update happens before the flip and every
+//! later one is atomic. Code that spawns a thread which touches objects
+//! before it takes the GIL makes counts atomic first (see
 //! [`revoke_refcount_bias`]).
 //!
 //! Deallocation always goes through `Arc`'s own drop, so the payload,

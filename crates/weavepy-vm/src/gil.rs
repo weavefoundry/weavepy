@@ -704,6 +704,15 @@ pub fn push_gil_guard(g: GilGuard) {
     GIL_GUARD_STACK.with(|cell| cell.borrow_mut().push(g));
 }
 
+/// Register the calling thread's guard stack for destruction now, ahead
+/// of its other thread-locals. A thread's destructors run in the reverse
+/// of the order its thread-locals were first used, so a guard a thread
+/// leaves on a stack armed first keeps the GIL through every other
+/// destructor of that thread, and gives it back in the stack's own.
+pub(crate) fn arm_guard_stack() {
+    let _ = GIL_GUARD_STACK.try_with(|_| ());
+}
+
 /// Pop and return the top guard. Returns `None` when the calling
 /// thread doesn't hold the GIL through this stack.
 pub fn pop_gil_guard() -> Option<GilGuard> {
@@ -768,6 +777,10 @@ impl GilScope {
 impl Drop for GilScope {
     fn drop(&mut self) {
         if self.engaged {
+            // This thread may touch objects after its outermost scope
+            // (an embedder reading a result): with other threads
+            // running, counts are atomic from here on.
+            crate::sync::counts_leave_gil();
             // The cooperative hand-off may have replaced the stack's
             // guards meanwhile, but it restores as many as it took.
             drop(GIL_GUARD_STACK.try_with(|cell| cell.borrow_mut().pop()));
@@ -825,16 +838,13 @@ impl<T> Drop for ReleaseUnderGil<T> {
 /// What a thread does before it releases the GIL to block: other threads
 /// may look at its frames meanwhile, so lean activations waiting for their
 /// shells and lazily running ones get them first. With no other thread (a
-/// second thread turns shared reference counts on before it starts) and no
-/// dump armed, nothing can look until this thread runs again, and whatever
+/// second thread is recorded before it starts) and no dump armed, nothing can look until this thread runs again, and whatever
 /// looks then makes the spine whole first (an event loop's `select` blocks
 /// once a step). Every release of the GIL by a thread with frames goes
 /// through here (C code's `PyEval_SaveThread` too).
 #[inline]
 pub fn before_gil_release() {
-    if crate::sync::rc_shared_flag().load(Ordering::Relaxed)
-        || crate::stdlib::faulthandler_mod::may_read_frames()
-    {
+    if crate::sync::threads_started() || crate::stdlib::faulthandler_mod::may_read_frames() {
         crate::builtins::sync_frame_spine();
     }
 }
@@ -1100,8 +1110,13 @@ fn maybe_yield_gil() {
     // shared counter (the `test_release_task_refs` race). Both clocks must
     // have run out: the holder has held for the interval *and* the waiter
     // has waited for it (`WAITER_SEEN_SINCE`), which is what CPython's
-    // waiter-timed drop request amounts to.
-    if !switch_interval_elapsed() || !waiter_interval_elapsed() {
+    // waiter-timed drop request amounts to. The two run side by side:
+    // the waiter's clock starts at the first checkpoint that sees it,
+    // whatever the holder's says (started only once the holder's had run
+    // out, it made a thread back from a blocking call wait two intervals
+    // for a busy one, 10 ms where CPython waits 5).
+    let waited = waiter_interval_elapsed();
+    if !switch_interval_elapsed() || !waited {
         return;
     }
     // The next holder may look at this thread's frames (see

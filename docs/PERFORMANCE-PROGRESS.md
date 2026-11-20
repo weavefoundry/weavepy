@@ -1538,6 +1538,54 @@ branch and pull request.
     same audit on Linux and Windows (their blocking calls differ), a
     flag of its own for "other threads exist" (the shared-counts flag
     stands in for it in two places), and a test job that runs the audit.
+  - Reference counts stay plain with several threads. Under the GIL a
+    count needs no atomic update as long as every thread that touches an
+    object holds the GIL while it does, and that now holds by
+    construction: a worker takes the GIL before its first touch of an
+    object and keeps it on its guard stack through its thread-local
+    destructors (the stack is the first thread-local the thread uses,
+    so the last one destroyed), and no block that runs with the GIL
+    released builds or drops an object (all 118 were read; one, a
+    blocking `channel_send`, built its exceptions and dropped a
+    withdrawn item inside the block, and now hands the outcome back
+    out). Counts turn atomic, under the GIL, only when something will
+    touch one outside it: free-threading, a thread the VM didn't start,
+    the traceback watchdog, or a thread whose outermost GIL scope ends
+    while others still run (an embedder reading a result, the command
+    line's last steps beside daemon threads). Windows keeps atomic
+    counts until its blocking paths get the same audit, and
+    `WEAVEPY_ATOMIC_COUNTS=1` restores them anywhere. "Other threads
+    exist" is a flag of its own now, for the three places that asked
+    the shared-counts flag that question (frames made whole before a
+    blocking call, retired code objects, pickle's pins). An audit
+    build that checks the GIL at every count update ran over 36 groups
+    of CPython's tests and the bundled thread tests with no plain
+    update outside the GIL, on macOS and on Linux. On a release build
+    one idle thread now costs the four battery cases measured before 3%
+    to 8% more cycles (`list_dict_basics` 3%, `enum_dataclass_ops` 4%,
+    `class_features` 5%, `collections_ops` 8%) where atomic counts
+    cost 12% to 30%, and an item through a `queue.Queue` with three
+    consumers 19,300 instructions to 16,800 (CPython 14,200). What is
+    left is the cell borrows' lock word, which a second thread still
+    turns on.
+  - A thread back from a blocking call waited two switch intervals for
+    a busy thread, and `sys.setswitchinterval` changed neither. The
+    hand-off wants both clocks run out, the holder's turn and the
+    waiter's wait, but the waiter's only started at the first
+    checkpoint after the holder's had expired: 10 ms where CPython
+    waits about 6. The two now run side by side, and the interval a
+    program sets is the one the checkpoints use: 5.2 ms at the default,
+    0.2 ms at 10 microseconds (CPython 6.2 and 0.18). A test that
+    sleeps beside two busy threads took 21.5 s and takes 0.23 s
+    (CPython 0.29 s).
+  - A thread's interpreter shares its parent's table of leaf builtins
+    instead of copying it (two hash maps and a vector of handles built
+    at each start and dropped at each exit, a twentieth of a start and
+    join). Starting and joining a thread: 522,000 instructions to
+    463,000 with the change above (CPython 192,000, kernel included;
+    in user space the cost is spread over the thread module's Python,
+    a fresh allocator heap and interpreter for each thread, and their
+    teardown).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

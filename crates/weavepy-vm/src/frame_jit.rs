@@ -13457,7 +13457,7 @@ pub(crate) unsafe fn register_lazy(st: &mut State) {
 /// thread's may: it stays alive for good once threads run, which so rare an
 /// assignment can afford.
 pub(crate) fn retire_code(code: Rc<CodeObject>) {
-    if crate::sync::rc_shared_flag().load(Ordering::Relaxed) {
+    if crate::sync::threads_started() {
         std::mem::forget(code);
     }
 }

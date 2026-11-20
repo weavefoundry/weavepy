@@ -128,7 +128,7 @@ struct Encoder<'a> {
     memo: MemoTable,
     // Pins prevent another thread's container mutation from releasing an
     // already memoized value and reusing its address during this operation.
-    // While one thread owns every object, nothing else can mutate the graph,
+    // While only one thread runs, nothing else can mutate the graph,
     // so the values stay alive and unpinned.
     pins: Option<Vec<Object>>,
     // Memo positions taken by the default state's temporary tuple and
@@ -857,7 +857,7 @@ fn encode_with_context(
             frame_start: None,
         },
         memo,
-        pins: (!crate::sync::bias_held()).then(Vec::new),
+        pins: crate::sync::threads_started().then(Vec::new),
         anonymous: 0,
         active: Vec::new(),
         python_headroom,

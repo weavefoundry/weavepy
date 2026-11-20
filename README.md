@@ -168,10 +168,13 @@ measurements and the work behind them.
   code pages a program is done with once its imports are over; a plain
   release build does that only in processes that run for more than a tenth
   of a second.
-- **Threads.** Once a program starts a second thread, reference counts are
-  updated atomically and cell borrows take a lock, even while that thread is
-  idle. On x86 that costs object-heavy code 13% to 55% more time; CPython, under
-  its GIL, pays nothing comparable.
+- **Threads.** Once a program starts a second thread, cell borrows take a
+  lock, even while that thread is idle: object-heavy code runs 3% to 8% slower
+  on x86, where CPython, under its GIL, pays nothing comparable. (Reference
+  counts stay plain under the GIL; on Windows they still turn atomic, which
+  costs 12% to 30%.) Starting and joining a thread takes about twice
+  CPython's time, and so does handing items to freshly started workers through
+  a `queue.Queue`.
 - **Imports and warm-up.** Importing large parts of the standard library costs
   about 1.4 times CPython's instructions; a faster start-up hides most of it
   in short scripts. Cold time is a little under CPython's overall, but some

@@ -470,10 +470,9 @@ pub(crate) fn release_gates_ptr() -> *const u32 {
 /// but the reference-count bias's `rc_shared`).
 pub(crate) const RELEASE_OBSERVER_GATES: u32 = u32::from_ne_bytes([0, 0xff, 0xff, 0xff]);
 
-/// Whether reference counts must be updated atomically: set whenever the
-/// cell bias is revoked, and also before spawning a thread that may touch
-/// objects before it registers (see [`crate::rc`]). Cleared again only by
-/// [`restore_bias`].
+/// Whether reference counts must be updated atomically: set once a thread
+/// may touch a count without the GIL (see [`gil_orders_counts`], and
+/// [`crate::rc`]). Cleared again only by [`restore_bias`].
 static RC_SHARED: &std::sync::atomic::AtomicBool = &RELEASE_GATES.rc_shared;
 
 /// The flag [`bias_held`] reads (native code that takes references in
@@ -482,25 +481,87 @@ pub(crate) fn rc_shared_flag() -> &'static std::sync::atomic::AtomicBool {
     RC_SHARED
 }
 
-/// True while one thread owns every reference count (see [`crate::rc`]).
+/// True while reference counts are updated with plain loads and stores:
+/// one thread owns every count, or the GIL orders every update (see
+/// [`crate::rc`]).
 #[cfg_attr(debug_assertions, allow(dead_code))]
 #[inline(always)]
 pub(crate) fn bias_held() -> bool {
     // A plain read (one compare with memory, where a relaxed load is a load,
-    // a test and an address computation): the flag changes before a second
-    // thread touches an object, and that thread's GIL acquire orders the
-    // change before this thread's next read. Nothing can hold the value
-    // across a GIL release, which is a synchronizing call.
+    // a test and an address computation): the flag is set by a thread that
+    // holds the GIL (or before a second thread exists), and every other
+    // thread's GIL acquire orders the change before its next read. Nothing
+    // can hold the value across a GIL release, which is a synchronizing
+    // call.
     // SAFETY: a `bool` in a live static (see above for the ordering).
     !unsafe { RC_SHARED.as_ptr().read() }
 }
 
-/// Make reference counting atomic before spawning a thread that will run
-/// VM code. Cell borrows keep their bias until the thread registers: the
-/// spawner may hold a lock-free guard now, and it can't hand the GIL to the
-/// new thread until that guard is released.
+/// Whether a thread other than the first runs VM code, or was spawned to:
+/// set with the first worker's spawn or a second thread's first GIL
+/// acquire, cleared by [`restore_bias`]. Another thread can then look at
+/// this one's frames and mutate what it reads whenever it gives up the
+/// GIL, whether or not reference counts are atomic (see
+/// [`gil_orders_counts`]).
+static VM_THREADS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether more than one thread runs VM code (see [`VM_THREADS`]).
+#[inline]
+pub(crate) fn threads_started() -> bool {
+    VM_THREADS.load(Ordering::Relaxed)
+}
+
+/// Whether the GIL alone orders reference-count updates, so that counts
+/// stay plain with several threads: every thread that touches an object
+/// holds the GIL while it does, and a hand-off of the GIL orders one
+/// thread's updates before the next one's.
+///
+/// That holds for the threads the VM starts and for the first thread
+/// while it stays inside the VM (see [`counts_leave_gil`]). It doesn't
+/// with free-threading, with a watcher that reads state from outside the
+/// GIL, or after a thread the VM didn't start appeared, whose discipline
+/// is its own; counts are atomic then, as they are on Windows (whose
+/// blocking paths haven't been checked against the rule) and under
+/// `WEAVEPY_ATOMIC_COUNTS=1`.
+fn gil_orders_counts() -> bool {
+    static ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ALLOWED.get_or_init(|| {
+        !cfg!(windows) && std::env::var_os("WEAVEPY_ATOMIC_COUNTS").is_none_or(|v| v == "0")
+    }) && !CELLS_UNGUARDED.load(Ordering::SeqCst)
+        && !FOREIGN_SEEN.load(Ordering::SeqCst)
+        && !crate::gil::free_threading_enabled()
+}
+
+/// Make reference counting atomic before spawning a thread that may touch
+/// objects without the GIL. Cell borrows keep their bias until the thread
+/// registers: the spawner may hold a lock-free guard now, and it can't
+/// hand the GIL to the new thread until that guard is released.
 pub(crate) fn revoke_bias_for_spawn() {
+    VM_THREADS.store(true, Ordering::SeqCst);
     RC_SHARED.store(true, Ordering::SeqCst);
+}
+
+/// Before spawning a worker that takes the GIL ahead of its first touch
+/// of an object, and keeps it through its last: counts stay plain when
+/// the spawner holds the GIL too (see [`gil_orders_counts`]).
+pub(crate) fn note_worker_spawn(spawner_holds_gil: bool) {
+    VM_THREADS.store(true, Ordering::SeqCst);
+    if !spawner_holds_gil || !gil_orders_counts() {
+        RC_SHARED.store(true, Ordering::SeqCst);
+    }
+}
+
+/// The calling thread, holding the GIL, is about to give it up outside a
+/// blocking call's bracket (its outermost scope ends) and may touch
+/// objects afterwards: an embedder reading a result, the command line
+/// reporting an exception. With other threads running, counts are atomic
+/// from here on. Every other thread is parked outside the VM or in a
+/// blocking call now, and takes the GIL, which orders this store, before
+/// its next update.
+pub(crate) fn counts_leave_gil() {
+    if VM_THREADS.load(Ordering::Relaxed) && !RC_SHARED.load(Ordering::Relaxed) {
+        RC_SHARED.store(true, Ordering::SeqCst);
+    }
 }
 
 /// The first thread to run VM code (see [`note_vm_thread`]).
@@ -681,7 +742,10 @@ fn retract_sole_guard() {
 /// including the biased thread backing out of its own fast path — never
 /// waits on a guard it is itself holding.
 fn revoke_bias() {
-    RC_SHARED.store(true, Ordering::SeqCst);
+    VM_THREADS.store(true, Ordering::SeqCst);
+    if !gil_orders_counts() {
+        RC_SHARED.store(true, Ordering::SeqCst);
+    }
     if CELLS_SHARED.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -772,7 +836,10 @@ pub(crate) fn note_gil_thread(thread_id: u64) {
         if k.get() == 0 {
             k.set(1);
             if FIRST.load(Ordering::Acquire) != thread_id {
+                // (Under the GIL just taken: counts are atomic before
+                // this thread, whose discipline is its own, touches one.)
                 FOREIGN_SEEN.store(true, Ordering::SeqCst);
+                RC_SHARED.store(true, Ordering::SeqCst);
             }
         }
     });
@@ -787,7 +854,7 @@ pub(crate) fn note_gil_thread(thread_id: u64) {
 /// that touches objects without the GIL appeared, or while this thread
 /// holds a cell borrow taken on the locked path.
 pub(crate) fn restore_bias(thread_id: u64) -> bool {
-    if !RC_SHARED.load(Ordering::SeqCst)
+    if !VM_THREADS.load(Ordering::SeqCst)
         || CELLS_UNGUARDED.load(Ordering::SeqCst)
         || FOREIGN_SEEN.load(Ordering::SeqCst)
         || FIRST.load(Ordering::SeqCst) != thread_id
@@ -801,6 +868,7 @@ pub(crate) fn restore_bias(thread_id: u64) -> bool {
     }
     CELLS_SHARED.store(false, Ordering::SeqCst);
     RC_SHARED.store(false, Ordering::SeqCst);
+    VM_THREADS.store(false, Ordering::SeqCst);
     true
 }
 
@@ -819,7 +887,8 @@ pub(crate) fn revoke_bias_for_test() {
 
 pub fn mark_cells_shared() {
     // Ordered before the revocation: a thread that observes the bias
-    // gone must also observe that guardless reads are off.
+    // gone must also observe that guardless reads are off. (With the
+    // flag set, the revocation makes counts atomic too.)
     CELLS_UNGUARDED.store(true, Ordering::SeqCst);
     revoke_bias();
 }

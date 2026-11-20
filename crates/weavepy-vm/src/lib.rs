@@ -1072,8 +1072,10 @@ pub struct Interpreter {
     #[allow(clippy::vec_box)]
     chain_pool: Vec<Box<ChainRec>>,
     /// The builtins the leaf burst may call directly (see [`LeafFns`]),
-    /// resolved on first use.
-    leaf_fns: std::cell::OnceCell<LeafFns>,
+    /// resolved on first use. Shared with the interpreter's forks for
+    /// threads: the table doesn't change once built, and a copy of its
+    /// maps was a twentieth of a thread's start.
+    leaf_fns: std::cell::OnceCell<Rc<LeafFns>>,
     /// The registered leaf builtins (see [`leaf_builtins`]) this
     /// interpreter has looked up, and the builtins it found unregistered
     /// under the registry generation beside them.
@@ -1509,7 +1511,8 @@ impl Interpreter {
             lazy_top: std::cell::Cell::new(0),
             recs: frame_jit::DirectRecs::new(),
             chain_pool: Vec::new(),
-            // (The same builtins, so the same function objects.)
+            // (The same builtins, so the same function objects: the
+            // table itself, when the parent has built it.)
             leaf_fns: self.leaf_fns.clone(),
             leaf_opaque: ThreadCell::new((
                 0,
@@ -2022,18 +2025,8 @@ impl Interpreter {
         // to trip an auto-collection), so engage the GIL here just as
         // `run_module_as` does for the program body. The process is
         // single-threaded at this point, so the acquire is uncontended.
-        let engaged_gil = if crate::gil::current_thread_holds_gil() {
-            false
-        } else {
-            crate::gil::push_gil_guard(crate::gil::global_gil().acquire());
-            crate::gil::note_gil_acquired();
-            true
-        };
-        let site_result = self.run_site_inner();
-        if engaged_gil {
-            drop(crate::gil::pop_gil_guard());
-        }
-        site_result
+        let _gil = crate::gil::hold_gil();
+        self.run_site_inner()
     }
 
     fn run_site_inner(&mut self) -> Result<(), RuntimeError> {
@@ -33663,7 +33656,7 @@ impl Interpreter {
                     .or_default()
                     .push((*recv, f.clone()));
             }
-            LeafFns {
+            Rc::new(LeafFns {
                 calls,
                 len_ptr,
                 next_ptr,
@@ -33672,7 +33665,7 @@ impl Interpreter {
                 range_ty: bt.range_.clone(),
                 list_ty: bt.list_.clone(),
                 str_ty: bt.str_.clone(),
-            }
+            })
         })
     }
 
@@ -77360,7 +77353,6 @@ fn leaf_recv_tag(recv: &Object) -> Option<u64> {
 /// match makes redundant).
 // (A thread's fork shares the builtins, and so this table: see
 // `Interpreter::fork_for_thread`.)
-#[derive(Clone)]
 struct LeafFns {
     /// Function address → kind, for pointer-identity dispatch at `CALL`.
     calls: std::collections::HashMap<usize, LeafKind, crate::fasthash::FxBuildHasher>,
