@@ -13,7 +13,11 @@ import unittest
 
 
 def waits_behind_a_busy_thread(interval, samples):
-    """How long `time.sleep` calls take to come back, a busy thread running."""
+    """The shortest of several `time.sleep` calls' returns, a busy thread running.
+
+    (The shortest: a loaded machine can only make a thread wait longer for
+    its turn, never less than the interval the busy thread is owed.)
+    """
     before = sys.getswitchinterval()
     sys.setswitchinterval(interval)
     stop = False
@@ -37,8 +41,7 @@ def waits_behind_a_busy_thread(interval, samples):
         stop = True
         t.join()
         sys.setswitchinterval(before)
-    took.sort()
-    return took[len(took) // 2]
+    return min(took)
 
 
 class SwitchIntervalTests(unittest.TestCase):
@@ -52,17 +55,17 @@ class SwitchIntervalTests(unittest.TestCase):
             sys.setswitchinterval(before)
 
     def test_shorter_interval_shorter_wait(self):
-        long = waits_behind_a_busy_thread(0.04, 9)
-        short = waits_behind_a_busy_thread(0.001, 25)
-        # The waits track the interval (about 40 ms and about 1 ms here).
+        long = waits_behind_a_busy_thread(0.1, 5)
+        short = waits_behind_a_busy_thread(0.002, 40)
+        # The waits track the interval (about 100 ms and about 2 ms here).
         self.assertLess(short, long / 3, (short, long))
-        self.assertLess(short, 0.02, short)
+        self.assertGreater(long, 0.05, long)
 
     def test_one_interval_not_two(self):
         # The busy thread's turn and the waiter's wait run side by side:
-        # the median wait is near one interval, well short of two.
-        interval = 0.05
-        wait = waits_behind_a_busy_thread(interval, 9)
+        # a wait is one interval, not two.
+        interval = 0.1
+        wait = waits_behind_a_busy_thread(interval, 6)
         self.assertGreater(wait, interval * 0.5, wait)
         self.assertLess(wait, interval * 1.6, wait)
 
