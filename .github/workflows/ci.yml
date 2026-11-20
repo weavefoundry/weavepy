@@ -287,6 +287,23 @@ jobs:
           name: cold-jit-diagnostic-${{ matrix.os }}
           path: target/performance/cold-jit-ci/${{ github.run_id }}-${{ github.run_attempt }}/
           if-no-files-found: warn
+      # Where a flagged fixture's time went: each tier setting's kernel
+      # time and, on macOS, instructions and cycles, for both binaries
+      # (see tools/bench_gate_counts.py). Equal counts with unequal times
+      # are the runner or the code's layout; unequal counts name a tier.
+      - name: Count instructions for the fixtures a failed gate flagged
+        if: failure() && matrix.os != 'windows-latest' && github.event_name == 'pull_request' && steps.bench_gate.outcome == 'failure'
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          python tools/bench_gate_counts.py \
+            --base "$BASE_WEAVEPY" --new target/release/weavepy \
+            --report bench-report.md | tee bench-gate-counts.md
+          {
+            echo "## Flagged fixtures by tier setting"
+            echo
+            cat bench-gate-counts.md
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Append bench report to job summary
         if: always()
         shell: bash
