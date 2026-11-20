@@ -27,17 +27,20 @@ jobs:
           RUSTFLAGS: --cap-lints warn
         run: |
           mkdir -p bins
-          # oldest first: merge base, last commit that read level, the
-          # three after it, and a later one that failed the gate
-          for sha in 5db22e15 be83162d 45bff3bb a8581354 4369a2c9 22aabfe9; do
+          # oldest first: merge base, the last commit that read level,
+          # the first that read high, and this push
+          # (Each from a fresh worktree, the head too: a checkout older
+          # than the shared target directory's libraries would be taken
+          # for already built.)
+          for sha in 5db22e15 be83162d 4369a2c9 "$GITHUB_SHA"; do
             git worktree add --detach ../w "$sha"
             cargo build --release -p weavepy-cli \
               --manifest-path ../w/Cargo.toml --target-dir ../w-target
-            cp ../w-target/release/weavepy "bins/$sha"
+            name="$sha"
+            [ "$sha" = "$GITHUB_SHA" ] && name=head
+            cp ../w-target/release/weavepy "bins/$name"
             git worktree remove --force ../w
           done
-          cargo build --release -p weavepy-cli --target-dir ../w-target
-          cp ../w-target/release/weavepy bins/head
           ls -la bins
       - name: Time the fixture and its operations
         shell: bash
@@ -132,7 +135,7 @@ jobs:
           EOF
           cat > timeit.py <<'EOF'
           import os, subprocess, sys, statistics
-          bins = ["5db22e15", "be83162d", "45bff3bb", "a8581354", "4369a2c9", "22aabfe9", "head"]
+          bins = ["5db22e15", "be83162d", "4369a2c9", "head"]
           ops = "read_plain,read_slot,read_both,write_plain,write_slot,write_both,tick_plain,tick_slot,tick_both,cmp_str,no_cmp,no_ticks,whole"
           def run(b, env_extra):
               env = dict(os.environ, PYTHONHASHSEED="0", **env_extra)
