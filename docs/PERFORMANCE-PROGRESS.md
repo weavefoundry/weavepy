@@ -1436,6 +1436,25 @@ branch and pull request.
     step now grows the stack when the native code arrives, and an entry a
     small stack turned away no longer counts against the entry (680M in
     every run of a quick build, 673M synchronous).
+  - A compiled attribute read keeps two classes' field positions in line
+    and up to four more in the site's table, but the table was consulted
+    last: a third class's read went through the whole miss chain (the
+    property, class-attribute and descriptor lanes, then the table, then
+    an attempt to memoize the value as a class attribute, which a field
+    never is) at about 1,000 instructions. `argparse` reads `action.dest`
+    and its neighbors over three action classes: 120 such reads an
+    iteration, 7% of its steady state. The table is now the first thing
+    the slow path tries for an instance (an entry is for a class version
+    at which the name resolved to the instance, so nothing ahead of it
+    would answer otherwise): 1.908M instructions an iteration to 1.796M.
+  - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
+    merge base run after run (and `str_methods` 11% to 22%), at the 15%
+    limit, while on x86 both builds execute the same instruction counts
+    and time the same. For the next run that flags a fixture, the gate
+    job now prints each flagged fixture under five tier settings for
+    both binaries, with instructions and cycles on macOS
+    (`tools/bench_gate_counts.py`): equal counts with unequal times are
+    the runner or the layout, unequal counts name the tier.
   - Looked at and left: the frame JIT waits 128 call heats before taking
     code whose call entry tier 2 missed and whose loops haven't run
     (`argparse`'s `take_action` and `_format_action`, the case's hottest
