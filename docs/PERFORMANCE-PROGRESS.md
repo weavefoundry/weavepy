@@ -1424,6 +1424,24 @@ branch and pull request.
     cached getter) had gone ahead of it: the `datetime_ops` fixture ran
     4.7% more instructions than the merge base on Linux. The native
     field is read first again (352.5M instructions to 340M).
+  - Fixed: the `generators` fixture ran either 667M or 763M instructions,
+    run to run, on any build (and always the higher with synchronous
+    compiles), which the bench gate read as a regression one run in two.
+    `sum(gen)` drains a generator's whole body in one step; the body gets
+    hot and compiles during that step, and its native code needs more
+    value-stack room than the step had sized the stack for. Every native
+    entry was then turned away, and after 32 at one instruction the entry
+    was given up for the rest of the run; how many entries were lost
+    depended on where the step's periodic check happened to end it. The
+    step now grows the stack when the native code arrives, and an entry a
+    small stack turned away no longer counts against the entry (680M in
+    every run of a quick build, 673M synchronous).
+  - Looked at and left: the frame JIT waits 128 call heats before taking
+    code whose call entry tier 2 missed and whose loops haven't run
+    (`argparse`'s `take_action` and `_format_action`, the case's hottest
+    functions, are still interpreted after 2,500 iterations). Taking
+    them at the first heat changes the case by under 1.5%: their bodies
+    are calls and attribute reads that cost about the same compiled.
   - Why wall time trails instruction counts on the battery's worst
     cases, from a cache and branch simulation of `argparse` in steady
     state (cachegrind, iterations 1,500 to 2,500): an iteration takes
