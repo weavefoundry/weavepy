@@ -12823,13 +12823,13 @@ impl Interpreter {
                 }
                 // A native method the site cached for this class version:
                 // straight to its fused call (the Python leaf probes below
-                // would miss).
+                // would miss, and so would a second try of this one).
                 if let (Object::Instance(i), Some(ms)) = (other, mslots.get(pc + 1)) {
                     if ms
                         .peek_inst_builtin(i.cls_raw().attr_version.get())
                         .is_some()
                     {
-                        if let Some(hit) = self.core_native_method(
+                        return self.core_native_method(
                             code,
                             other,
                             pc + 1,
@@ -12838,9 +12838,7 @@ impl Interpreter {
                             lbase,
                             nlocals,
                             consts,
-                        ) {
-                            return Some(hit);
-                        }
+                        );
                     }
                 }
                 let pure_site = !missed
@@ -24767,6 +24765,26 @@ impl Interpreter {
                         BinOpKind::BitAnd => a & b,
                         BinOpKind::BitOr => a | b,
                         BinOpKind::BitXor => a ^ b,
+                        // (Floored, as Python's: the remainder takes the
+                        // divisor's sign. A zero divisor raises through
+                        // the full path.)
+                        BinOpKind::Mod if b != 0 => {
+                            let r = a.checked_rem(b)?;
+                            if r != 0 && (r ^ b) < 0 {
+                                r + b
+                            } else {
+                                r
+                            }
+                        }
+                        BinOpKind::FloorDiv if b != 0 => {
+                            let q = a.checked_div(b)?;
+                            if (a ^ b) < 0 && q * b != a {
+                                q - 1
+                            } else {
+                                q
+                            }
+                        }
+                        BinOpKind::RShift if (0..64).contains(&b) => a >> b,
                         _ => return None,
                     };
                     ops[n - 2].write(Object::Int(r));

@@ -1743,12 +1743,29 @@ branch and pull request.
     bound method the interpreter expects. 1,384 instructions (119 to 129
     ns). The frame JIT still runs such a loop in 1,118: the two helper
     calls cost about 270 more than its method site, and a loop of
-    container calls has no typed work for tier 2 to win that back with,
-    so the next step is the admission rule, not the helpers.
-    `OrderedDict` calls (3,515 instructions an iteration of add and
-    `popitem(last=False)` against CPython's 2,201) and weak-value
-    dictionaries (five times CPython's time, in the weak references, not
-    the dict) are the other two.
+    container calls has no typed work for tier 2 to win that back with.
+    So tier 2 now leaves a loop to the frame JIT when it makes such a
+    call for fewer than four typed operations (`WEAVEPY_T2_METHODS`): the
+    pop loop runs in 1,102 instructions, under CPython's 1,248, and pop
+    and re-insert went 138 ns to 92 (CPython 130), a queue worker's loop
+    4% faster, with the suite's loops that mix such calls with typed
+    work (`chaos`, `go`, `raytrace`) within 1% either way.
+    `OrderedDict` calls were the next share: the frame JIT tried its
+    fused call (receiver, simple arguments, call in one helper) on every
+    method call of a local, and a call with a keyword or a computed
+    argument walked the instructions, declined, tried the native method
+    a second time, and then ran through the method site anyway, about
+    450 instructions each. Compiled code now makes the attempt only
+    where the arguments can be what it serves, the second try is gone,
+    and the fused arguments fold `%`, `//` and `>>` of two ints as they
+    did `+`, `-`, `*` and the bit operations (`od.move_to_end(i % n)`
+    1,594 instructions to 1,288, CPython 938; add and
+    `popitem(last=False)` 3,515 to 3,039, CPython 2,201; with a plain
+    key `move_to_end` is 1,050 against 941 and a store 824 against
+    1,120). Weak-value dictionaries (22,400 instructions an insertion
+    and expiry against CPython's 7,900, spread over the weak reference
+    class's Python-level `__new__`, `__init__` and callback) are what is
+    left of this group.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

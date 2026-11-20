@@ -20906,7 +20906,7 @@ impl<'a> Lower<'a> {
                 // an inlined body runs only what can't see its frame.)
                 if !self.method_inlined(pc + 1) {
                     self.method_kernel(pc);
-                    if !self.inlining() {
+                    if !self.inlining() && self.simple_call_ahead(pc + 2) {
                         self.method_call(pc)
                     }
                 }
@@ -20951,6 +20951,29 @@ impl<'a> Lower<'a> {
                     return n >= i.arg as usize
                         && matches!(crate::call_site_builtin(self.ext, k), Some((_, None, _)));
                 }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// Whether the instructions from `pc` are argument loads the fused
+    /// method call can take (locals, constants, small ints, and binary
+    /// operations it may fold) up to a positional `CALL`: every shape
+    /// `Interpreter::core_local_method` serves is one of these, so a call
+    /// with any other argument (an attribute, a subscript, a keyword)
+    /// skips the fused attempt, which would walk the instructions, decline
+    /// and leave the call to the method site anyway (about 450
+    /// instructions a call for a native method with a keyword).
+    fn simple_call_ahead(&self, pc: usize) -> bool {
+        for i in self.code.instructions.iter().skip(pc).take(16) {
+            match i.op {
+                OpCode::LoadFast
+                | OpCode::LoadFastBorrow
+                | OpCode::LoadConst
+                | OpCode::LoadSmallInt
+                | OpCode::BinaryOp => {}
+                OpCode::Call => return true,
                 _ => return false,
             }
         }

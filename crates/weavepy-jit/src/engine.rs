@@ -1134,6 +1134,9 @@ fn analyze_admitted(
     if call_bound(&tfunc) {
         return Err(JitVerdict::UnsupportedOpcode("call-bound loop"));
     }
+    if method_bound(&tfunc) {
+        return Err(JitVerdict::UnsupportedOpcode("method-bound loop"));
+    }
     if unpacks_pairs(&tfunc) {
         return Err(JitVerdict::UnsupportedOpcode("tuple-target loop"));
     }
@@ -1332,6 +1335,67 @@ fn call_bound(tfunc: &TFunc) -> bool {
         }
     }
     calls * weight > typed
+}
+
+/// Whether `tfunc`'s loops call methods through the generic load and call
+/// more than tier 2 repays: a method of a value whose class the compile
+/// didn't resolve (`d.pop(k)`, `out.add(x)`, `line.split()`) is a generic
+/// attribute load and a generic call, two helper round trips where the
+/// frame JIT's method site makes one cached call (about 270 host
+/// instructions more for a builtin value's method, more for others), and
+/// each typed operation saves tier 2 only a few. So a loop with fewer
+/// than [`method_weight`] typed operations for each such call runs
+/// faster in the frame JIT.
+fn method_bound(tfunc: &TFunc) -> bool {
+    use crate::ir::TOp;
+    let weight = method_weight();
+    if weight == 0
+        || tfunc.null_spans.is_empty()
+        || GENERIC_LOOPS_ADMITTED.load(std::sync::atomic::Ordering::Relaxed)
+        || !has_loop(tfunc)
+    {
+        return false;
+    }
+    let (mut methods, mut typed) = (0usize, 0usize);
+    for st in loop_blocks(tfunc).flat_map(|b| &b.stmts) {
+        match st.op {
+            // (A method-form load: the marker span of its call opens at it.)
+            TOp::DynAttrGet { .. } if tfunc.null_spans.iter().any(|s| s.live_from == st.pc) => {
+                methods += 1;
+            }
+            TOp::CallPy { .. } | TOp::CallPyKw { .. } | TOp::CallMethod { .. } => {
+                typed += call_weight();
+            }
+            TOp::IntArith(_)
+            | TOp::FloatArith(_)
+            | TOp::IntTrueDiv
+            | TOp::IntCmp(_)
+            | TOp::FloatCmp(_)
+            | TOp::IntNeg
+            | TOp::FloatNeg
+            | TOp::IntInvert => typed += 1,
+            _ => {}
+        }
+    }
+    methods * weight > typed
+}
+
+/// How many typed operations a loop needs for each generic method call
+/// before tier 2 takes it (see [`method_bound`]): 4 unless
+/// `WEAVEPY_T2_METHODS` says otherwise (`0` turns the rule off), a tuning
+/// aid. (At 4 a dict's pop and re-insert loop went from 138 ns to the
+/// frame JIT's 92 and a queue worker's loop ran 4% faster, while the
+/// suite's loops that mix such calls with typed work, `chaos`, `go` and
+/// `raytrace`, stayed within 1% either way; the instruction counts would
+/// allow a larger weight, but nothing measured asks for one.)
+fn method_weight() -> usize {
+    static WEIGHT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WEIGHT.get_or_init(|| {
+        std::env::var("WEAVEPY_T2_METHODS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4)
+    })
 }
 
 /// How many typed operations a loop needs for each dynamic call before

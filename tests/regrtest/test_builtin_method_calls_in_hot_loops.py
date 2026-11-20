@@ -218,6 +218,178 @@ class DictMethodTests(unittest.TestCase):
         self.assertEqual(run(HOT), [HOT // 500, HOT - HOT // 500])
 
 
+# Loops with enough integer work around each call for the second compiler
+# to take them (it leaves a loop that is all method calls to the first),
+# written at module level with plain locals. Each has a reference that
+# reaches the same values without a method call.
+
+
+def pop_loop(n):
+    d = {i: i for i in range(100)}
+    acc = 0
+    for i in range(100, 100 + n):
+        d[i] = i
+        a = i * 3 + 1
+        b = a - i
+        c = (b ^ i) & 1023
+        acc += d.pop(i - 100) + (a - b - c) % 7
+    return acc, len(d)
+
+
+def pop_loop_reference(n):
+    acc = 0
+    for i in range(100, 100 + n):
+        a = i * 3 + 1
+        b = a - i
+        c = (b ^ i) & 1023
+        acc += (i - 100) + (a - b - c) % 7
+    return acc, 100
+
+
+def overflow_in_argument(n, scale):
+    # `scale * (i + 1)` outgrows a machine word between the load of
+    # `d.get` and its call.
+    d = {i: i for i in range(64)}
+    acc = 0
+    for i in range(n):
+        scale = scale * 2 + (i & 1)
+        k = (i * 7 + 3) & 63
+        t = (k + 1) * 3 - k
+        acc += d.get((scale * (i + 1)) & 63, -1) + t - (t & 1)
+    return acc
+
+
+def overflow_in_argument_reference(n, scale):
+    acc = 0
+    for i in range(n):
+        scale = scale * 2 + (i & 1)
+        k = (i * 7 + 3) & 63
+        t = (k + 1) * 3 - k
+        acc += ((scale * (i + 1)) & 63) + t - (t & 1)
+    return acc
+
+
+def division_in_argument(n, bad):
+    # The argument divides by zero at `i == bad`, after `d.get` is loaded.
+    d = {i: i for i in range(64)}
+    acc = 0
+    for i in range(n):
+        a = i * 5 + 2
+        b = (a ^ i) & 63
+        acc += d.get(b // (bad - i), -7) + a - (a & 3) + b
+    return acc
+
+
+def division_in_argument_reference(n, bad):
+    acc = 0
+    for i in range(min(n, bad)):
+        a = i * 5 + 2
+        b = (a ^ i) & 63
+        q = b // (bad - i)
+        acc += (q if q < 64 else -7) + a - (a & 3) + b
+    return acc
+
+
+class Doubler:
+    def get(self, k, default):
+        return k * 2
+
+
+def changing_receivers(n, four):
+    # One call site, whose receiver is a dict three times in four.
+    acc = 0
+    for i in range(n):
+        a = i * 3 + 1
+        b = (a - i) & 15
+        acc += four[i & 3].get(b, -1) + a - b + (i & 7)
+    return acc
+
+
+def changing_receivers_reference(n):
+    acc = 0
+    for i in range(n):
+        a = i * 3 + 1
+        b = (a - i) & 15
+        which = i & 3
+        got = b if which == 0 else b * 2 if which == 1 else (-b if b < 8 else -1) if which == 2 else -1
+        acc += got + a - b + (i & 7)
+    return acc
+
+
+def changing_kinds(n, four):
+    # One call site over lists and tuples: two builtins of one name.
+    acc = 0
+    for i in range(n):
+        a = i * 3 + 1
+        b = (a - i) & 15
+        o = four[i & 3]
+        acc += o.count(b) + a - b + (i & 7)
+    return acc
+
+
+def changing_kinds_reference(n, four):
+    acc = 0
+    for i in range(n):
+        a = i * 3 + 1
+        b = (a - i) & 15
+        acc += sum(1 for x in four[i & 3] if x == b) + a - b + (i & 7)
+    return acc
+
+
+def nested_calls(n):
+    d = {i: i + 1 for i in range(64)}
+    acc = 0
+    for i in range(n):
+        a = (i * 5 + 2) & 31
+        b = (a ^ i) & 15
+        acc += d.get(d.get(b, 0), -1) + a - b + (a & 3)
+    return acc
+
+
+def nested_calls_reference(n):
+    acc = 0
+    for i in range(n):
+        a = (i * 5 + 2) & 31
+        b = (a ^ i) & 15
+        acc += b + 2 + a - b + (a & 3)
+    return acc
+
+
+class CompiledLoopTests(unittest.TestCase):
+    def test_pop_in_a_loop_with_integer_work(self):
+        self.assertEqual(pop_loop(HOT), pop_loop_reference(HOT))
+        self.assertEqual(pop_loop(COLD), pop_loop_reference(COLD))
+
+    def test_argument_overflows_between_load_and_call(self):
+        for scale in (1, 3):
+            self.assertEqual(
+                overflow_in_argument(HOT, scale),
+                overflow_in_argument_reference(HOT, scale),
+            )
+
+    def test_argument_raises_between_load_and_call(self):
+        bad = HOT - 5000
+        with self.assertRaises(ZeroDivisionError):
+            division_in_argument(HOT, bad)
+        self.assertEqual(
+            division_in_argument(bad, bad),
+            division_in_argument_reference(bad, bad),
+        )
+        self.assertEqual(
+            division_in_argument(HOT, 10 * HOT),
+            division_in_argument_reference(HOT, 10 * HOT),
+        )
+
+    def test_one_site_many_receivers(self):
+        four = ({i: i for i in range(16)}, Doubler(), {i: -i for i in range(8)}, {})
+        self.assertEqual(changing_receivers(HOT, four), changing_receivers_reference(HOT))
+        four = ([1, 2, 3, 2], (2, 2, 5), [7], (1,))
+        self.assertEqual(changing_kinds(HOT, four), changing_kinds_reference(HOT, four))
+
+    def test_a_call_inside_a_call(self):
+        self.assertEqual(nested_calls(HOT), nested_calls_reference(HOT))
+
+
 class OtherReceiverTests(unittest.TestCase):
     def test_str_methods(self):
         def run(n):
