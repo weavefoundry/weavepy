@@ -34314,7 +34314,7 @@ impl Interpreter {
                     == Some(true))
                 .then(|| d.clone());
             }
-            Object::Type(cls) => return Self::leaf_type_getattr(cls, name, default),
+            Object::Type(cls) => return Self::leaf_type_getattr_memo(cls, name_obj, default),
             // A plain module's global (`hasattr(os, 'getpid')`): its
             // dictionary's value (`ModuleType`'s descriptors are dunders;
             // a missing name may reach a module `__getattr__`).
@@ -34458,23 +34458,160 @@ impl Interpreter {
         name: &str,
         default: Option<&Object>,
     ) -> Option<Object> {
+        match Self::leaf_type_getattr_how(cls, name, default.is_some()) {
+            TypeGetattr::Found(v, _) => Some(v),
+            TypeGetattr::Missing => default.cloned(),
+            TypeGetattr::Decline => None,
+        }
+    }
+
+    /// [`Self::leaf_type_getattr`] behind a memo of its answers for a
+    /// class under plain `type`, by the class's attribute version and the
+    /// name object: a name nothing supplies (the default answers) or the
+    /// value found. `inspect`, `typing` and `dataclasses` ask the same few
+    /// questions of the same classes for every object they handle
+    /// (`getattr(cls, "__wrapped__", None)`), and each answer cost four
+    /// lookups along the MRO and three name classifications, about 1,000
+    /// instructions. The memo owns only values whose lifetime nothing
+    /// observes (scalars, builtin functions); any other is borrowed from
+    /// the Python class whose dictionary holds it, which it does while the
+    /// version stands, so an object a class stops holding dies when it
+    /// does.
+    fn leaf_type_getattr_memo(
+        cls: &Rc<TypeObject>,
+        name: &SharedStr,
+        default: Option<&Object>,
+    ) -> Option<Object> {
+        const SLOTS: usize = 128;
+        thread_local! {
+            static MEMO: RefCell<Vec<(u64, Option<SharedStr>, TypeGetattrKept)>> =
+                const { RefCell::new(Vec::new()) };
+        }
+        let ver = cls.attr_version.get();
+        // (A metaclass's attributes move with its own version, and a
+        // watched type's lookups are events.)
+        if ver == 0 || !Self::plain_metaclass(cls) || crate::capi_watchers::types_active() {
+            return Self::leaf_type_getattr(cls, name, default);
+        }
+        let word = SharedStr::addr(name) >> 4;
+        let slot = ((ver as usize) ^ word).wrapping_mul(0x9E37_79B9_7F4A_7C15_u64 as usize)
+            >> (usize::BITS - SLOTS.trailing_zeros());
+        let hit = MEMO.with(|m| {
+            let m = m.try_borrow().ok()?;
+            let (v, n, kept) = m.get(slot)?;
+            if *v != ver || !n.as_ref().is_some_and(|n| SharedStr::ptr_eq(n, name)) {
+                return None;
+            }
+            Some(match kept {
+                TypeGetattrKept::Missing => None,
+                TypeGetattrKept::Owned(v) => Some(v.clone()),
+                TypeGetattrKept::Borrowed(words) => {
+                    // SAFETY: the value's own words, which a class on the
+                    // MRO holds while the version stands; the view is never
+                    // dropped.
+                    let view = std::mem::ManuallyDrop::new(unsafe {
+                        std::ptr::from_ref(words).cast::<Object>().read()
+                    });
+                    Some(Object::clone(&view))
+                }
+            })
+        });
+        match hit {
+            Some(Some(v)) => return Some(v),
+            // (Missing with no default: the full path raises.)
+            Some(None) => return default.cloned(),
+            None => {}
+        }
+        let how = Self::leaf_type_getattr_how(cls, name, default.is_some());
+        let keep = match &how {
+            TypeGetattr::Missing => Some(TypeGetattrKept::Missing),
+            TypeGetattr::Found(
+                v @ (Object::None
+                | Object::Bool(_)
+                | Object::Int(_)
+                | Object::Float(_)
+                | Object::Str(_)
+                | Object::Bytes(_)
+                | Object::Builtin(_)),
+                _,
+            ) => Some(TypeGetattrKept::Owned(v.clone())),
+            TypeGetattr::Found(
+                v @ (Object::Tuple(_)
+                | Object::List(_)
+                | Object::Dict(_)
+                | Object::Type(_)
+                | Object::Function(_)
+                | Object::Property(_)),
+                true,
+            ) => {
+                const _: () = assert!(std::mem::size_of::<Object>() == 16);
+                // SAFETY: a plain read of the value's two words.
+                Some(TypeGetattrKept::Borrowed(unsafe {
+                    std::ptr::from_ref(v).cast::<[u64; 2]>().read()
+                }))
+            }
+            _ => None,
+        };
+        if let Some(kept) = keep {
+            MEMO.with(|m| {
+                if let Ok(mut m) = m.try_borrow_mut() {
+                    if m.is_empty() {
+                        m.resize_with(SLOTS, || (0, None, TypeGetattrKept::Missing));
+                    }
+                    // (The name is held: its address names it while the
+                    // entry stands.)
+                    m[slot] = (ver, Some(name.clone()), kept);
+                }
+            });
+        }
+        match how {
+            TypeGetattr::Found(v, _) => Some(v),
+            TypeGetattr::Missing => default.cloned(),
+            TypeGetattr::Decline => None,
+        }
+    }
+
+    /// How [`Self::leaf_type_getattr`] answers: the value found, a name
+    /// nothing supplies (asked only `with_default`: without one the full
+    /// path raises), or neither.
+    fn leaf_type_getattr_how(cls: &Rc<TypeObject>, name: &str, with_default: bool) -> TypeGetattr {
+        use TypeGetattr::{Decline, Found, Missing};
         // (A VM-native builtin class with a C mirror keeps its own dict
         // authoritative, as in `leaf_load_type_attr`.)
         if cls.native_kind.get() != 0
             || (cls.c_ext_ptr.get() != 0 && !cls.flags.is_builtin)
             || crate::capi_watchers::types_active()
-            || (name.starts_with("__")
-                && !Self::type_dunder_transparent(name)
-                && !matches!(name, "__format__" | "__new_member__")
-                && !Self::type_dunder_unclaimed(cls, name))
         {
-            return None;
+            return Decline;
+        }
+        // A class's name under plain `type`, as `load_attr_type` reads it:
+        // its own dictionary's string, else the type's own (never the
+        // MRO's or the metaclass's).
+        if (name == "__name__" || name == "__qualname__") && Self::plain_metaclass(cls) {
+            if let Some(v @ Object::Str(_)) = cls.dict.borrow().get(&crate::object::StrKey(name)) {
+                return Found(v.clone(), false);
+            }
+            if name == "__qualname__" {
+                if let Some(q) = cls.qualname.borrow().as_ref() {
+                    return Found(Object::interned_str(q), false);
+                }
+            }
+            return Found(Object::interned_str(&cls.name), false);
+        }
+        if name.starts_with("__")
+            && !Self::type_dunder_transparent(name)
+            && !matches!(name, "__format__" | "__new_member__")
+            && !Self::type_dunder_unclaimed(cls, name)
+        {
+            return Decline;
         }
         if !Self::plain_metaclass(cls) {
             // SAFETY: GIL-serialized raw read, as in `plain_metaclass`.
-            let meta = unsafe { (*cls.metaclass.as_ptr()).as_ref() }?;
+            let Some(meta) = (unsafe { (*cls.metaclass.as_ptr()).as_ref() }) else {
+                return Decline;
+            };
             if meta.c_ext_ptr.get() != 0 || !Self::default_getattribute(meta) {
-                return None;
+                return Decline;
             }
             // (What `leaf_load_meta_class_attr` lets the class answer.)
             if !matches!(
@@ -34489,21 +34626,27 @@ impl Interpreter {
                         | Object::Builtin(_)
                 )
             ) {
-                return None;
+                return Decline;
             }
         }
-        match cls.lookup(name) {
+        // (With the class whose dictionary supplies the value: a Python
+        // class's holds it for as long as the version stands.)
+        let found = cls
+            .lookup_with_owner(name)
+            .map(|(v, owner)| (v, !owner.flags.is_builtin));
+        match found {
             // (A builtin class's miss the full path remembered, as `hasattr`
             // of `coroutine` finds `_asyncio_future_blocking` missing.)
-            None => default
-                .filter(|_| {
-                    type_attr_certainly_missing(cls, name)
-                        || (type_miss_memo_ok(cls, name)
-                            && cls.verdict_cached(crate::types::Verdict::TypeAttrMissing, name)
-                                == Some(true))
-                })
-                .cloned(),
-            Some(
+            None if with_default
+                && (type_attr_certainly_missing(cls, name)
+                    || (type_miss_memo_ok(cls, name)
+                        && cls.verdict_cached(crate::types::Verdict::TypeAttrMissing, name)
+                            == Some(true))) =>
+            {
+                Missing
+            }
+            None => Decline,
+            Some((
                 v @ (Object::None
                 | Object::Bool(_)
                 | Object::Int(_)
@@ -34517,18 +34660,20 @@ impl Interpreter {
                 | Object::Function(_)
                 | Object::Builtin(_)
                 | Object::Property(_)),
-            ) => Some(v),
+                held,
+            )) => Found(v, held),
             // A plain instance stored on the class, unless its class makes
-            // it a descriptor.
-            Some(Object::Instance(i)) if i.cls_raw().lookup("__get__").is_none() => {
-                Some(Object::Instance(i))
+            // it a descriptor (which its own class's version decides).
+            Some((Object::Instance(i), _)) if i.cls_raw().lookup("__get__").is_none() => {
+                Found(Object::Instance(i), false)
             }
-            // A static method reads as its function, never bound.
-            Some(Object::StaticMethod(w)) => match w.func() {
-                f @ Object::Function(_) => Some(f),
-                _ => None,
+            // A static method reads as its function, never bound (the
+            // wrapper holds it).
+            Some((Object::StaticMethod(w), held)) => match w.func() {
+                f @ Object::Function(_) => Found(f, held),
+                _ => Decline,
             },
-            Some(_) => None,
+            Some(_) => Decline,
         }
     }
 
@@ -36206,52 +36351,94 @@ impl Interpreter {
     /// reads to the class's MRO (`dict.__setitem__`, `type(self).__setitem__
     /// is ...` in `OrderedDict.update`).
     fn type_dunder_transparent(name: &str) -> bool {
-        matches!(
-            name,
-            "__init__"
-                | "__enter__"
-                | "__exit__"
-                | "__aenter__"
-                | "__aexit__"
-                | "__getitem__"
-                | "__setitem__"
-                | "__delitem__"
-                | "__contains__"
-                | "__len__"
-                | "__iter__"
-                | "__next__"
-                | "__reversed__"
-                | "__bool__"
-                | "__missing__"
-                | "__lt__"
-                | "__le__"
-                | "__gt__"
-                | "__ge__"
-                | "__add__"
-                | "__sub__"
-                | "__mul__"
-                | "__truediv__"
-                | "__floordiv__"
-                | "__mod__"
-                | "__format__"
-                | "__getattr__"
-                | "__get__"
-                | "__set__"
-                | "__delete__"
-                | "__copy__"
-                | "__deepcopy__"
-                | "__setattr__"
-                | "__delattr__"
-                | "__getattribute__"
-                | "__repr__"
-                | "__str__"
-                | "__eq__"
-                | "__ne__"
-                | "__hash__"
-                | "__reduce__"
-                | "__reduce_ex__"
-                | "__init_subclass__"
-        )
+        Self::type_dunder_class(name) == Some(true)
+    }
+
+    /// Which of the two dunder lists `name` is on: `Some(true)` the
+    /// transparent ones (see [`Self::type_dunder_transparent`]),
+    /// `Some(false)` the ones `type` claims (see
+    /// [`Self::type_dunder_unclaimed`]), `None` neither. One hashed probe:
+    /// `getattr(cls, "__name__")` asks for every call, and matching the
+    /// name against the lists in turn cost it some forty comparisons.
+    fn type_dunder_class(name: &str) -> Option<bool> {
+        const TRANSPARENT: &[&str] = &[
+            "__init__",
+            "__enter__",
+            "__exit__",
+            "__aenter__",
+            "__aexit__",
+            "__getitem__",
+            "__setitem__",
+            "__delitem__",
+            "__contains__",
+            "__len__",
+            "__iter__",
+            "__next__",
+            "__reversed__",
+            "__bool__",
+            "__missing__",
+            "__lt__",
+            "__le__",
+            "__gt__",
+            "__ge__",
+            "__add__",
+            "__sub__",
+            "__mul__",
+            "__truediv__",
+            "__floordiv__",
+            "__mod__",
+            "__format__",
+            "__getattr__",
+            "__get__",
+            "__set__",
+            "__delete__",
+            "__copy__",
+            "__deepcopy__",
+            "__setattr__",
+            "__delattr__",
+            "__getattribute__",
+            "__repr__",
+            "__str__",
+            "__eq__",
+            "__ne__",
+            "__hash__",
+            "__reduce__",
+            "__reduce_ex__",
+            "__init_subclass__",
+        ];
+        const CLAIMED: &[&str] = &[
+            "__abstractmethods__",
+            "__annotations__",
+            "__base__",
+            "__bases__",
+            "__basicsize__",
+            "__class__",
+            "__dict__",
+            "__dir__",
+            "__doc__",
+            "__flags__",
+            "__itemsize__",
+            "__module__",
+            "__mro__",
+            "__name__",
+            "__qualname__",
+            "__subclasses__",
+            "__text_signature__",
+            "__type_params__",
+            "__weakref__",
+        ];
+        static KNOWN: std::sync::OnceLock<crate::fasthash::FxHashMap<&'static str, bool>> =
+            std::sync::OnceLock::new();
+        KNOWN
+            .get_or_init(|| {
+                TRANSPARENT
+                    .iter()
+                    .map(|n| (*n, true))
+                    .chain(CLAIMED.iter().map(|n| (*n, false)))
+                    .collect()
+            })
+            .get(name)
+            .copied()
     }
 
     /// Whether a class attribute read of dunder `name` (one that isn't on
@@ -36261,30 +36448,41 @@ impl Interpreter {
     /// outside the dicts (`__dataclass_fields__`, `__slots__`,
     /// `__match_args__`).
     fn type_dunder_unclaimed(cls: &TypeObject, name: &str) -> bool {
-        !matches!(
-            name,
-            "__abstractmethods__"
-                | "__annotations__"
-                | "__base__"
-                | "__bases__"
-                | "__basicsize__"
-                | "__class__"
-                | "__dict__"
-                | "__dir__"
-                | "__doc__"
-                | "__flags__"
-                | "__itemsize__"
-                | "__module__"
-                | "__mro__"
-                | "__name__"
-                | "__qualname__"
-                | "__subclasses__"
-                | "__text_signature__"
-                | "__type_params__"
-                | "__weakref__"
-        ) && !name.starts_with("__weavepy")
+        Self::type_dunder_class(name) != Some(false)
+            && !name.starts_with("__weavepy")
             && Self::plain_metaclass(cls)
-            && builtin_types().type_.lookup(name).is_none()
+            && Self::type_lacks(name)
+    }
+
+    /// Whether `type` (with `object` behind it) defines no attribute
+    /// `name`, remembered by name for `type`'s current attribute version:
+    /// every `getattr(cls, "__wrapped__")` asks, and the answer is the
+    /// same until `type` itself changes.
+    fn type_lacks(name: &str) -> bool {
+        thread_local! {
+            static LACKS: RefCell<(u64, crate::fasthash::FxHashMap<Box<str>, bool>)> =
+                RefCell::new((0, crate::fasthash::FxHashMap::default()));
+        }
+        let ty = &builtin_types().type_;
+        let ver = ty.attr_version.get();
+        if ver == 0 {
+            return ty.lookup(name).is_none();
+        }
+        LACKS.with(|c| {
+            let Ok(mut memo) = c.try_borrow_mut() else {
+                return ty.lookup(name).is_none();
+            };
+            if memo.0 != ver || memo.1.len() >= 256 {
+                memo.0 = ver;
+                memo.1.clear();
+            }
+            if let Some(&lacks) = memo.1.get(name) {
+                return lacks;
+            }
+            let lacks = ty.lookup(name).is_none();
+            memo.1.insert(name.into(), lacks);
+            lacks
+        })
     }
 
     /// Whether `cls`'s metaclass is `type` itself.
@@ -79854,6 +80052,27 @@ fn builtin_value_class(obj: &Object) -> Option<Rc<TypeObject>> {
 /// names, which the lookup special-cases, never qualify.
 fn attr_certainly_missing(obj: &Object, name: &str) -> bool {
     default_lookup_misses(obj, name, false)
+}
+
+/// How `getattr(cls, name[, default])` resolves without the full path (see
+/// [`Interpreter::leaf_type_getattr_how`]).
+enum TypeGetattr {
+    /// The value the class's MRO supplies, and whether a Python class's
+    /// dictionary holds it (for as long as the class's version stands).
+    Found(Object, bool),
+    /// Nothing supplies the name, certainly: the default answers.
+    Missing,
+    /// The full path decides.
+    Decline,
+}
+
+/// An answer [`Interpreter::leaf_type_getattr_memo`] keeps.
+enum TypeGetattrKept {
+    Missing,
+    /// A value whose lifetime nothing observes.
+    Owned(Object),
+    /// A value's two words, held by a class on the MRO.
+    Borrowed([u64; 2]),
 }
 
 /// Whether the full path may remember class `t`'s miss of `name` per class
