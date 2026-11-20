@@ -498,7 +498,7 @@ fn pop_node(
 ) -> Result<(Object, Object), RuntimeError> {
     let (key, _) = order
         .borrow_mut()
-        .shift_remove_index(index)
+        .lazy_remove_index(index)
         .ok_or_else(|| runtime_error("OrderedDict mutated during iteration"))?;
     crate::object::dict_watch_bump(order);
     let key = key.0;
@@ -732,9 +732,8 @@ fn leaf_unlink(
 ) -> Option<Object> {
     let mut m = main.try_borrow_mut().ok()?;
     let mut o = order.try_borrow_mut().ok()?;
-    let at = m.get_index_of(probe)?;
-    let (k, v) = m.shift_remove_index(at)?;
-    let node = o.shift_remove_index(index);
+    let (k, v) = m.lazy_remove_entry(probe)?;
+    let node = o.lazy_remove_index(index);
     drop((m, o));
     crate::object::dict_watch_bump(main);
     crate::object::dict_mutation_event(main);

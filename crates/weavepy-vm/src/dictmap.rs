@@ -14,11 +14,19 @@
 //! compares the slot's half-hash before it touches an entry, and an entry
 //! only when the full stored hash matches, so a key's `__eq__` runs only
 //! against keys of equal hash, as in CPython. Removal shifts the run that
-//! follows a freed slot back over it, so there are no tombstones.
+//! follows a freed slot back over it, so the slot table has no tombstones.
 //!
-//! Positions are dense: removing an entry shifts the later ones down, so
-//! `get_index(i)` is always the `i`-th key in order (the contract the
-//! iterators and the position caches rely on).
+//! Positions are dense: `get_index(i)` is always the `i`-th key in order
+//! (the contract the iterators and the position caches rely on), and
+//! removing a key moves the later ones down by one. Moving them in memory
+//! costs time in proportion to the entries behind the key, so the removals
+//! a program makes in bulk (`del d[k]`, `d.pop(k)`, an `OrderedDict`'s)
+//! leave a tombstone in the entry list instead
+//! ([`Table::lazy_remove_index`]). Positions stay dense all the same: a
+//! rank index over the tombstones ([`Holes`]) turns a position into its
+//! entry and back, and the table closes the gaps in one pass when the
+//! entry list fills or the tombstones outnumber the keys. A table that has
+//! no tombstone (nearly every table) pays one test per positional access.
 //!
 //! A lookup takes any [`Probe`]: a stored key's own type, or one of the
 //! borrowed probes in [`crate::object`] (a `&str` name, a native-equality
@@ -26,6 +34,7 @@
 
 use crate::object::{DictKey, Object};
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The most entries a table keeps without slots.
 pub const SMALL: usize = 8;
@@ -42,6 +51,31 @@ pub struct Bucket<V = Object> {
     pub(crate) hash: i64,
     pub key: DictKey,
     pub value: V,
+}
+
+/// Whether `b` is a tombstone: a removed key's place in the entry list,
+/// kept until the table closes its gaps (its key is the unbound marker,
+/// which no dict stores, and nothing points at it).
+#[inline(always)]
+fn is_tomb<V>(b: &Bucket<V>) -> bool {
+    matches!(b.key.0, Object::Unbound)
+}
+
+/// A value a tombstone can hold: one whose drop does nothing.
+pub trait Vacant {
+    fn vacant() -> Self;
+}
+
+impl Vacant for Object {
+    #[inline(always)]
+    fn vacant() -> Self {
+        Object::None
+    }
+}
+
+impl Vacant for () {
+    #[inline(always)]
+    fn vacant() -> Self {}
 }
 
 /// A key a table can be probed with: its Python hash and its equality with
@@ -238,12 +272,252 @@ fn long_key_bytes_eq(a: &[u8], b: &[u8]) -> bool {
 /// An ordered hash table from [`DictKey`] to `V` (see the module docs):
 /// [`DictMap`] for a dict, [`SetMap`] for a set.
 pub struct Table<V> {
+    /// The keys in order, with a tombstone wherever a lazy removal took
+    /// one; the last entry is always a key.
     entries: Vec<Bucket<V>>,
     /// The slot table: empty for a small table, else a power of two long.
     slots: Box<[u64]>,
     /// `64 - log2(slots.len())`: the shift that takes a mixed hash to its
     /// home slot.
     shift: u32,
+    /// How many of `entries` are tombstones.
+    dead: u32,
+    /// Where they are, once the table has had one.
+    holes: Option<Box<Holes>>,
+}
+
+/// No translation remembered (see [`Holes::last`]).
+const NO_PAIR: u64 = u64::MAX;
+
+/// The most entries a lazy removal moves down, in a table without
+/// tombstones, before it leaves a tombstone instead.
+const SHIFT_MAX: usize = 16;
+
+/// Where a table's tombstones are: what turns a key's position (its rank
+/// among the keys) into its entry's index and back.
+struct Holes {
+    /// One bit per entry, set for a tombstone. A power of two of words;
+    /// entries past them are keys.
+    bits: Vec<u64>,
+    /// A Fenwick tree over the words' tombstone counts: `tree[i]` counts
+    /// the `i & -i` words that end with word `i - 1` (`tree[0]` is unused).
+    tree: Vec<u32>,
+    /// Whether `tree` is kept: from the first tombstone past the front
+    /// run on (until then no position needs a count).
+    counted: bool,
+    /// How many entries at the front are tombstones: a table that loses
+    /// its oldest keys (a queue, a cache that evicts in order) keeps all
+    /// its tombstones there.
+    head: usize,
+    /// The first tombstone past those (or one before it), `usize::MAX`
+    /// for none: a key below it has its entry `head` past its position.
+    first: usize,
+    /// The last translation made, `position << 32 | entry`, or
+    /// [`NO_PAIR`]: a walk by position continues from it, and a position
+    /// just found by key is its entry again without a search.
+    last: AtomicU64,
+}
+
+impl Holes {
+    fn new() -> Self {
+        Self {
+            bits: Vec::new(),
+            tree: Vec::new(),
+            counted: false,
+            head: 0,
+            first: usize::MAX,
+            last: AtomicU64::new(NO_PAIR),
+        }
+    }
+
+    /// Forget every tombstone (the entries were closed up).
+    fn reset(&mut self) {
+        self.bits.fill(0);
+        self.counted = false;
+        self.head = 0;
+        self.first = usize::MAX;
+        *self.last.get_mut() = NO_PAIR;
+    }
+
+    /// Entry `p` (not the last) becomes a tombstone, one of `total` now,
+    /// in an entry list with room for `cap`.
+    fn mark(&mut self, p: usize, cap: usize, total: usize) {
+        let w = p / 64;
+        if w >= self.bits.len() {
+            let n = cap.max(p + 1).div_ceil(64).next_power_of_two();
+            self.bits.resize(n, 0);
+            if self.counted {
+                self.count();
+            }
+        }
+        self.bits[w] |= 1 << (p % 64);
+        if self.counted {
+            let mut i = w + 1;
+            while i < self.tree.len() {
+                self.tree[i] += 1;
+                i += i & i.wrapping_neg();
+            }
+        }
+        if p == self.head {
+            // The front run grows, through any tombstones that follow it.
+            self.head = self.next_live(p);
+            if self.first < self.head {
+                self.first = if total == self.head {
+                    usize::MAX
+                } else {
+                    self.next_dead(self.head)
+                };
+            }
+        } else {
+            self.first = self.first.min(p);
+        }
+        if self.first != usize::MAX && !self.counted {
+            self.count();
+        }
+        *self.last.get_mut() = NO_PAIR;
+    }
+
+    /// Build `tree` from `bits`, and keep it from here on.
+    #[cold]
+    fn count(&mut self) {
+        let n = self.bits.len();
+        self.tree.clear();
+        self.tree.resize(n + 1, 0);
+        for i in 1..=n {
+            let c = self.tree[i] + self.bits[i - 1].count_ones();
+            self.tree[i] = c;
+            let up = i + (i & i.wrapping_neg());
+            if up <= n {
+                self.tree[up] += c;
+            }
+        }
+        self.counted = true;
+    }
+
+    /// The first tombstone at or after entry `p` (`usize::MAX` for none).
+    /// (Each call from `mark` starts past where the last one ended, so
+    /// between two resets they read the bits once over.)
+    fn next_dead(&self, p: usize) -> usize {
+        let mut w = p / 64;
+        if w >= self.bits.len() {
+            return usize::MAX;
+        }
+        let mut word = self.bits[w] & (u64::MAX << (p % 64));
+        loop {
+            if word != 0 {
+                return w * 64 + word.trailing_zeros() as usize;
+            }
+            w += 1;
+            if w >= self.bits.len() {
+                return usize::MAX;
+            }
+            word = self.bits[w];
+        }
+    }
+
+    /// Tombstone `p` is gone (popped off the end of the entries).
+    fn unmark(&mut self, p: usize) {
+        let w = p / 64;
+        self.bits[w] &= !(1 << (p % 64));
+        if self.counted {
+            let mut i = w + 1;
+            while i < self.tree.len() {
+                self.tree[i] -= 1;
+                i += i & i.wrapping_neg();
+            }
+        }
+        *self.last.get_mut() = NO_PAIR;
+    }
+
+    /// How many of the `total` tombstones precede entry `p`, one at or
+    /// past [`Self::first`] (so the tree is kept).
+    fn rank(&self, p: usize, total: usize) -> usize {
+        debug_assert!(self.counted);
+        let w = p / 64;
+        if w >= self.bits.len() {
+            return total;
+        }
+        let mut n = (self.bits[w] & ((1u64 << (p % 64)) - 1)).count_ones() as usize;
+        let mut i = w;
+        while i > 0 {
+            n += self.tree[i] as usize;
+            i &= i - 1;
+        }
+        n
+    }
+
+    /// The entry of the `l`-th key, one at or past [`Self::first`] (so the
+    /// tree is kept).
+    fn select(&self, l: usize) -> usize {
+        debug_assert!(self.counted);
+        let n = self.bits.len();
+        // The last word with at most `l` keys before it, by descent.
+        let (mut word, mut rem, mut k) = (0, l, n);
+        while k > 0 {
+            let next = word + k;
+            if next <= n {
+                let keys = 64 * k - self.tree[next] as usize;
+                if keys <= rem {
+                    word = next;
+                    rem -= keys;
+                }
+            }
+            k >>= 1;
+        }
+        if word == n {
+            return 64 * n + rem;
+        }
+        // (That word holds more than `rem` keys.)
+        let mut live = !self.bits[word];
+        let mut base = 0;
+        loop {
+            let c = (live as u16).count_ones() as usize;
+            if rem < c {
+                break;
+            }
+            rem -= c;
+            live >>= 16;
+            base += 16;
+        }
+        let mut low = live as u16;
+        for _ in 0..rem {
+            low &= low - 1;
+        }
+        64 * word + base + low.trailing_zeros() as usize
+    }
+
+    /// The first key's entry after entry `p` (there is one).
+    fn next_live(&self, p: usize) -> usize {
+        let mut q = p + 1;
+        loop {
+            let w = q / 64;
+            if w >= self.bits.len() {
+                return q;
+            }
+            let live = !self.bits[w] >> (q % 64);
+            if live != 0 {
+                return q + live.trailing_zeros() as usize;
+            }
+            q = (w + 1) * 64;
+        }
+    }
+
+    /// The last key's entry before entry `p` (there is one).
+    fn prev_live(&self, p: usize) -> usize {
+        let mut q = p;
+        loop {
+            let w = (q - 1) / 64;
+            if w >= self.bits.len() {
+                return q - 1;
+            }
+            let upto = (q - 1) % 64 + 1;
+            let live = !self.bits[w] & (u64::MAX >> (64 - upto));
+            if live != 0 {
+                return w * 64 + 63 - live.leading_zeros() as usize;
+            }
+            q = w * 64;
+        }
+    }
 }
 
 #[inline(always)]
@@ -325,10 +599,15 @@ impl<V> Default for Table<V> {
 
 impl<V: Clone> Clone for Table<V> {
     fn clone(&self) -> Self {
+        if self.dead != 0 {
+            return self.clone_keys(0);
+        }
         Self {
             entries: self.entries.clone(),
             slots: self.slots.clone(),
             shift: self.shift,
+            dead: 0,
+            holes: None,
         }
     }
 }
@@ -337,21 +616,42 @@ impl<V: Clone> Table<V> {
     /// A copy whose entry list has room for `extra` more entries (a
     /// union's), allocated once.
     pub fn clone_with_room(&self, extra: usize) -> Self {
+        if self.dead != 0 {
+            return self.clone_keys(extra);
+        }
         let mut entries = Vec::with_capacity(self.entries.len() + extra);
         entries.extend_from_slice(&self.entries);
         Self {
             entries,
             slots: self.slots.clone(),
             shift: self.shift,
+            dead: 0,
+            holes: None,
         }
+    }
+
+    /// A copy of a table with tombstones, without them.
+    #[inline(never)]
+    fn clone_keys(&self, extra: usize) -> Self {
+        let mut entries = Vec::with_capacity(self.len() + extra);
+        entries.extend(self.entries.iter().filter(|b| !is_tomb(b)).cloned());
+        let mut m = Self {
+            entries,
+            slots: Box::new([]),
+            shift: 64,
+            dead: 0,
+            holes: None,
+        };
+        if m.entries.len() > SMALL {
+            m.rebuild_slots(slots_for(m.entries.len()));
+        }
+        m
     }
 }
 
 impl<V: fmt::Debug> fmt::Debug for Table<V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_map()
-            .entries(self.entries.iter().map(|b| (&b.key, &b.value)))
-            .finish()
+        f.debug_map().entries(self.iter()).finish()
     }
 }
 
@@ -363,6 +663,8 @@ impl<V> Table<V> {
             entries: Vec::new(),
             slots: Box::new([]),
             shift: 64,
+            dead: 0,
+            holes: None,
         }
     }
 
@@ -372,6 +674,8 @@ impl<V> Table<V> {
             entries: Vec::with_capacity(n),
             slots: Box::new([]),
             shift: 64,
+            dead: 0,
+            holes: None,
         };
         if n > SMALL {
             m.rebuild_slots(slots_for(n));
@@ -399,6 +703,8 @@ impl<V> Table<V> {
             entries,
             slots: Box::new([]),
             shift: 64,
+            dead: 0,
+            holes: None,
         };
         if m.entries.len() > SMALL {
             m.rebuild_slots(slots_for(m.entries.len()));
@@ -415,12 +721,134 @@ impl<V> Table<V> {
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.entries.len() - self.dead as usize
     }
 
+    /// (The last entry is a key, so a table without keys has no entry.)
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// The entry index of position `i` (past the entries for a position
+    /// past the keys).
+    #[inline(always)]
+    fn entry_of(&self, i: usize) -> usize {
+        if self.dead == 0 {
+            i
+        } else {
+            self.entry_of_holed(i)
+        }
+    }
+
+    #[inline(never)]
+    fn entry_of_holed(&self, i: usize) -> usize {
+        let Some(h) = self.holes.as_deref() else {
+            return i;
+        };
+        if i >= self.len() {
+            return usize::MAX;
+        }
+        if i + h.head < h.first {
+            return i + h.head;
+        }
+        let pair = h.last.load(Ordering::Relaxed);
+        let (at, entry) = ((pair >> 32) as usize, (pair & IX_MASK) as usize);
+        let p = if pair == NO_PAIR {
+            h.select(i)
+        } else if i == at {
+            return entry;
+        } else if i == at + 1 {
+            h.next_live(entry)
+        } else if i + 1 == at {
+            h.prev_live(entry)
+        } else {
+            h.select(i)
+        };
+        h.last
+            .store(((i as u64) << 32) | p as u64, Ordering::Relaxed);
+        p
+    }
+
+    /// The position of the key in entry `p`.
+    #[inline(always)]
+    fn position_of(&self, p: usize) -> usize {
+        if self.dead == 0 {
+            p
+        } else {
+            self.position_of_holed(p)
+        }
+    }
+
+    #[inline(never)]
+    fn position_of_holed(&self, p: usize) -> usize {
+        let Some(h) = self.holes.as_deref() else {
+            return p;
+        };
+        if p < h.first {
+            return p - h.head;
+        }
+        let i = p - h.rank(p, self.dead as usize);
+        h.last
+            .store(((i as u64) << 32) | p as u64, Ordering::Relaxed);
+        i
+    }
+
+    /// The entries without their tombstones (the slots are stale until
+    /// rebuilt).
+    fn drop_tombstones(&mut self) {
+        if self.dead == 0 {
+            return;
+        }
+        self.entries.retain(|b| !is_tomb(b));
+        self.dead = 0;
+        if let Some(h) = self.holes.as_deref_mut() {
+            h.reset();
+        }
+    }
+
+    /// Close the tombstones' gaps: the keys move down in order, and the
+    /// slot table is rebuilt at `n` slots.
+    #[inline(never)]
+    fn compact(&mut self, n: usize) {
+        self.drop_tombstones();
+        self.rebuild_slots(n);
+    }
+
+    /// [`Self::compact`] for an operation that works on the entry list as
+    /// a whole (a sort, a reversal, a cut).
+    #[inline(always)]
+    fn make_dense(&mut self) {
+        if self.dead != 0 {
+            self.compact(self.slots.len());
+        }
+    }
+
+    /// Pop the tombstones a removal left at the end of the entries.
+    #[inline(always)]
+    fn trim(&mut self) {
+        if self.dead != 0 {
+            self.trim_holed();
+        }
+    }
+
+    #[inline(never)]
+    fn trim_holed(&mut self) {
+        let Some(h) = self.holes.as_deref_mut() else {
+            return;
+        };
+        while self.entries.last().is_some_and(is_tomb) {
+            self.entries.pop();
+            h.unmark(self.entries.len());
+            self.dead -= 1;
+        }
+        *h.last.get_mut() = NO_PAIR;
+        if self.dead == 0 {
+            h.head = 0;
+        }
+        if self.dead as usize == h.head {
+            h.first = usize::MAX;
+        }
     }
 
     /// How many entries fit before the entry vector reallocates.
@@ -429,10 +857,21 @@ impl<V> Table<V> {
         self.entries.capacity()
     }
 
-    /// The entries in order.
+    /// The entries in order, of a table that takes no lazy removal (a
+    /// set's).
     #[inline]
     pub fn as_entries(&self) -> &[Bucket<V>] {
+        debug_assert_eq!(self.dead, 0, "entries with tombstones");
         &self.entries
+    }
+
+    /// Each key with its stored Python hash, in order.
+    #[inline]
+    pub fn hashed_keys(&self) -> impl Iterator<Item = (i64, &DictKey)> {
+        self.entries
+            .iter()
+            .filter(|b| !is_tomb(b))
+            .map(|b| (b.hash, &b.key))
     }
 
     /// Make room for `additional` more entries.
@@ -455,12 +894,20 @@ impl<V> Table<V> {
     fn reserve_slots(&mut self, additional: usize) {
         let want = self.entries.len().saturating_add(additional);
         if want > SMALL && (want * 3 > self.slots.len() * 2) {
+            if self.dead != 0 {
+                // Tombstones took the room: close them up (see
+                // `push_growing`).
+                let keys = self.len().saturating_add(additional);
+                self.compact(slots_for(keys + keys / 2).max(self.slots.len()));
+                return;
+            }
             self.rebuild_slots(slots_for(want));
         }
     }
 
     /// Release spare capacity.
     pub fn shrink_to_fit(&mut self) {
+        self.make_dense();
         self.entries.shrink_to_fit();
         if self.entries.len() <= SMALL {
             self.slots = Box::new([]);
@@ -483,6 +930,18 @@ impl<V> Table<V> {
         if !self.slots.is_empty() {
             self.slots.fill(0);
         }
+        self.forget_tombstones();
+    }
+
+    /// The entry list was emptied: so is the tombstones' index.
+    #[inline(always)]
+    fn forget_tombstones(&mut self) {
+        if self.dead != 0 {
+            self.dead = 0;
+            if let Some(h) = self.holes.as_deref_mut() {
+                h.reset();
+            }
+        }
     }
 
     /// Rebuild the slot table at `n` slots (a power of two) from the
@@ -496,7 +955,11 @@ impl<V> Table<V> {
         self.slots = vec![0u64; n].into_boxed_slice();
         self.shift = 64 - n.trailing_zeros();
         let mask = n - 1;
+        let holed = self.dead != 0;
         for (i, b) in self.entries.iter().enumerate() {
+            if holed && is_tomb(b) {
+                continue;
+            }
             let m = mix(b.hash);
             let mut pos = (m >> self.shift) as usize;
             // SAFETY: `pos` is masked into the table throughout.
@@ -518,9 +981,8 @@ impl<V> Table<V> {
         self.rebuild_slots(self.slots.len());
     }
 
-    /// The position of the entry equal to `key` with hash `hash`, or, on a
-    /// miss, `Err` with the empty slot where it would go (unused for a
-    /// small table).
+    /// The entry equal to `key` with hash `hash`, or, on a miss, `Err` with
+    /// the empty slot where it would go (unused for a small table).
     #[inline(always)]
     fn find_hashed<Q: Probe + ?Sized>(&self, hash: i64, key: &Q) -> Result<usize, usize> {
         if self.slots.is_empty() {
@@ -605,9 +1067,16 @@ impl<V> Table<V> {
     // ----------------------------------------------------------------
     // Lookups.
 
-    /// The position of the entry equal to `key`.
+    /// The position of the key equal to `key`.
     #[inline]
     pub fn get_index_of<Q: Probe + ?Sized>(&self, key: &Q) -> Option<usize> {
+        let p = self.find(key)?;
+        Some(self.position_of(p))
+    }
+
+    /// The entry of the key equal to `key`.
+    #[inline]
+    fn find<Q: Probe + ?Sized>(&self, key: &Q) -> Option<usize> {
         if self.slots.is_empty() {
             if self.entries.is_empty() {
                 return None;
@@ -638,7 +1107,7 @@ impl<V> Table<V> {
     /// fast paths, where the call would cost a fair share of the probe.
     #[inline(always)]
     pub fn get_hot<Q: Probe + ?Sized>(&self, key: &Q) -> Option<&V> {
-        let i = self.get_index_hot(key)?;
+        let i = self.find_hot(key)?;
         // SAFETY: a found position is in bounds.
         Some(unsafe { &self.entries.get_unchecked(i).value })
     }
@@ -646,8 +1115,9 @@ impl<V> Table<V> {
     /// A lookup that settles natively, always in line and calling nothing
     /// (the subscript fast paths that use it need no stack frame): `eq`
     /// compares the probe with a stored key of equal hash. `Ok(i)` found
-    /// at `i`, `Err(pos)` exactly absent (`pos` as [`Self::find_hashed`]
-    /// gives it), `None` undecided.
+    /// in entry `i` (for [`Self::value_at_unchecked`]; not a position),
+    /// `Err(pos)` exactly absent (`pos` as [`Self::find_hashed`] gives
+    /// it), `None` undecided.
     #[inline(always)]
     pub fn find_native<E: NativeEq>(&self, hash: i64, eq: &E) -> Option<Result<usize, usize>> {
         if self.slots.is_empty() {
@@ -769,11 +1239,13 @@ impl<V> Table<V> {
         true
     }
 
-    /// The value at position `i`, which the caller found.
+    /// The value of entry `i`, which a [`Self::find_native`] of the
+    /// caller's found.
     ///
     /// # Safety
     ///
-    /// `i` is below [`Self::len`].
+    /// `i` is an entry that lookup gave, with no change to the table
+    /// since.
     #[inline(always)]
     pub unsafe fn value_at_unchecked(&self, i: usize) -> &V {
         // SAFETY: per the caller.
@@ -794,6 +1266,13 @@ impl<V> Table<V> {
     /// [`Self::get_index_of`], always in line (see [`Self::get_hot`]).
     #[inline(always)]
     pub fn get_index_hot<Q: Probe + ?Sized>(&self, key: &Q) -> Option<usize> {
+        let p = self.find_hot(key)?;
+        Some(self.position_of(p))
+    }
+
+    /// [`Self::find`], always in line.
+    #[inline(always)]
+    fn find_hot<Q: Probe + ?Sized>(&self, key: &Q) -> Option<usize> {
         if self.slots.is_empty() {
             if self.entries.is_empty() {
                 return None;
@@ -807,23 +1286,23 @@ impl<V> Table<V> {
 
     #[inline]
     pub fn get<Q: Probe + ?Sized>(&self, key: &Q) -> Option<&V> {
-        let i = self.get_index_of(key)?;
+        let i = self.find(key)?;
         // SAFETY: a found position is in bounds.
         Some(unsafe { &self.entries.get_unchecked(i).value })
     }
 
     #[inline]
     pub fn get_mut<Q: Probe + ?Sized>(&mut self, key: &Q) -> Option<&mut V> {
-        let i = self.get_index_of(key)?;
+        let i = self.find(key)?;
         // SAFETY: a found position is in bounds.
         Some(unsafe { &mut self.entries.get_unchecked_mut(i).value })
     }
 
     #[inline]
     pub fn get_full<Q: Probe + ?Sized>(&self, key: &Q) -> Option<(usize, &DictKey, &V)> {
-        let i = self.get_index_of(key)?;
-        let b = &self.entries[i];
-        Some((i, &b.key, &b.value))
+        let p = self.find(key)?;
+        let b = &self.entries[p];
+        Some((self.position_of(p), &b.key, &b.value))
     }
 
     #[inline]
@@ -831,21 +1310,22 @@ impl<V> Table<V> {
         &mut self,
         key: &Q,
     ) -> Option<(usize, &DictKey, &mut V)> {
-        let i = self.get_index_of(key)?;
-        let b = &mut self.entries[i];
+        let p = self.find(key)?;
+        let i = self.position_of(p);
+        let b = &mut self.entries[p];
         Some((i, &b.key, &mut b.value))
     }
 
     #[inline]
     pub fn get_key_value<Q: Probe + ?Sized>(&self, key: &Q) -> Option<(&DictKey, &V)> {
-        let i = self.get_index_of(key)?;
+        let i = self.find(key)?;
         let b = &self.entries[i];
         Some((&b.key, &b.value))
     }
 
     #[inline]
     pub fn contains_key<Q: Probe + ?Sized>(&self, key: &Q) -> bool {
-        self.get_index_of(key).is_some()
+        self.find(key).is_some()
     }
 
     /// The position of the first entry with Python hash `hash` that `eq`
@@ -862,6 +1342,7 @@ impl<V> Table<V> {
         }
         self.find_hashed(hash, &Pred(std::cell::RefCell::new(&mut eq)))
             .ok()
+            .map(|p| self.position_of(p))
     }
 
     /// Every stored key with Python hash `hash`, in probe order.
@@ -879,7 +1360,7 @@ impl<V> Table<V> {
     /// The stored Python hash of the entry at `i`.
     #[inline]
     pub fn hash_at(&self, i: usize) -> Option<i64> {
-        self.entries.get(i).map(|b| b.hash)
+        self.entries.get(self.entry_of(i)).map(|b| b.hash)
     }
 
     // ----------------------------------------------------------------
@@ -887,19 +1368,23 @@ impl<V> Table<V> {
 
     #[inline]
     pub fn get_index(&self, i: usize) -> Option<(&DictKey, &V)> {
-        self.entries.get(i).map(|b| (&b.key, &b.value))
+        self.entries
+            .get(self.entry_of(i))
+            .map(|b| (&b.key, &b.value))
     }
 
     #[inline]
     pub fn get_index_mut(&mut self, i: usize) -> Option<(&DictKey, &mut V)> {
-        self.entries.get_mut(i).map(|b| (&b.key, &mut b.value))
+        let p = self.entry_of(i);
+        self.entries.get_mut(p).map(|b| (&b.key, &mut b.value))
     }
 
     /// Mutable access to a key in place. The caller must keep its hash
     /// and equality unchanged.
     #[inline]
     pub fn get_index_mut2(&mut self, i: usize) -> Option<(&mut DictKey, &mut V)> {
-        self.entries.get_mut(i).map(|b| (&mut b.key, &mut b.value))
+        let p = self.entry_of(i);
+        self.entries.get_mut(p).map(|b| (&mut b.key, &mut b.value))
     }
 
     #[inline]
@@ -916,7 +1401,7 @@ impl<V> Table<V> {
     // Insertion.
 
     /// Append `key` (hash `hash`), known to be absent, at slot `pos` (from
-    /// a missed [`Self::find_hashed`]): its position.
+    /// a missed [`Self::find_hashed`]): its entry.
     #[inline(always)]
     fn push_at(&mut self, pos: usize, hash: i64, key: DictKey, value: V) -> usize {
         let i = self.entries.len();
@@ -940,6 +1425,17 @@ impl<V> Table<V> {
     /// table is rebuilt larger with it.
     #[inline(never)]
     fn push_growing(&mut self, bucket: Bucket<V>) -> usize {
+        if self.dead != 0 {
+            // Tombstones took the room: close them up instead, in a table
+            // with room for half as many keys again (so a table that loses
+            // a key for each it gains makes this pass once per that many).
+            let keys = self.len() + 1;
+            self.drop_tombstones();
+            let i = self.entries.len();
+            self.entries.push(bucket);
+            self.rebuild_slots(slots_for(keys + keys / 2).max(self.slots.len()));
+            return i;
+        }
         let i = self.entries.len();
         assert!(i < IX_MASK as usize - 1, "dict too large");
         let n = if self.slots.is_empty() {
@@ -959,12 +1455,13 @@ impl<V> Table<V> {
     pub fn insert_full(&mut self, key: DictKey, value: V) -> (usize, Option<V>) {
         if let Some((hash, r)) = self.find_object_hashing(&key.0) {
             return match r {
-                Ok(i) => {
-                    // SAFETY: a found position.
-                    let slot = unsafe { &mut self.entries.get_unchecked_mut(i).value };
-                    (i, Some(std::mem::replace(slot, value)))
+                Ok(p) => {
+                    // SAFETY: a found entry.
+                    let slot = unsafe { &mut self.entries.get_unchecked_mut(p).value };
+                    let old = std::mem::replace(slot, value);
+                    (self.position_of(p), Some(old))
                 }
-                Err(pos) => (self.push_at(pos, hash, key, value), None),
+                Err(pos) => (self.push_last(pos, hash, key, value), None),
             };
         }
         let hash = key.probe_hash();
@@ -975,13 +1472,21 @@ impl<V> Table<V> {
     #[inline]
     pub fn insert_hashed(&mut self, hash: i64, key: DictKey, value: V) -> (usize, Option<V>) {
         match self.find_hashed(hash, &key) {
-            Ok(i) => {
-                // SAFETY: a found position is in bounds.
-                let slot = unsafe { &mut self.entries.get_unchecked_mut(i).value };
-                (i, Some(std::mem::replace(slot, value)))
+            Ok(p) => {
+                // SAFETY: a found entry is in bounds.
+                let slot = unsafe { &mut self.entries.get_unchecked_mut(p).value };
+                let old = std::mem::replace(slot, value);
+                (self.position_of(p), Some(old))
             }
-            Err(pos) => (self.push_at(pos, hash, key, value), None),
+            Err(pos) => (self.push_last(pos, hash, key, value), None),
         }
+    }
+
+    /// [`Self::push_at`], giving the new key's position (the last).
+    #[inline(always)]
+    fn push_last(&mut self, pos: usize, hash: i64, key: DictKey, value: V) -> usize {
+        let p = self.push_at(pos, hash, key, value);
+        p - self.dead as usize
     }
 
     #[inline]
@@ -1001,7 +1506,7 @@ impl<V> Table<V> {
         while self.slots[pos] != 0 {
             pos = (pos + 1) & mask;
         }
-        self.push_at(pos, hash, key, value)
+        self.push_last(pos, hash, key, value)
     }
 
     /// The entry for `key`, to read, change, or fill.
@@ -1036,58 +1541,34 @@ impl<V> Table<V> {
     // ----------------------------------------------------------------
     // Removal.
 
-    /// Remove entry `i`, shifting the later entries down.
-    pub fn shift_remove_index(&mut self, i: usize) -> Option<(DictKey, V)> {
+    /// Remove entry `p`, moving the last entry into its place.
+    fn swap_remove_entry(&mut self, p: usize) -> (DictKey, V) {
         let n = self.entries.len();
-        if i >= n {
-            return None;
-        }
-        if self.slots.is_empty() {
-            let b = self.entries.remove(i);
-            return Some((b.key, b.value));
-        }
-        let pos = self.slot_of(self.entries[i].hash, i);
-        self.erase_slot(pos);
-        let b = self.entries.remove(i);
-        // Renumber the entries that moved down: one slot walk each when
-        // few moved, else one pass over the table.
-        let moved = n - 1 - i;
-        if moved * 4 <= self.slots.len() {
-            for j in i..n - 1 {
-                let h = self.entries[j].hash;
-                self.repoint(h, j + 1, j);
-            }
-        } else {
-            let above = i as u64 + 1;
-            for s in self.slots.iter_mut() {
-                if *s & IX_MASK > above {
-                    *s -= 1;
-                }
-            }
-        }
-        Some((b.key, b.value))
-    }
-
-    /// Remove entry `i`, moving the last entry into its place.
-    pub fn swap_remove_index(&mut self, i: usize) -> Option<(DictKey, V)> {
-        let n = self.entries.len();
-        if i >= n {
-            return None;
-        }
         if !self.slots.is_empty() {
-            let pos = self.slot_of(self.entries[i].hash, i);
+            let pos = self.slot_of(self.entries[p].hash, p);
             self.erase_slot(pos);
-            if i != n - 1 {
+            if p != n - 1 {
                 let h = self.entries[n - 1].hash;
-                self.repoint(h, n - 1, i);
+                self.repoint(h, n - 1, p);
             }
         }
-        let b = self.entries.swap_remove(i);
-        Some((b.key, b.value))
+        let b = self.entries.swap_remove(p);
+        self.trim();
+        (b.key, b.value)
     }
 
-    /// Put `key` (hash `hash`), known to be absent, in entry `i`'s place,
-    /// leaving every other entry where it is: the replaced key and value.
+    /// Remove the key at position `i`, moving the last key into its place.
+    pub fn swap_remove_index(&mut self, i: usize) -> Option<(DictKey, V)> {
+        let p = self.entry_of(i);
+        if p >= self.entries.len() {
+            return None;
+        }
+        Some(self.swap_remove_entry(p))
+    }
+
+    /// Put `key` (hash `hash`), known to be absent, in the place of the
+    /// key at position `i`, leaving every other key where it is: the
+    /// replaced key and value.
     pub fn replace_index_unique(
         &mut self,
         i: usize,
@@ -1095,6 +1576,7 @@ impl<V> Table<V> {
         key: DictKey,
         value: V,
     ) -> Option<(DictKey, V)> {
+        let i = self.entry_of(i);
         let old = self.entries.get(i)?.hash;
         if !self.slots.is_empty() {
             let pos = self.slot_of(old, i);
@@ -1111,7 +1593,7 @@ impl<V> Table<V> {
         Some((b.key, b.value))
     }
 
-    /// Remove the last entry.
+    /// Remove the last key.
     pub fn pop(&mut self) -> Option<(DictKey, V)> {
         let n = self.entries.len();
         if n == 0 {
@@ -1122,46 +1604,36 @@ impl<V> Table<V> {
             self.erase_slot(pos);
         }
         let b = self.entries.pop()?;
+        self.trim();
         Some((b.key, b.value))
     }
 
-    pub fn shift_remove_full<Q: Probe + ?Sized>(&mut self, key: &Q) -> Option<(usize, DictKey, V)> {
-        let i = self.get_index_of(key)?;
-        let (k, v) = self.shift_remove_index(i)?;
-        Some((i, k, v))
-    }
-
-    pub fn shift_remove_entry<Q: Probe + ?Sized>(&mut self, key: &Q) -> Option<(DictKey, V)> {
-        let i = self.get_index_of(key)?;
-        self.shift_remove_index(i)
-    }
-
-    pub fn shift_remove<Q: Probe + ?Sized>(&mut self, key: &Q) -> Option<V> {
-        self.shift_remove_entry(key).map(|(_, v)| v)
-    }
-
     pub fn swap_remove<Q: Probe + ?Sized>(&mut self, key: &Q) -> Option<V> {
-        let i = self.get_index_of(key)?;
-        self.swap_remove_index(i).map(|(_, v)| v)
+        let p = self.find(key)?;
+        Some(self.swap_remove_entry(p).1)
     }
 
     pub fn swap_remove_full<Q: Probe + ?Sized>(&mut self, key: &Q) -> Option<(usize, DictKey, V)> {
-        let i = self.get_index_of(key)?;
-        let (k, v) = self.swap_remove_index(i)?;
+        let p = self.find(key)?;
+        let i = self.position_of(p);
+        let (k, v) = self.swap_remove_entry(p);
         Some((i, k, v))
     }
 
     /// Keep the entries `keep` accepts, in order.
     pub fn retain(&mut self, mut keep: impl FnMut(&DictKey, &mut V) -> bool) {
         let n = self.entries.len();
-        self.entries.retain_mut(|b| keep(&b.key, &mut b.value));
+        self.entries
+            .retain_mut(|b| !is_tomb(b) && keep(&b.key, &mut b.value));
         if self.entries.len() != n {
+            self.forget_tombstones();
             self.reindex();
         }
     }
 
     /// Keep the first `len` entries.
     pub fn truncate(&mut self, len: usize) {
+        self.make_dense();
         if len < self.entries.len() {
             self.entries.truncate(len);
             self.reindex();
@@ -1170,12 +1642,15 @@ impl<V> Table<V> {
 
     /// Split off the entries from `at` on.
     pub fn split_off(&mut self, at: usize) -> Self {
+        self.make_dense();
         let tail = self.entries.split_off(at);
         self.reindex();
         let mut out = Self {
             entries: tail,
             slots: Box::new([]),
             shift: 64,
+            dead: 0,
+            holes: None,
         };
         if out.entries.len() > SMALL {
             out.rebuild_slots(slots_for(out.entries.len()));
@@ -1188,6 +1663,7 @@ impl<V> Table<V> {
         &mut self,
         range: R,
     ) -> std::vec::IntoIter<(DictKey, V)> {
+        self.make_dense();
         let out: Vec<(DictKey, V)> = self
             .entries
             .drain(range)
@@ -1197,13 +1673,9 @@ impl<V> Table<V> {
         out.into_iter()
     }
 
-    /// Move entry `from` to position `to`, shifting the ones between.
-    pub fn move_index(&mut self, from: usize, to: usize) {
-        let n = self.entries.len();
-        assert!(from < n && to < n, "move_index out of bounds");
-        if from == to {
-            return;
-        }
+    /// Move entry `from` to position `to`, shifting the ones between, in
+    /// a table without tombstones.
+    fn rotate_index(&mut self, from: usize, to: usize) {
         if self.slots.is_empty() {
             if from < to {
                 self.entries[from..=to].rotate_left(1);
@@ -1239,6 +1711,7 @@ impl<V> Table<V> {
         if a == b {
             return;
         }
+        let (a, b) = (self.entry_of(a), self.entry_of(b));
         if !self.slots.is_empty() {
             let pa = self.slot_of(self.entries[a].hash, a);
             let pb = self.slot_of(self.entries[b].hash, b);
@@ -1250,6 +1723,7 @@ impl<V> Table<V> {
 
     /// Reverse the order.
     pub fn reverse(&mut self) {
+        self.make_dense();
         self.entries.reverse();
         self.reindex();
     }
@@ -1259,6 +1733,7 @@ impl<V> Table<V> {
         &mut self,
         mut cmp: impl FnMut(&DictKey, &V, &DictKey, &V) -> std::cmp::Ordering,
     ) {
+        self.make_dense();
         self.entries
             .sort_by(|a, b| cmp(&a.key, &a.value, &b.key, &b.value));
         self.reindex();
@@ -1269,6 +1744,7 @@ impl<V> Table<V> {
         &mut self,
         mut cmp: impl FnMut(&DictKey, &DictKey) -> std::cmp::Ordering,
     ) {
+        self.make_dense();
         self.entries.sort_by(|a, b| cmp(&a.key, &b.key));
         self.reindex();
     }
@@ -1278,42 +1754,207 @@ impl<V> Table<V> {
 
     #[inline]
     pub fn iter(&self) -> Iter<'_, V> {
-        Iter(self.entries.iter())
+        Iter {
+            left: self.len(),
+            inner: self.entries.iter(),
+        }
     }
 
     #[inline]
     pub fn iter_mut(&mut self) -> IterMut<'_, V> {
-        IterMut(self.entries.iter_mut())
+        IterMut {
+            left: self.len(),
+            inner: self.entries.iter_mut(),
+        }
     }
 
     /// Mutable keys and values. The caller must keep every key's hash and
     /// equality unchanged.
     #[inline]
     pub fn iter_mut2(&mut self) -> IterMut2<'_, V> {
-        IterMut2(self.entries.iter_mut())
+        IterMut2 {
+            left: self.len(),
+            inner: self.entries.iter_mut(),
+        }
     }
 
     #[inline]
     pub fn keys(&self) -> Keys<'_, V> {
-        Keys(self.entries.iter())
+        Keys {
+            left: self.len(),
+            inner: self.entries.iter(),
+        }
     }
 
     #[inline]
     pub fn values(&self) -> Values<'_, V> {
-        Values(self.entries.iter())
+        Values {
+            left: self.len(),
+            inner: self.entries.iter(),
+        }
     }
 
     #[inline]
     pub fn values_mut(&mut self) -> ValuesMut<'_, V> {
-        ValuesMut(self.entries.iter_mut())
+        ValuesMut {
+            left: self.len(),
+            inner: self.entries.iter_mut(),
+        }
     }
 
-    pub fn into_keys(self) -> impl DoubleEndedIterator<Item = DictKey> + ExactSizeIterator {
+    pub fn into_keys(mut self) -> impl DoubleEndedIterator<Item = DictKey> + ExactSizeIterator {
+        self.drop_tombstones();
         self.entries.into_iter().map(|b| b.key)
     }
 
-    pub fn into_values(self) -> impl DoubleEndedIterator<Item = V> + ExactSizeIterator {
+    pub fn into_values(mut self) -> impl DoubleEndedIterator<Item = V> + ExactSizeIterator {
+        self.drop_tombstones();
         self.entries.into_iter().map(|b| b.value)
+    }
+}
+
+impl<V: Vacant> Table<V> {
+    /// Remove entry `p` of a table with slots. The entries behind it move
+    /// down, unless the table has tombstones already, or `lazy` and more
+    /// than [`SHIFT_MAX`] would move: then a tombstone takes its place.
+    fn remove_entry(&mut self, p: usize, lazy: bool) -> (DictKey, V) {
+        let n = self.entries.len();
+        let pos = self.slot_of(self.entries[p].hash, p);
+        self.erase_slot(pos);
+        if p == n - 1 {
+            let b = self.entries.pop().expect("entry `p`");
+            self.trim();
+            return (b.key, b.value);
+        }
+        let moved = n - 1 - p;
+        if self.dead == 0 && (!lazy || moved <= SHIFT_MAX) {
+            let b = self.entries.remove(p);
+            // Renumber the entries that moved down: one slot walk each
+            // when few moved, else one pass over the table.
+            if moved * 4 <= self.slots.len() {
+                for j in p..n - 1 {
+                    let h = self.entries[j].hash;
+                    self.repoint(h, j + 1, j);
+                }
+            } else {
+                let above = p as u64 + 1;
+                for s in self.slots.iter_mut() {
+                    if *s & IX_MASK > above {
+                        *s -= 1;
+                    }
+                }
+            }
+            return (b.key, b.value);
+        }
+        let tomb = Bucket {
+            hash: 0,
+            key: DictKey(Object::Unbound),
+            value: V::vacant(),
+        };
+        let b = std::mem::replace(&mut self.entries[p], tomb);
+        self.dead += 1;
+        let cap = self.entries.capacity();
+        self.holes
+            .get_or_insert_with(|| Box::new(Holes::new()))
+            .mark(p, cap, self.dead as usize);
+        // More tombstones than keys: close them up (a pass over the keys,
+        // paid for by the removals that made the tombstones).
+        if self.dead as usize > self.len() + SHIFT_MAX {
+            self.compact(self.slots.len());
+        }
+        (b.key, b.value)
+    }
+
+    /// Remove entry `p` (see [`Self::remove_entry`]).
+    #[inline]
+    fn take(&mut self, p: usize, lazy: bool) -> (DictKey, V) {
+        if self.slots.is_empty() {
+            let b = self.entries.remove(p);
+            return (b.key, b.value);
+        }
+        self.remove_entry(p, lazy)
+    }
+
+    /// Remove the key at position `i`, shifting the later entries down.
+    pub fn shift_remove_index(&mut self, i: usize) -> Option<(DictKey, V)> {
+        let p = self.entry_of(i);
+        if p >= self.entries.len() {
+            return None;
+        }
+        Some(self.take(p, false))
+    }
+
+    /// Remove the key at position `i`; the later keys' positions go down
+    /// by one, but their entries may stay where they are, a tombstone in
+    /// the removed one's place (see the module docs). For a table that
+    /// loses keys anywhere, many times over: the cost doesn't grow with
+    /// the keys behind the removed one.
+    pub fn lazy_remove_index(&mut self, i: usize) -> Option<(DictKey, V)> {
+        let p = self.entry_of(i);
+        if p >= self.entries.len() {
+            return None;
+        }
+        Some(self.take(p, true))
+    }
+
+    pub fn shift_remove_full<Q: Probe + ?Sized>(&mut self, key: &Q) -> Option<(usize, DictKey, V)> {
+        let p = self.find(key)?;
+        let i = self.position_of(p);
+        let (k, v) = self.take(p, false);
+        Some((i, k, v))
+    }
+
+    pub fn shift_remove_entry<Q: Probe + ?Sized>(&mut self, key: &Q) -> Option<(DictKey, V)> {
+        let p = self.find(key)?;
+        Some(self.take(p, false))
+    }
+
+    pub fn shift_remove<Q: Probe + ?Sized>(&mut self, key: &Q) -> Option<V> {
+        self.shift_remove_entry(key).map(|(_, v)| v)
+    }
+
+    /// [`Self::lazy_remove_index`] of the key equal to `key`.
+    pub fn lazy_remove_entry<Q: Probe + ?Sized>(&mut self, key: &Q) -> Option<(DictKey, V)> {
+        let p = self.find(key)?;
+        Some(self.take(p, true))
+    }
+
+    /// [`Self::lazy_remove_entry`] if `ok` accepts the key's value (one
+    /// probe for the test and the removal).
+    pub fn lazy_remove_entry_if<Q: Probe + ?Sized>(
+        &mut self,
+        key: &Q,
+        ok: impl FnOnce(&V) -> bool,
+    ) -> Option<(DictKey, V)> {
+        let p = self.find(key)?;
+        if !ok(&self.entries[p].value) {
+            return None;
+        }
+        Some(self.take(p, true))
+    }
+
+    /// [`Self::lazy_remove_entry`], giving the value alone.
+    pub fn lazy_remove<Q: Probe + ?Sized>(&mut self, key: &Q) -> Option<V> {
+        self.lazy_remove_entry(key).map(|(_, v)| v)
+    }
+
+    /// Move the key at position `from` to position `to`, shifting the ones
+    /// between. A move to the end is a lazy removal and an append.
+    pub fn move_index(&mut self, from: usize, to: usize) {
+        let n = self.len();
+        assert!(from < n && to < n, "move_index out of bounds");
+        if from == to {
+            return;
+        }
+        if to == n - 1 && !self.slots.is_empty() {
+            let p = self.entry_of(from);
+            let hash = self.entries[p].hash;
+            let (key, value) = self.remove_entry(p, true);
+            self.insert_unique_hashed(hash, key, value);
+            return;
+        }
+        self.make_dense();
+        self.rotate_index(from, to);
     }
 }
 
@@ -1324,7 +1965,7 @@ pub enum Entry<'a, V = Object> {
     Vacant(VacantEntry<'a, V>),
 }
 
-/// A present entry.
+/// A present entry (`index` is its entry, not its position).
 #[derive(Debug)]
 pub struct OccupiedEntry<'a, V = Object> {
     map: &'a mut Table<V>,
@@ -1372,16 +2013,17 @@ impl<'a, V> Entry<'a, V> {
 
     pub fn index(&self) -> usize {
         match self {
-            Entry::Occupied(e) => e.index,
+            Entry::Occupied(e) => e.index(),
             Entry::Vacant(e) => e.map.len(),
         }
     }
 }
 
 impl<'a, V> OccupiedEntry<'a, V> {
+    /// The key's position.
     #[inline]
     pub fn index(&self) -> usize {
-        self.index
+        self.map.position_of(self.index)
     }
 
     #[inline]
@@ -1408,11 +2050,11 @@ impl<'a, V> OccupiedEntry<'a, V> {
     pub fn insert(&mut self, value: V) -> V {
         std::mem::replace(self.get_mut(), value)
     }
+}
 
+impl<V: Vacant> OccupiedEntry<'_, V> {
     pub fn shift_remove_entry(self) -> (DictKey, V) {
-        self.map
-            .shift_remove_index(self.index)
-            .expect("occupied entry is present")
+        self.map.take(self.index, false)
     }
 
     pub fn shift_remove(self) -> V {
@@ -1443,35 +2085,56 @@ impl<V> ProbeVacancy<'_, V> {
     /// its position.
     #[inline]
     pub fn insert(self, key: DictKey, value: V) -> usize {
-        self.map.push_at(self.pos, self.hash, key, value)
+        self.map.push_last(self.pos, self.hash, key, value)
     }
 }
 
 macro_rules! entry_iter {
     ($name:ident, $inner:ty, $item:ty, |$b:ident| $map:expr) => {
-        pub struct $name<'a, V = Object>($inner);
+        /// (`left` counts the keys ahead: the entries less their
+        /// tombstones.)
+        pub struct $name<'a, V = Object> {
+            inner: $inner,
+            left: usize,
+        }
 
         impl<'a, V> Iterator for $name<'a, V> {
             type Item = $item;
 
             #[inline]
             fn next(&mut self) -> Option<Self::Item> {
-                self.0.next().map(|$b| $map)
+                loop {
+                    let $b = self.inner.next()?;
+                    if !is_tomb(&*$b) {
+                        self.left -= 1;
+                        return Some($map);
+                    }
+                }
             }
 
             #[inline]
             fn size_hint(&self) -> (usize, Option<usize>) {
-                self.0.size_hint()
+                (self.left, Some(self.left))
             }
 
             #[inline]
             fn nth(&mut self, n: usize) -> Option<Self::Item> {
-                self.0.nth(n).map(|$b| $map)
+                if self.left == self.inner.len() {
+                    // No tombstone ahead.
+                    let found = self.inner.nth(n);
+                    self.left = self.inner.len();
+                    let $b = found?;
+                    return Some($map);
+                }
+                for _ in 0..n {
+                    self.next()?;
+                }
+                self.next()
             }
 
             #[inline]
             fn count(self) -> usize {
-                self.0.len()
+                self.left
             }
 
             #[inline]
@@ -1483,19 +2146,34 @@ macro_rules! entry_iter {
         impl<V> DoubleEndedIterator for $name<'_, V> {
             #[inline]
             fn next_back(&mut self) -> Option<Self::Item> {
-                self.0.next_back().map(|$b| $map)
+                loop {
+                    let $b = self.inner.next_back()?;
+                    if !is_tomb(&*$b) {
+                        self.left -= 1;
+                        return Some($map);
+                    }
+                }
             }
 
             #[inline]
             fn nth_back(&mut self, n: usize) -> Option<Self::Item> {
-                self.0.nth_back(n).map(|$b| $map)
+                if self.left == self.inner.len() {
+                    let found = self.inner.nth_back(n);
+                    self.left = self.inner.len();
+                    let $b = found?;
+                    return Some($map);
+                }
+                for _ in 0..n {
+                    self.next_back()?;
+                }
+                self.next_back()
             }
         }
 
         impl<V> ExactSizeIterator for $name<'_, V> {
             #[inline]
             fn len(&self) -> usize {
-                self.0.len()
+                self.left
             }
         }
 
@@ -1539,19 +2217,28 @@ entry_iter!(
 
 impl<V> Clone for Iter<'_, V> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        Self {
+            inner: self.inner.clone(),
+            left: self.left,
+        }
     }
 }
 
 impl<V> Clone for Keys<'_, V> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        Self {
+            inner: self.inner.clone(),
+            left: self.left,
+        }
     }
 }
 
 impl<V> Clone for Values<'_, V> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        Self {
+            inner: self.inner.clone(),
+            left: self.left,
+        }
     }
 }
 
@@ -1591,7 +2278,8 @@ impl<V> IntoIterator for Table<V> {
     type Item = (DictKey, V);
     type IntoIter = IntoIter<V>;
 
-    fn into_iter(self) -> IntoIter<V> {
+    fn into_iter(mut self) -> IntoIter<V> {
+        self.drop_tombstones();
         IntoIter(self.entries.into_iter())
     }
 }
@@ -1659,7 +2347,7 @@ impl<V> std::ops::Index<usize> for Table<V> {
     type Output = V;
 
     fn index(&self, i: usize) -> &V {
-        &self.entries[i].value
+        &self.entries[self.entry_of(i)].value
     }
 }
 
@@ -1690,6 +2378,7 @@ impl Table<Object> {
         // SAFETY: the length goes to zero first, so a drop that panics
         // leaks the rest rather than dropping one twice; each entry is
         // released once.
+        // (A tombstone's key and value are scalars: nothing to release.)
         unsafe {
             self.entries.set_len(0);
             for i in 0..n {
@@ -1698,6 +2387,7 @@ impl Table<Object> {
                 release(&raw mut (*b).value);
             }
         }
+        self.forget_tombstones();
     }
 }
 
@@ -2127,13 +2817,292 @@ mod tests {
     }
 
     fn check(m: &DictMap) {
-        for (i, b) in m.entries.iter().enumerate() {
-            assert_eq!(m.get_index_of(&b.key), Some(i));
+        let tombs = m.entries.iter().filter(|b| is_tomb(b)).count();
+        assert_eq!(tombs, m.dead as usize);
+        assert!(!m.entries.last().is_some_and(is_tomb));
+        assert_eq!(m.iter().len(), m.len());
+        for (i, (key, _)) in m.iter().enumerate() {
+            assert_eq!(m.get_index_of(key), Some(i));
+            assert!(m.get_index(i).is_some_and(|(k, _)| k == key));
         }
+        assert!(m.get_index(m.len()).is_none());
         if !m.slots.is_empty() {
             let used = m.slots.iter().filter(|s| **s != 0).count();
             assert_eq!(used, m.len());
         }
+    }
+
+    fn int(o: &Object) -> i64 {
+        match o {
+            Object::Int(i) => *i,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Every operation, in a random order, against a plain vector of
+    /// pairs: the same keys at the same positions throughout, whatever
+    /// tombstones the table holds.
+    #[test]
+    fn matches_a_vector_through_lazy_removals() {
+        let mut seed = 0x2545_F491_4F6C_DD1D_u64;
+        let mut rnd = move |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as usize % n.max(1)
+        };
+        for round in 0..6 {
+            let mut m = DictMap::new();
+            let mut model: Vec<(i64, i64)> = Vec::new();
+            let mut fresh = 0_i64;
+            let steps = [400_i64, 3000, 3000, 6000, 12_000, 20_000][round];
+            // (The first third of a round mostly adds keys, more of them
+            // in the later rounds; the rest loses more than it adds.)
+            let grow = [2, 3, 3, 4, 6, 8][round];
+            let mut most = 0;
+            for step in 0..steps {
+                let n = model.len();
+                let op = if step < steps / 3 && rnd(grow) != 0 {
+                    0
+                } else {
+                    rnd(22)
+                };
+                most = most.max(m.dead);
+                match op {
+                    // A new key (several of every draw, so tables grow).
+                    0..=2 | 22.. => {
+                        fresh += 1;
+                        let key = fresh * 1024 + (fresh % 3);
+                        let (at, old) = m.insert_full(k(key), Object::Int(step));
+                        assert!(old.is_none());
+                        assert_eq!(at, n);
+                        model.push((key, step));
+                    }
+                    // A present key's value.
+                    3 if n > 0 => {
+                        let i = rnd(n);
+                        let (at, old) = m.insert_full(k(model[i].0), Object::Int(-1));
+                        assert_eq!(at, i);
+                        assert_eq!(old.as_ref().map(int), Some(model[i].1));
+                        model[i].1 = -1;
+                    }
+                    // Lazy removals: by key, by position, the first key.
+                    4..=6 if n > 0 => {
+                        let i = rnd(n);
+                        let (key, v) = m.lazy_remove_entry(&k(model[i].0)).expect("present");
+                        assert_eq!((int(&key.0), int(&v)), model.remove(i));
+                    }
+                    7 | 8 if n > 0 => {
+                        let i = if op == 7 { 0 } else { rnd(n) };
+                        let (key, v) = m.lazy_remove_index(i).expect("in range");
+                        assert_eq!((int(&key.0), int(&v)), model.remove(i));
+                    }
+                    9 if n > 0 => {
+                        let i = rnd(n);
+                        let (at, key, v) = m.shift_remove_full(&k(model[i].0)).expect("present");
+                        assert_eq!(at, i);
+                        assert_eq!((int(&key.0), int(&v)), model.remove(i));
+                    }
+                    10 if n > 0 => {
+                        let i = rnd(n);
+                        let (key, v) = m.swap_remove_index(i).expect("in range");
+                        assert_eq!((int(&key.0), int(&v)), model.swap_remove(i));
+                    }
+                    11 if n > 0 => {
+                        let (key, v) = m.pop().expect("a key");
+                        assert_eq!(Some((int(&key.0), int(&v))), model.pop());
+                    }
+                    // Moves: to the end (a lazy removal and an append),
+                    // to the front, anywhere.
+                    12 | 13 if n > 0 => {
+                        let from = rnd(n);
+                        // (A move that isn't to the end closes the gaps,
+                        // so it is the rare one.)
+                        let to = match rnd(60) {
+                            0 => 0,
+                            1 => rnd(n),
+                            _ => n - 1,
+                        };
+                        m.move_index(from, to);
+                        let e = model.remove(from);
+                        model.insert(to, e);
+                    }
+                    14 if n > 1 => {
+                        let (a, b) = (rnd(n), rnd(n));
+                        m.swap_indices(a, b);
+                        model.swap(a, b);
+                    }
+                    15 if n > 0 => {
+                        let i = rnd(n);
+                        fresh += 1;
+                        let key = k(fresh * 1024);
+                        let hash = key.probe_hash();
+                        let (old, _) = m
+                            .replace_index_unique(i, hash, key, Object::Int(7))
+                            .expect("in range");
+                        assert_eq!(int(&old.0), model[i].0);
+                        model[i] = (fresh * 1024, 7);
+                    }
+                    // Reads by position and by key.
+                    16 if n > 0 => {
+                        let i = rnd(n);
+                        let (key, v) = m.get_index(i).expect("in range");
+                        assert_eq!((int(&key.0), int(v)), model[i]);
+                        assert_eq!(m.get_index_of(&k(model[i].0)), Some(i));
+                        assert_eq!(m.get_full(&k(model[i].0)).map(|f| f.0), Some(i));
+                        assert_eq!(m.hash_at(i), Some(k(model[i].0).probe_hash()));
+                        assert_eq!(int(&m[i]), model[i].1);
+                        assert_eq!(m.first().map(|f| int(&f.0 .0)), Some(model[0].0));
+                        assert_eq!(m.last().map(|f| int(&f.0 .0)), Some(model[n - 1].0));
+                        // A walk by position, forward and back.
+                        let from = rnd(n);
+                        for (j, e) in model.iter().enumerate().skip(from).take(40) {
+                            assert_eq!(m.get_index(j).map(|f| int(&f.0 .0)), Some(e.0));
+                        }
+                        for j in (from.saturating_sub(40)..from).rev() {
+                            assert_eq!(m.get_index(j).map(|f| int(&f.0 .0)), Some(model[j].0));
+                        }
+                        if let Entry::Occupied(e) = m.entry(k(model[i].0)) {
+                            assert_eq!(e.index(), i);
+                        } else {
+                            panic!("present");
+                        }
+                    }
+                    // Whole-table operations (rare: each closes the gaps).
+                    17 if rnd(40) == 0 => match rnd(7) {
+                        0 => {
+                            m.reverse();
+                            model.reverse();
+                        }
+                        1 => {
+                            m.sort_by_key_with(|a, b| int(&a.0).cmp(&int(&b.0)));
+                            model.sort_by_key(|e| e.0);
+                        }
+                        2 => {
+                            let keep = rnd(n + 1);
+                            m.truncate(keep);
+                            model.truncate(keep);
+                        }
+                        3 => {
+                            m.retain(|key, _| int(&key.0) % 5 != 0);
+                            model.retain(|e| e.0 % 5 != 0);
+                        }
+                        4 => {
+                            let (a, b) = (rnd(n + 1), rnd(n + 1));
+                            let (a, b) = (a.min(b), a.max(b));
+                            let got: Vec<i64> = m.drain(a..b).map(|e| int(&e.0 .0)).collect();
+                            let want: Vec<i64> = model.drain(a..b).map(|e| e.0).collect();
+                            assert_eq!(got, want);
+                        }
+                        5 => {
+                            let at = rnd(n + 1);
+                            let tail = m.split_off(at);
+                            let want = model.split_off(at);
+                            check(&tail);
+                            let got: Vec<i64> = tail.keys().map(|key| int(&key.0)).collect();
+                            assert_eq!(got, want.iter().map(|e| e.0).collect::<Vec<_>>());
+                        }
+                        _ => {
+                            m.shrink_to_fit();
+                        }
+                    },
+                    18 if rnd(20) == 0 => {
+                        let c = m.clone();
+                        check(&c);
+                        assert_eq!(c.dead, 0);
+                        let got: Vec<(i64, i64)> = c
+                            .into_iter()
+                            .map(|(key, v)| (int(&key.0), int(&v)))
+                            .collect();
+                        assert_eq!(got, model);
+                    }
+                    19 if n > 0 => {
+                        let i = rnd(n);
+                        if let Entry::Occupied(e) = m.entry(k(model[i].0)) {
+                            let (key, v) = e.shift_remove_entry();
+                            assert_eq!((int(&key.0), int(&v)), model.remove(i));
+                        }
+                    }
+                    20 => {
+                        if rnd(25) == 0 {
+                            m.reserve(rnd(64));
+                        }
+                        let absent = k(-5);
+                        assert!(m.get(&absent).is_none());
+                        assert!(m.lazy_remove(&absent).is_none());
+                        assert!(m.get_index_of(&absent).is_none());
+                    }
+                    _ => {}
+                }
+                assert_eq!(m.len(), model.len());
+                assert_eq!(m.is_empty(), model.is_empty());
+                if step % 97 == 0 || m.len() < 40 {
+                    check(&m);
+                    let got: Vec<(i64, i64)> =
+                        m.iter().map(|(key, v)| (int(&key.0), int(v))).collect();
+                    assert_eq!(got, model);
+                    let back: Vec<i64> = m.keys().rev().map(|key| int(&key.0)).collect();
+                    let want: Vec<i64> = model.iter().rev().map(|e| e.0).collect();
+                    assert_eq!(back, want);
+                    assert_eq!(m.values().len(), model.len());
+                    let skip = rnd(model.len() + 2);
+                    assert_eq!(
+                        m.keys().nth(skip).map(|key| int(&key.0)),
+                        model.get(skip).map(|e| e.0)
+                    );
+                    assert_eq!(
+                        m.keys().nth_back(skip).map(|key| int(&key.0)),
+                        model.iter().rev().nth(skip).map(|e| e.0)
+                    );
+                    for e in &model {
+                        assert_eq!(m.get(&k(e.0)).map(int), Some(e.1));
+                    }
+                }
+            }
+            // Drained from the front: the first key each time.
+            while let Some((key, _)) = m.first() {
+                let key = int(&key.0);
+                assert_eq!(key, model[0].0);
+                assert!(m.lazy_remove(&k(key)).is_some());
+                model.remove(0);
+                if model.len().is_multiple_of(64) {
+                    check(&m);
+                }
+            }
+            assert!(m.is_empty() && model.is_empty());
+            assert_eq!(m.dead, 0);
+            assert!(round < 3 || most > 200, "round {round}: {most} tombstones");
+        }
+    }
+
+    /// A table that loses its oldest key for each new one keeps its
+    /// tombstones bounded by its keys, and a set never has one.
+    #[test]
+    fn tombstones_stay_bounded() {
+        let mut m = DictMap::new();
+        for i in 0..1000 {
+            m.insert(k(i), Object::Int(i));
+        }
+        let mut most = 0;
+        for i in 1000..60_000_i64 {
+            m.insert(k(i), Object::Int(i));
+            assert!(m.lazy_remove(&k(i - 1000)).is_some());
+            most = most.max(m.dead as usize);
+            assert!(m.entries.len() <= 3 * m.len() + SHIFT_MAX + 1);
+        }
+        assert!(most > 0);
+        assert_eq!(m.len(), 1000);
+        assert_eq!(m.first().map(|f| int(&f.0 .0)), Some(59_000));
+        check(&m);
+        let mut s = SetMap::new();
+        for i in 0..200 {
+            s.insert(k(i));
+        }
+        for i in 0..150 {
+            assert!(s.shift_remove(&k(i)));
+        }
+        assert_eq!(s.0.dead, 0);
+        assert_eq!(s.as_entries().len(), 50);
     }
 
     #[test]

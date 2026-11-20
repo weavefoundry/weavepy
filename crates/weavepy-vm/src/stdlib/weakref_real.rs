@@ -1486,7 +1486,7 @@ fn remove_dead_weakref(args: &[Object]) -> Result<Object, RuntimeError> {
     // is CPython's `is_dead_weakref` predicate.
     if matches!(wrapper_referent(&value), Some(None)) {
         crate::object::key_cmp_scope(|| {
-            d.borrow_mut().shift_remove(&dk);
+            d.borrow_mut().lazy_remove(&dk);
         })?;
     }
     Ok(Object::None)

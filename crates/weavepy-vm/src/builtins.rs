@@ -5841,13 +5841,24 @@ pub(crate) fn int_from_plain_hex(digits: &[u8]) -> Option<Object> {
     if digits.is_empty() || digits.len() > MAX {
         return None;
     }
-    let nibble = |c: u8| -> Option<u8> {
-        match c {
-            b'0'..=b'9' => Some(c - b'0'),
-            b'a'..=b'f' => Some(c - b'a' + 10),
-            b'A'..=b'F' => Some(c - b'A' + 10),
-            _ => None,
+    /// Each byte's hex digit value, `0xff` for a byte that isn't one.
+    const NIBBLE: [u8; 256] = {
+        let mut t = [0xffu8; 256];
+        let mut c = 0;
+        while c < 256 {
+            t[c] = match c as u8 {
+                b'0'..=b'9' => c as u8 - b'0',
+                b'a'..=b'f' => c as u8 - b'a' + 10,
+                b'A'..=b'F' => c as u8 - b'A' + 10,
+                _ => 0xff,
+            };
+            c += 1;
         }
+        t
+    };
+    let nibble = |c: u8| -> Option<u8> {
+        let v = NIBBLE[usize::from(c)];
+        (v != 0xff).then_some(v)
     };
     if digits.len() <= 15 {
         let mut v = 0i64;
@@ -6141,33 +6152,26 @@ fn byteorder_str(o: &Object) -> Result<String, RuntimeError> {
 /// zero-padded; `None` for a negative value, one that doesn't fit, or a
 /// value that isn't a plain `int`.
 fn unsigned_to_bytes(n: &Object, length: usize, little: bool) -> Option<Vec<u8>> {
-    let mut out = vec![0u8; length];
-    // Least significant byte first, then turned for big-endian.
-    let mut put = |k: usize, byte: u8| -> bool {
-        if byte == 0 {
-            return true;
-        }
-        if k >= length {
-            return false;
-        }
-        out[k] = byte;
-        true
-    };
+    // The magnitude's bytes, least significant first, into a zeroed
+    // result, a word at a time; then turned for big-endian.
+    let mut out;
     match n {
         Object::Int(v) if *v >= 0 => {
-            for (k, byte) in v.to_le_bytes().into_iter().enumerate() {
-                if !put(k, byte) {
-                    return None;
-                }
+            let v = *v as u64;
+            if (64 - v.leading_zeros() as usize).div_ceil(8) > length {
+                return None;
             }
+            out = vec![0u8; length];
+            let n = length.min(8);
+            out[..n].copy_from_slice(&v.to_le_bytes()[..n]);
         }
         Object::Long(b) if !b.is_negative() => {
-            for (d, digit) in b.iter_u64_digits().enumerate() {
-                for (k, byte) in digit.to_le_bytes().into_iter().enumerate() {
-                    if !put(8 * d + k, byte) {
-                        return None;
-                    }
-                }
+            if (b.bits() as usize).div_ceil(8) > length {
+                return None;
+            }
+            out = vec![0u8; length];
+            for (chunk, digit) in out.chunks_mut(8).zip(b.iter_u64_digits()) {
+                chunk.copy_from_slice(&digit.to_le_bytes()[..chunk.len()]);
             }
         }
         _ => return None,
@@ -14656,9 +14660,8 @@ pub(crate) fn dict_remove(
     // comparison scope (see `dict_lookup`).
     if let Some(probe) = crate::object::LeafProbe::new(key) {
         if let Ok(mut m) = d.try_borrow_mut() {
-            match m.get_index_of(&probe) {
-                Some(i) => {
-                    let (k, v) = m.shift_remove_index(i).expect("found above");
+            match m.lazy_remove_entry(&probe) {
+                Some((k, v)) => {
                     drop(m);
                     crate::object::dict_watch_bump(d);
                     crate::object::dict_mutation_event(d);
@@ -14678,7 +14681,7 @@ pub(crate) fn dict_remove(
     let (removed, deferred) = crate::object::with_key_eq_deferred(|| {
         crate::object::key_cmp_scope(|| {
             d.borrow_mut()
-                .shift_remove_entry(&DictKey(key.clone()))
+                .lazy_remove_entry(&DictKey(key.clone()))
                 .map(|(k, v)| (k.0, v))
         })
     });
@@ -15043,9 +15046,8 @@ pub(crate) fn dict_pop_leaf(args: &[Object]) -> Option<Result<Object, RuntimeErr
     let probe = crate::object::LeafProbe::new(key)?;
     let cell = leaf_dict_of(recv)?;
     let mut m = cell.try_borrow_mut().ok()?;
-    match m.get_index_of(&probe) {
-        Some(i) => {
-            let (k, v) = m.shift_remove_index(i)?;
+    match m.lazy_remove_entry(&probe) {
+        Some((k, v)) => {
             drop(m);
             crate::object::dict_watch_bump(cell);
             crate::object::dict_mutation_event(cell);

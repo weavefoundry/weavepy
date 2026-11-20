@@ -23264,11 +23264,7 @@ impl Interpreter {
                         let probe = crate::object::LeafProbe::new(k)?;
                         // SAFETY: as above (the probe runs no code).
                         let d = unsafe { cell.peek_mut() }?;
-                        let at = d.get_index_of(&probe)?;
-                        if !d.get_index(at).is_some_and(|(_, v)| removed_ok(v)) {
-                            return None;
-                        }
-                        let (key, v) = d.shift_remove_index(at)?;
+                        let (key, v) = d.lazy_remove_entry_if(&probe, removed_ok)?;
                         crate::object::dict_watch_bump(cell);
                         crate::object::dict_mutation_event(cell);
                         (v, key.0)
@@ -81211,16 +81207,14 @@ pub(crate) fn keys_view_algebra(a: &Object, b: &Object, op: BinOpKind) -> Option
     }
     let keys = {
         let d = v.dict.try_borrow().ok()?;
-        let entries = d.as_entries();
-        if entries
-            .iter()
-            .any(|e| crate::object::dict_key_is_reentrant(&e.key.0))
+        if d.keys()
+            .any(|key| crate::object::dict_key_is_reentrant(&key.0))
         {
             return None;
         }
-        let mut keys = crate::object::SetData::with_capacity(entries.len());
-        for e in entries {
-            keys.insert_hashed(e.hash, e.key.clone());
+        let mut keys = crate::object::SetData::with_capacity(d.len());
+        for (hash, key) in d.hashed_keys() {
+            keys.insert_hashed(hash, key.clone());
         }
         keys
     };

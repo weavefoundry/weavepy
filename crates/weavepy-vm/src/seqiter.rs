@@ -2325,6 +2325,12 @@ pub(crate) fn builtin_ctor_arms(cls: &Rc<TypeObject>, args: &[Object]) -> Option
             // (a prefix, an underscore or anything malformed is the full
             // constructor's).
             [Object::Str(text), Object::Int(base)] if (2..=36).contains(base) => {
+                // (Hex digits and nothing else, of any width: read once.)
+                if *base == 16 {
+                    if let Some(v) = crate::builtins::int_from_plain_hex(text.as_bytes()) {
+                        return Some(v);
+                    }
+                }
                 let t = text.trim_matches(|c: char| c.is_ascii_whitespace());
                 let digits = t.strip_prefix(['+', '-']).unwrap_or(t);
                 if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_alphanumeric()) {

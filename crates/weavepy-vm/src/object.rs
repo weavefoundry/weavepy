@@ -4920,7 +4920,7 @@ pub(crate) fn dict_reentrant_remove(
             let mut m = d.borrow_mut();
             match m.find_by_hash(probe.hash, |k| k.0.is_same(&stored)) {
                 Some(i) => {
-                    let (k, v) = m.shift_remove_index(i).expect("found above");
+                    let (k, v) = m.lazy_remove_index(i).expect("found above");
                     drop(m);
                     dict_watch_bump(d);
                     dict_mutation_event(d);
@@ -4940,9 +4940,10 @@ pub(crate) fn dict_reentrant_remove(
 // same `ma_used`, so the size trip-wire stays silent — because the delete
 // leaves a tombstone and the reinsert *appends*: the iterator then finds an
 // entry beyond the `di->len` elements it expected and raises `RuntimeError:
-// dictionary keys changed during iteration`. Our table has no
-// tombstones (`shift_remove` compacts in place), so the layout carries no
-// trace of the churn. Instead, dict iterators register a *watch* on their
+// dictionary keys changed during iteration`. Our table keeps positions
+// dense (a removal moves the later keys' positions down, whether or not it
+// leaves a tombstone in the entry list), so an iterator's position carries
+// no trace of the churn. Instead, dict iterators register a *watch* on their
 // source dict; the centralized structural mutators (`dict_insert` on a new
 // key, `dict_remove`, `clear`, `popitem`) bump the watched dict's version,
 // and the iterator's checked `__next__` raises on a version change.
