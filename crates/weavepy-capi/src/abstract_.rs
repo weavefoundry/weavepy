@@ -3652,11 +3652,17 @@ pub unsafe extern "C" fn PySequence_Check(o: *mut PyObject) -> c_int {
             // raise "Could not convert object to sequence". A foreign sequence
             // that really has `sq_item` (numpy's `_array_converter`) returns 1
             // at the C-slot check above and never reaches here.
-            if matches!(
-                inst.cls().lookup("__getitem__"),
-                Some(Object::Function(_) | Object::BoundMethod(_))
-            ) {
-                return 1;
+            match inst.cls().lookup("__getitem__") {
+                Some(Object::Function(_) | Object::BoundMethod(_)) => return 1,
+                // A class written in Python whose `__getitem__` is served
+                // natively and that declares itself a sequence
+                // (`Py_TPFLAGS_SEQUENCE`: `array.array`, whose C type in
+                // CPython has `sq_item`): Pillow's `putdata(array(...))`
+                // asks exactly this.
+                Some(Object::Builtin(_)) if inst.cls().collection_flags() & (1 << 5) != 0 => {
+                    return 1
+                }
+                _ => {}
             }
         }
     }

@@ -1980,6 +1980,12 @@ branch and pull request.
     `re` on a `bytearray` or `memoryview` widens the whole subject per
     call, `BytesIO` reads and writes at 2 to 3 times CPython,
     `iter_unpack` at 3 times, UTF-16 decoding at 2.5 times.
+    One thing the native `array` methods broke, which the ecosystem lane
+    caught: the C API's `PySequence_Check` took an instance for a
+    sequence only when its class's `__getitem__` was a Python function,
+    so Pillow's `putdata(array(...))` refused the array. A natively
+    served `__getitem__` on a class that declares itself a sequence
+    counts too, as CPython's own `array` type does.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
