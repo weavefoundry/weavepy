@@ -9959,6 +9959,16 @@ unsafe extern "C" fn attr_local_slow(st: *mut State, site: *const AttrSite) -> u
             }
             // (A class attribute the site has read before.)
             Object::Instance(inst) => {
+                // A natively served value's public field (`dt.hour`), read
+                // off its packed state: every read of one comes here (the
+                // site keeps nothing for it), so it goes ahead of the
+                // lanes that probe the site's other memos.
+                if inst.cls_raw().native_kind.get() != 0 {
+                    if let Some(v) = native_field_read(site, inst) {
+                        (*st).stack.add(slot).write(v);
+                        return 0;
+                    }
+                }
                 // `inst.__dict__`, as the site answered it before.
                 if let Some(v) = inst_dict_known(site, inst) {
                     (*st).stack.add(slot).write(v);
