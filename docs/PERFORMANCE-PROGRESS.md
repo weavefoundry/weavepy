@@ -1722,10 +1722,14 @@ branch and pull request.
     instructions. The same operations now: 378, 158, 143, 129 and 4,560
     ns, flat from 1,000 keys to 20,000 (`dict` FIFO by `next(iter(d))`
     282 ns, where CPython's own scan past its tombstones takes 6,400).
-    A table grew from 48 to 56 bytes for the index's pointer, which costs
-    16 bytes a dict in the allocator's size classes (a million two-key
-    dicts 262 MB to 277 MB): to be won back by deriving the slot count
-    from the shift.
+    The index's pointer first took the table from 48 to 56 bytes, which
+    cost 16 bytes a dict in the allocator's size classes (a million
+    two-key dicts 262 MB to 277 MB). The slot table is now one word, a
+    pointer whose length is the shift's (compiled code tests the shift
+    for a table without slots, where it tested the length), so a table
+    is 48 bytes again and a dict takes what it took (262 MB); the
+    fixtures read 0.997 of their instructions, a probe's mask coming
+    from the shift it already loads.
   - What is left on those loops is the call, not the dict. Tier 2 ran a
     method call on a builtin value as two generic helpers: a load that
     allocated a bound method and pinned it for the rest of the

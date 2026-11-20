@@ -1840,7 +1840,7 @@ struct IterLayout {
 
 /// Where a dict value's table is, from its payload word (its `Rc`'s
 /// allocation): the cell's borrow counter, the entries' and slots'
-/// pointers, the slot count and the shift; an entry's size and its
+/// pointers and the shift; an entry's size and its
 /// hash's, key's and value's places; where a string keeps its cached hash
 /// (`-1` unknown); and the slot mixing constants (see
 /// `crate::dictmap::TableLayout`). `BINARY_SUBSCR` probes a `str` key's
@@ -1850,7 +1850,6 @@ struct DictLayout {
     borrow: i32,
     entries: i32,
     slots: i32,
-    slots_len: i32,
     shift: i32,
     bucket_size: i64,
     bucket_hash: i32,
@@ -1910,7 +1909,6 @@ fn dict_layout() -> Option<DictLayout> {
         borrow: off(cell + borrow)?,
         entries: off(base + t.entries_ptr)?,
         slots: off(base + t.slots_ptr)?,
-        slots_len: off(base + t.slots_len)?,
         shift: off(base + t.shift)?,
         bucket_size: i64::try_from(t.bucket_size).ok()?,
         bucket_hash: off(t.bucket_hash)?,
@@ -22192,12 +22190,12 @@ impl<'a> Lower<'a> {
         let h = self.b.ins().load(types::I64, FLAGS, k, l.str_hash);
         let unknown = self.b.ins().icmp_imm(IntCC::Equal, h, -1);
         self.branch_out(unknown, helper_block);
-        let nslots = self.b.ins().load(types::I64, FLAGS, obj, l.slots_len);
-        let small = self.b.ins().icmp_imm(IntCC::Equal, nslots, 0);
+        // (A table without slots keeps 64 for its shift.)
+        let shift = self.b.ins().uload32(FLAGS, obj, l.shift);
+        let small = self.b.ins().icmp_imm(IntCC::Equal, shift, 64);
         self.branch_out(small, helper_block);
         // The home slot: the mixed hash's top bits.
         let m = self.b.ins().imul_imm(h, l.mix);
-        let shift = self.b.ins().uload32(FLAGS, obj, l.shift);
         let pos = self.b.ins().ushr(m, shift);
         let slots = self.b.ins().load(self.ptr, FLAGS, obj, l.slots);
         let at = self.b.ins().ishl_imm(pos, 3);

@@ -275,15 +275,37 @@ pub struct Table<V> {
     /// The keys in order, with a tombstone wherever a lazy removal took
     /// one; the last entry is always a key.
     entries: Vec<Bucket<V>>,
-    /// The slot table: empty for a small table, else a power of two long.
-    slots: Box<[u64]>,
-    /// `64 - log2(slots.len())`: the shift that takes a mixed hash to its
-    /// home slot.
+    /// The slot table: `1 << (64 - shift)` words this table owns, none
+    /// (a dangling pointer) for a small table. (One word, not a boxed
+    /// slice's two: the count is in `shift`.)
+    slots: std::ptr::NonNull<u64>,
+    /// `64 - log2(the slot count)`: the shift that takes a mixed hash to
+    /// its home slot; 64 for a small table.
     shift: u32,
     /// How many of `entries` are tombstones.
     dead: u32,
     /// Where they are, once the table has had one.
     holes: Option<Box<Holes>>,
+}
+
+// SAFETY: the slot words are owned by the table (allocated in
+// `alloc_slots`, freed in `free_slots` and on drop) and reached only
+// through it, as a boxed slice's would be.
+unsafe impl<V: Send> Send for Table<V> {}
+// SAFETY: as above.
+unsafe impl<V: Sync> Sync for Table<V> {}
+
+impl<V> Drop for Table<V> {
+    fn drop(&mut self) {
+        self.free_slots();
+    }
+}
+
+/// `n` zeroed slot words (`n` a power of two).
+fn alloc_slots(n: usize) -> std::ptr::NonNull<u64> {
+    let words: Box<[u64]> = vec![0u64; n].into_boxed_slice();
+    // SAFETY: a box's pointer is never null.
+    unsafe { std::ptr::NonNull::new_unchecked(Box::into_raw(words).cast::<u64>()) }
 }
 
 /// No translation remembered (see [`Holes::last`]).
@@ -532,7 +554,6 @@ fn mix(hash: i64) -> u64 {
 pub(crate) struct TableLayout {
     pub(crate) entries_ptr: usize,
     pub(crate) slots_ptr: usize,
-    pub(crate) slots_len: usize,
     pub(crate) shift: usize,
     pub(crate) bucket_size: usize,
     pub(crate) bucket_hash: usize,
@@ -543,16 +564,19 @@ pub(crate) struct TableLayout {
 }
 
 /// [`TableLayout`], read off a sample table (`None` if it isn't the shape
-/// the code assumes: a vector's and a boxed slice's words told apart by
-/// their values, a 32-bit shift).
+/// the code assumes: a vector's words told apart by their values, a
+/// one-word slot pointer, a 32-bit shift that reads 64 for a table
+/// without slots).
 pub(crate) fn table_layout() -> Option<TableLayout> {
     let n = SMALL + 4;
     let mut t: Table<Object> = Table::with_capacity(n);
     for i in 0..n as i64 {
         t.insert_hashed(i, DictKey(Object::Int(i)), Object::Int(i));
     }
-    if t.slots.is_empty()
-        || t.entries.capacity() == t.entries.len() && t.entries.len() == t.slots.len()
+    if t.is_small()
+        || t.entries.capacity() == t.entries.len()
+        || Table::<Object>::new().shift != 64
+        || std::mem::size_of_val(&t.slots) != std::mem::size_of::<usize>()
     {
         return None;
     }
@@ -563,18 +587,12 @@ pub(crate) fn table_layout() -> Option<TableLayout> {
     let entries_ptr = (0..3)
         .map(|k| vec_at + 8 * k)
         .find(|&off| word(off) == t.entries.as_ptr() as usize)?;
-    let slots_at = std::mem::offset_of!(Table<Object>, slots);
-    let slots_ptr = (0..2)
-        .map(|k| slots_at + 8 * k)
-        .find(|&off| word(off) == t.slots.as_ptr() as usize)?;
-    let slots_len = (0..2)
-        .map(|k| slots_at + 8 * k)
-        .find(|&off| word(off) == t.slots.len())?;
+    let slots_ptr = std::mem::offset_of!(Table<Object>, slots);
+    (word(slots_ptr) == t.slots.as_ptr() as usize).then_some(())?;
     (std::mem::size_of::<u32>() == std::mem::size_of_val(&t.shift)).then_some(())?;
     Some(TableLayout {
         entries_ptr,
         slots_ptr,
-        slots_len,
         shift: std::mem::offset_of!(Table<Object>, shift),
         bucket_size: std::mem::size_of::<Bucket<Object>>(),
         bucket_hash: std::mem::offset_of!(Bucket<Object>, hash),
@@ -604,7 +622,7 @@ impl<V: Clone> Clone for Table<V> {
         }
         Self {
             entries: self.entries.clone(),
-            slots: self.slots.clone(),
+            slots: self.clone_slots(),
             shift: self.shift,
             dead: 0,
             holes: None,
@@ -623,7 +641,7 @@ impl<V: Clone> Table<V> {
         entries.extend_from_slice(&self.entries);
         Self {
             entries,
-            slots: self.slots.clone(),
+            slots: self.clone_slots(),
             shift: self.shift,
             dead: 0,
             holes: None,
@@ -637,7 +655,7 @@ impl<V: Clone> Table<V> {
         entries.extend(self.entries.iter().filter(|b| !is_tomb(b)).cloned());
         let mut m = Self {
             entries,
-            slots: Box::new([]),
+            slots: std::ptr::NonNull::dangling(),
             shift: 64,
             dead: 0,
             holes: None,
@@ -661,7 +679,7 @@ impl<V> Table<V> {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
-            slots: Box::new([]),
+            slots: std::ptr::NonNull::dangling(),
             shift: 64,
             dead: 0,
             holes: None,
@@ -672,7 +690,7 @@ impl<V> Table<V> {
     pub fn with_capacity(n: usize) -> Self {
         let mut m = Self {
             entries: Vec::with_capacity(n),
-            slots: Box::new([]),
+            slots: std::ptr::NonNull::dangling(),
             shift: 64,
             dead: 0,
             holes: None,
@@ -701,7 +719,7 @@ impl<V> Table<V> {
         unsafe { entries.set_len(n) };
         let mut m = Self {
             entries,
-            slots: Box::new([]),
+            slots: std::ptr::NonNull::dangling(),
             shift: 64,
             dead: 0,
             holes: None,
@@ -728,6 +746,86 @@ impl<V> Table<V> {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Whether the table has no slots (a probe scans its entries).
+    #[inline(always)]
+    fn is_small(&self) -> bool {
+        self.shift == 64
+    }
+
+    /// How many slots the table has.
+    #[inline(always)]
+    fn nslots(&self) -> usize {
+        if self.shift == 64 {
+            0
+        } else {
+            1 << (64 - self.shift)
+        }
+    }
+
+    /// The slot count less one, of a table with slots.
+    #[inline(always)]
+    fn slot_mask(&self) -> usize {
+        debug_assert!(!self.is_small());
+        (u64::MAX >> (self.shift & 63)) as usize
+    }
+
+    /// The slot words.
+    #[cfg(test)]
+    fn slot_words(&self) -> &[u64] {
+        // SAFETY: `nslots` words the table owns (none: a dangling
+        // pointer, which an empty slice may hold).
+        unsafe { std::slice::from_raw_parts(self.slots.as_ptr(), self.nslots()) }
+    }
+
+    /// [`Self::slot_words`], to write.
+    #[inline(always)]
+    fn slot_words_mut(&mut self) -> &mut [u64] {
+        // SAFETY: as `slot_words`, and the table is borrowed mutably.
+        unsafe { std::slice::from_raw_parts_mut(self.slots.as_ptr(), self.nslots()) }
+    }
+
+    /// Slot `pos` (below the slot count).
+    #[inline(always)]
+    fn slot(&self, pos: usize) -> u64 {
+        debug_assert!(pos < self.nslots());
+        // SAFETY: inside the table's slot words, per the caller.
+        unsafe { *self.slots.as_ptr().add(pos) }
+    }
+
+    /// Set slot `pos` (below the slot count).
+    #[inline(always)]
+    fn set_slot(&mut self, pos: usize, s: u64) {
+        debug_assert!(pos < self.nslots());
+        // SAFETY: as `slot`, and the table is borrowed mutably.
+        unsafe { *self.slots.as_ptr().add(pos) = s }
+    }
+
+    /// Give the slot words back: the table is small again.
+    fn free_slots(&mut self) {
+        let n = self.nslots();
+        if n != 0 {
+            // SAFETY: the boxed slice `alloc_slots` made, of `n` words,
+            // which nothing else refers to.
+            drop(unsafe {
+                Box::from_raw(std::ptr::slice_from_raw_parts_mut(self.slots.as_ptr(), n))
+            });
+            self.slots = std::ptr::NonNull::dangling();
+            self.shift = 64;
+        }
+    }
+
+    /// A copy of the slot words (to go with a copy of `shift`).
+    fn clone_slots(&self) -> std::ptr::NonNull<u64> {
+        let n = self.nslots();
+        if n == 0 {
+            return std::ptr::NonNull::dangling();
+        }
+        let copy = alloc_slots(n);
+        // SAFETY: two allocations of `n` words each.
+        unsafe { std::ptr::copy_nonoverlapping(self.slots.as_ptr(), copy.as_ptr(), n) };
+        copy
     }
 
     /// The entry index of position `i` (past the entries for a position
@@ -820,7 +918,7 @@ impl<V> Table<V> {
     #[inline(always)]
     fn make_dense(&mut self) {
         if self.dead != 0 {
-            self.compact(self.slots.len());
+            self.compact(self.nslots());
         }
     }
 
@@ -893,12 +991,12 @@ impl<V> Table<V> {
 
     fn reserve_slots(&mut self, additional: usize) {
         let want = self.entries.len().saturating_add(additional);
-        if want > SMALL && (want * 3 > self.slots.len() * 2) {
+        if want > SMALL && (want * 3 > self.nslots() * 2) {
             if self.dead != 0 {
                 // Tombstones took the room: close them up (see
                 // `push_growing`).
                 let keys = self.len().saturating_add(additional);
-                self.compact(slots_for(keys + keys / 2).max(self.slots.len()));
+                self.compact(slots_for(keys + keys / 2).max(self.nslots()));
                 return;
             }
             self.rebuild_slots(slots_for(want));
@@ -910,9 +1008,8 @@ impl<V> Table<V> {
         self.make_dense();
         self.entries.shrink_to_fit();
         if self.entries.len() <= SMALL {
-            self.slots = Box::new([]);
-            self.shift = 64;
-        } else if slots_for(self.entries.len()) < self.slots.len() {
+            self.free_slots();
+        } else if slots_for(self.entries.len()) < self.nslots() {
             self.rebuild_slots(slots_for(self.entries.len()));
         }
     }
@@ -927,8 +1024,8 @@ impl<V> Table<V> {
         // cost about 100 ns (glibc's AVX-512 `memset` stores through a mask
         // there, apparently taking a microcode assist for the unmapped
         // page).
-        if !self.slots.is_empty() {
-            self.slots.fill(0);
+        if !self.is_small() {
+            self.slot_words_mut().fill(0);
         }
         self.forget_tombstones();
     }
@@ -952,7 +1049,8 @@ impl<V> Table<V> {
             n <= 1 << 32 && self.entries.len() < IX_MASK as usize,
             "dict too large"
         );
-        self.slots = vec![0u64; n].into_boxed_slice();
+        self.free_slots();
+        self.slots = alloc_slots(n);
         self.shift = 64 - n.trailing_zeros();
         let mask = n - 1;
         let holed = self.dead != 0;
@@ -964,10 +1062,10 @@ impl<V> Table<V> {
             let mut pos = (m >> self.shift) as usize;
             // SAFETY: `pos` is masked into the table throughout.
             unsafe {
-                while *self.slots.get_unchecked(pos) != 0 {
+                while *self.slots.as_ptr().add(pos) != 0 {
                     pos = (pos + 1) & mask;
                 }
-                *self.slots.get_unchecked_mut(pos) = (m & !IX_MASK) | (i as u64 + 1);
+                *self.slots.as_ptr().add(pos) = (m & !IX_MASK) | (i as u64 + 1);
             }
         }
     }
@@ -975,17 +1073,17 @@ impl<V> Table<V> {
     /// Re-derive the slots after the entries were reordered or dropped in
     /// bulk.
     fn reindex(&mut self) {
-        if self.slots.is_empty() {
+        if self.is_small() {
             return;
         }
-        self.rebuild_slots(self.slots.len());
+        self.rebuild_slots(self.nslots());
     }
 
     /// The entry equal to `key` with hash `hash`, or, on a miss, `Err` with
     /// the empty slot where it would go (unused for a small table).
     #[inline(always)]
     fn find_hashed<Q: Probe + ?Sized>(&self, hash: i64, key: &Q) -> Result<usize, usize> {
-        if self.slots.is_empty() {
+        if self.is_small() {
             for (i, b) in self.entries.iter().enumerate() {
                 if b.hash == hash && key.probe_eq(&b.key) {
                     return Ok(i);
@@ -994,13 +1092,13 @@ impl<V> Table<V> {
             return Err(0);
         }
         let m = mix(hash);
-        let mask = self.slots.len() - 1;
+        let mask = self.slot_mask();
         let mut pos = (m >> self.shift) as usize;
         loop {
             // SAFETY: `pos` is masked into the table, and a nonzero slot
             // holds a live entry index plus one.
             unsafe {
-                let s = *self.slots.get_unchecked(pos);
+                let s = *self.slots.as_ptr().add(pos);
                 if s == 0 {
                     return Err(pos);
                 }
@@ -1020,13 +1118,13 @@ impl<V> Table<V> {
     #[inline]
     fn slot_of(&self, hash: i64, ix: usize) -> usize {
         let m = mix(hash);
-        let mask = self.slots.len() - 1;
+        let mask = self.slot_mask();
         let mut pos = (m >> self.shift) as usize;
         let want = ix as u64 + 1;
         loop {
             // SAFETY: masked into the table; entry `ix` is present, so
             // the walk ends at its slot before any empty one.
-            let s = unsafe { *self.slots.get_unchecked(pos) };
+            let s = unsafe { *self.slots.as_ptr().add(pos) };
             debug_assert!(s != 0, "entry {ix} has no slot");
             if s & IX_MASK == want {
                 return pos;
@@ -1037,11 +1135,11 @@ impl<V> Table<V> {
 
     /// Free slot `pos`, shifting back the run after it (no tombstones).
     fn erase_slot(&mut self, mut pos: usize) {
-        let mask = self.slots.len() - 1;
+        let mask = self.slot_mask();
         let bits = 64 - self.shift;
         let mut next = (pos + 1) & mask;
         loop {
-            let s = self.slots[next];
+            let s = self.slot(next);
             if s == 0 {
                 break;
             }
@@ -1049,19 +1147,19 @@ impl<V> Table<V> {
             // The entry at `next` may fill the hole when its home is not
             // strictly between the hole and itself.
             if (next.wrapping_sub(home) & mask) >= (next.wrapping_sub(pos) & mask) {
-                self.slots[pos] = s;
+                self.set_slot(pos, s);
                 pos = next;
             }
             next = (next + 1) & mask;
         }
-        self.slots[pos] = 0;
+        self.set_slot(pos, 0);
     }
 
     /// Point the slot of entry `from` (hash `hash`) at entry `to`.
     #[inline]
     fn repoint(&mut self, hash: i64, from: usize, to: usize) {
         let pos = self.slot_of(hash, from);
-        self.slots[pos] = (self.slots[pos] & !IX_MASK) | (to as u64 + 1);
+        self.set_slot(pos, (self.slot(pos) & !IX_MASK) | (to as u64 + 1));
     }
 
     // ----------------------------------------------------------------
@@ -1077,7 +1175,7 @@ impl<V> Table<V> {
     /// The entry of the key equal to `key`.
     #[inline]
     fn find<Q: Probe + ?Sized>(&self, key: &Q) -> Option<usize> {
-        if self.slots.is_empty() {
+        if self.is_small() {
             if self.entries.is_empty() {
                 return None;
             }
@@ -1120,7 +1218,7 @@ impl<V> Table<V> {
     /// it), `None` undecided.
     #[inline(always)]
     pub fn find_native<E: NativeEq>(&self, hash: i64, eq: &E) -> Option<Result<usize, usize>> {
-        if self.slots.is_empty() {
+        if self.is_small() {
             for (i, b) in self.entries.iter().enumerate() {
                 if b.hash == hash && eq.native_eq(&b.key)? {
                     return Some(Ok(i));
@@ -1129,12 +1227,12 @@ impl<V> Table<V> {
             return Some(Err(0));
         }
         let m = mix(hash);
-        let mask = self.slots.len() - 1;
+        let mask = self.slot_mask();
         let mut pos = (m >> self.shift) as usize;
         loop {
             // SAFETY: as in `find_hashed`.
             unsafe {
-                let s = *self.slots.get_unchecked(pos);
+                let s = *self.slots.as_ptr().add(pos);
                 if s == 0 {
                     return Some(Err(pos));
                 }
@@ -1213,17 +1311,17 @@ impl<V> Table<V> {
         if i == self.entries.capacity() {
             return false;
         }
-        if self.slots.is_empty() {
+        if self.is_small() {
             if i >= SMALL {
                 return false;
             }
         } else {
-            if (i + 1) * 3 > self.slots.len() * 2 || i >= IX_MASK as usize - 1 {
+            if (i + 1) * 3 > self.nslots() * 2 || i >= IX_MASK as usize - 1 {
                 return false;
             }
             // SAFETY: `pos` is an empty slot inside the table.
             unsafe {
-                *self.slots.get_unchecked_mut(pos) = (mix(hash) & !IX_MASK) | (i as u64 + 1);
+                *self.slots.as_ptr().add(pos) = (mix(hash) & !IX_MASK) | (i as u64 + 1);
             }
         }
         // SAFETY: `i` is below the capacity (checked); the length covers
@@ -1273,7 +1371,7 @@ impl<V> Table<V> {
     /// [`Self::find`], always in line.
     #[inline(always)]
     fn find_hot<Q: Probe + ?Sized>(&self, key: &Q) -> Option<usize> {
-        if self.slots.is_empty() {
+        if self.is_small() {
             if self.entries.is_empty() {
                 return None;
             }
@@ -1405,15 +1503,15 @@ impl<V> Table<V> {
     #[inline(always)]
     fn push_at(&mut self, pos: usize, hash: i64, key: DictKey, value: V) -> usize {
         let i = self.entries.len();
-        if self.slots.is_empty() {
+        if self.is_small() {
             if i < SMALL {
                 self.entries.push(Bucket { hash, key, value });
                 return i;
             }
-        } else if (i + 1) * 3 <= self.slots.len() * 2 && i < IX_MASK as usize - 1 {
+        } else if (i + 1) * 3 <= self.nslots() * 2 && i < IX_MASK as usize - 1 {
             // SAFETY: `pos` is an empty slot inside the table.
             unsafe {
-                *self.slots.get_unchecked_mut(pos) = (mix(hash) & !IX_MASK) | (i as u64 + 1);
+                *self.slots.as_ptr().add(pos) = (mix(hash) & !IX_MASK) | (i as u64 + 1);
             }
             self.entries.push(Bucket { hash, key, value });
             return i;
@@ -1433,15 +1531,15 @@ impl<V> Table<V> {
             self.drop_tombstones();
             let i = self.entries.len();
             self.entries.push(bucket);
-            self.rebuild_slots(slots_for(keys + keys / 2).max(self.slots.len()));
+            self.rebuild_slots(slots_for(keys + keys / 2).max(self.nslots()));
             return i;
         }
         let i = self.entries.len();
         assert!(i < IX_MASK as usize - 1, "dict too large");
-        let n = if self.slots.is_empty() {
+        let n = if self.is_small() {
             slots_for(i + 1)
         } else {
-            self.slots.len() * 2
+            self.nslots() * 2
         };
         self.entries.push(bucket);
         self.rebuild_slots(n);
@@ -1497,13 +1595,13 @@ impl<V> Table<V> {
     /// Append `key` with Python hash `hash` without looking for an equal
     /// key: the caller knows there is none. Its position.
     pub fn insert_unique_hashed(&mut self, hash: i64, key: DictKey, value: V) -> usize {
-        if self.slots.is_empty() {
+        if self.is_small() {
             return self.push_at(0, hash, key, value);
         }
         let m = mix(hash);
-        let mask = self.slots.len() - 1;
+        let mask = self.slot_mask();
         let mut pos = (m >> self.shift) as usize;
-        while self.slots[pos] != 0 {
+        while self.slot(pos) != 0 {
             pos = (pos + 1) & mask;
         }
         self.push_last(pos, hash, key, value)
@@ -1544,7 +1642,7 @@ impl<V> Table<V> {
     /// Remove entry `p`, moving the last entry into its place.
     fn swap_remove_entry(&mut self, p: usize) -> (DictKey, V) {
         let n = self.entries.len();
-        if !self.slots.is_empty() {
+        if !self.is_small() {
             let pos = self.slot_of(self.entries[p].hash, p);
             self.erase_slot(pos);
             if p != n - 1 {
@@ -1578,16 +1676,16 @@ impl<V> Table<V> {
     ) -> Option<(DictKey, V)> {
         let i = self.entry_of(i);
         let old = self.entries.get(i)?.hash;
-        if !self.slots.is_empty() {
+        if !self.is_small() {
             let pos = self.slot_of(old, i);
             self.erase_slot(pos);
             let m = mix(hash);
-            let mask = self.slots.len() - 1;
+            let mask = self.slot_mask();
             let mut pos = (m >> self.shift) as usize;
-            while self.slots[pos] != 0 {
+            while self.slot(pos) != 0 {
                 pos = (pos + 1) & mask;
             }
-            self.slots[pos] = (m & !IX_MASK) | (i as u64 + 1);
+            self.set_slot(pos, (m & !IX_MASK) | (i as u64 + 1));
         }
         let b = std::mem::replace(&mut self.entries[i], Bucket { hash, key, value });
         Some((b.key, b.value))
@@ -1599,7 +1697,7 @@ impl<V> Table<V> {
         if n == 0 {
             return None;
         }
-        if !self.slots.is_empty() {
+        if !self.is_small() {
             let pos = self.slot_of(self.entries[n - 1].hash, n - 1);
             self.erase_slot(pos);
         }
@@ -1647,7 +1745,7 @@ impl<V> Table<V> {
         self.reindex();
         let mut out = Self {
             entries: tail,
-            slots: Box::new([]),
+            slots: std::ptr::NonNull::dangling(),
             shift: 64,
             dead: 0,
             holes: None,
@@ -1676,7 +1774,7 @@ impl<V> Table<V> {
     /// Move entry `from` to position `to`, shifting the ones between, in
     /// a table without tombstones.
     fn rotate_index(&mut self, from: usize, to: usize) {
-        if self.slots.is_empty() {
+        if self.is_small() {
             if from < to {
                 self.entries[from..=to].rotate_left(1);
             } else {
@@ -1697,7 +1795,7 @@ impl<V> Table<V> {
             } else {
                 k + 1
             };
-            self.slots[pos] = (self.slots[pos] & !IX_MASK) | (new as u64 + 1);
+            self.set_slot(pos, (self.slot(pos) & !IX_MASK) | (new as u64 + 1));
         }
         if from < to {
             self.entries[from..=to].rotate_left(1);
@@ -1712,11 +1810,11 @@ impl<V> Table<V> {
             return;
         }
         let (a, b) = (self.entry_of(a), self.entry_of(b));
-        if !self.slots.is_empty() {
+        if !self.is_small() {
             let pa = self.slot_of(self.entries[a].hash, a);
             let pb = self.slot_of(self.entries[b].hash, b);
-            self.slots[pa] = (self.slots[pa] & !IX_MASK) | (b as u64 + 1);
-            self.slots[pb] = (self.slots[pb] & !IX_MASK) | (a as u64 + 1);
+            self.set_slot(pa, (self.slot(pa) & !IX_MASK) | (b as u64 + 1));
+            self.set_slot(pb, (self.slot(pb) & !IX_MASK) | (a as u64 + 1));
         }
         self.entries.swap(a, b);
     }
@@ -1804,12 +1902,14 @@ impl<V> Table<V> {
 
     pub fn into_keys(mut self) -> impl DoubleEndedIterator<Item = DictKey> + ExactSizeIterator {
         self.drop_tombstones();
-        self.entries.into_iter().map(|b| b.key)
+        std::mem::take(&mut self.entries).into_iter().map(|b| b.key)
     }
 
     pub fn into_values(mut self) -> impl DoubleEndedIterator<Item = V> + ExactSizeIterator {
         self.drop_tombstones();
-        self.entries.into_iter().map(|b| b.value)
+        std::mem::take(&mut self.entries)
+            .into_iter()
+            .map(|b| b.value)
     }
 }
 
@@ -1831,14 +1931,14 @@ impl<V: Vacant> Table<V> {
             let b = self.entries.remove(p);
             // Renumber the entries that moved down: one slot walk each
             // when few moved, else one pass over the table.
-            if moved * 4 <= self.slots.len() {
+            if moved * 4 <= self.nslots() {
                 for j in p..n - 1 {
                     let h = self.entries[j].hash;
                     self.repoint(h, j + 1, j);
                 }
             } else {
                 let above = p as u64 + 1;
-                for s in self.slots.iter_mut() {
+                for s in self.slot_words_mut() {
                     if *s & IX_MASK > above {
                         *s -= 1;
                     }
@@ -1860,7 +1960,7 @@ impl<V: Vacant> Table<V> {
         // More tombstones than keys: close them up (a pass over the keys,
         // paid for by the removals that made the tombstones).
         if self.dead as usize > self.len() + SHIFT_MAX {
-            self.compact(self.slots.len());
+            self.compact(self.nslots());
         }
         (b.key, b.value)
     }
@@ -1868,7 +1968,7 @@ impl<V: Vacant> Table<V> {
     /// Remove entry `p` (see [`Self::remove_entry`]).
     #[inline]
     fn take(&mut self, p: usize, lazy: bool) -> (DictKey, V) {
-        if self.slots.is_empty() {
+        if self.is_small() {
             let b = self.entries.remove(p);
             return (b.key, b.value);
         }
@@ -1946,7 +2046,7 @@ impl<V: Vacant> Table<V> {
         if from == to {
             return;
         }
-        if to == n - 1 && !self.slots.is_empty() {
+        if to == n - 1 && !self.is_small() {
             let p = self.entry_of(from);
             let hash = self.entries[p].hash;
             let (key, value) = self.remove_entry(p, true);
@@ -2280,7 +2380,7 @@ impl<V> IntoIterator for Table<V> {
 
     fn into_iter(mut self) -> IntoIter<V> {
         self.drop_tombstones();
-        IntoIter(self.entries.into_iter())
+        IntoIter(std::mem::take(&mut self.entries).into_iter())
     }
 }
 
@@ -2826,8 +2926,8 @@ mod tests {
             assert!(m.get_index(i).is_some_and(|(k, _)| k == key));
         }
         assert!(m.get_index(m.len()).is_none());
-        if !m.slots.is_empty() {
-            let used = m.slots.iter().filter(|s| **s != 0).count();
+        if !m.is_small() {
+            let used = m.slot_words().iter().filter(|s| **s != 0).count();
             assert_eq!(used, m.len());
         }
     }
@@ -3143,9 +3243,9 @@ mod tests {
         for i in 0..8 {
             m.insert(k(i), Object::Int(i));
         }
-        assert!(m.slots.is_empty());
+        assert!(m.is_small());
         m.insert(k(8), Object::Int(8));
-        assert!(!m.slots.is_empty());
+        assert!(!m.is_small());
         let c = m.clone();
         check(&c);
         assert_eq!(
