@@ -531,6 +531,8 @@ fn lookup_method_memo(obj: &Object, name: &str, tag: u8) -> Option<Object> {
             "write" => crate::leaf_builtins::register_fast(b, file_write_fast),
             "readline" => crate::leaf_builtins::register_fast(b, file_readline_fast),
             "getvalue" => crate::leaf_builtins::register_fast(b, file_getvalue_fast),
+            "read" => crate::leaf_builtins::register_fast(b, file_read_fast),
+            "readinto" => crate::leaf_builtins::register_fast(b, file_readinto_fast),
             _ => {}
         }
     }
@@ -19169,6 +19171,13 @@ fn file_write_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
         }
         [Object::File(f), Object::Bytes(b)] => (f.write_bytes_pure(b) || f.mem_bytes_append(b))
             .then(|| Ok(Object::Int(b.len() as i64))),
+        // (A buffer's bytes, read in place, into a `BytesIO`: the stream's
+        // own buffer is refused by the append, which can't borrow it.)
+        [Object::File(f), Object::ByteArray(b)] => {
+            let b = b.try_borrow().ok()?;
+            f.mem_bytes_append(&b)
+                .then(|| Ok(Object::Int(b.len() as i64)))
+        }
         _ => None,
     }
 }
@@ -19184,6 +19193,53 @@ fn file_getvalue_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
         return None;
     }
     f.getvalue().map(Ok)
+}
+
+/// `f.read([n])` of an open `BytesIO`: its bytes at the position, copied
+/// once into the result. A leaf half, like [`file_write_fast`].
+fn file_read_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let (f, n) = match args {
+        [Object::File(f)] | [Object::File(f), Object::None] => (f, None),
+        [Object::File(f), Object::Int(n)] => (f, usize::try_from(*n).ok()),
+        _ => return None,
+    };
+    f.mem_bytes_read_with(n, |run| (Object::new_bytes(run), run.len()))
+        .map(Ok)
+}
+
+/// `f.readinto(b)` of an open `BytesIO` into a `bytearray` no view
+/// exports, or a live, writable, contiguous `memoryview`: the bytes copied
+/// straight from the stream. A leaf half, like [`file_write_fast`].
+fn file_readinto_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::File(f), target] = args else {
+        return None;
+    };
+    let copied = match target {
+        Object::ByteArray(b) => {
+            let mut dst = b.try_borrow_mut().ok()?;
+            let room = dst.len();
+            f.mem_bytes_read_with(Some(room), |run| {
+                dst[..run.len()].copy_from_slice(run);
+                (run.len(), run.len())
+            })?
+        }
+        Object::MemoryView(mv)
+            if !mv.released.get() && !mv.readonly.get() && mv.is_c_contiguous() =>
+        {
+            let (start, room) = (mv.start.get(), mv.len.get());
+            mv.buffer
+                .with_write(|all| {
+                    let dst = all.get_mut(start..start + room)?;
+                    f.mem_bytes_read_with(Some(room), |run| {
+                        dst[..run.len()].copy_from_slice(run);
+                        (run.len(), run.len())
+                    })
+                })
+                .flatten()?
+        }
+        _ => return None,
+    };
+    Some(Ok(Object::Int(copied as i64)))
 }
 
 /// `f.readline()` when a whole line waits in the stream's buffer (see

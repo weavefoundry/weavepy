@@ -1998,6 +1998,14 @@ branch and pull request.
     (91 ns an item to 21, CPython 15). An ASCII string's run with a
     negative bound (`s[:-1]`) is copied once from the text, not through
     a vector of bytes (14 µs to 6 for 226,000 characters, CPython 6.2).
+  - `io.BytesIO` reads, `readinto` and writes after a seek went through
+    the file layer's general path (its sibling stream, read-ahead and
+    write-buffer checks, and a vector per read): `read(64)` 164 ns to 68
+    (CPython 62), `readinto` 154 to 54 (44), a write over earlier bytes
+    165 to 64 (46), and a `bytearray` written 146 to 62 (51). Each is
+    now a fast half on the stream's buffer, declining a closed stream,
+    one with bytes parked ahead, an exported buffer, and a stream read
+    into its own buffer.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

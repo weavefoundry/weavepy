@@ -8243,12 +8243,51 @@ impl PyFile {
         let Ok(mut b) = buf.try_borrow_mut() else {
             return false;
         };
-        if *pos != b.len() {
+        // (At the end: appended. Inside the buffer, after a seek: written
+        // over what is there, the buffer growing if the data runs past its
+        // end. Past the end is the full method's, which fills the gap.)
+        let at = *pos;
+        if at > b.len() {
             return false;
         }
-        b.extend_from_slice(data);
-        *pos = b.len();
+        let over = data.len().min(b.len() - at);
+        b[at..at + over].copy_from_slice(&data[..over]);
+        b.extend_from_slice(&data[over..]);
+        *pos = at + data.len();
         true
+    }
+
+    /// The open `BytesIO`'s bytes at its position, where they are: `f` on
+    /// up to `n` of them (all of them with `None`), the position then moved
+    /// past the `f`'s count. `None` for any other stream, a closed one, or
+    /// one with bytes parked ahead of it.
+    pub(crate) fn mem_bytes_read_with<R>(
+        &self,
+        n: Option<usize>,
+        f: impl FnOnce(&[u8]) -> (R, usize),
+    ) -> Option<R> {
+        if self.io_kind.get() != IoKind::BytesIO {
+            return None;
+        }
+        // SAFETY: guard-free views, each dropped at once (nothing here
+        // runs code).
+        if unsafe { self.closed.peek() }.is_none_or(|c| *c)
+            || unsafe { self.read_ahead.peek() }.is_none_or(|ra| ra.pending() != 0)
+        {
+            return None;
+        }
+        let mut backend = self.backend.try_borrow_mut().ok()?;
+        let FileBackend::MemBytes { data, pos } = &mut *backend else {
+            return None;
+        };
+        let d = data.try_borrow().ok()?;
+        let start = (*pos).min(d.len());
+        let end = n.map_or(d.len(), |n| start.saturating_add(n).min(d.len()));
+        let (r, used) = f(&d[start..end]);
+        if used > 0 {
+            *pos = start + used;
+        }
+        Some(r)
     }
 
     /// `sys.stdout.write(s)` when the text's bytes go to the shared sink as
