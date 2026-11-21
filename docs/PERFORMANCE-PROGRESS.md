@@ -2074,6 +2074,22 @@ branch and pull request.
     and the step ends as exhausted (0.93 µs). `next(it)` without a
     default still declines on such a step, since its full call raises
     the exception with its traceback and would repeat the stores.
+  - A named tuple built with a default filled in (`P(1)` of
+    `namedtuple(..., defaults=...)` or a `typing.NamedTuple` with a
+    default) or with keywords (`P(x=1, y=2)`) ran the generated
+    `__new__` as a frame and went through `object.__new__`'s seeding
+    (743 and 914 ns; CPython 228 and 340): the construction lanes now
+    place keywords by field name and take the rest from `__new__`'s
+    defaults as they stand, building the tuple directly (256 and 279
+    ns). A rebound `__defaults__` or `__new__`, and every call that
+    binds otherwise, still runs the function.
+  - The frameless `f(*args)` path took only plain functions given
+    their exact arity, so `obj.m(*args)` (a method read as an attribute
+    first) ran as a frame, and a spread short of the arity went through
+    the keyword binder: a bound method's receiver now binds first, and
+    trailing parameters come straight from the positional defaults
+    (`obj.m(*args)` 243 ns to 136, CPython 87; `f(*(1,))` with a
+    default 84 to 74, CPython 45).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

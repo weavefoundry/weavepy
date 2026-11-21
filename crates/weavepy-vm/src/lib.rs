@@ -11813,30 +11813,91 @@ impl Interpreter {
     /// instance `tuple.__new__(cls, (a, b, c))` builds, without running
     /// the generated function. `None` (nothing done) for any other shape.
     #[inline]
-    fn instantiate_named_tuple(&mut self, cls: &Rc<TypeObject>, args: &[Object]) -> Option<Object> {
+    fn instantiate_named_tuple(
+        &mut self,
+        cls: &Rc<TypeObject>,
+        args: &[Object],
+        kwargs: &[(String, Object)],
+    ) -> Option<Object> {
         let plan = self.instance_plan(cls);
-        let (code, nfields) = plan.tuple_new?;
-        if args.len() != nfields {
-            return None;
-        }
-        let Some(Object::Function(f)) = &plan.user_new else {
-            return None;
-        };
-        // `__new__.__code__ = …` since registration, or a call observer
-        // that must see the function run.
-        // SAFETY: GIL-serialized raw read of the function's code cell; only
-        // the pointer is compared.
-        if unsafe { Rc::as_ptr(&*f.code.as_ptr()) } as usize != code
-            || crate::trace::any_observers_active()
-        {
-            return None;
-        }
-        let (inst, tracked) =
-            crate::stdlib::collections_native::new_named_tuple(cls, args.to_vec());
+        let items = Self::named_tuple_items(
+            &plan,
+            args,
+            &mut kwargs.iter().map(|(k, v)| (k.as_str(), v)),
+        )?;
+        let (inst, tracked) = crate::stdlib::collections_native::new_named_tuple(cls, items);
         if tracked && gc_trace::maybe_auto_collect() {
             self.run_pending_finalizers();
         }
         Some(inst)
+    }
+
+    /// The items `cls(*positional, **kw)` gives a named tuple class whose
+    /// plan has its generated `__new__` (see
+    /// [`Self::instantiate_named_tuple`]): the positionals, each keyword
+    /// at its field, and the function's defaults (its `__defaults__` as
+    /// it stands) for the fields left. `None` for any call that binds
+    /// otherwise (too many arguments, an unknown or repeated name, a
+    /// field nothing fills), which the generated function then reports,
+    /// and while the function's code was replaced or an observer must see
+    /// it run.
+    fn named_tuple_items<'k>(
+        plan: &crate::types::InstancePlan,
+        positional: &[Object],
+        kw: &mut dyn Iterator<Item = (&'k str, &'k Object)>,
+    ) -> Option<Vec<Object>> {
+        let (code, nfields) = plan.tuple_new?;
+        let Some(Object::Function(f)) = &plan.user_new else {
+            return None;
+        };
+        // SAFETY: GIL-serialized raw read of the function's code cell.
+        let code_rc = unsafe { &*f.code.as_ptr() };
+        if Rc::as_ptr(code_rc) as usize != code
+            || crate::trace::any_observers_active()
+            || positional.len() > nfields
+        {
+            return None;
+        }
+        let mut items: Vec<Object> = Vec::with_capacity(nfields);
+        crate::object::extend_cloned(&mut items, positional);
+        let mut kw = kw.peekable();
+        if items.len() == nfields && kw.peek().is_none() {
+            return Some(items);
+        }
+        // (Unfilled fields hold `Unbound` until the keywords and defaults
+        // have been placed.)
+        items.resize(nfields, Object::Unbound);
+        let names = code_rc.varnames.get(1..=nfields)?;
+        for (name, value) in kw {
+            let at = names.iter().position(|n| n.as_str() == name)?;
+            if !matches!(items[at], Object::Unbound) {
+                return None;
+            }
+            items[at] = value.clone();
+        }
+        if items.iter().any(|v| matches!(v, Object::Unbound)) {
+            let overridden;
+            let defaults: &[Object] = if f.defaults_maybe_overridden() {
+                match f.slot("__defaults__") {
+                    None => &f.defaults,
+                    Some(Object::Tuple(t)) => {
+                        overridden = t;
+                        &overridden
+                    }
+                    Some(Object::None) => &[],
+                    Some(_) => return None,
+                }
+            } else {
+                &f.defaults
+            };
+            let first = nfields.checked_sub(defaults.len())?;
+            for (i, v) in items.iter_mut().enumerate() {
+                if matches!(v, Object::Unbound) {
+                    *v = defaults.get(i.checked_sub(first)?)?.clone();
+                }
+            }
+        }
+        Some(items)
     }
 
     fn instantiate_plain_lean(
@@ -20118,10 +20179,18 @@ impl Interpreter {
         let Some(cs) = n.checked_sub(4) else {
             return false;
         };
-        let [Object::Function(f), Object::Unbound, Object::Tuple(items), mapping] =
-            &frame.stack[cs..]
-        else {
+        let [callee, Object::Unbound, Object::Tuple(items), mapping] = &frame.stack[cs..] else {
             return false;
+        };
+        // A function, or a bound method of one (`obj.m(*args)`, which
+        // loads the method as an attribute): its receiver first.
+        let (f, head): (&Rc<PyFunction>, &[Object]) = match callee {
+            Object::Function(f) => (f, &[]),
+            Object::BoundMethod(bm) if !bm.redispatch_descriptor => match &bm.function {
+                Object::Function(f) => (f, std::slice::from_ref(&bm.receiver)),
+                _ => return false,
+            },
+            _ => return false,
         };
         let kw = match mapping {
             Object::Unbound => None,
@@ -20151,26 +20220,44 @@ impl Interpreter {
         }
         let mut ptrs: [*const Object; 8] = [std::ptr::null(); 8];
         let arity = leaf_arity(code);
+        let given = head.len() + items.len();
         if kw.is_none()
-            && items.len() == code.arg_count as usize
+            && given == code.arg_count as usize
             && !code.has_varargs
             && !code.has_varkeywords
             && arity <= 8
         {
             // The common exact shape: the items in order, any keyword-only
             // parameters from their defaults.
-            for (p, a) in ptrs.iter_mut().zip(items.iter()) {
+            for (p, a) in ptrs.iter_mut().zip(head.iter().chain(items.iter())) {
                 *p = a;
             }
             if code.kwonly_count != 0 && leaf_kwonly_defaults(f, code, &mut ptrs, 0).is_none() {
                 return false;
+            }
+        } else if let Some(missing) = (kw.is_none()
+            && code.kwonly_count == 0
+            && !code.has_varargs
+            && !code.has_varkeywords
+            && arity <= 8)
+            .then(|| Self::missing_defaults(f, code, given))
+            .flatten()
+        {
+            // Fewer items: the trailing parameters from the function's
+            // positional defaults.
+            for (p, a) in ptrs.iter_mut().zip(head.iter().chain(items.iter())) {
+                *p = a;
+            }
+            let defaults = &f.defaults[f.defaults.len() - missing..];
+            for (p, d) in ptrs[given..given + missing].iter_mut().zip(defaults) {
+                *p = d;
             }
         } else {
             let kw = kw
                 .into_iter()
                 .flat_map(|d| d.iter())
                 .map(|(k, v)| (&k.0, v));
-            if Self::leaf_bind_keywords(f, code, &[], items, kw, &mut ptrs).is_none() {
+            if Self::leaf_bind_keywords(f, code, head, items, kw, &mut ptrs).is_none() {
                 return false;
             }
         }
@@ -20712,6 +20799,41 @@ impl Interpreter {
             return false;
         };
         let values = &frame.stack[len - 1 - kwc..len - 1];
+        // A named tuple: its items placed by field name (see
+        // `named_tuple_items`).
+        if let Object::Type(ty) = &frame.stack[callee_slot] {
+            if !ty.flags.is_builtin
+                && ty.native_kind.get() == 0
+                && matches!(frame.stack[callee_slot + 1], Object::Unbound)
+                && Self::metaclass_calls_like_type(ty)
+            {
+                let ty = ty.clone();
+                let plan = self.instance_plan(&ty);
+                let mut kw = names.iter().zip(values).map(|(k, v)| match k {
+                    Object::Str(k) => (&**k, v),
+                    _ => ("", v),
+                });
+                if let Some(fields) = plan.tuple_new.and_then(|_| {
+                    Self::named_tuple_items(
+                        &plan,
+                        &frame.stack[callee_slot + 2..len - 1 - kwc],
+                        &mut kw,
+                    )
+                }) {
+                    drop(plan);
+                    let (inst, tracked) =
+                        crate::stdlib::collections_native::new_named_tuple(&ty, fields);
+                    self.release_call_operands(&mut frame.stack, callee_slot);
+                    frame.stack.push(inst);
+                    frame.pc = pc as u32 + 1;
+                    if tracked && gc_trace::maybe_auto_collect() {
+                        self.run_pending_finalizers();
+                    }
+                    return true;
+                }
+            }
+        }
+        let values = &frame.stack[len - 1 - kwc..len - 1];
         self.core_new_bind(
             sw,
             pc,
@@ -20964,11 +21086,34 @@ impl Interpreter {
         {
             // SAFETY: GIL-serialized raw read of the function's code cell;
             // only the pointer is compared.
-            if argc == nfields && unsafe { Rc::as_ptr(&*f.code.as_ptr()) } as usize == code {
+            let same = unsafe { Rc::as_ptr(&*f.code.as_ptr()) } as usize == code;
+            if argc == nfields && same && !crate::trace::any_observers_active() {
                 let fields: Vec<Object> = frame.stack.drain(self_slot + 1..).collect();
                 let (inst, tracked) =
                     crate::stdlib::collections_native::new_named_tuple(&ty, fields);
                 frame.stack.truncate(callee_slot);
+                frame.stack.push(inst);
+                frame.pc = pc as u32 + 1;
+                if tracked && gc_trace::maybe_auto_collect() {
+                    self.run_pending_finalizers();
+                }
+                return true;
+            }
+            // (Fewer arguments: the rest from the function's defaults.)
+            if let Some(fields) = (argc < nfields)
+                .then(|| {
+                    Self::named_tuple_items(
+                        &plan,
+                        &frame.stack[self_slot + 1..],
+                        &mut std::iter::empty(),
+                    )
+                })
+                .flatten()
+            {
+                let (inst, tracked) =
+                    crate::stdlib::collections_native::new_named_tuple(&ty, fields);
+                // (The operands leave as the generic call releases them.)
+                self.release_call_operands(&mut frame.stack, callee_slot);
                 frame.stack.push(inst);
                 frame.pc = pc as u32 + 1;
                 if tracked && gc_trace::maybe_auto_collect() {
@@ -66559,10 +66704,12 @@ impl Interpreter {
                 return r;
             }
         }
-        if kwargs.is_empty() && !cls.flags.is_builtin {
-            if let Some(r) = self.instantiate_named_tuple(&cls, args) {
+        if !cls.flags.is_builtin {
+            if let Some(r) = self.instantiate_named_tuple(&cls, args, kwargs) {
                 return Ok(r);
             }
+        }
+        if kwargs.is_empty() && !cls.flags.is_builtin {
             if let Some(r) = self.instantiate_plain_lean(&cls, args) {
                 return r;
             }
