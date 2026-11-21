@@ -1271,6 +1271,30 @@ impl crate::types::PyInstance {
     ///
     /// As [`crate::sync::GilCell::peek`].
     #[inline(always)]
+    /// The value at position `i` of the instance's published dictionary
+    /// (one its `__dict__` made), when the key there is still `name`.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::sync::GilCell::peek`]: the view ends before anything
+    /// that could store an attribute runs.
+    #[inline]
+    pub unsafe fn published_field(&self, i: usize, name: &Object) -> Option<&Object> {
+        let Object::Str(name) = name else {
+            return None;
+        };
+        // SAFETY: forwarded contract.
+        let d = unsafe { self.dict.published()?.peek() }?;
+        match d.get_index(i)? {
+            (DictKey(Object::Str(k)), v)
+                if std::ptr::eq(k.as_ptr(), name.as_ptr()) || **k == **name =>
+            {
+                Some(v)
+            }
+            _ => None,
+        }
+    }
+
     pub unsafe fn split_field(&self, i: usize) -> Option<&Object> {
         let keys: *const SharedKeys = self.cls_raw().shared_keys.get()?;
         // SAFETY: forwarded contract.

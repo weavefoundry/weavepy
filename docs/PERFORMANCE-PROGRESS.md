@@ -2107,6 +2107,15 @@ branch and pull request.
     The core loop's lazy step now takes `chain` first, and the active
     list, tuple or range cursor is read and stepped in one call (173
     instructions; 4.2 µs).
+  - A compiled frameless leaf (a getter, a `__hash__`, a comparison)
+    cached where an instance keeps a field only for split layouts. An
+    instance whose `__dict__` was materialized (a `cached_property`
+    computed, `vars(obj).update(...)`, anything `copy` or `pickle`
+    rebuilt) resolved the field by name and checked its class on every
+    read, about 500 instructions (`hash(obj)` of `return hash(self.x)`
+    151 ns against 105 for a split instance). Its position in the
+    published dictionary is cached too and checked by name as read
+    (116 ns).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

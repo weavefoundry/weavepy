@@ -575,6 +575,11 @@ unsafe extern "C" fn h_field<const EFFECT: bool>(
                 let hit = unsafe {
                     if idx & SLOT_FIELD != 0 {
                         inst.laid_out_slot((idx & !SLOT_FIELD) as usize)
+                    } else if idx & DICT_FIELD != 0 {
+                        let (_, ext, _) = (*fr).parts();
+                        ext.name_objs
+                            .get((pc_name >> 16) as usize)
+                            .and_then(|n| inst.published_field((idx & !DICT_FIELD) as usize, n))
                     } else {
                         inst.split_field(idx as usize)
                     }
@@ -603,7 +608,11 @@ unsafe extern "C" fn h_field<const EFFECT: bool>(
         // The instance's own field (not a class value or descriptor),
         // from its split layout.
         let found = match Interpreter::leaf_resolve_instance_attr_ix(code, inst, pc_name >> 16) {
-            Some((_, Some(idx))) => inst.dict.published().is_none().then_some((idx, 0)),
+            // (A published dictionary's position, checked by name as read.)
+            Some((_, Some(idx))) if inst.dict.published().is_some() => {
+                (idx & (SLOT_FIELD | DICT_FIELD) == 0).then_some((idx | DICT_FIELD, 0))
+            }
+            Some((_, Some(idx))) => Some((idx, 0)),
             // A class value or descriptor.
             Some(_) => None,
             // A `__slots__` member laid out over its class's names.
@@ -625,6 +634,12 @@ unsafe extern "C" fn h_field<const EFFECT: bool>(
 /// class's slot layout (see [`crate::types::PyInstance::laid_out_slot`])
 /// rather than a split field's.
 const SLOT_FIELD: u32 = 1 << 31;
+
+/// A [`FieldCache`] position in the instance's published dictionary (see
+/// [`crate::types::PyInstance::published_field`]), which the read checks
+/// by name. Native code's in-line read never takes one: it reads split
+/// values only.
+const DICT_FIELD: u32 = 1 << 30;
 
 /// Where `inst` keeps the attribute `code.names[name]` when reading it
 /// means reading a `__slots__` member its class (at version `ver`) lays
