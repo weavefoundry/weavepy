@@ -789,20 +789,11 @@ pub fn utf16_decode(
     if (data.len() - start).is_multiple_of(2) {
         // (ASCII text, the commonest: each unit's low byte is its
         // character.)
-        let (lo, hi) = if big { (1, 0) } else { (0, 1) };
         let body = &data[start..];
-        // (Every high byte and every low byte's top bit, gathered without
-        // a branch: zero means ASCII.)
-        let pairs = body.as_chunks::<2>().0;
-        let stray = pairs
-            .iter()
-            .fold(0u8, |acc, pair| acc | pair[hi] | (pair[lo] & 0x80));
-        if stray == 0 {
-            let text: Vec<u8> = pairs.iter().map(|pair| pair[lo]).collect();
-            if let Some(text) = well_formed_text(&text) {
-                return Ok((text, data.len(), byteorder));
-            }
+        if let Some(text) = utf16_ascii(body, big) {
+            return Ok((text, data.len(), byteorder));
         }
+        let pairs = body.as_chunks::<2>().0;
         let units = pairs.iter().map(|pair| {
             if big {
                 u16::from_be_bytes(*pair)
@@ -973,6 +964,61 @@ pub fn ascii_decode(data: &[u8], errors: &str) -> Result<(Object, usize), Runtim
 
 /// The `str` of bytes that are well-formed UTF-8 (ASCII text is born
 /// knowing its length in characters); `None` for any other bytes.
+/// UTF-16 `body` (whole units, little-endian unless `big`) that is all
+/// ASCII, as the `str` of its low bytes: checked eight bytes at a time
+/// (every high byte and every low byte's top bit clear), then each word's
+/// four low bytes packed straight into the string. `None` for any other
+/// text.
+fn utf16_ascii(body: &[u8], big: bool) -> Option<Object> {
+    use crate::shared_value::SharedStr;
+    let (words, tail) = body.as_chunks::<8>();
+    // (A unit's high byte, and its low byte's top bit, in a word read
+    // little-endian.)
+    let mask: u64 = if big {
+        0x80FF_80FF_80FF_80FF
+    } else {
+        0xFF80_FF80_FF80_FF80
+    };
+    let stray = words
+        .iter()
+        .fold(0u64, |acc, w| acc | (u64::from_le_bytes(*w) & mask));
+    let tail_units = tail.as_chunks::<2>().0;
+    let (lo, hi) = if big { (1, 0) } else { (0, 1) };
+    let tail_stray = tail_units
+        .iter()
+        .fold(0u8, |acc, pair| acc | pair[hi] | (pair[lo] & 0x80));
+    if stray != 0 || tail_stray != 0 {
+        return None;
+    }
+    let len = body.len() / 2;
+    if len <= 2 {
+        let text: Vec<u8> = body
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| pair[lo])
+            .collect();
+        return well_formed_text(&text);
+    }
+    let shift = if big { 8 } else { 0 };
+    // SAFETY: every byte written is ASCII (checked above), `len` of them,
+    // one code point each.
+    let text = unsafe {
+        SharedStr::build_unchecked(len, Some(len), |out| {
+            for w in words {
+                let mut x = (u64::from_le_bytes(*w) >> shift) & 0x00FF_00FF_00FF_00FF;
+                x = (x | (x >> 8)) & 0x0000_FFFF_0000_FFFF;
+                x = (x | (x >> 16)) & 0x0000_0000_FFFF_FFFF;
+                out.push(&(x as u32).to_le_bytes());
+            }
+            for pair in tail_units {
+                out.push_byte(pair[lo]);
+            }
+        })
+    };
+    Some(Object::Str(text))
+}
+
 fn well_formed_text(data: &[u8]) -> Option<Object> {
     use crate::shared_value::SharedStr;
     if data.is_ascii() {

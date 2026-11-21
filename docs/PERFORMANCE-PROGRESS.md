@@ -2146,6 +2146,11 @@ branch and pull request.
     dunder (`len(deque)`) looked the dunder up along the MRO on every
     call (190 of the 270 instructions a `len(dq)` cost): the class now
     caches the builtin it resolves per version.
+  - UTF-16 decoding of ASCII text checked each unit, gathered the low
+    bytes into a vector, then validated and copied them into the string
+    (110 KB 47 µs, CPython 19): it now checks eight bytes at a time and
+    packs each word's four low bytes straight into the string's
+    allocation (22.5 µs).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
