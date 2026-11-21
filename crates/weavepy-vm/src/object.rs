@@ -13584,7 +13584,9 @@ impl Object {
             }),
             Object::MemoryView(mv) => {
                 if mv.released.get() {
-                    return Err(value_error("memoryview: released"));
+                    return Err(value_error(
+                        "operation forbidden on released memoryview object",
+                    ));
                 }
                 // CPython's `memoryiter` yields *format-unpacked elements*
                 // (an `int64` exporter iterates as Python ints, `'d'` as
@@ -13597,6 +13599,37 @@ impl Object {
                     return Err(crate::error::not_implemented_error(
                         "multi-dimensional sub-views are not implemented",
                     ));
+                }
+                // A plain byte view of a `bytes` object: its bytes, which
+                // can't change, stepped as the `bytes` object's would be
+                // (no object made for each element first).
+                if let (Some((start, len)), MemoryViewBuffer::Bytes(all)) =
+                    (crate::mv_plain_bytes(mv), &mv.buffer)
+                {
+                    // (The whole object shares its storage; a window is
+                    // copied.)
+                    let data = if start == 0 && len == all.len() {
+                        Some(all.clone())
+                    } else {
+                        all.get(start..start + len).map(SharedSlice::from)
+                    };
+                    if let Some(data) = data {
+                        return Ok(PyIterator::Bytes { data, index: 0 });
+                    }
+                }
+                // A plain byte view over a whole `bytearray` (which can't
+                // be resized while the view exports it): the bytearray's
+                // live iterator, which sees a store made mid-loop, as
+                // CPython's `memoryiter` does.
+                if let (Some((0, len)), MemoryViewBuffer::ByteArray(data)) =
+                    (crate::mv_plain_bytes(mv), &mv.buffer)
+                {
+                    if data.try_borrow().is_ok_and(|d| d.len() == len) {
+                        return Ok(PyIterator::ByteArray {
+                            data: data.clone(),
+                            index: 0,
+                        });
+                    }
                 }
                 let items = crate::mv_element_objects(mv)?;
                 Ok(PyIterator::List {

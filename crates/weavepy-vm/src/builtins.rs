@@ -20182,7 +20182,9 @@ fn memoryview_tobytes(
 ) -> Result<Object, RuntimeError> {
     let mv = memoryview_self(args)?;
     if mv.released.get() {
-        return Err(value_error("memoryview: released"));
+        return Err(value_error(
+            "operation forbidden on released memoryview object",
+        ));
     }
     // `tobytes(order=None)`: 'C'/None gather row-major, 'F' column-major,
     // 'A' follows the view's own layout ('F' only when Fortran-contiguous).
@@ -20250,7 +20252,9 @@ fn memoryview_tobytes(
 fn memoryview_tolist(args: &[Object]) -> Result<Object, RuntimeError> {
     let mv = memoryview_self(args)?;
     if mv.released.get() {
-        return Err(value_error("memoryview: released"));
+        return Err(value_error(
+            "operation forbidden on released memoryview object",
+        ));
     }
     // CPython `memoryview.tolist` unpacks elements per the view's format
     // (`'l'` → ints, `'d'` → floats, …), nesting one list per dimension.

@@ -77035,7 +77035,7 @@ fn mv_slice_subview(
 /// stored shape, strides or suboffsets): where its first byte is in the
 /// buffer, and how many it spans. (Whether the view is live is the
 /// caller's to check.)
-fn mv_plain_bytes(mv: &crate::object::PyMemoryView) -> Option<(usize, usize)> {
+pub(crate) fn mv_plain_bytes(mv: &crate::object::PyMemoryView) -> Option<(usize, usize)> {
     (mv.itemsize.get() == 1
         && !mv.zero_dim.get()
         && mv.shape.borrow().is_empty()

@@ -2175,6 +2175,14 @@ branch and pull request.
     view raises `ValueError` and a strided one `BufferError` in all of
     them, as CPython's do. (SHA-256 itself is the `sha2` crate's portable
     code, about half OpenSSL's AVX2 speed on this machine.)
+  - Iterating a memoryview made an object of every element first, then
+    walked that snapshot (`for b in memoryview(data)` over 200 KB 9.6 ms,
+    CPython 4.9). A plain byte view of a `bytes` object now steps as the
+    bytes do, sharing their storage when it covers them (1.4 ms), and one
+    over a whole `bytearray` steps the bytearray live, so a store made
+    mid-loop is seen, as CPython's iterator sees it (the snapshot missed
+    it). A released view's error reads as CPython's in `iter`, `tobytes`
+    and `tolist`.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
