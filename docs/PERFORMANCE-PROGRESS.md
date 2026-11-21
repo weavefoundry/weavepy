@@ -2235,6 +2235,24 @@ branch and pull request.
     now caches its Python and native hooks per version (3,385). The rest
     is the hook's activation in the core loop: compiled code leaves for
     it on every store.
+  - Building an `itemgetter`, `attrgetter` or `methodcaller` ran its Python
+    `__init__`, whose `*items` takes a frame (`itemgetter(1)` 321 ns, CPython
+    121; `attrgetter` 416, CPython 151; `methodcaller` 389, CPython 108).
+    The exact classes now have pure constructors that lay their slots out
+    at once (189, 178 and 206 ns); a subclass, keywords to `methodcaller`, a
+    name that isn't a `str`, or a class changed since registration take the
+    Python `__init__`.
+  - A keyword call of a native method or function took the core loop's
+    keyword lane: the names copied into strings, the operands into
+    vectors, and the general call (`xs.sort(key=None)` 279 ns, CPython 90;
+    `sorted(xs, reverse=True)` 335, CPython 207). `list.sort` and `sorted`
+    now have keyword halves for no key and a plain flag, bound as the
+    existing keyword halves bind (with keyword-only and positional-only
+    parameters marked, so `xs.sort(None)` and `sorted(iterable=xs)` still
+    raise), and the sort they share also takes tuples of ints and strings
+    (`pairs.sort()`). `xs.sort(reverse=True)` 286 ns to 108, `sorted(xs,
+    key=None)` 335 to 186. The per-call lookup of a builtin's keyword
+    half took a lock each time: a per-thread cache answers it.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

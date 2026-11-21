@@ -29053,11 +29053,13 @@ impl Interpreter {
                 let Object::Builtin(b) = &bm.function else {
                     return None;
                 };
-                (b, &bm.receiver)
+                (b, Some(&bm.receiver))
             }
             (Object::Builtin(b), recv) if !matches!(recv, Object::Unbound) && b.binds_instance => {
-                (b, recv)
+                (b, Some(recv))
             }
+            // A builtin function (`sorted(xs, reverse=True)`).
+            (Object::Builtin(b), Object::Unbound) if !b.binds_instance => (b, None),
             _ => return None,
         };
         let Object::Tuple(names) = ops.last()? else {
@@ -29068,6 +29070,13 @@ impl Interpreter {
             return None;
         }
         let (params, fast) = leaf_builtins::fast_kw(b)?;
+        // (A parameter named `*name` is keyword-only: no positional binds
+        // it, and the half takes `Unbound` where the call leaves it out. One
+        // named `/name` is positional-only: no keyword binds it.)
+        let keyword_only = |p: &str| p.starts_with('*');
+        if params.len() > 4 || params.iter().take(argc).any(|p| keyword_only(p)) {
+            return None;
+        }
         let mut bound: [Option<&Object>; 4] = [None; 4];
         for (i, a) in ops[2..2 + argc].iter().enumerate() {
             bound[i] = Some(a);
@@ -29076,28 +29085,50 @@ impl Interpreter {
             let Object::Str(name) = name else {
                 return None;
             };
-            let i = params.iter().position(|p| *p == name.as_ref())?;
+            let i = params
+                .iter()
+                .position(|p| !p.starts_with('/') && p.trim_start_matches('*') == name.as_ref())?;
             if i >= 4 || bound[i].is_some() {
                 return None;
             }
             bound[i] = Some(value);
         }
-        let n = bound.iter().take_while(|a| a.is_some()).count();
-        if bound[n..].iter().any(Option::is_some) || !Self::core_all_droppable(ops) {
+        let unbound = Object::Unbound;
+        let n = if params.iter().any(|p| keyword_only(p)) {
+            for (i, p) in params.iter().enumerate() {
+                if bound[i].is_none() {
+                    if !keyword_only(p) {
+                        return None;
+                    }
+                    bound[i] = Some(&unbound);
+                }
+            }
+            params.len()
+        } else {
+            let n = bound.iter().take_while(|a| a.is_some()).count();
+            if bound[n..].iter().any(Option::is_some) {
+                return None;
+            }
+            n
+        };
+        if !Self::core_all_droppable(ops) {
             return None;
         }
         // Bitwise views of the receiver and the bound arguments, never
         // dropped: the leaf half reads them (and clones what it keeps), and
         // nothing it runs can reach the operands they alias.
         let mut args = [const { std::mem::MaybeUninit::<Object>::uninit() }; 5];
-        // SAFETY: a borrowed copy of the live receiver.
-        args[0].write(unsafe { std::ptr::read(recv) });
-        for (slot, a) in args[1..].iter_mut().zip(&bound[..n]) {
-            // SAFETY: a borrowed copy of a live operand.
-            slot.write(unsafe { std::ptr::read(a.expect("prefix")) });
+        let first = usize::from(recv.is_some());
+        if let Some(recv) = recv {
+            // SAFETY: a borrowed copy of the live receiver.
+            args[0].write(unsafe { std::ptr::read(recv) });
         }
-        // SAFETY: the first `n + 1` entries were written.
-        let args = unsafe { std::slice::from_raw_parts(args.as_ptr().cast::<Object>(), n + 1) };
+        for (slot, a) in args[first..].iter_mut().zip(&bound[..n]) {
+            // SAFETY: a borrowed copy of a live operand.
+            slot.write(unsafe { std::ptr::read(a.expect("bound")) });
+        }
+        // SAFETY: the first `n + first` entries were written.
+        let args = unsafe { std::slice::from_raw_parts(args.as_ptr().cast::<Object>(), n + first) };
         fast(args)?.ok()
     }
 
@@ -33911,7 +33942,27 @@ impl Interpreter {
                         crate::builtins::bytes_translate_fast,
                     );
                 }
+                // `xs.sort(reverse=True)`, `xs.sort(key=None)`: keyword-only.
+                if let Some(Object::Builtin(b)) =
+                    crate::builtins::lookup_method(&Object::new_list(Vec::new()), "sort")
+                {
+                    leaf_builtins::register_fast_kw(
+                        &b,
+                        &["*key", "*reverse"],
+                        crate::seqiter::list_sort_kw_fast,
+                    );
+                }
             });
+            // `sorted(xs, reverse=True)`, this interpreter's `sorted`.
+            if let Some(Object::Builtin(b)) =
+                self.builtins.borrow().get(&crate::object::StrKey("sorted"))
+            {
+                leaf_builtins::register_fast_kw(
+                    b,
+                    &["/iterable", "*key", "*reverse"],
+                    crate::seqiter::sorted_kw_fast,
+                );
+            }
             for (recv, probe, names) in table {
                 // The type's own entry for each name, a receiver-checking
                 // shim over the method (what `str.upper` reads as), takes
@@ -79715,16 +79766,38 @@ pub(crate) mod leaf_builtins {
         let mut reg = FAST_KW.lock();
         reg.retain(|(w, _, _)| w.strong_count() > 0);
         reg.push((Rc::downgrade(b), names, fast));
+        FAST_KW_GEN.fetch_add(1, Ordering::Release);
     }
 
     /// `b`'s keyword binding and leaf half, if registered (by identity).
     pub(crate) fn fast_kw(b: &Rc<crate::object::BuiltinFn>) -> Option<(KwNames, Fast)> {
-        FAST_KW
+        // (The last answer per thread, by the builtin's address and the
+        // registrations' count: a keyword call site asks about one builtin
+        // again and again. The registry's weak handle keeps a registered
+        // builtin's allocation, so no other builtin lives at its address
+        // until a registration prunes it, which a new count marks.)
+        thread_local! {
+            static LAST: std::cell::Cell<(usize, u64, Option<(KwNames, Fast)>)> =
+                const { std::cell::Cell::new((0, 0, None)) };
+        }
+        let at = Rc::as_ptr(b) as usize;
+        let gen = FAST_KW_GEN.load(Ordering::Acquire);
+        if let Ok((p, g, found)) = LAST.try_with(std::cell::Cell::get) {
+            if p == at && g == gen {
+                return found;
+            }
+        }
+        let found = FAST_KW
             .lock()
             .iter()
-            .find(|(w, _, _)| std::ptr::eq(w.as_ptr(), Rc::as_ptr(b)) && w.strong_count() > 0)
-            .map(|&(_, names, fast)| (names, fast))
+            .find(|(w, _, _)| std::ptr::eq(w.as_ptr(), at as *const _) && w.strong_count() > 0)
+            .map(|&(_, names, fast)| (names, fast));
+        let _ = LAST.try_with(|c| c.set((at, gen, found)));
+        found
     }
+
+    /// Bumped by every [`register_fast_kw`] (see [`fast_kw`]'s cache).
+    static FAST_KW_GEN: AtomicU64 = AtomicU64::new(1);
 
     /// Builtins opted into the JIT's native method lane (see
     /// `tier2::MethodCallee::Native`), each with its direct operation.
