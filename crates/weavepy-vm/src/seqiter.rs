@@ -1131,6 +1131,13 @@ fn chain_pure_ready(source: Option<&Object>, active: Option<&Object>) -> bool {
 /// (Releasing a spent cursor frees nothing: its sequence is held
 /// elsewhere.)
 fn chain_pure_next(source: &mut Option<Object>, active: &mut Option<Object>) -> Option<Object> {
+    // The common step: the active source a plain cursor with an item.
+    if let Some(Object::Iter(c)) = active.as_ref() {
+        // SAFETY: a step that runs no code; the view ends with it.
+        if let Some(v) = unsafe { c.peek_mut() }.and_then(PyIterator::pure_next) {
+            return Some(v);
+        }
+    }
     if let Some(a) = active.as_ref() {
         if let Object::Iter(c) = a {
             if let Some(v) = cursor_peek(c) {
@@ -4041,6 +4048,9 @@ impl Interpreter {
             // A `filter` or `enumerate` over a source only the
             // interpreter can step.
             LazyIterKind::Filter { .. } | LazyIterKind::Enumerate { .. } => None,
+            // `chain(xs, ys)`: its active source's next item, a plain
+            // cursor's read and stepped in one.
+            LazyIterKind::Chain { source, active } => chain_pure_next(source, active).map(Some),
             _ => lazy_pure_next(l),
         }
     }

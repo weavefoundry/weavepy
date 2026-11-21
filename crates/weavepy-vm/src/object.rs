@@ -11784,6 +11784,44 @@ impl PyIterator {
     /// sequence iterator, whatever the sequence holds now): `false` for
     /// any other iterator, untouched.
     #[inline]
+    /// [`Self::pure_peek`] and [`Self::pure_skip`] in one, for the plain
+    /// cursors (a list's with no owner, a tuple's, a range's): the next
+    /// item, stepped past. `None`, changing nothing, when there is none or
+    /// for any other iterator.
+    #[inline]
+    pub fn pure_next(&mut self) -> Option<Object> {
+        match self {
+            PyIterator::List {
+                items,
+                index,
+                owner: None,
+            } => {
+                // SAFETY: a read that runs no code.
+                let v = crate::clone_hot(unsafe { items.peek() }?.get(*index)?);
+                *index += 1;
+                Some(v)
+            }
+            PyIterator::Tuple { items, index } => {
+                let v = crate::clone_hot(items.get(*index)?);
+                *index += 1;
+                Some(v)
+            }
+            PyIterator::Range {
+                current,
+                stop,
+                step,
+            } => {
+                if !((*step > 0 && current < stop) || (*step < 0 && current > stop)) {
+                    return None;
+                }
+                let v = *current;
+                *current = current.wrapping_add(*step);
+                Some(Object::Int(v))
+            }
+            _ => None,
+        }
+    }
+
     pub fn pure_skip(&mut self) -> bool {
         match self {
             PyIterator::List {

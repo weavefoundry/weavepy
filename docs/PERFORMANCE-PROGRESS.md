@@ -2100,6 +2100,13 @@ branch and pull request.
     µs). `weakref.ref` calls have a leaf half that calls the referent's
     deref closure in place (78 ns to 45, CPython 26), and `r(1)` raises
     CPython's `TypeError` instead of ignoring the argument.
+  - `for x in itertools.chain(xs, ys)` stepped each item through six
+    layers (the core loop's lazy step, the zip check, the itertools
+    machine's dispatch, then a peek and a skip of the active cursor):
+    349 instructions an item (two 100-item lists 6.3 µs, CPython 2.1).
+    The core loop's lazy step now takes `chain` first, and the active
+    list, tuple or range cursor is read and stepped in one call (173
+    instructions; 4.2 µs).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
