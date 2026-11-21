@@ -793,6 +793,17 @@ class OrderedDict(dict):
         '''Create a new ordered dictionary with keys from iterable and values set to value.
         '''
         self = cls()
+        # WeavePy: an exact OrderedDict takes the keys of a list, tuple or
+        # str in one native pass (`dict.fromkeys` keeps the first
+        # occurrence's order, as the loop below does); a subclass may
+        # override `__setitem__`, and an unhashable key raises from the
+        # loop, which words the error as CPython's OrderedDict does.
+        if type(self) is OrderedDict and type(iterable) in (list, tuple, str):
+            try:
+                self.update(dict.fromkeys(iterable, value))
+                return self
+            except TypeError:
+                self.clear()
         for key in iterable:
             self[key] = value
         return self

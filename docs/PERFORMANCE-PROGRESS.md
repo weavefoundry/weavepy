@@ -2135,6 +2135,13 @@ branch and pull request.
     slot above; the receiver is released as the full call releases its
     operands (a temporary's finalizers run before the next statement) and
     the result moved into its slot (28.5 and 32.4 ns).
+  - `OrderedDict.fromkeys` stored its keys one subscript at a time in
+    Python (270 keys 21.2 µs; CPython's C loop 12.7). An exact
+    `OrderedDict` now takes a list's, tuple's or str's keys through
+    `dict.fromkeys` and its native update in one pass (10.0 µs);
+    subclasses keep the loop for their own `__setitem__`, and an
+    unhashable key still raises from the loop, which words the error as
+    CPython's `OrderedDict` does.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
