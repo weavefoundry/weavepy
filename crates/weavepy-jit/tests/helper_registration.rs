@@ -33,6 +33,7 @@ fn function(ops: &[TOp]) -> TFunc {
         math_guards: vec![],
         math_spans: vec![],
         null_spans: vec![],
+        py_dyn_calls: vec![],
         osr_entries: vec![],
         max_call_args: 1,
         ret_lane: None,

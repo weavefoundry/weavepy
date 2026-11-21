@@ -245,6 +245,13 @@ pub struct Probes<'a> {
     /// *unbound* slot keeps the retriable probe-miss verdict, so a
     /// later training point can still specialize.
     pub obj: &'a mut dyn FnMut(u32) -> bool,
+    /// Whether local `slot` holds a plain Python function, or a method
+    /// bound to one, in the requesting activation: a dynamic call of it
+    /// runs Python through the generic call helper (see
+    /// [`TFunc::py_dyn_calls`]).
+    /// (A global's name index with [`PY_CALLEE_GLOBAL`] set asks the same
+    /// of the global that name resolves to.)
+    pub py_callee: &'a mut dyn FnMut(u32) -> bool,
     /// The observed lane of local `slot` in the requesting activation,
     /// graded like [`Self::param`] (scalars, `str`, `bytes`, and the
     /// object lane; lists and dicts stay `None` for their use-site
@@ -630,6 +637,7 @@ pub fn analyze_with_probes(
         obj_global: &mut |_| None,
         cell: &mut |_| None,
         obj: &mut |_| false,
+        py_callee: &mut |_| false,
         local: &mut |_| None,
         stack_iter: &mut |_| None,
         pairs: &mut |_| None,
@@ -664,6 +672,7 @@ pub fn analyze_for_ret(
         obj_global: &mut obj,
         cell: &mut |_| None,
         obj: &mut |_| false,
+        py_callee: &mut |_| false,
         local: &mut |_| None,
         stack_iter: &mut |_| None,
         pairs: &mut |_| None,
@@ -689,6 +698,53 @@ thread_local! {
     /// The instruction the last failed inference/emission step stopped
     /// at (see `carve_step`).
     static FAIL_PC: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// The analysis work this thread may still do (see [`with_work_budget`]).
+    static WORK_LEFT: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+    /// Whether an analysis stopped for want of work budget since the
+    /// budget was set (see [`with_work_budget`]).
+    static WORK_SHORT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The [`JitVerdict::ProbeMiss`] reason of an analysis that ran out of
+/// its work budget (see [`with_work_budget`]).
+pub const OVER_BUDGET: &str = "analysis budget";
+
+/// Run `f` with at most `budget` units of analysis work: one unit is one
+/// instruction of a code object passed over once, and an analysis passes
+/// over its code once for each attempt (each carving step, each retry
+/// with other assumptions) and over each callee it types the same way.
+/// An analysis that would exceed the budget fails as a
+/// [`JitVerdict::ProbeMiss`] of [`OVER_BUDGET`], as does every analysis
+/// after it. Returns `f`'s result, the work done, and whether any
+/// analysis stopped short: a result reached after one did (a callee left
+/// untyped, say) reflects the budget, not the code, so the embedder
+/// treats the whole attempt as out of budget.
+pub fn with_work_budget<R>(budget: u64, f: impl FnOnce() -> R) -> (R, u64, bool) {
+    let prev = (WORK_LEFT.replace(budget), WORK_SHORT.replace(false));
+    let r = f();
+    let left = WORK_LEFT.replace(prev.0);
+    let short = WORK_SHORT.replace(prev.1);
+    (r, budget - left, short)
+}
+
+/// Whether an analysis has stopped for want of work budget since the
+/// budget was set (see [`with_work_budget`]).
+pub fn work_short() -> bool {
+    WORK_SHORT.get()
+}
+
+/// Charge one pass over `code` to the work budget; `false` when the
+/// budget doesn't cover it (see [`with_work_budget`]).
+fn charge_pass(code: &CodeObject) -> bool {
+    let cost = code.instructions.len() as u64;
+    let left = WORK_LEFT.get();
+    if left < cost {
+        WORK_LEFT.set(0);
+        WORK_SHORT.set(true);
+        return false;
+    }
+    WORK_LEFT.set(left - cost);
+    true
 }
 
 /// One loop of a code object's (structured) loop nest.
@@ -771,6 +827,26 @@ fn innermost_loop(loops: &[LoopInfo], pc: usize) -> Option<usize> {
     (0..loops.len())
         .filter(|&k| loops[k].head <= pc && pc <= loops[k].end)
         .max_by_key(|&k| loops[k].head)
+}
+
+/// [`innermost_loop`] of every pc below `n`, filled loop by loop over
+/// each extent instead of searching the forest per pc.
+fn innermost_loops(loops: &[LoopInfo], n: usize) -> Vec<Option<usize>> {
+    let mut out: Vec<Option<usize>> = vec![None; n];
+    for (k, lp) in loops.iter().enumerate() {
+        if lp.head >= n {
+            continue;
+        }
+        for slot in &mut out[lp.head..=lp.end.min(n - 1)] {
+            // The innermost is the containing loop with the latest head
+            // (the later one on a tie, as `max_by_key` picks).
+            if slot.is_none_or(|j| loops[j].head <= lp.head) {
+                *slot = Some(k);
+            }
+        }
+    }
+    debug_assert!((0..n).all(|pc| out[pc] == innermost_loop(loops, pc)));
+    out
 }
 
 /// The start of the statement holding the top-level (loop-free) `p`:
@@ -876,9 +952,7 @@ impl Region {
         let roots = (0..loops.len())
             .filter(|&k| !stays[k] && loops[k].parent.is_some_and(|p| stays[p]))
             .collect();
-        let innermost = (0..code.instructions.len())
-            .map(|pc| innermost_loop(loops, pc))
-            .collect();
+        let innermost = innermost_loops(loops, code.instructions.len());
         Region {
             stays,
             innermost,
@@ -915,6 +989,36 @@ impl Region {
     }
 }
 
+/// The flag that marks a [`Probes::py_callee`] argument as a global's name
+/// index rather than a local slot.
+pub const PY_CALLEE_GLOBAL: u32 = 1 << 31;
+
+/// With [`PY_CALLEE_GLOBAL`], asks instead whether a guarded call of the
+/// global (a `CallPy`) runs its callee through the embedder's frameless
+/// evaluator: a short function that tier 2 hasn't compiled and that isn't
+/// one of the evaluator's tiny shapes. Such a call costs several hundred
+/// instructions, as a dynamic one does (see [`crate::engine`]'s
+/// `call_bound`).
+pub const PY_CALLEE_FRAMELESS: u32 = 1 << 30;
+
+/// Whether the callee of a dynamic call is a Python function: a local's
+/// value the probe answers for, or (`f` from a `LOAD_GLOBAL` whose
+/// self-or-null slot follows it) the global's.
+fn dyn_callee_is_py(
+    ins: &[weavepy_compiler::Instruction],
+    src: Option<u32>,
+    null_pc: u32,
+    probes: &mut Probes<'_>,
+) -> bool {
+    if let Some(slot) = src {
+        return (probes.py_callee)(slot);
+    }
+    let Some(load) = (null_pc as usize).checked_sub(1).and_then(|i| ins.get(i)) else {
+        return false;
+    };
+    matches!(load.op, OpCode::LoadGlobal) && (probes.py_callee)(PY_CALLEE_GLOBAL | load.arg)
+}
+
 /// Whether tier 2 compiles code of this kind and signature at all. Sync
 /// generator bodies are admitted (RFC 0070 WS2: yields become `Yielded`
 /// side exits; entry is OSR-only); coroutines and async generators aren't.
@@ -923,8 +1027,17 @@ fn signature_admitted(code: &CodeObject) -> bool {
         || code.is_async_generator
         || code.is_class_body
         || code.has_varargs
-        || code.has_varkeywords
-        || code.kwonly_count > 0)
+        || code.has_varkeywords)
+}
+
+/// How many local slots the call binds before the body runs: the
+/// positional parameters, then the keyword-only ones (`*args` and
+/// `**kwargs` frames aren't admitted). Keyword-only parameters are plain
+/// locals the caller's binding fills, so a frame entered with them bound
+/// compiles like any other; a direct native call never takes them (see
+/// the embedder's `py_callee_ok`).
+fn param_slots(code: &CodeObject) -> u32 {
+    code.arg_count + code.kwonly_count
 }
 
 /// Whether a failure verdict depends on the activation the compile ran
@@ -974,6 +1087,9 @@ fn analyze_impl(
     let mut num_slots = numeric_slots(code);
     let mut backoffs = 0usize;
     loop {
+        if !charge_pass(code) {
+            return Err(JitVerdict::ProbeMiss(OVER_BUDGET));
+        }
         FAIL_PC.with(|c| c.set(None));
         let mut in_plan = false;
         match analyze_once(
@@ -1355,7 +1471,7 @@ fn analyze_once(
     // [`Probes::param`]). A seeded slot behaves exactly like one typed
     // by an assignment: conflicting evidence still rejects, and the
     // final `TFunc` entry-guards it.
-    for slot in 0..code.arg_count {
+    for slot in 0..param_slots(code) {
         if local_types[slot as usize].is_none() {
             if let Some(t) = (probes.param)(slot) {
                 // RFC 0071 — `Str`/`Bytes` (WS6) and the nullable
@@ -1524,6 +1640,7 @@ fn analyze_once(
         math_guards: Vec::new(),
         math_spans: Vec::new(),
         null_spans: Vec::new(),
+        py_dyn_calls: Vec::new(),
         max_call_args: 0,
         loop_depths: HashMap::default(),
         comp_saved: HashMap::default(),
@@ -1716,7 +1833,7 @@ fn analyze_once(
     // kernel first called with ints and later with a float would pack
     // the float as 0 and silently compute garbage.)
     let mut livein = livein;
-    for slot in 0..code.arg_count {
+    for slot in 0..param_slots(code) {
         if local_types.get(slot as usize).copied().flatten().is_some() {
             livein.insert(slot);
         }
@@ -1848,6 +1965,12 @@ fn analyze_once(
         math_guards: out.math_guards,
         math_spans: out.math_spans,
         null_spans: out.null_spans,
+        py_dyn_calls: {
+            let mut v = out.py_dyn_calls;
+            v.sort_unstable();
+            v.dedup();
+            v
+        },
         osr_entries,
         resume_entries,
         max_call_args: out.max_call_args,
@@ -1976,6 +2099,36 @@ fn merge_entry(
     Ok(())
 }
 
+/// The jump-landing pcs of a code object ([`plan_rewrite`]'s), as a
+/// bitmap: the planner asks about a few pcs around each candidate site,
+/// once per analysis of every code tier 2 looks at.
+struct JumpTargets(Vec<bool>);
+
+impl JumpTargets {
+    fn new(n: usize) -> Self {
+        Self(vec![false; n + 1])
+    }
+
+    /// (A target past the code's end lands on nothing the planner asks
+    /// about.)
+    fn insert(&mut self, pc: usize) {
+        if let Some(slot) = self.0.get_mut(pc) {
+            *slot = true;
+        }
+    }
+
+    fn contains(&self, pc: usize) -> bool {
+        self.0.get(pc).copied().unwrap_or(false)
+    }
+
+    /// Whether some target lies in `lo..=hi`, `except` aside (none when
+    /// `lo` wrapped below zero: the site is too near the code's start).
+    fn any_in(&self, lo: usize, hi: usize, except: usize) -> bool {
+        let hi = hi.min(self.0.len().saturating_sub(1));
+        (lo..=hi).any(|pc| pc != except && self.0[pc])
+    }
+}
+
 /// Recognize every `FOR_ITER` as the canonical counted `range` loop and
 /// build the rewrite [`Plan`]. Any `FOR_ITER` that doesn't match the
 /// shape disqualifies the whole frame (there is no generic iterator
@@ -1997,7 +2150,7 @@ fn plan_rewrite(
 
     // All jump-landing pcs, to reject jumps into the middle of a
     // recognized `range(...)` prefix.
-    let mut targets: HashSet<usize> = HashSet::default();
+    let mut targets = JumpTargets::new(n);
     for (i, item) in ins.iter().enumerate() {
         match item.op {
             OpCode::PopJumpIfFalse
@@ -2090,7 +2243,7 @@ fn plan_rewrite(
             && matches!(ins[i + 2].op, OpCode::StoreFast)
             && matches!(ins[i + 3].op, OpCode::StoreFast)
         {
-            if targets.iter().any(|&t| i - 1 <= t && t <= i + 3 && t != i) {
+            if targets.any_in(i.wrapping_sub(1), i + 3, i) {
                 return Err(bail());
             }
             let seq_slot = n_real + plan.n_synth;
@@ -2202,7 +2355,7 @@ fn plan_rewrite(
         if i >= 1 && matches!(ins[i - 1].op, OpCode::GetIter) {
             // No jump may land on the `GET_ITER` or the fused store —
             // the header itself is the only allowed landing point.
-            if targets.iter().any(|&t| i - 1 <= t && t <= i + 1 && t != i) {
+            if targets.any_in(i.wrapping_sub(1), i + 1, i) {
                 return Err(bail());
             }
             let seq_slot = n_real + plan.n_synth;
@@ -2268,9 +2421,8 @@ fn plan_rewrite(
             // prologue, and nothing may land in the erased epilogue
             // (the `FOR_ITER`'s own exit target lands on `END_FOR`,
             // which starts a block of pure no-ops).
-            if targets
-                .iter()
-                .any(|&t| (i - 5 <= t && t <= i + 1 && t != i) || (exit < t && t <= exit + 3))
+            if targets.any_in(i.wrapping_sub(5), i + 1, i)
+                || targets.any_in(exit + 1, exit + 3, usize::MAX)
             {
                 return Err(bail());
             }
@@ -2439,8 +2591,8 @@ fn plan_rewrite(
             || !matches!(ins[i + 1].op, OpCode::LoadConst)
             || !matches!(ins[i + 2].op, OpCode::ListExtend)
             || ins[i + 2].arg != 1
-            || targets.contains(&(i + 1))
-            || targets.contains(&(i + 2))
+            || targets.contains(i + 1)
+            || targets.contains(i + 2)
         {
             continue;
         }
@@ -2486,7 +2638,7 @@ fn plan_rewrite(
                         && !plan.const_list.contains_key(&(i - 1))
                         && !plan.nop.contains(&(i - 1))
                         && !plan.nop.contains(&i)
-                        && !targets.contains(&i);
+                        && !targets.contains(i);
                     if lit {
                         sites.entry(ins[i].arg).or_default().push(i - 1);
                     } else {
@@ -2569,7 +2721,7 @@ fn plan_rewrite(
         }
         // Nothing may land inside the erased window (the list load
         // itself starts the expression and may be a landing point).
-        if targets.iter().any(|&t| list_load < t && t <= c)
+        if targets.any_in(list_load + 1, c, usize::MAX)
             || (list_load..c).any(|p| plan.nop.contains(&p))
         {
             continue;
@@ -2670,8 +2822,8 @@ fn plan_rewrite(
     for i in 1..n {
         if !matches!(ins[i].op, OpCode::CallKw)
             || !matches!(ins[i - 1].op, OpCode::LoadConst)
-            || targets.contains(&i)
-            || targets.contains(&(i - 1))
+            || targets.contains(i)
+            || targets.contains(i - 1)
         {
             continue;
         }
@@ -2699,7 +2851,7 @@ fn plan_rewrite(
 fn range_prefix(
     code: &CodeObject,
     plan: &Plan,
-    targets: &HashSet<usize>,
+    targets: &JumpTargets,
     i: usize,
 ) -> Option<(usize, usize, Option<usize>, u8)> {
     let ins = &code.instructions;
@@ -2770,7 +2922,7 @@ fn range_prefix(
     // No jump may land inside the prefix or on the fused store — the
     // header itself (a JUMP_BACKWARD target) is the only allowed
     // landing point.
-    if targets.iter().any(|&t| callee < t && t <= i + 1 && t != i) {
+    if targets.any_in(callee + 1, i + 1, i) {
         return None;
     }
     Some((callee, push_null, step_nop, pops))
@@ -3417,9 +3569,16 @@ fn compute_livein(
     reachable: &[usize],
     n_locals: u32,
 ) -> HashSet<u32> {
-    let width = slot_width(code, n_locals.max(code.arg_count));
-    let assigned_in =
-        assigned_on_entry(code, raw, reachable, None, code.arg_count, n_locals, width);
+    let width = slot_width(code, n_locals.max(param_slots(code)));
+    let assigned_in = assigned_on_entry(
+        code,
+        raw,
+        reachable,
+        None,
+        param_slots(code),
+        n_locals,
+        width,
+    );
     // Collect live-in: a load of a slot not definitely assigned yet.
     let mut livein = HashSet::default();
     let mut cur = SlotBits::empty(width);
@@ -3456,7 +3615,7 @@ fn root_livein(
         raw,
         reachable,
         Some(roots),
-        code.arg_count.min(n_real),
+        param_slots(code).min(n_real),
         n_real,
         width,
     );
@@ -4660,7 +4819,7 @@ fn step_abstract(
                         // A plain local assigned in this body (a
                         // comprehension result, say) may be typed by a
                         // later fixpoint iteration: transient.
-                        if v.src.is_some_and(|slot| slot >= code.arg_count) {
+                        if v.src.is_some_and(|slot| slot >= param_slots(code)) {
                             return Ok(());
                         }
                         // The param probe is a no-op on the unseeded
@@ -5393,7 +5552,7 @@ fn step_abstract(
                         } else if (probes.dict)(slot).is_some() {
                             // RFC 0073 WS2 — `len(d)` on an exact dict.
                             set_local(local_types, slot, JitType::Dict, changed)?;
-                        } else if slot >= code.arg_count {
+                        } else if slot >= param_slots(code) {
                             // A plain local assigned in this body: a
                             // later fixpoint iteration may type it.
                         } else {
@@ -7009,6 +7168,9 @@ struct EmitOut {
     /// RFC 0074 WS2 — self-or-null `Unbound` markers of opaque-call
     /// sites (`token` unused, `live_to` = the consuming `CALL` pc).
     null_spans: Vec<CalleeSpanMeta>,
+    /// The pcs of `CallDyn`s whose callee is a Python function (see
+    /// [`TFunc::py_dyn_calls`]).
+    py_dyn_calls: Vec<u32>,
     max_call_args: u32,
     /// RFC 0073 WS1 — per-loop interpreter depth of the erased
     /// iterator, keyed by the loop span's `live_from` pc (recorded at
@@ -8235,6 +8397,8 @@ fn emit_instr(
                 ctor: ctor_site,
                 self_ctor: self_site,
                 slot_member: false,
+                in_line: false,
+                position: None,
             });
             push(TOp::AttrGet { site, out: lane }, Some(lane), stack, stmts);
             // RFC 0071 WS3 — extend the provenance chain on the result.
@@ -8470,6 +8634,8 @@ fn emit_instr(
                 ctor: ctor_site,
                 self_ctor: self_site,
                 slot_member: false,
+                in_line: false,
+                position: None,
             });
             push(TOp::AttrGet { site, out: lane }, Some(lane), stack, stmts);
             // RFC 0071 WS3 — extend the provenance chain on the result.
@@ -8623,6 +8789,8 @@ fn emit_instr(
                 ctor: ctor_site,
                 self_ctor: None,
                 slot_member: false,
+                in_line: false,
+                position: None,
             });
             // Native stack order matches the interpreter: value below,
             // receiver on top. Lowering pops receiver then value.
@@ -8833,6 +9001,9 @@ fn emit_instr(
                 if !f.ty.is_pinned() {
                     return Err(JitVerdict::UnsupportedOpcode("CALL (callee lane)"));
                 }
+                if dyn_callee_is_py(&code.instructions, f.src, null_pc, probes) {
+                    out.py_dyn_calls.push(pc);
+                }
                 for &ty in &arg_tys {
                     // Any representable lane stages by tag — pins are
                     // meaningful here (the marshal never leaves this
@@ -8993,6 +9164,15 @@ fn emit_instr(
                 interp_depth: mark.interp_depth,
             });
             *max_call_args = (*max_call_args).max(argc as u32);
+            if mark.kind == MarkKind::Py && !mark.ctor && !mark.is_self {
+                let load = code.instructions.get(mark.load_pc as usize);
+                if load.is_some_and(|l| {
+                    l.op == OpCode::LoadGlobal
+                        && (probes.py_callee)(PY_CALLEE_GLOBAL | PY_CALLEE_FRAMELESS | l.arg)
+                }) {
+                    out.py_dyn_calls.push(pc);
+                }
+            }
             push(
                 TOp::CallPy {
                     token: mark.token,
@@ -9042,6 +9222,9 @@ fn emit_instr(
                 // See `CALL`: the helper receives pin bits.
                 if !f.ty.is_pinned() {
                     return Err(JitVerdict::UnsupportedOpcode("CALL_KW (callee lane)"));
+                }
+                if dyn_callee_is_py(&code.instructions, f.src, null_pc, probes) {
+                    out.py_dyn_calls.push(pc);
                 }
                 for &ty in &arg_tys {
                     if !ty.is_representable() {

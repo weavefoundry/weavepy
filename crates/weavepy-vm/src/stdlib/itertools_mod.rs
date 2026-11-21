@@ -74,6 +74,17 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             register_classmethod_descriptor
         );
         reg!("_register_types", register_types);
+        // `__next__` for the classes whose Python one is
+        // `return next(self._core)`: a method (it binds the instance).
+        d.insert(
+            DictKey(Object::from_static("_core_next")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "__next__",
+                binds_instance: true,
+                call: Box::new(core_next),
+                call_kw: None,
+            })),
+        );
         reg!("groupby_core", groupby_core);
         reg!("grouper_core", grouper_core);
         reg!("groupby_setstate", groupby_setstate);
@@ -479,6 +490,31 @@ const KINDS: [(&str, u8); 19] = [
     ("batched", K_BATCHED),
 ];
 
+/// `__next__(self)` of the frozen `itertools.py` classes that step their
+/// native core (`return next(self._core)`): the adapter itself when the
+/// instance is one (an exact class's), else the instance's `_core` (a
+/// subclass's), stepped in place with no Python frame, as CPython's C
+/// types step (`c.__next__()`, `threading`'s `_counter`).
+fn core_next(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [slf] = args else {
+        return Err(type_error(format!(
+            "expected 0 arguments, got {}",
+            args.len().saturating_sub(1)
+        )));
+    };
+    let interp = crate::builtins::reentrant_interp()?;
+    let core = match slf {
+        Object::LazyIter(_) => slf.clone(),
+        _ => interp.load_attr_public(slf, "_core")?,
+    };
+    let globals = interp.builtins_dict();
+    // (A `StopIteration` the source raised goes on, value and all.)
+    match interp.iter_step(&core, &globals)? {
+        Some(v) => Ok(v),
+        None => Err(crate::error::stop_iteration()),
+    }
+}
+
 /// `_register_types(namespace)`: mark the module's exact classes.
 fn register_types(args: &[Object]) -> Result<Object, RuntimeError> {
     let [Object::Dict(ns)] = args else {
@@ -685,7 +721,7 @@ pub(crate) fn native_new(
     let core = match kind {
         K_CHAIN => {
             let source = Object::Iter(Rc::new(RefCell::new(
-                Object::new_tuple(args.to_vec()).make_iter().ok()?,
+                Object::tuple_from_slice(args).make_iter().ok()?,
             )));
             chain_core(&[source, Object::None])
         }
@@ -910,6 +946,33 @@ pub(crate) fn native_new_pure(
         cls.lazy_ctor.get(),
         args,
         &[],
+        &mut pure_iter,
+        &mut pure_pool,
+    )?
+    .ok()?;
+    Some(with_class(core, cls))
+}
+
+/// [`native_new_pure`] with keywords, `names` (strings) naming `values`
+/// (`product(xs, repeat=2)`): `None` for every other shape.
+pub(crate) fn native_new_pure_kw(
+    cls: &Rc<crate::types::TypeObject>,
+    args: &[Object],
+    names: &[Object],
+    values: &[Object],
+) -> Option<Object> {
+    let kwargs = names
+        .iter()
+        .zip(values)
+        .map(|(n, v)| match n {
+            Object::Str(s) => Some((s.to_string(), v.clone())),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let core = native_new(
+        cls.lazy_ctor.get(),
+        args,
+        &kwargs,
         &mut pure_iter,
         &mut pure_pool,
     )?

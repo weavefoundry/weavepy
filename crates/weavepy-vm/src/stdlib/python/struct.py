@@ -97,8 +97,11 @@ def _readable(buffer):
     buffer-protocol object here, and this is the slice of that protocol we
     can reach from the frozen wrapper (test_struct.test_unpack_with_buffer).
     """
-    if isinstance(buffer, (bytes, bytearray, memoryview)):
+    if type(buffer) in (bytes, bytearray, memoryview):
         return buffer
+    # (A subclass instance's bytes through a view, which the core reads.)
+    if isinstance(buffer, (bytes, bytearray, memoryview)):
+        return memoryview(buffer)
     tobytes = getattr(buffer, "tobytes", None)
     if callable(tobytes):
         return tobytes()
@@ -120,18 +123,34 @@ def calcsize(format, /):
         raise error(str(e)) from None
 
 
+def _format_error(e, buffer):
+    """The `struct.error` for the core's `ValueError` `e`, unless `buffer`
+    is a released view: that refusal is the view's own `ValueError`."""
+    if isinstance(buffer, memoryview):
+        try:
+            buffer.nbytes
+        except ValueError:
+            return e
+    return error(str(e))
+
+
 def unpack(format, buffer, /):
     try:
+        # (`bytes`, the common buffer, goes straight to the core.)
+        if type(buffer) is bytes:
+            return _impl.unpack(format, buffer)
         return _impl.unpack(format, _readable(buffer))
     except ValueError as e:
-        raise error(str(e)) from None
+        raise _format_error(e, buffer) from None
 
 
 def unpack_from(format, /, buffer, offset=0):
     try:
+        if type(buffer) is bytes:
+            return _impl.unpack_from(format, buffer, offset)
         return _impl.unpack_from(format, _readable(buffer), offset)
     except ValueError as e:
-        raise error(str(e)) from None
+        raise _format_error(e, buffer) from None
 
 
 def pack(format, /, *v):
@@ -145,6 +164,19 @@ def pack(format, /, *v):
         return _impl.pack(format, *v)
     except ValueError as e:
         raise error(str(e)) from None
+
+
+# The public `pack` packs plain values natively and calls the function
+# above for anything else (coercions, and every error).
+pack = _impl._native_pack(pack)
+
+# Likewise `unpack`: a `bytes` buffer is read natively; anything else
+# (another buffer, every error) goes through the function above.
+unpack = _impl._native_unpack(unpack)
+
+# And `unpack_from`: a `bytes`, `bytearray` or `memoryview` buffer with a
+# plain offset is read where its bytes are.
+unpack_from = _impl._native_unpack_from(unpack_from)
 
 
 def _writable(buffer):
@@ -191,6 +223,11 @@ def pack_into(format, buffer, offset, /, *v):
         raise error(str(e)) from None
 
 
+# `pack_into` writes plain numbers into a `bytearray` or a writable
+# `memoryview` natively; anything else goes through the function above.
+pack_into = _impl._native_pack_into(pack_into)
+
+
 class unpack_iterator:
     """Iterator returned by `iter_unpack` / `Struct.iter_unpack`.
 
@@ -218,6 +255,14 @@ class unpack_iterator:
 
     def __length_hint__(self):
         return (self._len - self._offset) // self._size
+
+
+# The iterator's step is native while it has a chunk left (CPython's is a
+# C type); its end, and anything unusual, is the method above.
+if hasattr(_impl, "_unpack_iterator_methods"):
+    for _owner, _name, _method in _impl._unpack_iterator_methods(unpack_iterator):
+        setattr(_owner, _name, _method)
+    del _owner, _name, _method
 
 
 def _make_unpack_iterator(fmt, buffer, size):

@@ -549,7 +549,7 @@ impl MarshalWriter {
     /// is the empty-bytes singleton.
     fn write_kinds_bytes(&mut self, kinds: &[u8]) -> Result<(), RuntimeError> {
         if self.plan.is_none() || kinds.is_empty() {
-            return self.write_table_bytes(&Object::new_bytes(kinds.to_vec()));
+            return self.write_table_bytes(&Object::new_bytes(kinds));
         }
         self.write_byte(TYPE_STRING);
         self.write_int(kinds.len() as i32);

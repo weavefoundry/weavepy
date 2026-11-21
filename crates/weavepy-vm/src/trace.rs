@@ -123,8 +123,8 @@ impl Default for ObserverSnapshot {
 }
 
 thread_local! {
-    static TRACE_HOOK: RefCell<Option<Object>> = const { RefCell::new(None) };
-    static PROFILE_HOOK: RefCell<Option<Object>> = const { RefCell::new(None) };
+    static TRACE_HOOK: crate::gil::ReleaseUnderGil<RefCell<Option<Object>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
+    static PROFILE_HOOK: crate::gil::ReleaseUnderGil<RefCell<Option<Object>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
     static MONITORING_TOOLS: RefCell<MonitoringTools> = RefCell::new(MonitoringTools::new());
     /// Re-entrance guard. Set while inside any hook callout so a
     /// hook calling Python code (which itself triggers more events)

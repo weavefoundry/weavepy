@@ -67,6 +67,12 @@ pub fn lower(s: &str) -> String {
     let cps: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
     for i in 0..cps.len() {
+        // (An ASCII letter's mapping is its ASCII case: the common case in
+        // mostly-ASCII text.)
+        if cps[i].is_ascii() {
+            out.push(cps[i].to_ascii_lowercase());
+            continue;
+        }
         push_cps(&mut out, lower_at(&cps, i));
     }
     out
@@ -78,6 +84,10 @@ pub fn upper(s: &str) -> String {
     }
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
+        if c.is_ascii() {
+            out.push(c.to_ascii_uppercase());
+            continue;
+        }
         push_cps(&mut out, ucd::to_upper_full(c as u32));
     }
     out
@@ -90,6 +100,10 @@ pub fn casefold(s: &str) -> String {
     }
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
+        if c.is_ascii() {
+            out.push(c.to_ascii_lowercase());
+            continue;
+        }
         push_cps(&mut out, ucd::to_fold_full(c as u32));
     }
     out

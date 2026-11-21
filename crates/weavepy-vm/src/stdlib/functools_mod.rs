@@ -96,6 +96,9 @@ struct PartialReg {
     cls: crate::sync::Weak<crate::types::TypeObject>,
     placeholder: Object,
     py_new: Object,
+    /// Whether the class lays out exactly [`PARTIAL_SLOTS`], in order (its
+    /// instances' slots are then built in one piece).
+    laid_out: std::sync::OnceLock<bool>,
 }
 
 /// `_partial_new_for(partial, Placeholder, _partial_new)`: the native
@@ -111,7 +114,17 @@ fn partial_new_for(args: &[Object]) -> Result<Object, RuntimeError> {
         cls: Rc::downgrade(cls),
         placeholder: placeholder.clone(),
         py_new: py_new.clone(),
+        laid_out: std::sync::OnceLock::new(),
     });
+    // (`partial(f, *args)` of the exact class builds in place through the
+    // class's constructor hook, which finds this registration on it.)
+    if cls
+        .native_ext
+        .set(crate::rc_unsize!(reg.clone() => dyn std::any::Any + Send + Sync))
+        .is_ok()
+    {
+        cls.pure_new.set(Some(partial_pure_new));
+    }
     let reg_kw = reg.clone();
     Ok(Object::Builtin(Rc::new(BuiltinFn {
         name: "__new__",
@@ -182,7 +195,7 @@ pub(crate) fn with_partial_call<R>(
 
 thread_local! {
     /// The interned names of a partial's first four slots.
-    static PARTIAL_KEYS: [crate::shared_value::SharedStr; 4] = PARTIAL_SLOTS[..4]
+    static PARTIAL_KEYS: crate::gil::ReleaseUnderGil<[crate::shared_value::SharedStr; 4]> = crate::gil::ReleaseUnderGil::new(PARTIAL_SLOTS[..4]
         .iter()
         .map(|name| match crate::stdlib::sys::intern_name(name) {
             Object::Str(s) => s,
@@ -190,7 +203,7 @@ thread_local! {
         })
         .collect::<Vec<_>>()
         .try_into()
-        .unwrap_or_else(|_| unreachable!("four names"));
+        .unwrap_or_else(|_| unreachable!("four names")));
 }
 
 /// `f` over a partial instance's `_func`, `_args`, `_keywords`, and
@@ -200,10 +213,15 @@ fn with_partial_fields<R>(
     inst: &crate::types::PyInstance,
     f: impl FnOnce([&Object; 4]) -> R,
 ) -> Option<R> {
+    /// The `__slots__` layout found led by the four names (see
+    /// `SlotStorage::leading_memo`): a store with it skips their
+    /// comparison at every call.
+    static PARTIAL_LAYOUT: crate::types::LayoutMemo = crate::types::LayoutMemo::new();
     PARTIAL_KEYS.with(|keys| {
         // SAFETY: a read; `f` runs no code that could borrow the slots.
         let slots = unsafe { inst.slots.peek() }?;
-        let fields = slots.leading_interned([&keys[0], &keys[1], &keys[2], &keys[3]])?;
+        let fields =
+            slots.leading_memo(&PARTIAL_LAYOUT, [&keys[0], &keys[1], &keys[2], &keys[3]])?;
         Some(f(fields))
     })
 }
@@ -250,6 +268,41 @@ fn partial_new(
     let Object::Type(sub) = &args[0] else {
         unreachable!("checked above");
     };
+    Ok(build_partial(reg, &cls, sub, &args[1], &args[2..], kwargs))
+}
+
+/// `partial(func, *args)` of the exact class, from its constructor hook:
+/// as [`partial_new`] builds the common shape (a callable that isn't a
+/// partial, no `Placeholder`), anything else left to the call.
+fn partial_pure_new(cls: &Rc<crate::types::TypeObject>, args: &[Object]) -> Option<Object> {
+    let reg = cls.native_ext.get()?.downcast_ref::<PartialReg>()?;
+    let own = reg.cls.upgrade()?;
+    if !Rc::ptr_eq(&own, cls) {
+        return None;
+    }
+    let [func, rest @ ..] = args else {
+        return None;
+    };
+    if !crate::builtins::object_is_callable(func)
+        || matches!(func, Object::Instance(i) if i.cls().is_subclass_of(&own))
+        || rest.iter().any(|a| a.is_same(&reg.placeholder))
+    {
+        return None;
+    }
+    Some(build_partial(reg, &own, cls, func, rest, &[]))
+}
+
+/// A new `partial` instance of `sub` (a subclass of `cls`, the registered
+/// class) over `func`, the stored positionals and keywords, its slots laid
+/// out as both constructors lay them out.
+fn build_partial(
+    reg: &PartialReg,
+    cls: &Rc<crate::types::TypeObject>,
+    sub: &Rc<crate::types::TypeObject>,
+    func: &Object,
+    rest: &[Object],
+    kwargs: &[(String, Object)],
+) -> Object {
     let mut kw = DictData::default();
     for (k, v) in kwargs {
         kw.insert(DictKey(Object::from_str(k.clone())), v.clone());
@@ -257,19 +310,42 @@ fn partial_new(
     let keywords = Object::Dict(Rc::new(RefCell::new(kw)));
     crate::gc_trace::track(&keywords);
     let values = [
-        args[1].clone(),
-        Object::new_tuple(args[2..].to_vec()),
+        func.clone(),
+        Object::tuple_from_slice(rest),
         keywords,
         Object::Int(0),
         Object::None,
     ];
-    let inst = crate::types::PyInstance::new(sub.clone());
-    for (name, v) in PARTIAL_SLOTS.iter().zip(values) {
-        inst.slot_set(name, v);
-    }
+    // (The exact class's slots in one piece; a subclass's own layout has
+    // its own slots after these.)
+    let layout = Rc::ptr_eq(sub, cls)
+        .then(|| cls.own_slot_layout())
+        .flatten()
+        .filter(|layout| {
+            *reg.laid_out.get_or_init(|| {
+                layout.len() == PARTIAL_SLOTS.len()
+                    && layout
+                        .iter()
+                        .zip(PARTIAL_SLOTS)
+                        .all(|(k, n)| matches!(&k.0, Object::Str(s) if s.as_ref() == n))
+            })
+        });
+    let inst = match layout {
+        Some(layout) => crate::types::PyInstance::with_slots(
+            sub.clone(),
+            crate::types::SlotStorage::from_layout_array(layout.clone(), values),
+        ),
+        None => {
+            let inst = crate::types::PyInstance::new(sub.clone());
+            for (name, v) in PARTIAL_SLOTS.iter().zip(values) {
+                inst.slot_set(name, v);
+            }
+            inst
+        }
+    };
     let obj = Object::Instance(Rc::new(inst));
     crate::gc_trace::track(&obj);
-    Ok(obj)
+    obj
 }
 
 /// `partial.__call__(self, /, *args, **keywords)` without a Python
@@ -363,8 +439,9 @@ fn partial_call(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
 
 /// `cmp_to_key(mycmp)` — CPython implements this in C so the module
 /// attribute is a non-binding builtin (a test class stores it as a
-/// class attribute and calls it through `self.`). The K-class factory
-/// itself stays in the frozen `functools.py` (`_cmp_to_key_py`).
+/// class attribute and calls it through `self.`). The key factory it
+/// returns is the frozen `functools.py`'s `_CmpToKey`, one class for every
+/// call (`_cmp_to_key_py`, the pure-Python version, makes a class a call).
 fn cmp_to_key(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let mycmp = match (args, kwargs) {
         ([m], []) => m.clone(),
@@ -389,7 +466,7 @@ fn cmp_to_key(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
     let Some(functools) = interp.module_cache().get("functools") else {
         return Err(type_error("cmp_to_key() requires functools to be imported"));
     };
-    let factory = interp.load_attr_public(&functools, "_cmp_to_key_py")?;
+    let factory = interp.load_attr_public(&functools, "_CmpToKey")?;
     let globals = interp.builtins_dict();
     interp.call(&factory, &[mycmp], &[], &globals)
 }
@@ -440,8 +517,7 @@ static LRU_TYPE_ADDR: std::sync::atomic::AtomicUsize = std::sync::atomic::Atomic
 
 fn lru_type() -> Rc<crate::types::TypeObject> {
     thread_local! {
-        static LRU_TYPE: RefCell<Option<Rc<crate::types::TypeObject>>> =
-            const { RefCell::new(None) };
+        static LRU_TYPE: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<crate::types::TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
     }
     LRU_TYPE.with(|slot| {
         if let Some(t) = slot.borrow().as_ref() {
@@ -774,10 +850,115 @@ fn native_lru_tuple_key(key: &Object, depth: usize, remaining: &mut usize) -> bo
                 || Rc::ptr_eq(cls, &builtins.str_)
                 || Rc::ptr_eq(cls, &builtins.bytes_)
                 || Rc::ptr_eq(cls, &builtins.tuple_)
+                // (Or a user class that hashes and compares by identity,
+                // `typing`'s generics; see the instance arm below. The
+                // other builtin classes stay off this path: a typed key's
+                // `float` or `bool` would meet `1 == 1.0 == True`.)
+                || (!cls.flags.is_builtin && crate::object::type_hash_is_identity(cls))
         }
         Object::Tuple(items) if depth > 0 && items.len() <= *remaining => items
             .iter()
             .all(|item| native_lru_tuple_key(item, depth - 1, remaining)),
+        // An argument that hashes and compares by identity (`typing`'s
+        // `_tp_cache` keys an alias and a class): nothing runs for either,
+        // and an evicted key is released with the cache consistent.
+        Object::Instance(i) => crate::object::identity_instance(i),
+        _ => false,
+    }
+}
+
+/// The Python hash of a key item a probe takes (native scalars, objects
+/// that hash by identity, and, `depth` deep, tuples of these), or `None`.
+fn item_hash(item: &Object, depth: u32) -> Option<i64> {
+    Some(match item {
+        Object::Int(i) => crate::object::py_hash_long_i64(*i),
+        Object::Str(s) => crate::shared_value::SharedStr::hash_cached(s),
+        Object::None | Object::Bool(_) | Object::Float(_) | Object::Bytes(_) => {
+            crate::object::py_hash_value(item)?
+        }
+        // An object that hashes and compares by identity (`typing`'s
+        // `_tp_cache` keys an alias and a class), as the native key admits
+        // it (see `native_lru_tuple_key`).
+        Object::Instance(_) | Object::Type(_) if identity_item(item) => {
+            crate::object::identity_hash(item)
+        }
+        // (`Dict[str, Any]`'s parameters.)
+        Object::Tuple(items) if depth > 0 => {
+            let mut hash = crate::object::TupleHasher::new();
+            for it in items.iter() {
+                hash.push(item_hash(it, depth - 1)?);
+            }
+            hash.finish(items.len())
+        }
+        _ => return None,
+    })
+}
+
+/// Whether a probe's key item `arg` equals a stored key's `item`, as the
+/// tuples' comparison would find, when that runs no Python code: `None`
+/// when it might (a pairing only Python's `==` settles).
+fn item_eq(arg: &Object, item: &Object, depth: u32) -> Option<bool> {
+    Some(match (arg, item) {
+        (Object::Int(a), Object::Int(b)) => a == b,
+        (Object::Str(a), Object::Str(b)) => {
+            crate::shared_value::SharedStr::ptr_eq(a, b)
+                || crate::dictmap::key_bytes_eq(a.as_bytes(), b.as_bytes())
+        }
+        (Object::Bytes(a), Object::Bytes(b)) => a[..] == b[..],
+        // Two identity-comparing objects: the same one or unequal (no
+        // `__eq__` of either runs).
+        (a @ (Object::Instance(_) | Object::Type(_)), b)
+            if identity_item(a) && identity_item(b) =>
+        {
+            a.is_same(b)
+        }
+        (Object::Instance(_) | Object::Type(_), _) => return None,
+        (Object::Tuple(a), Object::Tuple(b)) if depth > 0 => {
+            if a.len() != b.len() {
+                return Some(false);
+            }
+            for (x, y) in a.iter().zip(b.iter()) {
+                if !item_eq(x, y, depth - 1)? {
+                    return Some(false);
+                }
+            }
+            true
+        }
+        // A tuple against anything else (or past the depth): Python's.
+        (Object::Tuple(_), _) => return None,
+        // A scalar never equals a tuple.
+        (_, Object::Tuple(_)) => false,
+        // (`bytes` against a `str` may warn under `-b`.)
+        (Object::Bytes(_), _) | (_, Object::Bytes(_)) => return None,
+        // Builtin scalars compare natively (`1 == 1.0 == True`), identity
+        // first as a tuple's items do.
+        (
+            arg,
+            item @ (Object::None
+            | Object::Bool(_)
+            | Object::Int(_)
+            | Object::Long(_)
+            | Object::Float(_)
+            | Object::Str(_)
+            | Object::WStr(_)),
+        ) => arg.is_same(item) || arg.eq_value(item),
+        _ => return None,
+    })
+}
+
+/// Whether `item` hashes and compares by identity with nothing run, as
+/// [`native_lru_tuple_key`] admits an instance or a class.
+fn identity_item(item: &Object) -> bool {
+    match item {
+        Object::Instance(i) => crate::object::identity_instance(i),
+        Object::Type(cls) => {
+            let builtins = crate::builtin_types::builtin_types();
+            Rc::ptr_eq(cls, &builtins.int_)
+                || Rc::ptr_eq(cls, &builtins.str_)
+                || Rc::ptr_eq(cls, &builtins.bytes_)
+                || Rc::ptr_eq(cls, &builtins.tuple_)
+                || (!cls.flags.is_builtin && crate::object::type_hash_is_identity(cls))
+        }
         _ => false,
     }
 }
@@ -956,6 +1137,10 @@ fn lru_native_lookup(
             let value = data.get_index(index)?.1.clone();
             if bounded {
                 lru_state::Links::new(&mut bytes, data.len())?.touch(index)?;
+                // (Counted with the scalar path's: the bounded native hits
+                // keep the same recency links.)
+                #[cfg(test)]
+                note_scalar_lru_event(0);
             }
             lru_state::hit(&mut bytes)?;
             Some(NativeLookup::Hit(value))
@@ -1034,6 +1219,8 @@ fn native_store_in<P: ExactProbe>(
             return Ok(None);
         };
         links.touch(head).ok_or_else(invalid_lru_order)?;
+        #[cfg(test)]
+        note_scalar_lru_event(1);
         let evicted = data.replace_index_unique(head, hash, DictKey(key.clone()), result.clone());
         return Ok(Some(evicted));
     }
@@ -1160,11 +1347,25 @@ pub(crate) fn lru_probe(inst: &crate::types::PyInstance, args: &[Object]) -> Opt
         // without building it unless the call misses.
         [_, ..] if args.len() <= LRU_ARGS_MAX => {
             lru_probe_with::<_, true>(inst, &ArgsProbe::new(args, &[], &[])?, || {
-                Object::new_tuple(args.to_vec())
+                Object::tuple_from_slice(args)
             })
         }
         _ => None,
     }
+}
+
+/// [`lru_hit`] of `inst` if it's a wrapper (`f(*args)` forwarded to one,
+/// as `typing`'s `_tp_cache` does).
+pub(crate) fn lru_hit_if_wrapper(
+    inst: &crate::types::PyInstance,
+    args: &[Object],
+) -> Option<Object> {
+    if std::ptr::from_ref(inst.cls_raw()) as usize
+        != LRU_TYPE_ADDR.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return None;
+    }
+    lru_hit(inst, args)
 }
 
 /// [`lru_probe`]'s hit for a native caller (`Interpreter::call`), which
@@ -1297,14 +1498,7 @@ impl<'a> ArgsProbe<'a> {
         };
         let mut hash = crate::object::TupleHasher::new();
         for i in 0..len {
-            hash.push(match probe.item(i) {
-                Object::Int(i) => crate::object::py_hash_long_i64(*i),
-                Object::Str(s) => crate::shared_value::SharedStr::hash_cached(s),
-                item @ (Object::None | Object::Bool(_) | Object::Float(_) | Object::Bytes(_)) => {
-                    crate::object::py_hash_value(item)?
-                }
-                _ => return None,
-            });
+            hash.push(item_hash(probe.item(i), 1)?);
         }
         probe.hash = hash.finish(len);
         Some(probe)
@@ -1350,39 +1544,13 @@ impl crate::dictmap::Probe for ArgsProbe<'_> {
             // unequal pair settles it.
             Object::Tuple(items) if items.len() == self.len => {
                 for (i, item) in items.iter().enumerate() {
-                    let equal = match (self.item(i), item) {
-                        (Object::Int(a), Object::Int(b)) => a == b,
-                        (Object::Str(a), Object::Str(b)) => {
-                            crate::shared_value::SharedStr::ptr_eq(a, b)
-                                || crate::dictmap::key_bytes_eq(a.as_bytes(), b.as_bytes())
-                        }
-                        (Object::Bytes(a), Object::Bytes(b)) => a[..] == b[..],
-                        // A scalar never equals a tuple.
-                        (_, Object::Tuple(_)) => false,
-                        // (`bytes` against a `str` may warn under `-b`.)
-                        (Object::Bytes(_), _) | (_, Object::Bytes(_)) => {
+                    match item_eq(self.item(i), item, 1) {
+                        Some(true) => {}
+                        Some(false) => return false,
+                        None => {
                             self.foreign.set(true);
                             return false;
                         }
-                        // Builtin scalars compare natively (`1 == 1.0 ==
-                        // True`), identity first as a tuple's items do.
-                        (
-                            arg,
-                            item @ (Object::None
-                            | Object::Bool(_)
-                            | Object::Int(_)
-                            | Object::Long(_)
-                            | Object::Float(_)
-                            | Object::Str(_)
-                            | Object::WStr(_)),
-                        ) => arg.is_same(item) || arg.eq_value(item),
-                        _ => {
-                            self.foreign.set(true);
-                            return false;
-                        }
-                    };
-                    if !equal {
-                        return false;
                     }
                 }
                 true

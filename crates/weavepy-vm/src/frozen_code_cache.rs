@@ -153,10 +153,58 @@ fn disk_dir() -> Option<&'static PathBuf> {
     .as_ref()
 }
 
-/// The artifact path for a frozen module. Frozen names are dotted
-/// identifiers (`os.path`), safe as single filename components.
-fn disk_path(name: &str) -> Option<PathBuf> {
-    Some(disk_dir()?.join(name))
+/// The artifact path for a frozen module's source: its name and the
+/// source's hash, so two builds whose frozen sources differ (a developer's
+/// branches, a benchmark's merge-base build run between the PR's) keep an
+/// artifact each instead of compiling and replacing the other's at every
+/// start. Frozen names are dotted identifiers (`os.path`), safe as single
+/// filename components.
+fn disk_path(name: &str, source: &str) -> Option<PathBuf> {
+    let hash = crate::stdlib::frozen_source_hash(name, source);
+    Some(disk_dir()?.join(format!("{name}.{hash:016x}")))
+}
+
+/// After a write of `keep`, remove `name`'s artifacts for other sources
+/// (and its unhashed one, an earlier layout's) that no start has replaced
+/// for a day, so the directory doesn't grow with every source change. (A
+/// fresher one may belong to a build still in use.)
+fn prune_stale(name: &str, keep: &std::path::Path) {
+    let Some(dir) = keep.parent() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let day = std::time::Duration::from_hours(24);
+    for entry in entries.flatten() {
+        let file = entry.file_name();
+        let Some(file) = file.to_str() else {
+            continue;
+        };
+        // (An unhashed name is an earlier layout's artifact.)
+        let Some(rest) = file.strip_prefix(name) else {
+            continue;
+        };
+        let hashed = rest
+            .strip_prefix('.')
+            .is_some_and(|h| h.len() == 16 && h.bytes().all(|b| b.is_ascii_hexdigit()));
+        if !(rest.is_empty() || hashed) {
+            continue;
+        }
+        let path = entry.path();
+        if path == keep {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > day);
+        if old {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// Try the on-disk cache for a frozen module. On a healthy hit the
@@ -166,7 +214,7 @@ fn disk_path(name: &str) -> Option<PathBuf> {
 pub fn get_disk(name: &str, source: &str, filename: &str) -> Option<CodeObject> {
     use std::io::Read;
     use weavepy_compiler::native_code;
-    let mut file = std::fs::File::open(disk_path(name)?).ok()?;
+    let mut file = std::fs::File::open(disk_path(name, source)?).ok()?;
     let size = usize::try_from(file.metadata().ok()?.len()).ok()?;
     let mut head = [0u8; FROZEN_HEADER_LEN];
     file.read_exact(&mut head).ok()?;
@@ -396,7 +444,7 @@ fn discard_disk_cache() {
 }
 
 pub fn write_disk(name: &str, source: &str, code: &CodeObject) {
-    let Some(path) = disk_path(name) else {
+    let Some(path) = disk_path(name, source) else {
         return;
     };
     if let Some(parent) = path.parent() {
@@ -416,7 +464,9 @@ pub fn write_disk(name: &str, source: &str, code: &CodeObject) {
     // half-written artifact.
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
     if std::fs::write(&tmp, &bytes).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
+        if std::fs::rename(&tmp, &path).is_ok() {
+            prune_stale(name, &path);
+        }
     } else {
         let _ = std::fs::remove_file(&tmp);
     }

@@ -146,7 +146,7 @@ fn desc2_call(_args: &[Object]) -> Result<Object, RuntimeError> {
 /// a fresh tuple of the positional arguments after `self`. The
 /// identity-preserving splat path lives in `CALL_FUNCTION_EX`.
 fn nopget_call(args: &[Object]) -> Result<Object, RuntimeError> {
-    Ok(Object::new_tuple(args[1..].to_vec()))
+    Ok(Object::tuple_from_slice(&args[1..]))
 }
 
 const VECTORCALL_SET_KEY: &str = "_weave_vectorcall_set";

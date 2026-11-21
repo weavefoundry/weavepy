@@ -2653,8 +2653,7 @@ thread_local! {
     /// identity (and holding the source object so its pointer can't be
     /// reused) makes repeated matches on one immutable subject O(1) after the
     /// first decode.
-    static SUBJECT_CACHE: std::cell::RefCell<Option<(usize, Object, Rc<Vec<u32>>)>> =
-        const { std::cell::RefCell::new(None) };
+    static SUBJECT_CACHE: crate::gil::ReleaseUnderGil<std::cell::RefCell<Option<(usize, Object, Rc<Vec<u32>>)>>> = const { crate::gil::ReleaseUnderGil::new(std::cell::RefCell::new(None)) };
 }
 
 /// Stable heap-identity key for an immutable subject. Returns `None` for
@@ -2979,7 +2978,19 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             ("_cache_get", sre_cache_get),
             ("_cache_put", sre_cache_put),
         ] {
-            d.insert(DictKey(Object::from_static(name)), b(name, f));
+            let builtin = b(name, f);
+            // (`Pattern._exec`'s match, once a search: over a `str` or
+            // `bytes` subject it runs no Python code, and compiled code
+            // calls it in place.)
+            if name == "exec_match" {
+                if let Object::Builtin(bf) = &builtin {
+                    crate::leaf_builtins::register_fast(bf, |args| {
+                        matches!(args.get(1), Some(Object::Str(_) | Object::Bytes(_)))
+                            .then(|| super::sre_objects::exec_match(args))
+                    });
+                }
+            }
+            d.insert(DictKey(Object::from_static(name)), builtin);
         }
         d.insert(
             DictKey(Object::from_static("compile_cached")),

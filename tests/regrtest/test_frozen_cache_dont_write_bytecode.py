@@ -43,7 +43,8 @@ if sys.implementation.name == 'weavepy':
                 'print(json.dumps({"v": frozen_cache_user_mod.VALUE}))\n')
         assert run(cache, directory, code, True) == '{"v": 7}\n'
         names = cached_names(cache)
-        assert 'json' in names or 'json.decoder' in names, sorted(names)[:20]
+        # (Artifacts are named by module and source hash: `json.<hash>`.)
+        assert any(n.split('.')[0] == 'json' for n in names), sorted(names)[:20]
         # The user module's bytecode stays unwritten under -B.
         assert not os.path.exists(os.path.join(directory, '__pycache__'))
         # A second process reads what the first wrote.

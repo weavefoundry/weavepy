@@ -179,6 +179,14 @@ enum Op {
         b: u8,
         kind: u8,
     },
+    /// `regs[dst] = (regs[item] in regs[cont]) != invert` (see
+    /// [`contains`]).
+    Contains {
+        dst: u8,
+        item: u8,
+        cont: u8,
+        invert: bool,
+    },
     /// `regs[dst] = regs[a][regs[b]]` (see [`subscr`]).
     Subscr {
         dst: u8,
@@ -189,6 +197,15 @@ enum Op {
     /// `regs[a]`, `regs[b]`, `regs[c]`, held by the owned scratch (see
     /// [`new_tuple`]).
     Tuple {
+        dst: u8,
+        a: u8,
+        b: u8,
+        c: u8,
+        n: u8,
+    },
+    /// `slice(regs[a], regs[b][, regs[c]])` (`n` bounds), its bounds
+    /// plain ints or `None`, held by the owned scratch.
+    Slice {
         dst: u8,
         a: u8,
         b: u8,
@@ -234,6 +251,12 @@ enum Op {
     /// Abandon the evaluation: the path reached an instruction the plan
     /// can't run.
     Decline,
+    /// `raise X` (`RAISE_VARARGS 1`): declines, unless this is the step
+    /// `Interpreter::leaf_python_step` asked for (see [`stop_ends_step`]),
+    /// where a bare `raise StopIteration` ends it as exhausted.
+    StopIter {
+        src: u8,
+    },
     /// An effect leaf's buffered `recv.name = val`.
     StoreAttr {
         recv: u8,
@@ -496,6 +519,18 @@ impl Builder<'_> {
                 }
                 self.ops.push(Op::Compare { dst, a, b, kind });
             }
+            // (`x in self.items`, a `__contains__`'s body.)
+            OpCode::ContainsOp => {
+                let cont = self.pop()?;
+                let item = self.pop()?;
+                let dst = self.push_new()?;
+                self.ops.push(Op::Contains {
+                    dst,
+                    item,
+                    cont,
+                    invert: arg == 1,
+                });
+            }
             OpCode::IsOp => {
                 let b = self.pop()?;
                 let a = self.pop()?;
@@ -550,6 +585,22 @@ impl Builder<'_> {
                 let dst = self.push_new()?;
                 let item = |k: usize| items.get(k).copied().unwrap_or(items[0]);
                 self.ops.push(Op::Tuple {
+                    dst,
+                    a: item(0),
+                    b: item(1),
+                    c: item(2),
+                    n: n as u8,
+                });
+            }
+            // (`w[::-1]`, a key function's reversal.)
+            OpCode::BuildSlice if matches!(arg, 2 | 3) => {
+                let n = arg as usize;
+                let at = self.stack.len().checked_sub(n)?;
+                let items: Vec<Opnd> = self.stack[at..].to_vec();
+                self.stack.truncate(at);
+                let dst = self.push_new()?;
+                let item = |k: usize| items.get(k).copied().unwrap_or(items[0]);
+                self.ops.push(Op::Slice {
                     dst,
                     a: item(0),
                     b: item(1),
@@ -653,6 +704,11 @@ impl Builder<'_> {
             OpCode::ReturnValue => {
                 let src = self.pop()?;
                 self.ops.push(Op::Return { src });
+                return Some(false);
+            }
+            OpCode::RaiseVarargs if arg == 1 => {
+                let src = self.pop()?;
+                self.ops.push(Op::StopIter { src });
                 return Some(false);
             }
             OpCode::StoreAttr => {
@@ -954,6 +1010,35 @@ pub(crate) enum LeafRet {
     Owned(Object),
 }
 
+/// Whether a `raise` of `v` at the top of an evaluation of `code` (at
+/// call nesting `nest`, on `args`) ends the frameless iterator step
+/// [`Interpreter::leaf_python_step`] is running as exhausted: `v` is the
+/// builtin `StopIteration` class, and the evaluation is that step's own.
+/// Its caller then answers as the exception's catcher would, the
+/// exception never built (nothing could observe it: the step is
+/// frameless), once the stores buffered ahead of the raise have landed.
+pub(super) fn stop_ends_step(
+    interp: &Interpreter,
+    code: &CodeObject,
+    nest: u8,
+    args: &[*const Object],
+    v: V,
+) -> bool {
+    let (want_code, want_it, _) = interp.leaf_stop.get();
+    if nest != 0
+        || want_code != std::ptr::from_ref(code) as usize
+        || args.first().map(|&a| a as usize) != Some(want_it)
+    {
+        return false;
+    }
+    let V::R(p) = v else {
+        return false;
+    };
+    // SAFETY: as `norm`.
+    matches!(unsafe { &*p }, Object::Type(t)
+        if t.flags.is_builtin && t.name.as_str() == "StopIteration")
+}
+
 /// The value of `f`'s closure cell `idx`, borrowed: nothing an evaluation
 /// runs can rebind a cell (a leaf has no `STORE_DEREF`), and the function
 /// holds its closure. `None` for an empty cell (the read raises).
@@ -1172,9 +1257,18 @@ impl Interpreter {
                 Op::Truth { dst, src } => set!(dst, V::B(truth(get!(src))?)),
                 Op::Unary { dst, src, kind } => set!(dst, unary(get!(src), kind)?),
                 Op::Binary { dst, a, b, kind } => set!(dst, binary(get!(a), get!(b), kind)?),
+                Op::Contains {
+                    dst,
+                    item,
+                    cont,
+                    invert,
+                } => set!(dst, V::B(contains(get!(item), get!(cont))? != invert)),
                 Op::Subscr { dst, a, b } => set!(dst, subscr(&mut owned, get!(a), get!(b))?),
                 Op::Tuple { dst, a, b, c, n } => {
                     set!(dst, new_tuple(&mut owned, [get!(a), get!(b), get!(c)], n)?)
+                }
+                Op::Slice { dst, a, b, c, n } => {
+                    set!(dst, new_slice(&mut owned, [get!(a), get!(b), get!(c)], n)?)
                 }
                 Op::Swap { a, b } => {
                     let (x, y) = (get!(a), get!(b));
@@ -1194,6 +1288,22 @@ impl Interpreter {
                 Op::Jump { target } => ip = usize::from(target),
                 Op::New { dst, dict } => set!(dst, new_container(&mut owned, dict)?),
                 Op::Decline => return None,
+                Op::StopIter { src } => {
+                    if depth == 0 && !FRESH && stop_ends_step(self, code, nest, args, get!(src)) {
+                        // The stores made before the raise land first, as
+                        // a return lands them (`self.i += 1` ahead of the
+                        // exhaustion test); one that can't declines with
+                        // nothing done.
+                        if pend.n > 0 {
+                            if !self.leaf_stop.get().2 {
+                                return None;
+                            }
+                            self.plan_finish::<EFFECT>(code, ext, plan, &owned, &mut pend, V::N)?;
+                        }
+                        return Some(LeafRet::Owned(Object::Unbound));
+                    }
+                    return None;
+                }
                 Op::Call { at, argc, pc } => {
                     // A pure-leaf callee, evaluated in place: only while
                     // no store is buffered (it would not see one).
@@ -1458,6 +1568,16 @@ pub(crate) fn unary(v: V, kind: u8) -> Option<V> {
 #[inline(always)]
 pub(crate) fn binary(a: V, b: V, kind: u8) -> Option<V> {
     Some(match (a, b) {
+        // `int / int` of operands a double holds exactly (at most `2**53`
+        // in magnitude): their quotient is correctly rounded, as CPython's
+        // `long_true_divide` gives it (`Fraction.__float__`).
+        (V::I(a), V::I(b)) if kind == BinOpKind::Div as u8 => {
+            const EXACT: i64 = 1 << 53;
+            if b == 0 || !(-EXACT..=EXACT).contains(&a) || !(-EXACT..=EXACT).contains(&b) {
+                return None;
+            }
+            V::F(a as f64 / b as f64)
+        }
         (V::I(a), V::I(b)) => V::I(match kind {
             k if k == BinOpKind::Add as u8 => a.checked_add(b)?,
             k if k == BinOpKind::Sub as u8 => a.checked_sub(b)?,
@@ -1497,6 +1617,37 @@ pub(crate) fn binary(a: V, b: V, kind: u8) -> Option<V> {
 /// key type), or an ASCII string's character (held by `owned`). Anything
 /// else, a miss included, declines.
 #[inline]
+/// `item in cont` when the test runs no code (see
+/// `Interpreter::leaf_contains`): a native container, never an instance,
+/// whose own `__contains__` could reach this evaluation again. `None`
+/// declines.
+pub(super) fn contains(item: V, cont: V) -> Option<bool> {
+    let V::R(c) = cont else {
+        return None;
+    };
+    // SAFETY: as `norm`.
+    let c = unsafe { &*c };
+    if matches!(c, Object::Instance(_)) {
+        return None;
+    }
+    let scalar;
+    let item: &Object = match item {
+        // SAFETY: as above.
+        V::R(p) => unsafe { &*p },
+        V::I(i) => {
+            scalar = Object::Int(i);
+            &scalar
+        }
+        V::B(b) => {
+            scalar = Object::Bool(b);
+            &scalar
+        }
+        V::N => &Object::None,
+        V::F(_) | V::Fn(_) | V::Bi(_) | V::Null => return None,
+    };
+    Interpreter::leaf_contains(c, item)
+}
+
 fn subscr(owned: &mut Owned, a: V, b: V) -> Option<V> {
     let V::R(c) = a else {
         return None;
@@ -1519,6 +1670,23 @@ fn subscr(owned: &mut Owned, a: V, b: V) -> Option<V> {
                 return None;
             }
             owned.own(Object::from_char(s.as_bytes()[index(i, s.len())?] as char))
+        }
+        // A plain sequence sliced by a slice of plain bounds (as the core
+        // loop's container step slices it).
+        (Object::List(_) | Object::Tuple(_) | Object::Str(_) | Object::Bytes(_), V::R(k))
+            if matches!(unsafe { &*k }, Object::Slice(_)) =>
+        {
+            let Object::Slice(sl) = (unsafe { &*k }) else {
+                return None;
+            };
+            if ![&sl.start, &sl.stop, &sl.step]
+                .iter()
+                .all(|v| matches!(v, Object::None | Object::Int(_)))
+                || matches!(sl.step, Object::Int(0))
+            {
+                return None;
+            }
+            owned.own(crate::Interpreter::core_slice(unsafe { &*c }, sl)?)
         }
         (Object::Dict(d), V::I(_) | V::R(_)) => {
             let int;
@@ -1560,6 +1728,21 @@ fn new_tuple(owned: &mut Owned, items: [V; 3], n: u8) -> Option<V> {
         _ => return None,
     };
     owned.own(t)
+}
+
+fn new_slice(owned: &mut Owned, items: [V; 3], n: u8) -> Option<V> {
+    let bound = |v: V| match v {
+        V::I(i) => Some(Object::Int(i)),
+        V::N => Some(Object::None),
+        _ => None,
+    };
+    let [a, b, c] = items;
+    let step = if n == 3 { bound(c)? } else { Object::None };
+    owned.own(Object::Slice(Rc::new(crate::object::PySlice {
+        start: bound(a)?,
+        stop: bound(b)?,
+        step,
+    })))
 }
 
 fn new_container(owned: &mut Owned, dict: bool) -> Option<V> {
@@ -1722,6 +1905,18 @@ impl Interpreter {
                     .and_then(|s| crate::class_attr_hit(s, cls))
                 {
                     Some(v) => owned.own(v),
+                    // An attribute of a class under a Python metaclass the
+                    // site found before (an enum's `_member_map_`): its
+                    // stamp is filled only past the checks below.
+                    None if !Self::plain_metaclass(cls) => {
+                        match crate::meta_entry_hit(code, cls, pc as usize) {
+                            Some(v) => owned.own(v),
+                            None => {
+                                let v = Self::leaf_load_type_attr(code, cls, pc, name)?;
+                                owned.own(v)
+                            }
+                        }
+                    }
                     None => {
                         let v = Self::leaf_load_type_attr(code, cls, pc, name)?;
                         // A scalar is a plain class value (see

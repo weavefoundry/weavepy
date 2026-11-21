@@ -187,9 +187,13 @@ fn b_kw(
 /// Coerce a zlib data argument. Unlike a plain `str`, zlib requires a
 /// *bytes-like* object (buffer protocol); `str` and numbers raise
 /// `TypeError`, which `test_badargs` checks explicitly.
-fn bytes_of(arg: Option<&Object>) -> Result<Vec<u8>, RuntimeError> {
+fn bytes_of(arg: Option<&Object>) -> Result<std::borrow::Cow<'_, [u8]>, RuntimeError> {
+    if let Some(o) = arg {
+        o.check_simple_buffer()?;
+    }
     match arg {
-        Some(o) => o.as_bytes_view().ok_or_else(|| {
+        // (A `bytes` object's bytes are read where they are.)
+        Some(o) => o.bytes_cow().ok_or_else(|| {
             type_error(format!(
                 "a bytes-like object is required, not '{}'",
                 o.type_name()
@@ -364,16 +368,13 @@ struct ZlibDecompressorState {
 }
 
 thread_local! {
-    static COMPRESS_REG: RefCell<HashMap<i64, Rc<RefCell<CompressState>>>> =
-        RefCell::new(HashMap::new());
-    static DECOMPRESS_REG: RefCell<HashMap<i64, Rc<RefCell<DecompressState>>>> =
-        RefCell::new(HashMap::new());
-    static ZDECOMP_REG: RefCell<HashMap<i64, Rc<RefCell<ZlibDecompressorState>>>> =
-        RefCell::new(HashMap::new());
+    static COMPRESS_REG: crate::gil::ReleaseUnderGil<RefCell<HashMap<i64, Rc<RefCell<CompressState>>>>> = crate::gil::ReleaseUnderGil::new(RefCell::new(HashMap::new()));
+    static DECOMPRESS_REG: crate::gil::ReleaseUnderGil<RefCell<HashMap<i64, Rc<RefCell<DecompressState>>>>> = crate::gil::ReleaseUnderGil::new(RefCell::new(HashMap::new()));
+    static ZDECOMP_REG: crate::gil::ReleaseUnderGil<RefCell<HashMap<i64, Rc<RefCell<ZlibDecompressorState>>>>> = crate::gil::ReleaseUnderGil::new(RefCell::new(HashMap::new()));
     static NEXT_ID: RefCell<i64> = const { RefCell::new(1) };
-    static COMPRESS_CLASS: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
-    static DECOMPRESS_CLASS: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
-    static ZDECOMP_CLASS: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
+    static COMPRESS_CLASS: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
+    static DECOMPRESS_CLASS: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
+    static ZDECOMP_CLASS: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
 }
 
 fn next_id() -> i64 {
@@ -770,11 +771,11 @@ fn store_decompress_attrs(args: &[Object], unused: &[u8], unconsumed: &[u8], eof
         let mut d = inst.dict_cell().borrow_mut();
         d.insert(
             DictKey(Object::from_static("unused_data")),
-            Object::new_bytes(unused.to_vec()),
+            Object::new_bytes(unused),
         );
         d.insert(
             DictKey(Object::from_static("unconsumed_tail")),
-            Object::new_bytes(unconsumed.to_vec()),
+            Object::new_bytes(unconsumed),
         );
         d.insert(DictKey(Object::from_static("eof")), Object::Bool(eof));
     }
@@ -880,32 +881,58 @@ fn read_bytes_attr(args: &[Object], name: &str) -> Vec<u8> {
     Vec::new()
 }
 
+/// `f` on a checksum's data: a `bytes`, `bytearray` or live `memoryview`
+/// read where it is (a checksum runs no code while it reads), anything
+/// else through [`bytes_of`] (its copy, or its error).
+fn with_data<R>(arg: Option<&Object>, f: impl FnOnce(&[u8]) -> R) -> Result<R, RuntimeError> {
+    let mut f = Some(f);
+    if let Some(o) = arg {
+        o.check_simple_buffer()?;
+        if let Some(r) = o.with_bytes_view(|d| (f.take().expect("called once"))(d)) {
+            return Ok(r);
+        }
+    }
+    let data = bytes_of(arg)?;
+    Ok((f.take().expect("called once"))(&data))
+}
+
 fn zlib_crc32(args: &[Object]) -> Result<Object, RuntimeError> {
-    let data = bytes_of(args.first())?;
     let init = match args.get(1) {
         Some(Object::Int(n)) => *n as u32,
         _ => 0,
     };
-    let mut hasher = crc32fast::Hasher::new_with_initial(init);
-    hasher.update(&data);
-    Ok(Object::Int(i64::from(hasher.finalize())))
+    let crc = with_data(args.first(), |data| {
+        let mut hasher = crc32fast::Hasher::new_with_initial(init);
+        hasher.update(data);
+        hasher.finalize()
+    })?;
+    Ok(Object::Int(i64::from(crc)))
 }
 
 fn zlib_adler32(args: &[Object]) -> Result<Object, RuntimeError> {
-    let data = bytes_of(args.first())?;
     let init = match args.get(1) {
         Some(Object::Int(n)) => *n as u32,
         _ => 1,
     };
-    // Classic Adler-32 from RFC 1950.
-    let mut a = init & 0xFFFF;
-    let mut b = (init >> 16) & 0xFFFF;
+    // Adler-32 from RFC 1950, reduced once per block of 5,552 bytes (zlib's
+    // NMAX: the most a block can add before `b` overflows 32 bits).
     const MOD_ADLER: u32 = 65521;
-    for &byte in &data {
-        a = (a + u32::from(byte)) % MOD_ADLER;
-        b = (b + a) % MOD_ADLER;
-    }
-    Ok(Object::Int(i64::from((b << 16) | a)))
+    const NMAX: usize = 5552;
+    let sum = with_data(args.first(), |data| {
+        let mut a = init & 0xFFFF;
+        let mut b = (init >> 16) & 0xFFFF;
+        for block in data.chunks(NMAX) {
+            for &byte in block {
+                a += u32::from(byte);
+                b += a;
+            }
+            a %= MOD_ADLER;
+            b %= MOD_ADLER;
+        }
+        // (zlib reduces the starting value even for no data.)
+        (b % MOD_ADLER) << 16 | (a % MOD_ADLER)
+    })?;
+    Ok(Object::Int(i64::from(sum)))
 }
 
 // ---- zlib._ZlibDecompressor -------------------------------------------
@@ -946,7 +973,7 @@ fn store_zd_attrs(args: &[Object], unused: &[u8], eof: bool, needs_input: bool) 
         let mut d = inst.dict_cell().borrow_mut();
         d.insert(
             DictKey(Object::from_static("unused_data")),
-            Object::new_bytes(unused.to_vec()),
+            Object::new_bytes(unused),
         );
         d.insert(DictKey(Object::from_static("eof")), Object::Bool(eof));
         d.insert(

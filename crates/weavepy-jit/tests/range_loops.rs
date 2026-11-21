@@ -180,3 +180,50 @@ fn params_are_entry_guarded() {
         tfunc.livein_locals
     );
 }
+
+const KERNEL: &str =
+    "def kernel(n):\n    total = 0\n    for i in range(n):\n        total = total + i * 2\n    return total\n";
+
+#[test]
+fn work_budget_counts_passes_over_the_code() {
+    let code = compile_first_fn(KERNEL);
+    let len = code.instructions.len() as u64;
+    let (res, spent, short) =
+        weavepy_jit::with_work_budget(len * 100, || analyze(&code, &mut range_only));
+    assert!(res.is_ok());
+    assert!(!short);
+    // One unit an instruction for each pass, and the kernel needs few.
+    assert!(
+        spent >= len && spent % len == 0 && spent <= len * 4,
+        "{spent} units for {len}"
+    );
+    // The budget is restored: an analysis outside one is unlimited.
+    assert!(!weavepy_jit::work_short());
+    assert!(analyze(&code, &mut range_only).is_ok());
+}
+
+#[test]
+fn work_budget_too_small_fails_as_a_retriable_miss() {
+    let code = compile_first_fn(KERNEL);
+    let len = code.instructions.len() as u64;
+    let (res, spent, short) =
+        weavepy_jit::with_work_budget(len - 1, || analyze(&code, &mut range_only));
+    assert_eq!(
+        res.err(),
+        Some(JitVerdict::ProbeMiss(weavepy_jit::OVER_BUDGET))
+    );
+    assert!(short);
+    assert_eq!(spent, len - 1);
+    // Every analysis after it in the same budget fails the same way, so
+    // one that reads the result of a callee's doesn't finish on it.
+    let (res, _, short) = weavepy_jit::with_work_budget(len + len / 2, || {
+        let first = analyze(&code, &mut range_only);
+        assert!(first.is_ok());
+        analyze(&code, &mut range_only)
+    });
+    assert_eq!(
+        res.err(),
+        Some(JitVerdict::ProbeMiss(weavepy_jit::OVER_BUDGET))
+    );
+    assert!(short);
+}

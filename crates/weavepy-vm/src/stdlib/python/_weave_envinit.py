@@ -25,6 +25,8 @@ import sys as _sys
 # (test_site.test_startup_imports counts them).
 from _collections_abc import Mapping, MutableMapping
 
+_MISSING = object()
+
 
 class _Environ(MutableMapping):
     """Verbatim port of CPython's ``os._Environ``."""
@@ -46,6 +48,19 @@ class _Environ(MutableMapping):
             # raise KeyError with the original key value
             raise KeyError(key) from None
         return self.decodevalue(value)
+
+    # `Mapping.get` and `Mapping.__contains__` find a missing variable
+    # through `__getitem__`, raising (and catching) two `KeyError`s; a
+    # program asks for unset variables all the time (color and locale
+    # probes), so these look in the backing store directly.
+    def get(self, key, default=None):
+        value = self._data.get(self.encodekey(key), _MISSING)
+        if value is _MISSING:
+            return default
+        return self.decodevalue(value)
+
+    def __contains__(self, key):
+        return self.encodekey(key) in self._data
 
     def __setitem__(self, key, value):
         key = self.encodekey(key)

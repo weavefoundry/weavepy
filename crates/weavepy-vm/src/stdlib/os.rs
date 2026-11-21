@@ -284,10 +284,15 @@ pub fn build(cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("listdir")),
             builtin("listdir", os_listdir),
         );
-        d.insert(
-            DictKey(Object::from_static("urandom")),
-            builtin("urandom", os_urandom),
-        );
+        d.insert(DictKey(Object::from_static("urandom")), {
+            // Takes only a plain int (no `__index__` call): no Python
+            // runs, whatever the arguments.
+            let f = builtin("urandom", os_urandom);
+            if let Object::Builtin(b) = &f {
+                crate::leaf_builtins::register(b);
+            }
+            f
+        });
         d.insert(
             DictKey(Object::from_static("close")),
             builtin("close", os_close_stub),
@@ -2019,7 +2024,7 @@ fn os_listdir(args: &[Object]) -> Result<Object, RuntimeError> {
                 name.to_string_lossy().into_owned().into_bytes(),
             ));
         } else {
-            out.push(Object::from_str(name.to_string_lossy()));
+            out.push(Object::from_str(os_text(&name)));
         }
     }
     Ok(Object::new_list(out))
@@ -2752,11 +2757,88 @@ fn stat_seq_finish(inst: &crate::types::PyInstance) {
     }
 }
 
+/// A `stat_result`'s named fields as a builder collects them (each name
+/// once), for [`stat_fields_finish`].
+struct StatFields(Vec<(&'static str, Object)>);
+
+impl StatFields {
+    fn insert(&mut self, name: &'static str, value: Object) {
+        debug_assert!(self.0.iter().all(|(n, _)| *n != name), "{name} twice");
+        self.0.push((name, value));
+    }
+
+    fn get(&self, name: &str) -> Option<&Object> {
+        self.0.iter().find(|(n, _)| *n == name).map(|(_, v)| v)
+    }
+}
+
+/// [`stat_seq_finish`] of the fields a builder collected: the tuple view
+/// from them directly, and the instance dict laid down in one go, its keys
+/// (and their hashes) made once per thread for each position a builder
+/// fills.
+fn stat_fields_finish(inst: &crate::types::PyInstance, fields: StatFields) {
+    #[cfg(target_os = "macos")]
+    let fields = {
+        let mut fields = fields;
+        for f in ["st_flags", "st_gen"] {
+            if fields.get(f).is_none() {
+                fields.insert(f, Object::Int(0));
+            }
+        }
+        if fields.get("st_birthtime").is_none() {
+            let v = fields
+                .get("st_ctime")
+                .cloned()
+                .unwrap_or(Object::Float(0.0));
+            fields.insert("st_birthtime", v);
+        }
+        fields
+    };
+    let mut seq: Vec<Object> = Vec::with_capacity(10);
+    for f in [
+        "st_mode", "st_ino", "st_dev", "st_nlink", "st_uid", "st_gid", "st_size",
+    ] {
+        seq.push(fields.get(f).cloned().unwrap_or(Object::Int(0)));
+    }
+    for f in ["st_atime", "st_mtime", "st_ctime"] {
+        seq.push(match fields.get(f) {
+            Some(Object::Float(x)) => Object::Int(*x as i64),
+            Some(other) => other.clone(),
+            None => Object::Int(0),
+        });
+    }
+    let _ = inst.native.set(Object::new_tuple(seq));
+    thread_local! {
+        static KEYS: crate::gil::ReleaseUnderGil<std::cell::RefCell<Vec<(usize, i64, DictKey)>>> = const { crate::gil::ReleaseUnderGil::new(std::cell::RefCell::new(Vec::new())) };
+    }
+    let n = fields.0.len();
+    let mut values = fields.0.into_iter();
+    let map = KEYS.with(|keys| {
+        let mut keys = keys.borrow_mut();
+        crate::dictmap::DictMap::from_unique_hashed(n, |i| {
+            let (name, value) = values.next().expect("n fields");
+            let at = name.as_ptr() as usize;
+            if keys.get(i).is_none_or(|k| k.0 != at) {
+                let key = static_name_key(name);
+                let entry = (at, crate::object::dict_key_hash(&key.0), key);
+                if i < keys.len() {
+                    keys[i] = entry;
+                } else {
+                    keys.push(entry);
+                }
+            }
+            let (_, hash, key) = &keys[i];
+            (*hash, key.clone(), value)
+        })
+    });
+    *inst.dict_cell().borrow_mut() = DictData::from(map);
+}
+
 fn stat_result_from_meta(meta: &std::fs::Metadata) -> Object {
     use crate::types::PyInstance;
     let ty = stat_result_type();
     let inst = PyInstance::new(ty);
-    let mut d = inst.dict_cell().borrow_mut();
+    let mut d = StatFields(Vec::with_capacity(24));
     // On Unix the OS already encodes the full `st_mode` — file-type bits
     // (S_IFREG / S_IFDIR / S_IFCHR / S_IFBLK / S_IFLNK / S_IFIFO / S_IFSOCK)
     // *and* permissions — so use it verbatim; otherwise char/block devices,
@@ -2786,11 +2868,8 @@ fn stat_result_from_meta(meta: &std::fs::Metadata) -> Object {
         };
         kind_bits | perm_bits
     };
-    d.insert(
-        DictKey(Object::from_static("st_size")),
-        Object::Int(meta.len() as i64),
-    );
-    d.insert(DictKey(Object::from_static("st_mode")), Object::Int(mode));
+    d.insert("st_size", Object::Int(meta.len() as i64));
+    d.insert("st_mode", Object::Int(mode));
     // On Unix derive the float `st_*time` straight from the integer
     // nanosecond fields below, so `st_atime` and `st_atime_ns` describe the
     // *same* instant (CPython invariant: `test_stat_attributes` checks they
@@ -2825,18 +2904,9 @@ fn stat_result_from_meta(meta: &std::fs::Metadata) -> Object {
             .map_or(mtime, |d| d.as_secs_f64());
         (atime, mtime, ctime)
     };
-    d.insert(
-        DictKey(Object::from_static("st_mtime")),
-        Object::Float(mtime),
-    );
-    d.insert(
-        DictKey(Object::from_static("st_atime")),
-        Object::Float(atime),
-    );
-    d.insert(
-        DictKey(Object::from_static("st_ctime")),
-        Object::Float(ctime),
-    );
+    d.insert("st_mtime", Object::Float(mtime));
+    d.insert("st_atime", Object::Float(atime));
+    d.insert("st_ctime", Object::Float(ctime));
     // The remaining fields come straight from the OS `stat(2)` record on
     // Unix. Real `st_ino`/`st_dev` are essential: `posixpath.samefile`/
     // `samestat` compare exactly those two, so leaving them 0 made every
@@ -2846,77 +2916,41 @@ fn stat_result_from_meta(meta: &std::fs::Metadata) -> Object {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        d.insert("st_ino", Object::Int(meta.ino() as i64));
+        d.insert("st_dev", Object::Int(meta.dev() as i64));
+        d.insert("st_nlink", Object::Int(meta.nlink() as i64));
+        d.insert("st_uid", Object::Int(i64::from(meta.uid())));
+        d.insert("st_gid", Object::Int(i64::from(meta.gid())));
+        d.insert("st_rdev", Object::Int(meta.rdev() as i64));
+        d.insert("st_blocks", Object::Int(meta.blocks() as i64));
+        d.insert("st_blksize", Object::Int(meta.blksize() as i64));
         d.insert(
-            DictKey(Object::from_static("st_ino")),
-            Object::Int(meta.ino() as i64),
-        );
-        d.insert(
-            DictKey(Object::from_static("st_dev")),
-            Object::Int(meta.dev() as i64),
-        );
-        d.insert(
-            DictKey(Object::from_static("st_nlink")),
-            Object::Int(meta.nlink() as i64),
-        );
-        d.insert(
-            DictKey(Object::from_static("st_uid")),
-            Object::Int(i64::from(meta.uid())),
-        );
-        d.insert(
-            DictKey(Object::from_static("st_gid")),
-            Object::Int(i64::from(meta.gid())),
-        );
-        d.insert(
-            DictKey(Object::from_static("st_rdev")),
-            Object::Int(meta.rdev() as i64),
-        );
-        d.insert(
-            DictKey(Object::from_static("st_blocks")),
-            Object::Int(meta.blocks() as i64),
-        );
-        d.insert(
-            DictKey(Object::from_static("st_blksize")),
-            Object::Int(meta.blksize() as i64),
-        );
-        d.insert(
-            DictKey(Object::from_static("st_mtime_ns")),
+            "st_mtime_ns",
             Object::Int(meta.mtime() * 1_000_000_000 + meta.mtime_nsec()),
         );
         d.insert(
-            DictKey(Object::from_static("st_atime_ns")),
+            "st_atime_ns",
             Object::Int(meta.atime() * 1_000_000_000 + meta.atime_nsec()),
         );
         d.insert(
-            DictKey(Object::from_static("st_ctime_ns")),
+            "st_ctime_ns",
             Object::Int(meta.ctime() * 1_000_000_000 + meta.ctime_nsec()),
         );
     }
     #[cfg(not(unix))]
     {
-        d.insert(DictKey(Object::from_static("st_ino")), Object::Int(0));
-        d.insert(DictKey(Object::from_static("st_dev")), Object::Int(0));
-        d.insert(DictKey(Object::from_static("st_nlink")), Object::Int(1));
-        d.insert(DictKey(Object::from_static("st_uid")), Object::Int(0));
-        d.insert(DictKey(Object::from_static("st_gid")), Object::Int(0));
-        d.insert(DictKey(Object::from_static("st_rdev")), Object::Int(0));
-        d.insert(DictKey(Object::from_static("st_blocks")), Object::Int(0));
-        d.insert(
-            DictKey(Object::from_static("st_blksize")),
-            Object::Int(4096),
-        );
+        d.insert("st_ino", Object::Int(0));
+        d.insert("st_dev", Object::Int(0));
+        d.insert("st_nlink", Object::Int(1));
+        d.insert("st_uid", Object::Int(0));
+        d.insert("st_gid", Object::Int(0));
+        d.insert("st_rdev", Object::Int(0));
+        d.insert("st_blocks", Object::Int(0));
+        d.insert("st_blksize", Object::Int(4096));
         let mtime_ns = (mtime * 1e9) as i64;
-        d.insert(
-            DictKey(Object::from_static("st_mtime_ns")),
-            Object::Int(mtime_ns),
-        );
-        d.insert(
-            DictKey(Object::from_static("st_atime_ns")),
-            Object::Int((atime * 1e9) as i64),
-        );
-        d.insert(
-            DictKey(Object::from_static("st_ctime_ns")),
-            Object::Int((ctime * 1e9) as i64),
-        );
+        d.insert("st_mtime_ns", Object::Int(mtime_ns));
+        d.insert("st_atime_ns", Object::Int((atime * 1e9) as i64));
+        d.insert("st_ctime_ns", Object::Int((ctime * 1e9) as i64));
     }
     // Windows-only extras CPython adds to `stat_result` (posixmodule.c's
     // `STRUCT_STAT` under `MS_WINDOWS`): the raw `dwFileAttributes` word —
@@ -2927,16 +2961,12 @@ fn stat_result_from_meta(meta: &std::fs::Metadata) -> Object {
     {
         use std::os::windows::fs::MetadataExt;
         d.insert(
-            DictKey(Object::from_static("st_file_attributes")),
+            "st_file_attributes",
             Object::Int(i64::from(meta.file_attributes())),
         );
-        d.insert(
-            DictKey(Object::from_static("st_reparse_tag")),
-            Object::Int(0),
-        );
+        d.insert("st_reparse_tag", Object::Int(0));
     }
-    drop(d);
-    stat_seq_finish(&inst);
+    stat_fields_finish(&inst, d);
     Object::Instance(Rc::new(inst))
 }
 
@@ -2985,29 +3015,26 @@ fn stat_result_from_libc_stat(st: &libc::stat) -> Object {
                 st.st_ctime as i64 * 1_000_000_000 + st.st_ctime_nsec as i64,
             ),
         ] {
-            d.insert(DictKey(Object::from_static(k)), Object::Int(v));
+            d.insert(static_name_key(k), Object::Int(v));
         }
         for (k, v) in [
             ("st_mtime", mtime),
             ("st_atime", atime),
             ("st_ctime", ctime),
         ] {
-            d.insert(DictKey(Object::from_static(k)), Object::Float(v));
+            d.insert(static_name_key(k), Object::Float(v));
         }
         // The BSD extras CPython exposes on macOS (`st_flags`, `st_gen`,
         // `st_birthtime`) come straight off the raw struct.
         #[cfg(target_os = "macos")]
         {
             d.insert(
-                DictKey(Object::from_static("st_flags")),
+                static_name_key("st_flags"),
                 Object::Int(i64::from(st.st_flags)),
             );
+            d.insert(static_name_key("st_gen"), Object::Int(i64::from(st.st_gen)));
             d.insert(
-                DictKey(Object::from_static("st_gen")),
-                Object::Int(i64::from(st.st_gen)),
-            );
-            d.insert(
-                DictKey(Object::from_static("st_birthtime")),
+                static_name_key("st_birthtime"),
                 Object::Float(ns(st.st_birthtime as i64, st.st_birthtime_nsec as i64)),
             );
         }
@@ -3377,13 +3404,13 @@ fn os_scandir(args: &[Object]) -> Result<Object, RuntimeError> {
         .map_err(|e| crate::error::io_error_to_py_named(&e, Some(&dir_path)))?
         .filter_map(|r| r.ok())
         .map(|entry| {
-            let fs_path = entry.path().to_string_lossy().into_owned();
+            let fs_path = os_text(entry.path().as_os_str()).into_owned();
             let (name_obj, path_obj) = if bytes_mode {
                 (dir_entry_name_bytes(&entry), dir_entry_path_bytes(&entry))
             } else {
                 (
-                    Object::from_str(entry.file_name().to_string_lossy()),
-                    Object::from_str(fs_path.clone()),
+                    Object::from_str(os_text(&entry.file_name())),
+                    Object::from_str(fs_path.as_str()),
                 )
             };
             // CPython caches the inode from the directory read, so
@@ -3399,6 +3426,20 @@ fn os_scandir(args: &[Object]) -> Result<Object, RuntimeError> {
         })
         .collect();
     Ok(build_scandir_iterator(entries))
+}
+
+/// An OS string as text, as `to_string_lossy` gives it: validated as UTF-8
+/// first, which runs several times faster than the lossy decoder's scan
+/// for the valid names nearly every directory holds.
+fn os_text(s: &std::ffi::OsStr) -> std::borrow::Cow<'_, str> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        if let Ok(t) = std::str::from_utf8(s.as_bytes()) {
+            return std::borrow::Cow::Borrowed(t);
+        }
+    }
+    s.to_string_lossy()
 }
 
 /// `DirEntry.name` as `bytes` for a `bytes`-mode `scandir`. On Unix the OS
@@ -3481,6 +3522,34 @@ fn os_access(args: &[Object], _kwargs: &[(String, Object)]) -> Result<Object, Ru
     }
 }
 
+thread_local! {
+    /// The `posix.ScandirIterator` class, made on first use.
+    static SCANDIR_CLS: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<crate::types::TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
+}
+
+/// `next(it)` of a `ScandirIterator` (`os.walk`'s loop), as its
+/// `__next__` steps it: `Some(Some(entry))`, or `Some(None)` at the end
+/// (the iterator then closed); `None` for any other instance.
+pub(crate) fn scandir_step(inst: &crate::types::PyInstance) -> Option<Option<Object>> {
+    let ours = SCANDIR_CLS.with(|slot| {
+        slot.try_borrow().ok().and_then(|c| {
+            c.as_ref()
+                .map(|c| std::ptr::eq(Rc::as_ptr(c), inst.cls_raw()))
+        })
+    })?;
+    if !ours {
+        return None;
+    }
+    let Some(Object::Iter(it)) = inst.native.get() else {
+        return None;
+    };
+    let v = it.try_borrow_mut().ok()?.next_value();
+    if v.is_none() {
+        scandir_mark_closed(inst);
+    }
+    Some(v)
+}
+
 /// Wrap the materialised `DirEntry` list in a CPython-shaped
 /// `ScandirIterator`: an iterator that is *also* a context manager
 /// (`with os.scandir(p) as it:`) with a no-op `close()`. CPython's
@@ -3488,20 +3557,27 @@ fn os_access(args: &[Object], _kwargs: &[(String, Object)]) -> Result<Object, Ru
 /// plain list can't satisfy.
 fn build_scandir_iterator(entries: Vec<Object>) -> Object {
     use crate::types::{PyInstance, TypeObject};
-    thread_local! {
-        static CLS: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
-    }
-    let class = CLS.with(|slot| {
+    let class = SCANDIR_CLS.with(|slot| {
         if let Some(c) = slot.borrow().as_ref() {
             return c.clone();
         }
         let bt = crate::builtin_types::builtin_types();
         let mut dict = DictData::default();
-        scandir_method(&mut dict, "__iter__", scandir_self);
-        scandir_method(&mut dict, "__next__", scandir_next);
-        scandir_method(&mut dict, "__enter__", scandir_self);
-        scandir_method(&mut dict, "__exit__", scandir_exit);
-        scandir_method(&mut dict, "close", scandir_exit);
+        // (These run no Python code: compiled code and the core loop step
+        // the iterator through its `__next__` in place.)
+        for (name, body) in [
+            (
+                "__iter__",
+                scandir_self as fn(&[Object]) -> Result<Object, RuntimeError>,
+            ),
+            ("__next__", scandir_next),
+            ("__enter__", scandir_self),
+            ("__exit__", scandir_exit),
+            ("close", scandir_exit),
+        ] {
+            let b = scandir_method(&mut dict, name, body);
+            crate::leaf_builtins::register(&b);
+        }
         // CPython's `ScandirIterator` keeps an open `DIR*`; if it is dropped
         // without being exhausted or closed, `__del__` emits a
         // `ResourceWarning` (`test_os.TestScandir.test_resource_warning`).
@@ -3532,16 +3608,18 @@ fn scandir_method(
     dict: &mut DictData,
     name: &'static str,
     body: fn(&[Object]) -> Result<Object, RuntimeError>,
-) {
+) -> Rc<crate::object::BuiltinFn> {
+    let b = Rc::new(crate::object::BuiltinFn {
+        name,
+        binds_instance: true,
+        call: Box::new(body),
+        call_kw: None,
+    });
     dict.insert(
         DictKey(Object::from_static(name)),
-        Object::Builtin(Rc::new(crate::object::BuiltinFn {
-            name,
-            binds_instance: true,
-            call: Box::new(body),
-            call_kw: None,
-        })),
+        Object::Builtin(b.clone()),
     );
+    b
 }
 
 fn scandir_self(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -3636,7 +3714,7 @@ fn dir_entry_follow(kwargs: &[(String, Object)]) -> bool {
 pub(crate) fn dir_entry_type() -> Rc<crate::types::TypeObject> {
     use crate::types::TypeObject;
     thread_local! {
-        static CLS: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
+        static CLS: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
     }
     CLS.with(|slot| {
         if let Some(c) = slot.borrow().as_ref() {
@@ -6526,7 +6604,7 @@ fn added_dll_directory_type() -> Rc<crate::types::TypeObject> {
     use crate::object::BuiltinFn;
     use crate::types::TypeObject;
     thread_local! {
-        static CLS: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
+        static CLS: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
     }
     fn self_dict(args: &[Object]) -> Option<Rc<RefCell<DictData>>> {
         match args.first() {
@@ -7076,12 +7154,19 @@ impl StructSeqLayout {
 thread_local! {
     /// name → (memoised type, leaked layout). Memoisation keeps type
     /// identity stable across module rebuilds so `isinstance` holds.
-    static STRUCT_SEQ_REGISTRY: RefCell<
+    static STRUCT_SEQ_REGISTRY: crate::gil::ReleaseUnderGil<RefCell<
         std::collections::HashMap<
             &'static str,
             (Rc<crate::types::TypeObject>, &'static StructSeqLayout),
         >,
-    > = RefCell::new(std::collections::HashMap::new());
+    >> = crate::gil::ReleaseUnderGil::new(RefCell::new(std::collections::HashMap::new()));
+}
+
+thread_local! {
+    /// The addresses of the registry's types, for [`struct_seq_tuple_of`]'s
+    /// check (a handful, scanned without hashing a name).
+    static STRUCT_SEQ_TYPES: RefCell<Vec<(usize, &'static StructSeqLayout)>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 /// Fetch a memoised struct-sequence type (and its layout) by name.
@@ -7101,6 +7186,141 @@ pub(crate) fn is_struct_seq_type(ty: &Rc<crate::types::TypeObject>) -> bool {
         r.borrow()
             .get(ty.name.as_str())
             .is_some_and(|(t, _)| Rc::ptr_eq(t, ty))
+    })
+}
+
+/// The tuple a struct sequence's instance keeps of its visible fields:
+/// `None` for any other instance (a subclass's included, which may
+/// override the comparisons).
+fn struct_seq_tuple_of(inst: &crate::types::PyInstance) -> Option<Object> {
+    let cls = inst.cls_raw();
+    if !cls.flags.is_builtin {
+        return None;
+    }
+    let t @ Object::Tuple(_) = inst.native.get()? else {
+        return None;
+    };
+    struct_seq_layout_of(cls).map(|_| t.clone())
+}
+
+/// The layout of `cls` when it's a struct sequence type itself.
+fn struct_seq_layout_of(cls: &crate::types::TypeObject) -> Option<&'static StructSeqLayout> {
+    let at = std::ptr::from_ref(cls) as usize;
+    STRUCT_SEQ_TYPES.with(|types| {
+        types
+            .borrow()
+            .iter()
+            .find_map(|&(t, layout)| (t == at).then_some(layout))
+    })
+}
+
+/// The keys of a layout's named fields in slot order (all of its slots
+/// are named), made once per thread.
+fn struct_seq_layout_keys(layout: &'static StructSeqLayout) -> std::rc::Rc<[DictKey]> {
+    thread_local! {
+        static KEYS: crate::gil::ReleaseUnderGil<RefCell<Vec<(usize, std::rc::Rc<[DictKey]>)>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(Vec::new())) };
+    }
+    let at = std::ptr::from_ref(layout) as usize;
+    KEYS.with(|k| {
+        if let Some((_, keys)) = k.borrow().iter().find(|(a, _)| *a == at) {
+            return keys.clone();
+        }
+        let keys: std::rc::Rc<[DictKey]> = layout
+            .slots
+            .iter()
+            .flatten()
+            .map(|f| static_name_key(f))
+            .collect();
+        k.borrow_mut().push((at, keys.clone()));
+        keys
+    })
+}
+
+/// `T(seq)` of a struct sequence type `ty` whose fields are all named,
+/// from a tuple or list of an accepted length, made directly as
+/// `struct_seq_init` would fill it: the leading items are the visible
+/// fields, the rest (and `None` past them) the hidden ones. `None` for
+/// anything else (a type with its own `__new__`, which refuses instances,
+/// another argument, a length the full path rejects, or a value other
+/// than a number, string or `None`).
+pub(crate) fn struct_seq_from_sequence(
+    ty: &Rc<crate::types::TypeObject>,
+    arg: &Object,
+) -> Option<Object> {
+    let layout = struct_seq_layout_of(ty)?;
+    let n_fields = layout.n_fields();
+    if layout.slots.iter().any(Option::is_none)
+        || layout.name == "stat_result"
+        || ty
+            .dict
+            .borrow()
+            .get(&crate::object::StrKey("__new__"))
+            .is_some()
+    {
+        return None;
+    }
+    let mut values = match arg {
+        Object::Tuple(t) if (layout.n_sequence..=n_fields).contains(&t.len()) => t.to_vec(),
+        Object::List(l) => {
+            let l = l.borrow();
+            if !(layout.n_sequence..=n_fields).contains(&l.len()) {
+                return None;
+            }
+            l.clone()
+        }
+        _ => return None,
+    };
+    // (Only values the instance may hold untracked, as the builders'.)
+    if !values.iter().all(|v| {
+        matches!(
+            v,
+            Object::Int(_) | Object::Float(_) | Object::Str(_) | Object::Bool(_) | Object::None
+        )
+    }) {
+        return None;
+    }
+    let mut hidden = values.split_off(layout.n_sequence);
+    hidden.resize(n_fields - layout.n_sequence, Object::None);
+    Some(struct_seq_instance_keyed(
+        ty.clone(),
+        &struct_seq_layout_keys(layout),
+        values,
+        &hidden,
+    ))
+}
+
+/// The operands of a comparison of a struct sequence with a tuple or with
+/// one of its own type, as the struct sequence's `__eq__`/`__lt__`/...
+/// compare them: as tuples of the visible fields. `None` for anything else.
+pub(crate) fn struct_seq_compare_operands(a: &Object, b: &Object) -> Option<(Object, Object)> {
+    match (a, b) {
+        (Object::Instance(ia), Object::Tuple(_)) => Some((struct_seq_tuple_of(ia)?, b.clone())),
+        (Object::Tuple(_), Object::Instance(ib)) => Some((a.clone(), struct_seq_tuple_of(ib)?)),
+        (Object::Instance(ia), Object::Instance(ib))
+            if std::ptr::eq(ia.cls_raw(), ib.cls_raw()) =>
+        {
+            Some((struct_seq_tuple_of(ia)?, struct_seq_tuple_of(ib)?))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `p`, found on a class's MRO under `name`, is a struct sequence's
+/// own field descriptor: a read-only property whose getter returns the
+/// instance dict's entry for the name. A read through it is then the
+/// instance dict's read (a missing entry is the descriptor's error, which
+/// the full path raises), so the attribute caches treat the name as the
+/// instance's own (`st.st_mode`, `time.localtime().tm_year`).
+pub(crate) fn struct_seq_field_descr(name: &str, p: &Rc<crate::object::PyProperty>) -> bool {
+    if !matches!(&*p.fset.borrow(), Object::None)
+        || !matches!(&*p.fget.borrow(), Object::Builtin(b) if b.name == name)
+    {
+        return false;
+    }
+    crate::descr_registry::lookup(&Object::Property(p.clone())).is_some_and(|m| {
+        matches!(m.kind, crate::descr_registry::DescrKind::Member)
+            && m.name == name
+            && is_struct_seq_type(&m.objclass)
     })
 }
 
@@ -7234,6 +7454,23 @@ pub(crate) fn struct_seq_type_layout(
                 )))
             }
         });
+        // Deletion fails the same way (`del st.st_mode` is CPython's
+        // "readonly attribute"). The override also keeps the fields off
+        // the instance-dict delete paths, which the attribute caches would
+        // otherwise offer them (see `struct_seq_field_descr`).
+        struct_seq_method(&mut dict, "__delattr__", move |args| {
+            let attr = match args.get(1) {
+                Some(Object::Str(s)) => s.to_string(),
+                _ => String::new(),
+            };
+            if layout.is_named(&attr) {
+                Err(crate::error::attribute_error("readonly attribute"))
+            } else {
+                Err(crate::error::attribute_error(format!(
+                    "'{name}' object has no attribute '{attr}'"
+                )))
+            }
+        });
         // CPython struct sequences subclass `tuple`, so `==`/`!=`/`hash()`
         // compare the visible fields by value (e.g. `os.stat(a) == os.stat(a)`
         // in `test_pathlib`, and using a `stat_result` as a dict key). Compare
@@ -7317,6 +7554,10 @@ pub(crate) fn struct_seq_type_layout(
                 }),
                 call_kw: None,
             }));
+            // (The read is a dictionary lookup: no Python runs.)
+            if let Object::Builtin(b) = &fget {
+                crate::leaf_builtins::register(b);
+            }
             let prop = Object::Property(Rc::new(crate::object::PyProperty::new(
                 fget,
                 Object::None,
@@ -7333,6 +7574,7 @@ pub(crate) fn struct_seq_type_layout(
             cls.dict.borrow_mut().insert(key, prop);
         }
         reg.borrow_mut().insert(name, (cls.clone(), layout));
+        STRUCT_SEQ_TYPES.with(|t| t.borrow_mut().push((Rc::as_ptr(&cls) as usize, layout)));
         cls
     })
 }
@@ -7472,7 +7714,7 @@ fn struct_seq_init(
         let mut d = inst.dict_cell().borrow_mut();
         for (i, v) in values.iter().enumerate() {
             if let Some(f) = layout.slots[i] {
-                d.insert(DictKey(Object::from_static(f)), v.clone());
+                d.insert(static_name_key(f), v.clone());
             }
         }
         // Hidden slots the sequence didn't reach: fill from `dict`, default
@@ -7483,11 +7725,11 @@ fn struct_seq_init(
             let f = slot.expect("hidden struct-seq slots are named");
             let v = dict_arg
                 .as_ref()
-                .and_then(|d2| d2.borrow().get(&DictKey(Object::from_static(f))).cloned());
+                .and_then(|d2| d2.borrow().get(&static_name_key(f)).cloned());
             if v.is_some() {
                 n_found += 1;
             }
-            d.insert(DictKey(Object::from_static(f)), v.unwrap_or(Object::None));
+            d.insert(static_name_key(f), v.unwrap_or(Object::None));
         }
         if let Some(d2) = &dict_arg {
             if d2.borrow().len() > n_found {
@@ -7499,7 +7741,7 @@ fn struct_seq_init(
     }
     let _ = inst
         .native
-        .set(Object::new_tuple(values[..layout.n_sequence].to_vec()));
+        .set(Object::tuple_from_slice(&values[..layout.n_sequence]));
     // posixmodule's `statresult_new`: a stat_result initialized from a bare
     // tuple leaves the float `st_?time` members `None`; backfill them from
     // the integer-seconds sequence slots so `os.stat_result(range(10)).st_atime`
@@ -7507,7 +7749,7 @@ fn struct_seq_init(
     if name == "stat_result" {
         let mut d = inst.dict_cell().borrow_mut();
         for (slot, f) in [(7usize, "st_atime"), (8, "st_mtime"), (9, "st_ctime")] {
-            let key = DictKey(Object::from_static(f));
+            let key = static_name_key(f);
             if matches!(d.get(&key), None | Some(Object::None)) {
                 if let Some(v) = values.get(slot) {
                     d.insert(key, v.clone());
@@ -7580,7 +7822,7 @@ fn struct_seq_replace(
     }
     let _ = new_inst
         .native
-        .set(Object::new_tuple(vals[..layout.n_sequence].to_vec()));
+        .set(Object::tuple_from_slice(&vals[..layout.n_sequence]));
     let obj = Object::Instance(Rc::new(new_inst));
     // CPython allocates the copy through the GC heap, so it is tracked from
     // birth (test_structseq.test_replace_gc_tracked builds a cycle out of it).
@@ -7622,6 +7864,17 @@ fn struct_seq_getitem(
 /// slots (`stat_result`'s integer times) that the named dict can't represent.
 /// Instances built before the native view existed fall back to the named
 /// visible fields, with `0` in any gap.
+/// The visible fields as a tuple: the instance's own when it keeps one.
+fn struct_seq_tuple(
+    layout: &'static StructSeqLayout,
+    inst: &Rc<crate::types::PyInstance>,
+) -> Object {
+    match inst.native.get() {
+        Some(t @ Object::Tuple(_)) => t.clone(),
+        _ => Object::new_tuple(struct_seq_values(layout, inst)),
+    }
+}
+
 fn struct_seq_values(
     layout: &'static StructSeqLayout,
     inst: &Rc<crate::types::PyInstance>,
@@ -7722,10 +7975,10 @@ fn struct_seq_richcompare(
             "struct sequence comparison requires an instance",
         ));
     };
-    let self_tuple = Object::new_tuple(struct_seq_values(layout, inst));
+    let self_tuple = struct_seq_tuple(layout, inst);
     let other = match args.get(1) {
         Some(Object::Instance(other_inst)) if Rc::ptr_eq(&inst.cls(), &other_inst.cls()) => {
-            Object::new_tuple(struct_seq_values(layout, other_inst))
+            struct_seq_tuple(layout, other_inst)
         }
         Some(t @ Object::Tuple(_)) => t.clone(),
         Some(Object::List(items)) => Object::new_tuple(items.borrow().clone()),
@@ -7747,8 +8000,7 @@ fn struct_seq_hash(
     let Some(Object::Instance(inst)) = args.first() else {
         return Err(type_error("struct sequence hash requires an instance"));
     };
-    let tuple = Object::new_tuple(struct_seq_values(layout, inst));
-    crate::builtins::hash_object(&tuple)
+    crate::builtins::hash_object(&struct_seq_tuple(layout, inst))
 }
 
 /// Build an instance of a [`struct_seq_type`], binding `values` positionally to
@@ -7812,8 +8064,7 @@ pub(crate) fn struct_seq_instance_keyed(
 /// once per instance.
 pub(crate) fn static_name_keys(fields: &'static [&'static str]) -> std::rc::Rc<[DictKey]> {
     thread_local! {
-        static KEYS: RefCell<std::collections::HashMap<(usize, usize), std::rc::Rc<[DictKey]>, crate::fasthash::FxBuildHasher>> =
-            RefCell::new(std::collections::HashMap::default());
+        static KEYS: crate::gil::ReleaseUnderGil<RefCell<std::collections::HashMap<(usize, usize), std::rc::Rc<[DictKey]>, crate::fasthash::FxBuildHasher>>> = crate::gil::ReleaseUnderGil::new(RefCell::new(std::collections::HashMap::default()));
     }
     let id = (fields.as_ptr() as usize, fields.len());
     if let Some(keys) = KEYS.with(|k| k.borrow().get(&id).cloned()) {
@@ -7830,17 +8081,21 @@ pub(crate) fn static_name_keys(fields: &'static [&'static str]) -> std::rc::Rc<[
 /// their names each time.
 pub(crate) fn static_name_key(name: &'static str) -> DictKey {
     thread_local! {
-        static KEYS: RefCell<std::collections::HashMap<(usize, usize), Object, crate::fasthash::FxBuildHasher>> =
-            RefCell::new(std::collections::HashMap::default());
+        static KEYS: crate::gil::ReleaseUnderGil<RefCell<std::collections::HashMap<(usize, usize), Object, crate::fasthash::FxBuildHasher>>> = crate::gil::ReleaseUnderGil::new(RefCell::new(std::collections::HashMap::default()));
     }
     KEYS.with(|keys| {
         let mut keys = keys.borrow_mut();
         let key = keys
             .entry((name.as_ptr() as usize, name.len()))
             .or_insert_with(|| {
-                let s = crate::shared_value::SharedStr::from(name);
-                crate::shared_value::SharedStr::hash_cached(&s);
-                Object::Str(s)
+                // The interned name: code that reads the field by name
+                // (`st.st_mode`) holds that same string, so a cached read
+                // matches the key by pointer.
+                let key = crate::stdlib::sys::intern_name(name);
+                if let Object::Str(s) = &key {
+                    crate::shared_value::SharedStr::hash_cached(s);
+                }
+                key
             });
         DictKey(key.clone())
     })
@@ -7937,11 +8192,11 @@ fn path_splitroot_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> 
             let (root, tail) = b.split_at(n);
             Object::new_tuple_array([
                 Object::new_bytes(Vec::new()),
-                Object::new_bytes(root.to_vec()),
+                Object::new_bytes(root),
                 if n == 0 {
                     p.clone()
                 } else {
-                    Object::new_bytes(tail.to_vec())
+                    Object::new_bytes(tail)
                 },
             ])
         }

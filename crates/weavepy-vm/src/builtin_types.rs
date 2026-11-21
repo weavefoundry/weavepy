@@ -219,6 +219,11 @@ impl BuiltinTypes {
             TypeObject::new_exception(name, base).expect("built-in exception must linearise")
         };
         let object_ = mk("object", vec![]);
+        // `object()`: a bare instance (as `b_object` builds it).
+        object_.pure_new.set(Some(|cls, args| {
+            args.is_empty()
+                .then(|| Object::Instance(Rc::new(crate::types::PyInstance::new(cls.clone()))))
+        }));
         // `object()` instances carry no `__dict__` (tp_dictoffset 0 in
         // CPython): attribute writes on a plain object raise
         // AttributeError, and weak references to one are refused.
@@ -250,6 +255,22 @@ impl BuiltinTypes {
         let float_ = mk("float", vec![object_.clone()]);
         let bool_ = mk("bool", vec![int_.clone()]);
         let complex_ = mk("complex", vec![object_.clone()]);
+        // `complex()`, `complex(x)` and `complex(x, y)` of plain numbers.
+        complex_.pure_new.set(Some(|_, args| {
+            let num = |o: &Object| match o {
+                Object::Int(i) => Some(*i as f64),
+                Object::Float(f) => Some(*f),
+                Object::Bool(b) => Some(f64::from(u8::from(*b))),
+                _ => None,
+            };
+            let (re, im) = match args {
+                [] => (0.0, 0.0),
+                [a] => (num(a)?, 0.0),
+                [a, b] => (num(a)?, num(b)?),
+                _ => return None,
+            };
+            Some(Object::new_complex(re, im))
+        }));
         let str_ = mk("str", vec![object_.clone()]);
         let bytes_ = mk("bytes", vec![object_.clone()]);
         let bytearray_ = mk("bytearray", vec![object_.clone()]);
@@ -261,6 +282,11 @@ impl BuiltinTypes {
         let range_ = mk("range", vec![object_.clone()]);
         let slice_ = mk("slice", vec![object_.clone()]);
         let memoryview_ = mk("memoryview", vec![object_.clone()]);
+        // `memoryview(b)` of a `bytes` or `bytearray`.
+        memoryview_.pure_new.set(Some(|_, args| match args {
+            [Object::Bytes(_) | Object::ByteArray(_)] => crate::builtins::b_memoryview(args).ok(),
+            _ => None,
+        }));
         let mappingproxy_ = mk("mappingproxy", vec![object_.clone()]);
         // `types.MappingProxyType(mapping)` is a live read-only *view*:
         // wrapping a dict shares the underlying storage (CPython's
@@ -961,6 +987,33 @@ impl BuiltinTypes {
             }
         }
 
+        // The builtin types `seqiter::builtin_ctor_arms` builds for some
+        // arguments, and the lazy adapters: their constructors' pure halves
+        // (any other builtin type's call skips them at a load).
+        for ty in [
+            &bool_,
+            &bytearray_,
+            &bytes_,
+            &dict_,
+            &enumerate_,
+            &float_,
+            &frozenset_,
+            &int_,
+            &list_,
+            &method_,
+            &reversed_,
+            &set_,
+            &slice_,
+            &str_,
+            &super_,
+            &tuple_,
+            &type_,
+        ] {
+            ty.pure_new.set(Some(crate::seqiter::builtin_ctor_arms));
+        }
+        for ty in [&map_, &filter_, &zip_] {
+            ty.pure_new.set(Some(crate::seqiter::seq_ctor_pure));
+        }
         let bt = BuiltinTypes {
             object_: object_.clone(),
             type_: type_.clone(),
@@ -1354,10 +1407,8 @@ impl BuiltinTypes {
 thread_local! {
     // The registry handles are local to this thread; only the referenced
     // type objects are shared. Borrowing a handle needs no object lock.
-    static BUILTIN_TYPES: std::cell::RefCell<Option<Rc<BuiltinTypes>>> =
-        const { std::cell::RefCell::new(None) };
-    static PROPERTY_CLASS: std::cell::RefCell<Option<Rc<TypeObject>>> =
-        const { std::cell::RefCell::new(None) };
+    static BUILTIN_TYPES: crate::gil::ReleaseUnderGil<std::cell::RefCell<Option<Rc<BuiltinTypes>>>> = const { crate::gil::ReleaseUnderGil::new(std::cell::RefCell::new(None)) };
+    static PROPERTY_CLASS: crate::gil::ReleaseUnderGil<std::cell::RefCell<Option<Rc<TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(std::cell::RefCell::new(None)) };
     /// The adopted registry behind [`builtin_types`]'s fast path.
     static BUILTIN_TYPES_PTR: std::cell::Cell<*const BuiltinTypes> =
         const { std::cell::Cell::new(std::ptr::null()) };
@@ -1660,7 +1711,7 @@ pub fn make_unicode_decode_error(
         .unwrap_or_else(|| bt.value_error.clone());
     let inst = PyInstance::new(class);
     let enc = Object::from_str(encoding);
-    let obj = Object::new_bytes(object.to_vec());
+    let obj = Object::new_bytes(object);
     let start_o = Object::Int(start as i64);
     let end_o = Object::Int(end as i64);
     let reason_o = Object::from_str(reason);
@@ -1725,6 +1776,77 @@ fn any_elements(obj: &Object) -> Option<Vec<Object>> {
     concrete_elements(obj).or_else(|| elements_via_interp(obj))
 }
 
+/// What `object.__new__` asks of a user class's bases, from one walk of its
+/// MRO: the position in `kinds` (see [`native_seed_for_new`]) of the value or
+/// container type it derives from, and whether it derives from `module`,
+/// `type` or `types.GenericAlias`. Memoized by the class's version, which is
+/// unique across classes and moves with any reshaping of its MRO.
+#[derive(Clone, Copy)]
+struct BaseFacts {
+    seed: Option<usize>,
+    module: bool,
+    type_: bool,
+    alias: bool,
+}
+
+fn base_facts(cls: &Rc<TypeObject>, kinds: &[&Rc<TypeObject>; 11]) -> BaseFacts {
+    thread_local! {
+        static SEEN: [std::cell::Cell<(u64, u8)>; 64] =
+            const { [const { std::cell::Cell::new((0, 0)) }; 64] };
+    }
+    const NONE: u8 = 0x0f;
+    let ver = cls.attr_version.get();
+    let slot = (ver as usize ^ (ver >> 6) as usize) & 63;
+    let unpack = |tag: u8| BaseFacts {
+        seed: (tag & NONE != NONE).then_some(usize::from(tag & NONE)),
+        module: tag & 0x10 != 0,
+        type_: tag & 0x20 != 0,
+        alias: tag & 0x40 != 0,
+    };
+    let memo = SEEN.with(|s| s[slot].get());
+    if ver != 0 && memo.0 == ver {
+        return unpack(memo.1);
+    }
+    let bt = builtin_types();
+    let mut tag = NONE;
+    for t in cls.mro.borrow().iter().skip(1) {
+        if tag & NONE == NONE {
+            if let Some(i) = kinds.iter().position(|k| Rc::ptr_eq(t, k)) {
+                tag = (tag & !NONE) | i as u8;
+            }
+        }
+        if Rc::ptr_eq(t, &bt.module_) {
+            tag |= 0x10;
+        } else if Rc::ptr_eq(t, &bt.type_) {
+            tag |= 0x20;
+        } else if Rc::ptr_eq(t, &bt.generic_alias_) {
+            tag |= 0x40;
+        }
+    }
+    if ver != 0 {
+        SEEN.with(|s| s[slot].set((ver, tag)));
+    }
+    unpack(tag)
+}
+
+/// The value or container kinds [`native_seed_for_new`] seeds, in the order
+/// [`BaseFacts::seed`] numbers them.
+fn seed_kinds(bt: &BuiltinTypes) -> [&Rc<TypeObject>; 11] {
+    [
+        &bt.int_,
+        &bt.float_,
+        &bt.complex_,
+        &bt.str_,
+        &bt.bytearray_,
+        &bt.bytes_,
+        &bt.tuple_,
+        &bt.frozenset_,
+        &bt.list_,
+        &bt.set_,
+        &bt.dict_,
+    ]
+}
+
 /// Build the native payload `object.__new__(cls, value?)` should stash
 /// on an instance of a value/container built-in subclass, or `None` for
 /// an ordinary `object` subclass. Mutable containers (`list`/`dict`/
@@ -1737,7 +1859,14 @@ fn native_seed_for_new(cls: &Rc<TypeObject>, value: Option<&Object>) -> Option<O
         return None;
     }
     let bt = builtin_types();
-    let is_strict = |base: &Rc<TypeObject>| cls.is_subclass_of(base) && !Rc::ptr_eq(cls, base);
+    // The one value or container type among these the class derives from
+    // (no class derives from two: their layouts conflict), found in one
+    // walk of its MRO instead of a subclass test per kind.
+    let kinds = seed_kinds(bt);
+    let found = base_facts(cls, &kinds).seed;
+    let is_strict = |base: &Rc<TypeObject>| {
+        found.is_some_and(|i| Rc::ptr_eq(kinds[i], base)) && !Rc::ptr_eq(cls, base)
+    };
     if is_strict(&bt.int_) {
         return Some(match value {
             None => Object::Int(0),
@@ -1848,7 +1977,7 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
     // `.args` but never runs `__init__` (CPython `BaseException_new`).
     // `UnicodeDecodeError.__new__(UnicodeDecodeError)` must succeed
     // with zero constructor arguments.
-    if cls.mro.borrow().iter().any(|t| t.name == "BaseException") {
+    if cls.flags.is_exception && cls.mro.borrow().iter().any(|t| t.name == "BaseException") {
         let new_args = if args.len() > 1 { &args[1..] } else { &[][..] };
         if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
             // SAFETY: published by an enclosing VM frame still live on
@@ -1859,7 +1988,7 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
         let inst = Rc::new(PyInstance::new(cls));
         inst.dict_cell().borrow_mut().insert(
             DictKey(Object::from_static("args")),
-            Object::new_tuple(new_args.to_vec()),
+            Object::tuple_from_slice(new_args),
         );
         let obj = Object::Instance(inst);
         crate::gc_trace::track(&obj);
@@ -1872,7 +2001,8 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
     // `module.__new__(module)` allocates an *uninitialized* module —
     // empty dict, no `__name__` — exactly CPython's `module_new` (the
     // name/doc seeding lives in `module.__init__` only).
-    if cls.is_subclass_of(&builtin_types().module_) {
+    let facts = base_facts(&cls, &seed_kinds(builtin_types()));
+    if facts.module || Rc::ptr_eq(&cls, &builtin_types().module_) {
         let inst = Object::Instance(Rc::new(PyInstance::new(cls)));
         crate::gc_trace::track(&inst);
         return Ok(inst);
@@ -1882,7 +2012,7 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
     // intercepted upstream (the 4-arg `__new__` route / `Meta(name,
     // bases, ns)`), so e.g. `type(typing.Any)()` must raise like
     // CPython's `type_new` ("takes exactly 3 arguments (0 given)").
-    if cls.is_subclass_of(&builtin_types().type_) && args.len() != 4 {
+    if (facts.type_ || Rc::ptr_eq(&cls, &builtin_types().type_)) && args.len() != 4 {
         return Err(crate::error::type_error(format!(
             "type.__new__() takes exactly 3 arguments ({} given)",
             args.len() - 1
@@ -1906,11 +2036,7 @@ pub(crate) fn object_new(args: &[Object]) -> Result<Object, RuntimeError> {
     // duck-typed generic alias. (numpy's `_array_like` builds
     // `collections.abc.Callable[..., Any]` exactly this way during import.)
     {
-        let bt = builtin_types();
-        if args.len() == 3
-            && !Rc::ptr_eq(&cls, &bt.generic_alias_)
-            && cls.is_subclass_of(&bt.generic_alias_)
-        {
+        if args.len() == 3 && facts.alias {
             let alias = crate::make_generic_alias_public(args[1].clone(), args[2].clone());
             // CPython `ga_new` allocates through `cls`, so the instance
             // reports the subclass as its type (test_dataclasses
@@ -2052,27 +2178,19 @@ pub(crate) fn overrides_dunder_new(cls: &Rc<TypeObject>) -> bool {
 
 /// Does `cls` (or a non-`object` base) define a *user* `__init__`?
 pub(crate) fn overrides_dunder_init(cls: &Rc<TypeObject>) -> bool {
-    for ty in cls.mro.borrow().iter() {
-        if let Some(init) = ty
-            .dict
-            .borrow()
-            .get(&DictKey(Object::from_static("__init__")))
-        {
-            // Surface-only default-`__init__` mirrors (RFC 0056 WS4)
-            // are not overrides.
-            if crate::descr_registry::is_surface_only(init) {
-                continue;
-            }
-            // `object.__init__` itself stored on a subclass (`typing`'s
-            // protocol init does `cls.__init__ = object.__init__`) leaves
-            // CPython's `tp_init` at `object_init`: not an override.
-            if matches!(init, Object::Builtin(b) if crate::is_object_init(b)) {
-                return false;
-            }
-            return ty.name != "object";
-        }
+    // (Through the class's type cache: the first `__init__` along the MRO,
+    // past the surface-only default mirrors of RFC 0056 WS4, which aren't
+    // overrides.)
+    let Some((init, owner)) = cls.lookup_with_owner("__init__") else {
+        return false;
+    };
+    // `object.__init__` itself stored on a subclass (`typing`'s protocol
+    // init does `cls.__init__ = object.__init__`) leaves CPython's
+    // `tp_init` at `object_init`: not an override.
+    if matches!(&init, Object::Builtin(b) if crate::is_object_init(b)) {
+        return false;
     }
-    false
+    owner.name != "object"
 }
 
 /// A fresh `Object::Builtin("__new__")` wrapping [`object_new`]. Each
@@ -2900,7 +3018,7 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
             ));
         }
         let name = match &args[1] {
-            Object::Str(s) => s.to_string(),
+            Object::Str(s) => s.clone(),
             _ => return Err(crate::error::type_error("attribute name must be str")),
         };
         match &args[0] {
@@ -2909,7 +3027,12 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
                     // SAFETY: published by an enclosing VM frame still
                     // live on this thread; the GIL keeps access exclusive.
                     let interp = unsafe { &mut *ptr };
-                    interp.generic_setattr_instance(inst, &args[0], &name, args[2].clone())?;
+                    interp.generic_setattr_instance_shared(
+                        inst,
+                        &args[0],
+                        &name,
+                        args[2].clone(),
+                    )?;
                 } else if matches!(inst.cls().lookup(&name), Some(Object::SlotDescriptor(_))) {
                     // No VM frame on this thread (e.g. a bare C-API embed):
                     // we can't run a Python property setter, but a
@@ -3054,14 +3177,75 @@ fn install_object_dunders(object_: &Rc<TypeObject>) {
             call_kw: None,
         })),
     );
+    /// `object.__setattr__(obj, name, value)`'s leaf half (see
+    /// `leaf_builtins::register_fast`), for the stores the default
+    /// `__setattr__` makes without running any code: a plain instance's
+    /// own attribute in its split dict (where the class holds nothing that
+    /// would intercept the name) or a writable `__slots__` member. What a
+    /// frozen dataclass's `__init__` pays per field. `None` leaves the
+    /// rest to the full store.
+    fn object_setattr_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+        let [Object::Instance(inst), Object::Str(name), value] = args else {
+            return None;
+        };
+        let n: &str = name;
+        let cls = inst.cls_raw();
+        // (Dunders and `args` have stores of their own; a bound method
+        // value is tracked first.)
+        if n.starts_with("__")
+            || n == "args"
+            || inst.native.get().is_some()
+            || inst.c_body.get() != 0
+            || cls.native_kind.get() != 0
+            || cls.is_super_proxy_type()
+            || matches!(value, Object::BoundMethod(_))
+            || crate::object::exotic_str_keys_possible()
+            || crate::capi_watchers::dicts_active()
+        {
+            return None;
+        }
+        match cls.lookup(n) {
+            Some(Object::SlotDescriptor(sd)) if sd.name == n && !sd.readonly => {
+                inst.note_slot_store(value);
+                let old = inst
+                    .slots
+                    .try_borrow_mut()
+                    .ok()?
+                    .insert_shared(name, value.clone());
+                drop(old);
+                Some(Ok(Object::None))
+            }
+            None
+            | Some(
+                Object::Function(_)
+                | Object::Int(_)
+                | Object::Float(_)
+                | Object::Bool(_)
+                | Object::None
+                | Object::Str(_),
+            ) if !cls.forbids_dict => {
+                let key = crate::stdlib::sys::intern_shared_memo(name);
+                match inst.split_store(&key, value.clone()) {
+                    Ok(old) => {
+                        drop(old);
+                        Some(Ok(Object::None))
+                    }
+                    Err(_) => None,
+                }
+            }
+            _ => None,
+        }
+    }
+    let setattr = Rc::new(BuiltinFn {
+        name: "__setattr__",
+        binds_instance: true,
+        call: Box::new(object_setattr),
+        call_kw: None,
+    });
+    crate::leaf_builtins::register_fast(&setattr, object_setattr_fast);
     dict.insert(
         DictKey(Object::from_static("__setattr__")),
-        Object::Builtin(Rc::new(BuiltinFn {
-            name: "__setattr__",
-            binds_instance: true,
-            call: Box::new(object_setattr),
-            call_kw: None,
-        })),
+        Object::Builtin(setattr),
     );
     dict.insert(
         DictKey(Object::from_static("__delattr__")),
@@ -3902,7 +4086,7 @@ fn install_import_error_init(import_error: &Rc<TypeObject>) {
                     }
                 }
             }
-            inst_rc.slot_set("args", Object::new_tuple(rest.to_vec()));
+            inst_rc.slot_set("args", Object::tuple_from_slice(rest));
             inst_rc.slot_set(
                 "msg",
                 if rest.len() == 1 {
@@ -3929,6 +4113,17 @@ fn install_import_error_init(import_error: &Rc<TypeObject>) {
             })),
         })),
     );
+}
+
+/// The address of `OSError.__init__`'s builtin (see [`is_os_error_init`]).
+static OS_ERROR_INIT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether `init` is `OSError`'s own `__init__`, whose work a built
+/// exception instance already holds (`Interpreter::build_exception_instance`
+/// sets the same fields).
+pub(crate) fn is_os_error_init(init: &Object) -> bool {
+    matches!(init, Object::Builtin(b)
+        if Rc::as_ptr(b) as usize == OS_ERROR_INIT.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 fn install_os_error_init(os_error: &Rc<TypeObject>) {
@@ -3981,7 +4176,7 @@ fn install_os_error_init(os_error: &Rc<TypeObject>) {
                 .is_subclass_of(&builtin_types().blocking_io_error);
             if is_blocking && rest.len() == 3 && matches!(rest[2], Object::Int(_) | Object::Long(_))
             {
-                inst_rc.slot_set("args", Object::new_tuple(rest.to_vec()));
+                inst_rc.slot_set("args", Object::tuple_from_slice(rest));
                 inst_rc.slot_set("errno", rest[0].clone());
                 inst_rc.slot_set("strerror", rest[1].clone());
                 inst_rc.slot_set("characters_written", rest[2].clone());
@@ -3993,9 +4188,9 @@ fn install_os_error_init(os_error: &Rc<TypeObject>) {
             // tuple is stored and the fields stay None.
             let populated = (2..=5).contains(&rest.len());
             let args_tuple = if populated {
-                Object::new_tuple(rest[..2].to_vec())
+                Object::tuple_from_slice(&rest[..2])
             } else {
-                Object::new_tuple(rest.to_vec())
+                Object::tuple_from_slice(rest)
             };
             inst_rc.slot_set("args", args_tuple);
             let pick = |i: usize| {
@@ -4060,14 +4255,19 @@ fn install_os_error_init(os_error: &Rc<TypeObject>) {
         }
     }
     let mut dict = os_error.dict.borrow_mut();
+    let init = Rc::new(BuiltinFn {
+        name: "__init__",
+        binds_instance: true,
+        call: Box::new(oserror_init),
+        call_kw: None,
+    });
+    OS_ERROR_INIT.store(
+        Rc::as_ptr(&init) as usize,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     dict.insert(
         DictKey(Object::from_static("__init__")),
-        Object::Builtin(Rc::new(BuiltinFn {
-            name: "__init__",
-            binds_instance: true,
-            call: Box::new(oserror_init),
-            call_kw: None,
-        })),
+        Object::Builtin(init),
     );
     dict.insert(
         DictKey(Object::from_static("__str__")),
@@ -4202,7 +4402,7 @@ fn install_unicode_error_dunders(ty: &Rc<TypeObject>, kind: UnicodeErrorKind) {
                 check(is_str(&rest[3]), 3, "str", &rest[3])?;
             }
         }
-        inst_rc.slot_set("args", Object::new_tuple(rest.to_vec()));
+        inst_rc.slot_set("args", Object::tuple_from_slice(rest));
         let mut i = 0;
         if kind != UnicodeErrorKind::Translate {
             inst_rc.slot_set("encoding", rest[i].clone());
@@ -4422,7 +4622,7 @@ fn install_syntax_error_dunders(syntax_error: &Rc<TypeObject>) {
             return Ok(Object::None);
         };
         let rest = if args.len() > 1 { &args[1..] } else { &[][..] };
-        inst_rc.slot_set("args", Object::new_tuple(rest.to_vec()));
+        inst_rc.slot_set("args", Object::tuple_from_slice(rest));
         // Defaults — CPython always defines these slots.
         for name in [
             "msg",
@@ -4600,7 +4800,7 @@ pub(crate) fn exc_init(args: &[Object]) -> Result<Object, RuntimeError> {
             let old = inst_rc
                 .slots
                 .borrow_mut()
-                .insert("args", Object::tuple_from_exact(rest.iter().cloned()));
+                .insert("args", Object::tuple_from_slice(rest));
             drop(old);
         }
         Ok(Object::None)
@@ -5073,7 +5273,7 @@ fn install_exception_group_init(base: &Rc<TypeObject>) {
             .first()
             .ok_or_else(|| crate::error::type_error("expected exception instance"))?;
         if let Object::Instance(inst_rc) = inst {
-            inst_rc.slot_set("args", Object::new_tuple(args[1..].to_vec()));
+            inst_rc.slot_set("args", Object::tuple_from_slice(&args[1..]));
         }
         Ok(Object::None)
     }
@@ -5874,6 +6074,32 @@ fn install_value_type_new(bt: &BuiltinTypes) {
             make_default_new()
         };
         register_new_metadata(&wrapper, ty);
+        // `str.__new__(cls, s)`, `tuple.__new__(cls, t)` and
+        // `int.__new__(cls, n)` of a value already of the type (a
+        // subclass's `super().__new__(cls, value)`, as `email`'s `Terminal`
+        // tokens make): the allocation, which runs no code for these.
+        if let Object::Builtin(b) = &wrapper {
+            if Rc::ptr_eq(ty, &bt.str_) {
+                crate::leaf_builtins::register_fast(b, |args| match args {
+                    [Object::Type(_), Object::Str(_)] => Some(object_new(args)),
+                    _ => None,
+                });
+            } else if Rc::ptr_eq(ty, &bt.tuple_) {
+                crate::leaf_builtins::register_fast(b, |args| match args {
+                    [Object::Type(_), Object::Tuple(_)] => Some(object_new(args)),
+                    _ => None,
+                });
+            } else if Rc::ptr_eq(ty, &bt.int_) {
+                crate::leaf_builtins::register_fast(b, |args| match args {
+                    [Object::Type(cls), Object::Int(_)]
+                        if !(cls.flags.is_builtin && cls.name == "bool") =>
+                    {
+                        Some(object_new(args))
+                    }
+                    _ => None,
+                });
+            }
+        }
         ty.dict
             .borrow_mut()
             .insert(DictKey(Object::from_static("__new__")), wrapper);

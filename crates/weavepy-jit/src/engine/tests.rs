@@ -33,6 +33,7 @@ fn function(ops: &[TOp]) -> TFunc {
         math_guards: vec![],
         math_spans: vec![],
         null_spans: vec![],
+        py_dyn_calls: vec![],
         osr_entries: vec![],
         max_call_args: 0,
         ret_lane: Some(JitType::Int),
@@ -388,6 +389,8 @@ fn attribute_chains_keep_the_first_read_deopt_snapshot() {
                 ctor: None,
                 self_ctor: None,
                 slot_member: false,
+                in_line: false,
+                position: None,
             })
             .collect();
         tfunc
@@ -711,6 +714,8 @@ fn cached_attribute_chains_keep_native_fallback_and_exact_exits() {
                 ctor: None,
                 self_ctor: None,
                 slot_member: false,
+                in_line: false,
+                position: None,
             })
             .collect();
         f
@@ -986,6 +991,8 @@ fn adjacent_scalar_reads_share_only_a_guarded_value() {
                 ctor: None,
                 self_ctor: None,
                 slot_member: false,
+                in_line: false,
+                position: None,
             };
             2
         ];

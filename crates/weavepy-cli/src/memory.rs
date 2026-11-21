@@ -7,7 +7,9 @@
 //!
 //! - releases the code pages it no longer runs (see [`crate::text_trim`]);
 //! - keeps freed heap resident longer once it's large (see
-//!   [`crate::alloc::note_resident`]).
+//!   [`crate::alloc::note_resident`]);
+//! - frees the large blocks kept for reuse that have sat idle (see
+//!   [`crate::alloc::trim_large_blocks`]).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -37,6 +39,7 @@ pub(crate) extern "C" fn tick() {
         return;
     }
     NEXT_LOOK.store(now + LOOK_EVERY_MICROS, Ordering::Relaxed);
+    crate::alloc::trim_large_blocks();
     if let Some(resident) = crate::text_trim::resident() {
         crate::alloc::note_resident(resident.all);
         crate::text_trim::grown(resident, now, weavepy_vm::import_activity());

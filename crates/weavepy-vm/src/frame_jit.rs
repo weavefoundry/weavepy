@@ -104,6 +104,11 @@ const CHAIN: u32 = 7;
 /// frame JIT takes it anyway (see `Slot::try_compile`).
 const LEFT_TO_TIER2: u32 = 16;
 
+/// How many times calls make code hot, after tier 2 missed its call entry
+/// and with none of its loops run, before the frame JIT takes it (see
+/// `Slot::try_compile`).
+const CALL_WAITS: u32 = 128;
+
 /// The heat per instruction of a code object at which it compiles (see
 /// `Slot::warm`; `WEAVEPY_FRAME_JIT_HOT` overrides it, a tuning aid). With
 /// the code generator a quarter of Cranelift's cost, 500 took 8% off the
@@ -554,7 +559,7 @@ impl Native {
     #[cold]
     #[inline(never)]
     fn ran(&self, st: &State, from: usize, len: usize, cap: usize, last: usize, status: u32) {
-        if status == INTERP && st.pc == from && st.last == last {
+        if status == INTERP && st.pc == from && st.last == last && cap >= self.need {
             self.note_fail(from);
         }
         if stats::enabled() {
@@ -584,7 +589,9 @@ impl Native {
         let (from, len, cap, last) = (st.pc, st.len, st.cap, st.last);
         // SAFETY: the caller's contract.
         let status = unsafe { self.call(st) };
-        if status == INTERP && st.pc == from && st.last == last {
+        // (An entry a stack too small for the code turned away says
+        // nothing of the entry: the caller's next run has the room.)
+        if status == INTERP && st.pc == from && st.last == last && cap >= self.need {
             self.note_fail(from);
         }
         if stats::enabled() {
@@ -621,6 +628,9 @@ pub(crate) struct Slot {
     /// How many times the code got hot while its loops waited for tier 2
     /// (see `try_compile`).
     left: AtomicU32,
+    /// How many times calls made the code hot after tier 2 had missed its
+    /// call entry, with none of its loops run (see `try_compile`).
+    call_waits: AtomicU32,
     /// A compile whose machine code a worker is generating (see
     /// [`background`]).
     pending: background::Pending,
@@ -802,7 +812,25 @@ impl Slot {
             if left > 0 {
                 self.left.store(left, Ordering::Relaxed);
             }
-            if left < LEFT_TO_TIER2 || crate::tier2::holds_compiled(code) {
+            // (Call heat goes to the frame JIT once tier 2 has missed the
+            // call entry, which it never attempts again, and the code has
+            // got hot that way `CALL_WAITS` times with none of its loops
+            // run: a loop that runs is tier 2's to enter by OSR, and one
+            // that runs only now and then shouldn't be taken too soon.)
+            // Code whose loops have run but which tier 2 still holds
+            // nothing for after `LEFT_TO_TIER2` such triggers runs loops
+            // too short a call for tier 2 to take (`argparse`'s
+            // `_get_values`, whose comprehensions it only ever left
+            // cold): it would otherwise stay interpreted for good.
+            let looped = code.jit_hint.backedges_seen();
+            let waits = if looped { LEFT_TO_TIER2 } else { CALL_WAITS };
+            let taken_for_calls = left == 0
+                && (looped || crate::tier2::missed_call_entry(code))
+                && self.call_waits.fetch_add(1, Ordering::Relaxed) + 1 >= waits;
+            // (Nor is code tier 2 keeps failing to compile its to keep.)
+            let left_to_tier2 =
+                left < LEFT_TO_TIER2 && !taken_for_calls && !crate::tier2::gave_up_often(code);
+            if left_to_tier2 || crate::tier2::holds_compiled(code) {
                 if stats::enabled() {
                     let kind = if left > 0 { "loop" } else { "call" };
                     eprintln!("frame jit: {} left to tier 2 ({kind})", code.qualname);
@@ -1764,7 +1792,8 @@ fn in_loop(code: &CodeObject, pc: usize) -> bool {
     }
     type Entry = (usize, usize, Rc<[bool]>);
     thread_local! {
-        static MEMO: std::cell::RefCell<Vec<Entry>> = const { std::cell::RefCell::new(Vec::new()) };
+        static MEMO: crate::gil::ReleaseUnderGil<std::cell::RefCell<Vec<Entry>>> =
+            const { crate::gil::ReleaseUnderGil::new(std::cell::RefCell::new(Vec::new())) };
     }
     let key = (std::ptr::from_ref(code) as usize, code.instructions.len());
     MEMO.with(|m| {
@@ -1811,7 +1840,7 @@ struct IterLayout {
 
 /// Where a dict value's table is, from its payload word (its `Rc`'s
 /// allocation): the cell's borrow counter, the entries' and slots'
-/// pointers, the slot count and the shift; an entry's size and its
+/// pointers and the shift; an entry's size and its
 /// hash's, key's and value's places; where a string keeps its cached hash
 /// (`-1` unknown); and the slot mixing constants (see
 /// `crate::dictmap::TableLayout`). `BINARY_SUBSCR` probes a `str` key's
@@ -1821,7 +1850,6 @@ struct DictLayout {
     borrow: i32,
     entries: i32,
     slots: i32,
-    slots_len: i32,
     shift: i32,
     bucket_size: i64,
     bucket_hash: i32,
@@ -1881,7 +1909,6 @@ fn dict_layout() -> Option<DictLayout> {
         borrow: off(cell + borrow)?,
         entries: off(base + t.entries_ptr)?,
         slots: off(base + t.slots_ptr)?,
-        slots_len: off(base + t.slots_len)?,
         shift: off(base + t.shift)?,
         bucket_size: i64::try_from(t.bucket_size).ok()?,
         bucket_hash: off(t.bucket_hash)?,
@@ -2156,6 +2183,17 @@ unsafe fn plain_release(v: &Object) -> bool {
     true
 }
 
+/// Whether releasing one reference to `v` leaves it alive (another owner
+/// holds it) and nothing observes releases: a container holding it can
+/// free with no finalizer queued (`for flag in self, other`).
+#[inline]
+fn held_elsewhere(v: &Object) -> bool {
+    crate::sync::release_gates() == 0
+        && v.strong_word()
+            // SAFETY: `v` owns a reference to the live allocation.
+            .is_some_and(|w| unsafe { &*w }.load(Ordering::Relaxed) > 1)
+}
+
 /// One operand a flush writes to the frame's stack (see [`h_copies`]).
 pub(crate) struct CopyItem {
     /// The stack slot it goes to.
@@ -2194,6 +2232,39 @@ unsafe extern "C" fn h_clone(dst: *mut Object, src: *const Object) {
 
 /// Release the heap value at `slot` (it leaves the stack): `0` released,
 /// anything else declined with the slot untouched.
+/// Whether releasing the value at `slot` could run code: `0` when it is
+/// droppable (see [`droppable`]), `1` otherwise.
+unsafe extern "C" fn h_droppable(slot: *const Object) -> u32 {
+    // SAFETY: the code passes an initialized stack slot.
+    u32::from(!droppable(unsafe { &*slot }))
+}
+
+/// A stack receiver's kernel ran (see `stack_method_kernel`): the
+/// receiver at `recv` released as the full call releases its operands
+/// (promptly reaped: a temporary it was the last owner of dies here, its
+/// finalizers before the next instruction) and the result at `out` moved
+/// into its slot: `0`, or `LEFT_MARKED` past the `CALL` at `pc` (the
+/// result on the stack, `len` deep) when a finalizer must run first, as
+/// [`call_status`] leaves after a call.
+unsafe extern "C" fn h_kernel_result(
+    st: *mut State,
+    recv: *mut Object,
+    out: *mut Object,
+    pc: u32,
+    len: u32,
+) -> u32 {
+    // SAFETY: the code passes its live state, the receiver's initialized
+    // slot and the kernel's result in the slot above it.
+    unsafe {
+        crate::release_operands(&*(*st).interp, recv, 1);
+        recv.write(out.read());
+        if (*(*st).maybe_dead).get() {
+            return left_marked(st, pc, len as usize);
+        }
+    }
+    0
+}
+
 unsafe extern "C" fn h_pop(slot: *mut Object) -> u32 {
     // SAFETY: the code passes an initialized stack slot.
     unsafe {
@@ -2287,6 +2358,57 @@ pub(crate) struct BinopSite {
     direct: *mut DirectSite,
     /// Whether to try a comparison method.
     dunder: bool,
+    /// For `x = x + t` (or `x += t`) of a local `x` whose store comes
+    /// next: `x`'s index, so that a `str` nothing else holds grows in
+    /// place (see [`str_grow_local`]); `NO_GROW` otherwise.
+    grow_local: u32,
+}
+
+/// No local grows in place at a [`BinopSite`].
+const NO_GROW: u32 = u32::MAX;
+
+/// `x = x + t` at a site whose operands are on the stack and whose next
+/// instruction stores into the local `x` the left operand came from: when
+/// both are `str`s and the left one is `x`'s own string, `x` lets go of it
+/// and it grows in place if nothing else holds it (CPython's
+/// `BINARY_OP_INPLACE_ADD_UNICODE`, and the core loop's arm), which makes
+/// a string built by appending in a loop cost its length once instead of
+/// once per append. `true` with the grown string in the left operand's
+/// slot, the right one released and `x` left unbound for the store that
+/// follows; `false` with everything as it was.
+///
+/// # Safety
+///
+/// The state is live, the site's two slots hold its operands, and
+/// `grow_local` is one of the frame's locals.
+#[inline]
+unsafe fn str_grow_local(st: *mut State, s: &BinopSite) -> bool {
+    use crate::shared_value::SharedStr;
+    // SAFETY: the caller's contract.
+    unsafe {
+        let at = (*st).stack.add(s.slot as usize);
+        let local = (*st).locals.add(s.grow_local as usize);
+        if !matches!(
+            (&*local, &*at, &*at.add(1)),
+            (Object::Str(x), Object::Str(a), Object::Str(_)) if SharedStr::ptr_eq(x, a)
+        ) {
+            return false;
+        }
+        // (The operand holds the string too: a plain decrement.)
+        crate::drop_hot(std::ptr::replace(local, Object::Unbound));
+        let grown = match (&mut *at, &*at.add(1)) {
+            (Object::Str(a), Object::Str(t)) => SharedStr::try_append(a, t),
+            _ => false,
+        };
+        if grown {
+            crate::drop_hot_at(at.add(1));
+            return true;
+        }
+        // Held elsewhere: `x` takes it back, and the ordinary
+        // concatenation runs.
+        local.write(crate::clone_hot(&*at));
+        false
+    }
 }
 
 /// `BINARY_OP` at `site` through [`h_binop`], then an operator method that
@@ -2299,6 +2421,9 @@ unsafe extern "C" fn h_binop_site(st: *mut State, site: *const BinopSite) -> u32
         let s = &*site;
         if !s.copies.is_empty() {
             h_copies(st, s.copies.as_ptr(), s.copies.len() as u64);
+        }
+        if s.grow_local != NO_GROW && str_grow_local(st, s) {
+            return 0;
         }
         if h_binop((*st).stack.add(s.slot as usize), s.arg) == 0 {
             return 0;
@@ -2382,6 +2507,17 @@ unsafe extern "C" fn h_compare_site(st: *mut State, site: *const BinopSite) -> u
                     }
                 }
                 return left(st, s.pc, s.last, s.slot as usize + 2);
+            }
+            // The reflected method of a class defining only the other
+            // ordering (`a > b` of one with `__lt__`): `f(b, a)` in place,
+            // the operands swapped for it and back on a decline.
+            if let Some(f) = Interpreter::compare_reflected_dunder(&*at, &*at.add(1), kind) {
+                std::ptr::swap(at, at.add(1));
+                let r = compare_leaf(st, at, &f);
+                if r <= 1 {
+                    return answered(r != 0);
+                }
+                std::ptr::swap(at, at.add(1));
             }
         }
         let r = h_compare_bool(at, s.arg);
@@ -2580,6 +2716,7 @@ unsafe fn op_after_reload(st: &mut State, op: records::MethodOp<'_>) {
             }
             records::MethodOp::Binary(..) => Ok(v),
             records::MethodOp::Compare(arg) => interp.compare_finish(frame, arg, v),
+            records::MethodOp::Iter => crate::iter_result(v),
         };
         match r {
             Ok(v) => frame.stack.push(v),
@@ -2706,9 +2843,10 @@ unsafe extern "C" fn h_for_iter(st: *mut State, it: *mut Object, out: *mut Objec
                     // out of line, so this helper's frame stays what the
                     // steps above need (in line here, they cost a string's
                     // loop 11% more instructions an item).
-                    PyIterator::Reversed { .. } | PyIterator::DictKeys { .. } => {
-                        return h_for_iter_view(st, it, out, pc)
-                    }
+                    PyIterator::Reversed { .. }
+                    | PyIterator::DictKeys { .. }
+                    | PyIterator::Bytes { .. }
+                    | PyIterator::ByteArray { .. } => return h_for_iter_view(st, it, out, pc),
                     _ => return h_for_iter_rest(st, it, out, pc),
                 };
                 if let Object::Int(i) = *v {
@@ -2726,8 +2864,9 @@ unsafe extern "C" fn h_for_iter(st: *mut State, it: *mut Object, out: *mut Objec
     }
 }
 
-/// [`h_for_iter`] of a reversed list's iterator, or a dict's or dict
-/// view's: the next item, key or value read in place, as the general step
+/// [`h_for_iter`] of a reversed list's iterator, a byte string's or
+/// buffer's, or a dict's or dict view's: the next item, byte, key or value
+/// read in place, as the general step
 /// takes it (the end, a list that shrank and a dict that changed are that
 /// step's, through [`h_for_iter_rest`]).
 #[inline(never)]
@@ -2743,6 +2882,20 @@ unsafe extern "C" fn h_for_iter_view(
         if let Object::Iter(rc) = &*it {
             if let Some(iter) = rc.peek_mut() {
                 match iter {
+                    // A byte string's or buffer's next byte, an int (the end
+                    // is the general step's).
+                    PyIterator::Bytes { data, index } if *index < data.len() => {
+                        (*st).out = u64::from(data[*index]);
+                        *index += 1;
+                        return 0;
+                    }
+                    PyIterator::ByteArray { data, index } => {
+                        if let Some(&b) = data.peek().and_then(|d| d.get(*index)) {
+                            *index += 1;
+                            (*st).out = u64::from(b);
+                            return 0;
+                        }
+                    }
                     PyIterator::Reversed { items, index, .. } if *index >= 0 => {
                         if let Some(v) = items.peek().and_then(|xs| xs.get(*index as usize)) {
                             *index -= 1;
@@ -2751,6 +2904,48 @@ unsafe extern "C" fn h_for_iter_view(
                                 return 0;
                             }
                             out.write(crate::clone_hot(v));
+                            return 1;
+                        }
+                    }
+                    // Exhausted, held by the stack alone, over a list that
+                    // lives on: it leaves the stack, as the core loop's end
+                    // retires it (its release frees nothing).
+                    PyIterator::Reversed {
+                        items,
+                        index,
+                        owner: None,
+                    } if *index < 0
+                        && Rc::strong_count(rc) == 1
+                        && crate::sync::Rc::strong_count(items) > 1 =>
+                    {
+                        drop(it.read());
+                        return 2;
+                    }
+                    // A plain dict's next key, the dict unchanged since the
+                    // iterator's first step (its watch set then): as
+                    // `core_dict_next` steps it, without the other shapes'
+                    // checks.
+                    PyIterator::DictKeys {
+                        kind: crate::object::DictViewKind::Keys,
+                        index,
+                        dict: Some(d),
+                        len,
+                        watch: Some(w),
+                        reverse: false,
+                        odict: None,
+                        ..
+                    } if !w.changed() => {
+                        if let Some((k, _)) = d
+                            .peek()
+                            .filter(|data| data.len() == *len)
+                            .and_then(|data| data.get_index(*index))
+                        {
+                            *index += 1;
+                            if let Object::Int(i) = k.0 {
+                                (*st).out = i as u64;
+                                return 0;
+                            }
+                            out.write(crate::clone_hot(&k.0));
                             return 1;
                         }
                     }
@@ -2904,16 +3099,18 @@ unsafe fn for_iter_drain(
         if !matches!(
             g.state_raw().peek(),
             Some(crate::object::GeneratorState::Created(_))
-        ) || !crate::gen_fast::steps_body(g)
-        {
+        ) {
             return None;
         }
+        // (A body the fast steps don't run, one that calls, drains by its
+        // lean resume instead: see `for_iter_fold`.)
+        let steps = crate::gen_fast::steps_body(g);
         let ins = &(&*st.frame).code.instructions;
         let (append, back) = (ins.get(pc + 1)?, ins.get(pc + 2)?);
         // An inlined `all(...)` or `any(...)` (`FOR_ITER; TO_BOOL;
         // POP_JUMP_IF_FALSE/TRUE; NOT_TAKEN; JUMP_BACKWARD`).
         if append.op == OpCode::ToBool {
-            return for_iter_truth(st, it, out, pc);
+            return for_iter_truth(st, it, out, pc, steps);
         }
         if append.op != OpCode::ListAppend
             || append.arg != 2
@@ -2931,6 +3128,25 @@ unsafe fn for_iter_drain(
         };
         if Rc::strong_count(list) != 1 {
             return None;
+        }
+        if !steps {
+            // (Code runs while the body does: the items gather apart and
+            // join the list as the drain stops, before the loop's own
+            // append of a yield it hands back.)
+            let mut gathered = Vec::new();
+            let list = list.clone();
+            return for_iter_fold(
+                st,
+                it,
+                out,
+                pc,
+                crate::FoldSink::Collect(&raw mut gathered),
+                || {
+                    if let Some(items) = list.peek_mut() {
+                        items.append(&mut gathered);
+                    }
+                },
+            );
         }
         // (Growing the list runs no code: nothing reaches it while it's
         // peeked at.)
@@ -2986,6 +3202,7 @@ unsafe fn for_iter_truth(
     it: *mut Object,
     out: *mut Object,
     pc: usize,
+    steps: bool,
 ) -> Option<u32> {
     use crate::gen_fast::GenNext;
     // SAFETY: the caller's contract.
@@ -3002,6 +3219,9 @@ unsafe fn for_iter_truth(
             || (pc + 5).checked_sub(back.arg as usize) != Some(pc)
         {
             return None;
+        }
+        if !steps {
+            return for_iter_fold(st, it, out, pc, crate::FoldSink::Truth(decides), || {});
         }
         let Object::Generator(g) = &*it else {
             return None;
@@ -3035,6 +3255,130 @@ unsafe fn for_iter_truth(
             }
             GenNext::Declined => None,
         }
+    }
+}
+
+/// [`for_iter_drain`] of a fresh generator whose body the fast steps
+/// don't run (it calls): its lean resume drains it into `fold` (see
+/// `Interpreter::core_gen_fold`), the frame synced as a native call's is
+/// (see [`native_body_here`]), and `joined` runs as the drain stops. Its
+/// end leaves the loop (`2`); a yield the sink declined is the
+/// instruction's result (`1`); a raise is the instruction's (`FOR_RAISED`).
+/// When the drain left the activation's code (a switch, a pending exit),
+/// the frame is left as the core loop's `FOR_ITER` would leave it
+/// (`FOR_SWITCHED`).
+///
+/// # Safety
+///
+/// As [`for_iter_drain`]'s, `it` holding a fresh generator.
+#[inline(never)]
+unsafe fn for_iter_fold(
+    st: &mut State,
+    it: *mut Object,
+    out: *mut Object,
+    pc: usize,
+    fold: crate::FoldSink,
+    joined: impl FnOnce(),
+) -> Option<u32> {
+    // SAFETY: the caller's contract; the stack slot keeps the generator
+    // alive while it runs.
+    unsafe {
+        if st.sw.is_null()
+            || !(*st.sw).calls_ok
+            || crate::hot_gates::loop_gen() != st.snap_gen
+            || (*st.maybe_dead).get()
+        {
+            return None;
+        }
+        let Object::Generator(g) = &*it else {
+            return None;
+        };
+        let g = g.clone();
+        let at = it.offset_from(st.stack) as usize;
+        // The frame synced, as the core loop's arm syncs it.
+        let frame = &mut *st.frame;
+        frame.stack.set_len(at + 1);
+        let lazy = !st.lazy.is_null() && !crate::sync::cells_unguarded();
+        if !lazy {
+            settle(st);
+            *(*st.sw).last = st.last;
+        }
+        let sw = &mut *st.sw;
+        let interp = &mut *st.interp.cast_mut();
+        let r = interp.core_gen_fold(
+            sw,
+            frame,
+            pc,
+            &g,
+            fold,
+            if lazy {
+                std::ptr::from_mut(st)
+            } else {
+                std::ptr::null_mut()
+            },
+        );
+        drop(g);
+        joined();
+        let mut in_place = false;
+        if !st.lazy.is_null() {
+            in_place = sw.pending.is_none() && crate::hot_gates::loop_gen() == st.snap_gen;
+            if !in_place {
+                settle(st);
+            }
+        }
+        let sw = &mut *st.sw;
+        in_place = in_place
+            || (sw.pending.is_none()
+                && std::ptr::eq(sw.cur, st.frame)
+                && crate::hot_gates::loop_gen() == st.snap_gen);
+        if in_place {
+            return Some(match r {
+                Ok(Some(v)) => {
+                    out.write(v);
+                    1
+                }
+                Ok(None) => {
+                    // The finished generator leaves the stack.
+                    drop(it.read());
+                    if (*st.maybe_dead).get() {
+                        return Some(for_iter_gen_marked(st, it, pc as u64));
+                    }
+                    2
+                }
+                Err(e) => {
+                    st.len = at + 1;
+                    st.pc = pc + 1;
+                    st.err = Some(e);
+                    FOR_RAISED
+                }
+            });
+        }
+        // The core loop goes on from the frame, left as its `FOR_ITER`
+        // leaves it.
+        let frame = &mut *st.frame;
+        match r {
+            Ok(Some(v)) => {
+                out.write(v);
+                frame.stack.set_len(at + 2);
+                frame.pc = pc as u32 + 1;
+            }
+            Ok(None) => {
+                drop(it.read());
+                frame.stack.set_len(at);
+                frame.pc = for_iter_exit(&frame.code, pc) as u32;
+            }
+            Err(e) => {
+                frame.stack.set_len(at + 1);
+                frame.pc = pc as u32 + 1;
+                sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Raised(e)));
+                return Some(FOR_SWITCHED);
+            }
+        }
+        *sw.last = pc;
+        if sw.pending.is_none() && (*sw.maybe_dead).get() {
+            sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Marked));
+        }
+        Some(FOR_SWITCHED)
     }
 }
 
@@ -4253,7 +4597,25 @@ unsafe extern "C" fn h_for_iter_rest(
                     st.err = Some(e);
                     FOR_RAISED
                 }
-                None => 3,
+                // A Python `__next__` that evaluates frameless, its bare
+                // `raise StopIteration` included; any other (and any other
+                // end) called through the core loop's lane.
+                None => match interp.leaf_python_step(obj, inst) {
+                    Some(Some(v)) => {
+                        // SAFETY: the slot above the iterator is free.
+                        unsafe { out.write(v) };
+                        1
+                    }
+                    // The exhausted iterator leaves the stack, as a
+                    // finished generator does.
+                    Some(None) => {
+                        // SAFETY: the slot holds the iterator.
+                        drop(unsafe { it.read() });
+                        2
+                    }
+                    // SAFETY: the caller's contract.
+                    None => unsafe { for_iter_lane(st, it, pc) },
+                },
             };
         }
         // A native adapter: a step that runs no code (`zip` of native
@@ -4267,6 +4629,14 @@ unsafe extern "C" fn h_for_iter_rest(
                 // SAFETY: the slot above the iterator is free.
                 unsafe { out.write(v) };
                 return 1;
+            }
+            // A `zip` at the end of its first sequence (or an
+            // `accumulate` at its source's), whose release runs nothing: it
+            // leaves the stack, as the core loop's end does.
+            if crate::seqiter::lazy_stops_quietly(l) {
+                // SAFETY: the iterator leaves the stack.
+                drop(unsafe { it.read() });
+                return 2;
             }
             // `enumerate(gen)` and a two-source `zip` over a generator, as
             // `h_for_iter_pair` steps them, here with the pair's tuple.
@@ -4381,7 +4751,7 @@ unsafe extern "C" fn h_for_iter_rest(
                 // tuple of names, `for k in key[:-1]`.)
                 if unique
                     && crate::shared_value::ThinArc::strong_count(items) == 1
-                    && !items.iter().all(plain_scalar)
+                    && !items.iter().all(|x| plain_scalar(x) || held_elsewhere(x))
                 {
                     return 3;
                 }
@@ -4423,23 +4793,33 @@ unsafe extern "C" fn h_for_iter_rest(
                 // only the stack holds leaves it, as the core loop's arm
                 // retires it, when its release frees nothing that could
                 // finalize (the list or tuple lives on).
-                let frees_nothing = unique
-                    && match &*inner {
-                        PyIterator::List {
-                            items,
-                            index,
-                            owner: None,
-                        } => {
-                            crate::sync::Rc::strong_count(items) > 1
-                                && items.try_borrow().is_ok_and(|v| *index >= v.len())
+                // A shared one (a generator expression's `.0` holds it too)
+                // leaves likewise, a list cursor detaching from its list as
+                // its own end detaches it (where that frees nothing that
+                // could finalize: the list lives on, or holds plain scalars).
+                let frees_nothing = match &mut *inner {
+                    PyIterator::List {
+                        items,
+                        index,
+                        owner: None,
+                    } => {
+                        let ok = items.try_borrow().is_ok_and(|v| {
+                            *index >= v.len()
+                                && (crate::sync::Rc::strong_count(items) > 1
+                                    || (!unique && v.iter().all(plain_scalar)))
+                        });
+                        if ok && !unique {
+                            *items = crate::sync::Rc::new(crate::sync::RefCell::new(Vec::new()));
                         }
-                        PyIterator::Tuple { items, index } => {
-                            *index >= items.len()
-                                && crate::shared_value::ThinArc::strong_count(items) > 1
-                        }
-                        PyIterator::Range { .. } => true,
-                        _ => false,
-                    };
+                        ok
+                    }
+                    PyIterator::Tuple { items, index } => {
+                        *index >= items.len()
+                            && (!unique || crate::shared_value::ThinArc::strong_count(items) > 1)
+                    }
+                    PyIterator::Range { .. } => unique,
+                    _ => false,
+                };
                 if !frees_nothing {
                     return 3;
                 }
@@ -4485,7 +4865,10 @@ unsafe extern "C" fn h_for_iter_rest(
         // the core loop's arm steps it (a change of size, a reverse view, an
         // exhaustion that could release anything are its own).
         view @ PyIterator::DictKeys { .. } => {
-            match Interpreter::core_dict_next(view, false, unique) {
+            // (A shared iterator, a generator expression's `.0`, exhausts
+            // as a sole one does: its other holder finds it exhausted, and
+            // the stack's reference leaves by a plain decrement.)
+            match Interpreter::core_dict_next(view, false, true) {
                 crate::DictStep::Item(v, _) => v,
                 crate::DictStep::Exhausted => {
                     // SAFETY: the iterator, held by the stack alone, leaves
@@ -4685,6 +5068,17 @@ const FOR_RAISED: u32 = 5;
 unsafe extern "C" fn h_list_append(list: *const Object, value: *const Object) -> u32 {
     // SAFETY: the code passes two initialized stack slots; growing the
     // list runs no code, so nothing reaches it while it is peeked at.
+    unsafe { h_list_append_ref(list, value, 1) }
+}
+
+/// [`h_list_append`] of a value read in place: moved from its stack slot
+/// (`owned` nonzero) or copied from a local or constant.
+unsafe extern "C" fn h_list_append_ref(
+    list: *const Object,
+    value: *const Object,
+    owned: u32,
+) -> u32 {
+    // SAFETY: as `h_list_append`'s; a borrowed value outlives the call.
     unsafe {
         let Object::List(l) = &*list else {
             return 1;
@@ -4692,8 +5086,156 @@ unsafe extern "C" fn h_list_append(list: *const Object, value: *const Object) ->
         let Some(items) = l.peek_mut() else {
             return 1;
         };
-        crate::push_fast(items, value.read());
+        let v = if owned != 0 {
+            value.read()
+        } else {
+            crate::clone_hot(&*value)
+        };
+        crate::push_fast(items, v);
         0
+    }
+}
+
+/// `MAP_ADD` (a dict comprehension's store) into the exact dict at `dict`
+/// of the key at `key` and the value at `value`: `0` both moved in, a new
+/// key the native probe settles (no stored key could equal it) or a scalar
+/// value replaced (its release runs nothing); anything else declined
+/// untouched.
+/// [`crate::object::LeafProbe::new`], or for an instance whose class's
+/// Python `__hash__` evaluates as a pure leaf (an `Enum` member, a frozen
+/// dataclass; see `Interpreter::leaf_instance_hash`), a probe carrying that
+/// hash: a stored key it meets is equal by identity alone, and any other of
+/// the same hash makes the probe foreign (its miss inexact).
+fn leaf_or_pure_probe(key: &Object) -> Option<crate::object::LeafProbe<'_>> {
+    crate::object::LeafProbe::new(key).or_else(|| {
+        let p = crate::vm_singletons::current_interpreter_ptr()?;
+        // SAFETY: the interpreter running on this thread, dormant while the
+        // helper runs; a pure-leaf evaluation runs no other code.
+        let h = unsafe { &*p }.leaf_instance_hash(key)?;
+        Some(crate::object::LeafProbe::with_hash(key, h))
+    })
+}
+
+unsafe extern "C" fn h_map_add(
+    dict: *const Object,
+    key: *const Object,
+    value: *const Object,
+    owned: u32,
+) -> u32 {
+    // SAFETY: the code passes three initialized values (the key in its
+    // stack slot when bit 0 of `owned` is set and the value when bit 1 is,
+    // else a local or constant that outlives the call); the probe and the
+    // insert run no code, so nothing reaches the dict meanwhile.
+    unsafe {
+        let take = |p: *const Object, bit: u32| {
+            if owned & bit != 0 {
+                p.read()
+            } else {
+                crate::clone_hot(&*p)
+            }
+        };
+        let Object::Dict(cell) = &*dict else {
+            return 1;
+        };
+        if crate::capi_watchers::dicts_active() {
+            return 1;
+        }
+        let Some(probe) = leaf_or_pure_probe(&*key) else {
+            return 1;
+        };
+        let Some(d) = cell.peek_mut() else {
+            return 1;
+        };
+        let added = match d.probe_entry(&probe) {
+            crate::dictmap::ProbeEntry::Occupied(e) => {
+                let slot = e.into_mut();
+                // (An instance key hits by identity: the dict holds it, so
+                // the new reference's release is never its last.)
+                if !matches!(
+                    slot,
+                    Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
+                ) || !matches!(
+                    &*key,
+                    Object::Int(_)
+                        | Object::Str(_)
+                        | Object::Bool(_)
+                        | Object::None
+                        | Object::Instance(_)
+                ) {
+                    return 1;
+                }
+                // (The key the dict holds stays; the new one leaves.)
+                *slot = take(value, 2);
+                if owned & 1 != 0 {
+                    crate::drop_hot_at(key);
+                }
+                false
+            }
+            crate::dictmap::ProbeEntry::Vacant(e) => {
+                if !probe.miss_is_exact() {
+                    return 1;
+                }
+                e.insert(crate::object::DictKey(take(key, 1)), take(value, 2));
+                true
+            }
+        };
+        if added {
+            crate::object::dict_watch_bump(cell);
+        }
+        crate::object::dict_mutation_event(cell);
+        0
+    }
+}
+
+/// `SET_ADD` (a set comprehension's store) into the exact set at `set` of
+/// the value at `value`: `0` the value moved in (or, a scalar or string
+/// equal to an element, released), anything else declined untouched.
+unsafe extern "C" fn h_set_add(set: *const Object, value: *const Object, owned: u32) -> u32 {
+    // SAFETY: the code passes two initialized values (the value in its
+    // stack slot when `owned` is nonzero, else a local or constant that
+    // outlives the call); the probe and the insert run no code, so nothing
+    // reaches the set meanwhile.
+    unsafe {
+        let Object::Set(cell) = &*set else {
+            return 1;
+        };
+        let Some(probe) = leaf_or_pure_probe(&*value) else {
+            return 1;
+        };
+        let Some(s) = cell.peek_mut() else {
+            return 1;
+        };
+        let take = || {
+            if owned != 0 {
+                value.read()
+            } else {
+                crate::clone_hot(&*value)
+            }
+        };
+        match s.insert_probe_if(
+            &probe,
+            |p| p.miss_is_exact(),
+            || crate::object::DictKey(take()),
+        ) {
+            Some(true) => 0,
+            // (An instance hits by identity: the set holds it.)
+            Some(false)
+                if matches!(
+                    &*value,
+                    Object::Int(_)
+                        | Object::Str(_)
+                        | Object::Bool(_)
+                        | Object::None
+                        | Object::Instance(_)
+                ) =>
+            {
+                if owned != 0 {
+                    crate::drop_hot_at(value);
+                }
+                0
+            }
+            _ => 1,
+        }
     }
 }
 
@@ -4721,10 +5263,11 @@ fn kernel_for(tag: u64, kind: crate::LeafKind, nargs: usize) -> Option<Kernel> {
         (1, K::ListPop, 0) => k_list_pop,
         (1, K::ListExtend, 1) => k_list_extend,
         (1, K::ListInsert, 2) => k_list_insert,
+        (1, K::ListRemove, 1) => k_list_remove,
         (1, K::ListReverse | K::ListCopy, 0) => k_body,
         (2, K::DictGet, 1 | 2) => k_dict_get,
-        (2, K::DictKeys | K::DictValues | K::DictItems, 0) => k_body,
-        (3, K::SetPop, 0) => k_body,
+        (2, K::DictKeys | K::DictValues | K::DictItems | K::Opaque, 0) => k_body,
+        (3, K::SetPop | K::Opaque, 0) => k_body,
         (3, K::SetAdd, 1) => k_set_add,
         (3, K::SetDiscard, 1) => k_set_discard,
         (3, K::SetRemove, 1) => k_set_remove,
@@ -4869,6 +5412,43 @@ unsafe extern "C" fn k_list_pop(
             return 1;
         };
         out.write(v);
+        0
+    }
+}
+
+/// `list.remove(x)` where every item up to the match compares with `x`
+/// without running code, and the removed item releases without running
+/// any: anything else (a miss's `ValueError` included) is declined.
+unsafe extern "C" fn k_list_remove(
+    out: *mut Object,
+    recv: *const Object,
+    a: *const Object,
+    _: *const Object,
+    _: *const crate::object::BuiltinFn,
+) -> u32 {
+    // SAFETY: as `Kernel`'s; the removed item moves out.
+    unsafe {
+        let (list, needle) = (&*recv, &*a);
+        let Object::List(l) = list else {
+            return 1;
+        };
+        let mut at = None;
+        if crate::builtins::list_scan_native(list, needle, |i| {
+            at = Some(i);
+            false
+        })
+        .is_none()
+        {
+            return 1;
+        }
+        let (Some(i), Some(items)) = (at, l.peek_mut()) else {
+            return 1;
+        };
+        if i >= items.len() || !droppable(&items[i]) {
+            return 1;
+        }
+        crate::drop_hot(items.remove(i));
+        out.write(Object::None);
         0
     }
 }
@@ -5039,6 +5619,42 @@ unsafe fn ascii_from(
     Some(Some((&bytes[i as usize..], i as usize)))
 }
 
+/// `s.startswith(t)` / `s.endswith(t)` of a tuple of `str`s with no start
+/// position: whether any matches (a byte prefix or suffix of valid UTF-8 is
+/// a character one). `None` to decline.
+///
+/// # Safety
+///
+/// As [`Kernel`]'s.
+unsafe fn str_affix_tuple(
+    recv: *const Object,
+    a: *const Object,
+    b: *const Object,
+    ends: bool,
+) -> Option<bool> {
+    // SAFETY: the caller's contract.
+    let (Object::Str(s), Object::Tuple(t)) = (unsafe { (&*recv, &*a) }) else {
+        return None;
+    };
+    if !b.is_null() {
+        return None;
+    }
+    let text = s.as_bytes();
+    let mut hit = false;
+    for p in t.iter() {
+        let Object::Str(p) = p else {
+            return None;
+        };
+        let p = p.as_bytes();
+        hit |= if ends {
+            text.ends_with(p)
+        } else {
+            text.starts_with(p)
+        };
+    }
+    Some(hit)
+}
+
 unsafe extern "C" fn k_str_startswith(
     out: *mut Object,
     recv: *const Object,
@@ -5048,6 +5664,10 @@ unsafe extern "C" fn k_str_startswith(
 ) -> u32 {
     // SAFETY: as `Kernel`'s.
     unsafe {
+        if let Some(hit) = str_affix_tuple(recv, a, b, false) {
+            out.write(Object::Bool(hit));
+            return 0;
+        }
         let Some((s, p)) = two_strs(recv, a) else {
             return 1;
         };
@@ -5069,6 +5689,10 @@ unsafe extern "C" fn k_str_endswith(
 ) -> u32 {
     // SAFETY: as `Kernel`'s.
     unsafe {
+        if let Some(hit) = str_affix_tuple(recv, a, b, true) {
+            out.write(Object::Bool(hit));
+            return 0;
+        }
         let Some((s, p)) = two_strs(recv, a) else {
             return 1;
         };
@@ -5324,6 +5948,9 @@ pub(crate) struct SuperSite {
     recv: usize,
     ver: u64,
     f: Option<Rc<crate::object::PyFunction>>,
+    /// The getter of the property the name resolved to instead (the
+    /// attribute form; see [`h_super_property`]).
+    getter: Option<Rc<crate::object::PyFunction>>,
 }
 
 /// `LOAD_SUPER_ATTR` `ins` at `pc` over the `len`-deep stack: a hit in
@@ -5359,6 +5986,13 @@ unsafe extern "C" fn h_super_attr(
             }
             _ => None,
         };
+        // A property's site declines at once (its getter is called by
+        // `h_super_property`).
+        if let (Some((cls, recv, ver)), Some(_)) = (key, &site.getter) {
+            if cls == site.cls && recv == site.recv && ver == site.ver {
+                return u64::MAX;
+            }
+        }
         if let (Some((cls, recv, ver)), Some(f)) = (key, &site.f) {
             if cls == site.cls
                 && recv == site.recv
@@ -5385,6 +6019,18 @@ unsafe extern "C" fn h_super_attr(
             }
         }
         let Some(n) = Interpreter::core_super_attr(&*code, ins, pc as usize, base, len) else {
+            if let Some((cls, recv, ver)) = key {
+                let ops = std::slice::from_raw_parts(base.add(len - 3), 3);
+                if let Some(g) = Interpreter::super_property_getter(&*code, ins, ops) {
+                    *site = SuperSite {
+                        cls,
+                        recv,
+                        ver,
+                        f: None,
+                        getter: Some(g),
+                    };
+                }
+            }
             return u64::MAX;
         };
         if let Some((cls, recv, ver)) = key {
@@ -5402,7 +6048,13 @@ unsafe extern "C" fn h_super_attr(
                     _ => None,
                 }
             };
-            *site = SuperSite { cls, recv, ver, f };
+            *site = SuperSite {
+                cls,
+                recv,
+                ver,
+                f,
+                getter: None,
+            };
         }
         n as u64
     }
@@ -5424,7 +6076,11 @@ unsafe fn subscr_raise_missing(st: &mut State, pc: u64, len: usize) -> Option<u6
     // SAFETY: per the caller.
     unsafe {
         let (c, k) = (&*st.stack.add(len - 2), &*st.stack.add(len - 1));
-        let (Object::Dict(d), Object::Str(_) | Object::Int(_) | Object::Tuple(_)) = (c, k) else {
+        let (
+            Object::Dict(d),
+            Object::Str(_) | Object::Int(_) | Object::Tuple(_) | Object::Bytes(_),
+        ) = (c, k)
+        else {
             return None;
         };
         let probe = crate::object::LeafProbe::new(k)?;
@@ -5715,6 +6371,37 @@ unsafe fn unpack_fast(
     unsafe {
         let n = n as usize;
         let s = &*src;
+        // A tuple subclass's instance (a `namedtuple`'s) whose class has no
+        // Python `__iter__` unpacks its tuple, as the generic unpack's
+        // iteration of it would.
+        if let Object::Instance(inst) = s {
+            let Some(Object::Tuple(t)) = inst.native.get() else {
+                return 1;
+            };
+            if t.len() != n
+                || (owned != 0 && !droppable(s))
+                || Interpreter::instance_dunder_function(
+                    inst,
+                    crate::types::AttrKey::vm(crate::types::vm_key::ITER_FN),
+                    "__iter__",
+                )
+                .is_some()
+            {
+                return 1;
+            }
+            // An owned instance sits in `dst`'s first slot, which the items
+            // overwrite: it moves out first (and keeps the tuple alive).
+            let held = if owned != 0 { Some(src.read()) } else { None };
+            let items = t.clone();
+            for (k, item) in items.iter().rev().enumerate() {
+                dst.add(k).write(crate::clone_hot(item));
+            }
+            drop(items);
+            if let Some(held) = held {
+                crate::drop_hot(held);
+            }
+            return 0;
+        }
         let fits = match s {
             Object::Tuple(t) => t.len() == n,
             Object::List(l) => l.peek().is_some_and(|xs| xs.len() == n),
@@ -5796,6 +6483,11 @@ unsafe fn store_subscr_fast(
         // A `dict` subclass's instance that keeps `dict.__setitem__` (see
         // `subscr_fast`).
         if let (Object::Instance(_), Object::Str(_) | Object::Int(_)) = (c, k) {
+            // A built-in base's own `__setitem__` with a leaf half (an
+            // `OrderedDict`'s).
+            if crate::inst_leaf_set(val, cont, key, owned & 7) == 0 {
+                return 0;
+            }
             return match owned & 7 {
                 0 => crate::h_inst_dict_set::<0>(val, cont, key),
                 1 => crate::h_inst_dict_set::<1>(val, cont, key),
@@ -5842,7 +6534,7 @@ unsafe fn store_subscr_fast(
                 if crate::capi_watchers::dicts_active() {
                     return 1;
                 }
-                let Some(probe) = crate::object::LeafProbe::new(k) else {
+                let Some(probe) = leaf_or_pure_probe(k) else {
                     return 1;
                 };
                 let Some(d) = cell.peek_mut() else {
@@ -5871,6 +6563,34 @@ unsafe fn store_subscr_fast(
                     crate::object::dict_mutation_event(cell);
                 }
                 old
+            }
+            // A unit-step slice of a list assigned an exact list's or
+            // tuple's items (`xs[:] = xs[n:]`): spliced in place, the
+            // displaced items released after.
+            (Object::List(xs), Object::Slice(sl)) if matches!(sl.step, Object::None) => {
+                let items: Vec<Object> = match &*val {
+                    Object::List(ys) => match ys.peek() {
+                        Some(ys) => ys.clone(),
+                        None => return 1,
+                    },
+                    Object::Tuple(t) => t.to_vec(),
+                    _ => return 1,
+                };
+                let Some(v) = xs.peek_mut() else {
+                    return 1;
+                };
+                let Some((lo, hi)) = Interpreter::slice_bounds(sl, v.len()) else {
+                    return 1;
+                };
+                if !v[lo..hi.max(lo)].iter().all(displaced_ok) {
+                    return 1;
+                }
+                let removed: Vec<Object> = v.splice(lo..hi.max(lo), items).collect();
+                if owned & 1 != 0 {
+                    crate::drop_hot_at(val);
+                }
+                drop(removed);
+                Object::None
             }
             _ => return 1,
         };
@@ -6067,6 +6787,17 @@ unsafe extern "C" fn h_binop(at: *mut Object, kind: u32) -> u32 {
     // SAFETY: the code passes two initialized stack slots, and a kind the
     // compiler emitted (`BinOpKind` is `repr(u8)`).
     unsafe {
+        // `s + t` whose left operand nothing else holds (the result of
+        // the concatenation before it, in `a + b + c`): it grows in place
+        // rather than being copied into a new string and freed.
+        if kind as u8 == BinOpKind::Add as u8 {
+            if let (Object::Str(x), Object::Str(t)) = (&mut *at, &*at.add(1)) {
+                if crate::shared_value::SharedStr::try_append(x, t) {
+                    crate::drop_hot_at(at.add(1));
+                    return 0;
+                }
+            }
+        }
         let (a, b) = (&*at, &*at.add(1));
         // Two numbers (the core loop's in-line arm), a `bool` as its int
         // value (but `bool & bool` and its kin stay a `bool`: the core
@@ -6115,6 +6846,10 @@ unsafe extern "C" fn h_binop(at: *mut Object, kind: u32) -> u32 {
             (Object::Str(_), _) | (Object::Int(_), Object::Str(_)) => {
                 Interpreter::core_str_binop(a, b, kind)
             }
+            // Complex arithmetic (an exact `complex` with a number).
+            (Object::Complex(_), _) | (_, Object::Complex(_)) => {
+                crate::complex_binop_fast(a, b, kind)
+            }
             // A list's `+=` extends it in place (`list.__iadd__`), and is
             // the list itself (`a += a` too: the items are copied first).
             (Object::List(x), Object::List(y))
@@ -6141,6 +6876,71 @@ unsafe extern "C" fn h_binop(at: *mut Object, kind: u32) -> u32 {
                 if kind == BinOpKind::Add && droppable(a) && droppable(b) =>
             {
                 Interpreter::core_seq_concat(a, b)
+            }
+            // A short tuple's or list's repetition (a list's `*=` repeats
+            // it in place: the core loop's).
+            (Object::Tuple(_) | Object::List(_), Object::Int(_))
+            | (Object::Int(_), Object::Tuple(_) | Object::List(_))
+                if kind == BinOpKind::Mult
+                    && (!inplace || !matches!(a, Object::List(_)))
+                    && droppable(a)
+                    && droppable(b) =>
+            {
+                Interpreter::core_seq_repeat(a, b)
+            }
+            // Two dicts' union (`dict.__or__`) whose keys hash and compare
+            // natively.
+            (Object::Dict(_), Object::Dict(_))
+                if !inplace && kind == BinOpKind::BitOr && droppable(a) && droppable(b) =>
+            {
+                crate::dict_union_plain(a, b)
+            }
+            // Two sets' union, intersection, difference or symmetric
+            // difference whose keys hash and compare natively (the core
+            // loop's set lane; an in-place one mutates, and is its own).
+            (Object::Set(_) | Object::FrozenSet(_), Object::Set(_) | Object::FrozenSet(_))
+                if !inplace
+                    && matches!(
+                        kind,
+                        BinOpKind::BitOr | BinOpKind::BitAnd | BinOpKind::Sub | BinOpKind::BitXor
+                    )
+                    && droppable(a)
+                    && droppable(b) =>
+            {
+                crate::set_algebra_fast(a, b, kind)
+            }
+            // A dict's keys view against a set (`d.keys() & s`): a set.
+            (Object::DictView(_), Object::Set(_) | Object::FrozenSet(_))
+                if !inplace
+                    && matches!(
+                        kind,
+                        BinOpKind::BitOr | BinOpKind::BitAnd | BinOpKind::Sub | BinOpKind::BitXor
+                    )
+                    && droppable(a)
+                    && droppable(b) =>
+            {
+                crate::keys_view_algebra(a, b, kind)
+            }
+            // `bytes % args` with plain conversions over ints and bytes
+            // (on success, everything released is one of those).
+            (Object::Bytes(t), Object::Int(_) | Object::Bytes(_) | Object::Tuple(_))
+                if kind == BinOpKind::Mod && droppable(a) && droppable(b) =>
+            {
+                crate::bytes_percent_simple(t, b).map(Object::new_bytes)
+            }
+            // A short `bytes`' repetition.
+            (Object::Bytes(x), Object::Int(n)) | (Object::Int(n), Object::Bytes(x))
+                if kind == BinOpKind::Mult
+                    && x.len().saturating_mul((*n).max(0) as usize) <= 1 << 20
+                    && droppable(a)
+                    && droppable(b) =>
+            {
+                if *n == 1 {
+                    // (`b * 1` is `b` itself, as CPython shares it.)
+                    Some(Object::Bytes(x.clone()))
+                } else {
+                    crate::bytes_repeat(x, (*n).max(0) as usize)
+                }
             }
             // Two `bytes`' concatenation (`_ALWAYS_SAFE_BYTES + safe`;
             // immutable, so `+=` is the same).
@@ -6391,6 +7191,9 @@ pub(crate) struct TruthSite {
     /// The version of a class whose instances the site found always true
     /// (no `__bool__` or `__len__`).
     ver: std::cell::Cell<u64>,
+    /// The version of a class whose instances' truth is a native method
+    /// (see [`crate::NativeTruthPlan`]), and that plan.
+    native: std::cell::Cell<(u64, crate::NativeTruthPlan)>,
     pc: u32,
     /// The stack slot of the value, or a local's free one above the stack.
     slot: u32,
@@ -6435,6 +7238,12 @@ unsafe fn truth_at(st: *mut State, v: &Object, site: &TruthSite) -> Option<bool>
                 if ver != 0 && site.ver.get() == ver {
                     return Some(true);
                 }
+                let (nver, plan) = site.native.get();
+                if ver != 0 && nver == ver {
+                    if let Some(b) = plan.run(v) {
+                        return Some(b);
+                    }
+                }
                 truth_instance(st, v, site)?
             }
             // Native objects with neither `__bool__` nor `__len__` (a
@@ -6466,7 +7275,13 @@ unsafe fn truth_instance(st: *mut State, v: &Object, site: &TruthSite) -> Option
                 site.ver.set(ver);
             }
         }
-        (*(*st).interp).leaf_instance_truth(v)
+        let r = (*(*st).interp).leaf_instance_truth(v);
+        if let (Some(_), Object::Instance(inst)) = (r, v) {
+            if let Some(plan) = (*(*st).interp).native_truth_plan(inst) {
+                site.native.set(plan);
+            }
+        }
+        r
     }
 }
 
@@ -7076,7 +7891,8 @@ unsafe extern "C" fn h_global(st: *mut State, c: *mut GlobalCache) -> u32 {
 /// [`h_global`] at a site whose cache holds the fused `len(local)` (see
 /// [`GlobalCache::len_of`]), the namespaces matching: the length of a
 /// list, tuple, str or dict straight off the local, as `h_load_global`
-/// fuses it; anything else through the miss, which tries the rest.
+/// fuses it (an instance's through its leaf `__len__`); anything else
+/// through the miss, which tries the rest.
 #[inline(never)]
 unsafe fn global_len_of(st: *mut State, c: *mut GlobalCache) -> u32 {
     // SAFETY: as `h_global`'s; `len_of` names one of the code's locals.
@@ -7089,6 +7905,10 @@ unsafe fn global_len_of(st: *mut State, c: *mut GlobalCache) -> u32 {
                 Object::Tuple(t) => Some(t.len()),
                 Object::Str(s) => Some(crate::object::str_char_len(s)),
                 Object::Dict(d) => d.try_borrow().ok().map(|d| d.len()),
+                v @ Object::Instance(_) => match (*st_ref.interp).leaf_instance_len(v) {
+                    Some(Object::Int(n)) => usize::try_from(n).ok(),
+                    _ => None,
+                },
                 _ => None,
             };
             if let Some(n) = n.and_then(|n| i64::try_from(n).ok()) {
@@ -7521,8 +8341,10 @@ pub(crate) struct MethodSite {
     builtin_recv: u8,
     builtin: [u64; 2],
     /// A value of the receiver's own (`self.fn(...)` of a function an
-    /// instance holds): its class's version, its values' shared names and
-    /// the value's position among them (`0` versions: none yet).
+    /// instance holds): its class's version, its values' shared names (or
+    /// [`OWN_PUBLISHED`] for a materialized dict, [`OWN_SLOT`] for a
+    /// `__slots__` member) and the value's position among them (`0`
+    /// versions: none yet).
     own: (u64, u64, u32),
     /// A `staticmethod` or `classmethod` of the receiver's class the site
     /// loaded last: the class's version, whether it binds the class, and
@@ -7530,6 +8352,18 @@ pub(crate) struct MethodSite {
     desc: Option<(u64, bool, Object)>,
     /// The class version whose attribute the site found isn't one.
     desc_miss: u64,
+    /// A native stream's method the site loaded last (`out.write`), or a
+    /// builtin value's of a kind the first cache doesn't hold: the kind,
+    /// as `builtins::method_memo_tag` keys it (a stream's methods follow
+    /// from the kind alone while it has no attributes of its own), and
+    /// the method.
+    stream: Option<(u8, Object)>,
+    /// A class receiver the site loaded an attribute of
+    /// (`object.__setattr__(self, ...)`, `dict.fromkeys(...)`, a user
+    /// class's static or class method): the class, its version, its
+    /// metaclass's, the attribute, and whether the class itself goes in
+    /// the self slot (a class method) or it stays empty.
+    type_attr: Option<(usize, u64, u64, Object, bool)>,
 }
 
 /// `LOAD_ATTR` with the method flag at `site`: the method in the
@@ -7590,6 +8424,16 @@ unsafe extern "C" fn h_method(st: *mut State, site: *mut MethodSite) -> u32 {
     }
 }
 
+/// [`MethodSite::own`]'s names for a value in an instance's materialized
+/// dict, which the site finds by position and name (no shared-names table
+/// sits at this address).
+const OWN_PUBLISHED: u64 = 1;
+
+/// [`MethodSite::own`]'s names for a `__slots__` member (`self._fn(...)`
+/// of a callable a slot holds), at its position in the class's slot
+/// layout: a data descriptor, which no instance entry shadows.
+const OWN_SLOT: u64 = 2;
+
 /// [`h_method`] for a receiver the site's first cache doesn't know.
 #[inline(never)]
 unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
@@ -7622,6 +8466,61 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
                 }
             }
         }
+        // A native stream's method of the kind the site loaded it for, the
+        // stream in the self slot. Likewise a builtin value's of a kind the
+        // site's first cache doesn't hold (a big `int`'s `to_bytes`, a
+        // float's, a tuple's, a `bytes` object's): the kind and the site's
+        // name decide the method.
+        let stream_tag = match &*top {
+            Object::File(_)
+            | Object::Long(_)
+            | Object::Int(_)
+            | Object::Bool(_)
+            | Object::Float(_)
+            | Object::Complex(_)
+            | Object::Tuple(_)
+            | Object::Bytes(_)
+            | Object::ByteArray(_)
+            | Object::FrozenSet(_)
+            | Object::Range(_) => crate::builtins::method_memo_tag(&*top),
+            _ => None,
+        };
+        if let (Some(t), Some((want, f))) = (stream_tag, &s.stream) {
+            if t == *want {
+                let f = crate::clone_hot(f);
+                let recv = top.read();
+                top.write(f);
+                (*st).stack.add(s.len as usize).write(recv);
+                return 0;
+            }
+        }
+        // A class's attribute the site loaded last, while the class's and
+        // its metaclass's versions hold: it and an empty self slot (or the
+        // class, for a class method), the receiver released.
+        let type_recv = match &*top {
+            Object::Type(t) if t.flags.is_builtin || t.attr_version.get() != 0 => {
+                let (ptr, ver, meta) = (
+                    Rc::as_ptr(t) as usize,
+                    t.attr_version.get(),
+                    meta_version(t),
+                );
+                if let Some((p, v, m, attr, binds)) = &s.type_attr {
+                    if *p == ptr && *v == ver && *m == meta {
+                        let attr = crate::clone_hot(attr);
+                        let recv = std::mem::replace(&mut *top, attr);
+                        if *binds {
+                            (*st).stack.add(s.len as usize).write(recv);
+                        } else {
+                            crate::drop_hot(recv);
+                            (*st).stack.add(s.len as usize).write(Object::Unbound);
+                        }
+                        return 0;
+                    }
+                }
+                Some((ptr, ver, meta, t.flags.is_builtin))
+            }
+            _ => None,
+        };
         // The instance's own value the site found last, at its position
         // among the instance's names while the class version holds (no
         // data descriptor of the name has come since): it and an empty
@@ -7629,16 +8528,30 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
         let recv = match &*top {
             Object::Instance(inst) => {
                 let (ver, keys, idx) = s.own;
-                if ver != 0
-                    && ver == inst.cls_raw().attr_version.get()
-                    && inst.dict.published().is_none()
-                    && droppable(&*top)
-                {
-                    if let Some(v) = inst
-                        .dict
-                        .split_peek()
-                        .and_then(|split| split.get_over(keys as *const _, idx as usize))
-                    {
+                if ver != 0 && ver == inst.cls_raw().attr_version.get() && droppable(&*top) {
+                    let v = if keys == OWN_SLOT {
+                        // (The class's version settles its layout.)
+                        inst.laid_out_slot(idx as usize)
+                    } else if keys == OWN_PUBLISHED {
+                        // (Its entry at the position, by the site's name.)
+                        let code = &*s.code;
+                        inst.attr_peek_index(idx as usize)
+                            .filter(|(k, _)| {
+                                crate::slot_name_matches(
+                                    code,
+                                    code.instructions[s.pc as usize].arg,
+                                    k,
+                                )
+                            })
+                            .map(|(_, v)| v)
+                    } else if inst.dict.published().is_none() {
+                        inst.dict
+                            .split_peek()
+                            .and_then(|split| split.get_over(keys as *const _, idx as usize))
+                    } else {
+                        None
+                    };
+                    if let Some(v) = v {
                         if !matches!(v, Object::Unbound) {
                             let v = crate::clone_hot(v);
                             crate::drop_hot(std::mem::replace(&mut *top, v));
@@ -7669,6 +8582,19 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
                         return 0;
                     }
                 }
+                // A `__slots__` member the class resolves the name to (its
+                // slot descriptor, which no instance entry shadows): the
+                // value and an empty self slot, its position for the next
+                // time.
+                if let Some(i) = slot_member_position(s, inst) {
+                    if let (Some(v), true) = (inst.laid_out_slot(i as usize), droppable(&*top)) {
+                        let v = crate::clone_hot(v);
+                        s.own = (inst.cls_raw().attr_version.get(), OWN_SLOT, i);
+                        crate::drop_hot(std::mem::replace(&mut *top, v));
+                        (*st).stack.add(s.len as usize).write(Object::Unbound);
+                        return 0;
+                    }
+                }
                 Some(inst.clone())
             }
             _ => None,
@@ -7684,6 +8610,37 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
         );
         if r != 0 {
             return left(st, s.pc, s.last, s.len as usize);
+        }
+        // A builtin type's unbound function or builtin, or a user class's
+        // plain, static or class method that the class's attributes alone
+        // decide: for the next time.
+        if let Some((ptr, ver, meta, builtin)) = type_recv {
+            let callable = &*(*st).stack.add(s.len as usize - 1);
+            let binds = match &*(*st).stack.add(s.len as usize) {
+                Object::Unbound => Some(false),
+                Object::Type(t) if Rc::as_ptr(t) as usize == ptr => Some(true),
+                _ => None,
+            };
+            if let (Some(binds), Object::Builtin(_) | Object::Function(_)) = (binds, callable) {
+                if builtin || class_method_plain(s, ptr, binds) {
+                    s.type_attr = Some((ptr, ver, meta, callable.clone(), binds));
+                }
+            }
+        }
+        // A native stream's method bound to it: for the next stream of the
+        // kind.
+        if let Some(t) = stream_tag {
+            let (callable, self_slot) = (
+                &*(*st).stack.add(s.len as usize - 1),
+                &*(*st).stack.add(s.len as usize),
+            );
+            if let Object::Builtin(b) = callable {
+                // (The receiver itself in the self slot: the method as
+                // the kind's unbound builtin.)
+                if b.binds_instance && crate::builtins::method_memo_tag(self_slot) == Some(t) {
+                    s.stream = Some((t, callable.clone()));
+                }
+            }
         }
         // A `staticmethod`'s or `classmethod`'s function: the descriptor, for
         // the next time.
@@ -7709,15 +8666,24 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
             let name = code
                 .names
                 .get(code.instructions[s.pc as usize].arg as usize);
-            if let (Some(name), None, Some(split)) =
-                (name, inst.dict.published(), inst.dict.split_peek())
-            {
+            let found = &*(*st).stack.add(s.len as usize - 1);
+            let same =
+                |v: &Object| v.strong_word().is_some() && v.strong_word() == found.strong_word();
+            if inst.dict.published().is_some() {
+                // A materialized dict's entry (an instance that assigned
+                // its names out of the class's order): where it sits.
+                let arg = code.instructions[s.pc as usize].arg;
+                if let Some((crate::LeafAttr::Value(v), Some(ix))) =
+                    Interpreter::leaf_resolve_instance_attr_ix(code, &inst, arg)
+                {
+                    if same(&v) {
+                        s.own = (inst.cls_raw().attr_version.get(), OWN_PUBLISHED, ix);
+                    }
+                }
+            } else if let (Some(name), Some(split)) = (name, inst.dict.split_peek()) {
                 let (keys, _) = split.keys_and_len();
                 if let Some(idx) = split.position_str(name) {
-                    let found = &*(*st).stack.add(s.len as usize - 1);
-                    if split.get_over(keys as *const _, idx).is_some_and(|v| {
-                        v.strong_word().is_some() && v.strong_word() == found.strong_word()
-                    }) {
+                    if split.get_over(keys as *const _, idx).is_some_and(same) {
                         s.own = (inst.cls_raw().attr_version.get(), keys as u64, idx as u32);
                     }
                 }
@@ -7730,6 +8696,31 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
     }
 }
 
+/// The position in `inst`'s class's slot layout of the `__slots__` member
+/// the method site `s` loads, when the class resolves the name to that
+/// member's descriptor under its default attribute lookup. `None` for any
+/// other name.
+fn slot_member_position(s: &MethodSite, inst: &crate::types::PyInstance) -> Option<u32> {
+    let cls = inst.cls_raw();
+    if cls.slot_layout.get().is_none_or(Option::is_none)
+        || cls.attr_version.get() == 0
+        || !Interpreter::default_getattribute(cls)
+    {
+        return None;
+    }
+    // SAFETY: the site's code is live (the caller's code runs it).
+    let code = unsafe { &*s.code };
+    let name = code
+        .names
+        .get(code.instructions[s.pc as usize].arg as usize)?;
+    if matches!(name.as_str(), "__dict__" | "__weakref__")
+        || !matches!(cls.lookup(name), Some(Object::SlotDescriptor(sd)) if sd.name == *name && sd.default.is_none())
+    {
+        return None;
+    }
+    inst.laid_out_position(name).map(|(i, _)| i)
+}
+
 /// Record in `s` the `staticmethod` or `classmethod` of `inst`'s class that
 /// the site's load just found, as `callable` and `self_slot` hold its
 /// result: its function, and the class (or nothing) bound to it.
@@ -7737,6 +8728,62 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
 /// # Safety
 ///
 /// `s`'s code is live.
+/// Whether the user class at `ptr` (the site's receiver) yields its
+/// method at the site as a function of its attributes and its
+/// metaclass's: its metaclass reads attributes as `type` does and defines
+/// the name, if at all, as a non-data descriptor (`EnumType.__new__`,
+/// which the class's own entry overrides), and the class's own value is a
+/// plain function (no self bound), a `staticmethod`, or a `classmethod`
+/// (`binds`).
+///
+/// # Safety
+///
+/// `ptr` is the receiver class, alive on the stack.
+unsafe fn class_method_plain(s: &MethodSite, ptr: usize, binds: bool) -> bool {
+    // SAFETY: the caller's contract.
+    let cls = unsafe { &*(ptr as *const crate::types::TypeObject) };
+    if crate::object::exotic_str_keys_possible() {
+        return false;
+    }
+    // SAFETY: the site's code is live.
+    let code = unsafe { &*s.code };
+    let Some(name) = code
+        .names
+        .get(code.instructions[s.pc as usize].arg as usize)
+    else {
+        return false;
+    };
+    if !cls.metaclass_is_type() {
+        let meta = cls.metaclass_or_type();
+        let ty = &crate::builtin_types::builtin_types().type_;
+        let same_getattr = match (
+            meta.lookup("__getattribute__"),
+            ty.lookup("__getattribute__"),
+        ) {
+            (Some(a), Some(b)) => a.is_same(&b),
+            _ => false,
+        };
+        let non_data = match meta.lookup(name) {
+            None => true,
+            Some(
+                Object::Function(_)
+                | Object::StaticMethod(_)
+                | Object::ClassMethod(_)
+                | Object::Builtin(_),
+            ) => true,
+            Some(_) => false,
+        };
+        if !same_getattr || !non_data {
+            return false;
+        }
+    }
+    matches!(
+        (cls.lookup(name), binds),
+        (Some(Object::Function(_) | Object::StaticMethod(_)), false)
+            | (Some(Object::ClassMethod(_)), true)
+    )
+}
+
 unsafe fn note_method_desc(
     s: &mut MethodSite,
     inst: &Rc<crate::types::PyInstance>,
@@ -8095,6 +9142,17 @@ pub(crate) struct AttrSite {
     /// as a value last (see [`builtin_attr_read`]): the receiver's kind
     /// and the method.
     builtin_attr: std::cell::RefCell<Option<(u8, Rc<crate::object::BuiltinFn>)>>,
+    /// The pure leaf getter of a property the site last read in place (see
+    /// [`site_property_leaf`]): the class version it read for, the getter
+    /// function and its code, and the property's getter cell.
+    prop_leaf: Cell<(u64, usize, usize, usize)>,
+    /// Where an instance with a published dict (one `copy`, `pickle` or
+    /// `vars()` made) last had the site's name: its class's version and
+    /// the dict position (see [`pub_hit`]).
+    pub_hint: Cell<(u64, u32)>,
+    /// The version of an exception class whose read of the site's name is
+    /// one of its slot descriptors (`e.args`; see [`exc_slot_read`]).
+    exc_slot: Cell<u64>,
 }
 
 /// The value `recv`'s read at `site` finds through the site's caches past
@@ -8245,6 +9303,15 @@ unsafe fn attr_miss_quick(
                         return Some(v);
                     }
                 }
+                // (A tuple's field first: it has no dict to probe.)
+                if matches!(inst.native.get(), Some(Object::Tuple(_))) {
+                    if let Some(v) = (*site.ext)
+                        .stamp_slot(site.pc as usize)
+                        .and_then(|s| crate::tuple_field_hit(s, inst))
+                    {
+                        return Some(v);
+                    }
+                }
                 if let Some(d) = inst_dict_read(site, inst) {
                     return Some(d);
                 }
@@ -8300,6 +9367,21 @@ unsafe fn attr_miss_quick(
             _ => None,
         }
     }
+}
+
+/// [`inst_dict_read`] once it has answered for the instance's class at
+/// its version: the dict, from the memo alone (no name to compare).
+#[inline]
+fn inst_dict_known(site: &AttrSite, inst: &crate::types::PyInstance) -> Option<Object> {
+    let cls = inst.cls_raw();
+    let (p, ver) = (std::ptr::from_ref(cls) as usize | 1, cls.attr_version.get());
+    let known = site
+        .type_attr
+        .try_borrow()
+        .ok()?
+        .as_ref()
+        .is_some_and(|m| m.cls == p && m.ver == ver && ver != 0);
+    (known && inst.native.get().is_none()).then(|| Object::Dict(inst.dict_shared()))
 }
 
 /// `inst.__dict__` at `site`, where the instance's class keeps its default
@@ -8379,6 +9461,76 @@ unsafe fn attr_miss(st: *mut State, site: &AttrSite, at: *mut Object, local: boo
             }
             _ => None,
         };
+        // A missing attribute a class's pure leaf `__getattr__` answers,
+        // evaluated in place ahead of the lanes that can't.
+        if let Object::Instance(inst) = &*at {
+            if inst
+                .cls_raw()
+                .dunder(crate::types::Dunder::GetAttr)
+                .present()
+            {
+                let code = &*site.code;
+                let arg = code.instructions[site.pc as usize].arg;
+                if let Some(v) = code
+                    .names
+                    .get(arg as usize)
+                    .and_then(|name| (*(*st).interp).leaf_getattr_hook(&*at, name, code, arg))
+                {
+                    if local {
+                        (*st).stack.add(site.slot as usize).write(v);
+                    } else {
+                        if !droppable(&*at) {
+                            drop(v);
+                            return left(st, site.pc, site.last, site.slot as usize + 1);
+                        }
+                        crate::drop_hot(std::mem::replace(&mut *at, v));
+                    }
+                    return 0;
+                }
+            }
+        }
+        // A bound method's receiver, function, or its function's names.
+        if let Object::BoundMethod(bm) = &*at {
+            let code = &*site.code;
+            let arg = code.instructions[site.pc as usize].arg;
+            if let Some(v) = Interpreter::leaf_bound_method_read(code, bm, arg) {
+                if local {
+                    (*st).stack.add(site.slot as usize).write(v);
+                } else {
+                    if !droppable(&*at) {
+                        drop(v);
+                        return left(st, site.pc, site.last, site.slot as usize + 1);
+                    }
+                    crate::drop_hot(std::mem::replace(&mut *at, v));
+                }
+                return 0;
+            }
+        }
+        // A namespace's own entry (a `typing` union's `__args__`, a
+        // `SimpleNamespace`'s field): the full handler's first answer.
+        if let Object::SimpleNamespace(d) = &*at {
+            let code = &*site.code;
+            let v = code
+                .names
+                .get(code.instructions[site.pc as usize].arg as usize)
+                .and_then(|name| {
+                    d.try_borrow()
+                        .ok()
+                        .and_then(|d| d.get(&crate::object::StrKey(name)).cloned())
+                });
+            if let Some(v) = v {
+                if local {
+                    (*st).stack.add(site.slot as usize).write(v);
+                } else {
+                    if !droppable(&*at) {
+                        drop(v);
+                        return left(st, site.pc, site.last, site.slot as usize + 1);
+                    }
+                    crate::drop_hot(std::mem::replace(&mut *at, v));
+                }
+                return 0;
+            }
+        }
         // An instance of a class with a `__getattribute__` of its own: no
         // cached read applies, and the full handler runs the hook.
         if let Object::Instance(inst) = &*at {
@@ -8401,9 +9553,68 @@ unsafe fn attr_miss(st: *mut State, site: &AttrSite, at: *mut Object, local: boo
                     return r;
                 }
             }
+            // A published dict's own value, its position remembered, or
+            // an exception's pseudo-slot.
+            if let Some(v) = pub_note(site, inst).or_else(|| exc_slot_read(site, inst)) {
+                if local {
+                    (*st).stack.add(site.slot as usize).write(v);
+                } else {
+                    if !droppable(&*at) {
+                        drop(v);
+                        return left(st, site.pc, site.last, site.slot as usize + 1);
+                    }
+                    crate::drop_hot(std::mem::replace(&mut *at, v));
+                }
+                return 0;
+            }
+            // A property whose getter the site's slot holds for the class
+            // (settled after the code compiled, or read in a generator's
+            // step), evaluated in place when it's a pure leaf. (A property
+            // is a data descriptor: nothing the reads below find wins.)
+            if site_property_leaf(&mut *st, site, at, local) {
+                return 0;
+            }
+            // (Read now: a stack receiver leaves with the read.)
+            let ver = inst.cls_raw().attr_version.get();
+            if let Some(ms) = (*site.ext)
+                .method_slot(site.pc as usize)
+                .filter(|m| m.holds_getter())
+            {
+                let (pc, slot) = (site.pc as usize, site.slot as usize);
+                if property_leaf_here(&mut *st, site.code, pc, slot, at, u64::from(local)).is_some()
+                {
+                    site_property_note(site, ver);
+                    return 0;
+                }
+                // A getter the site cached for the class that runs as an
+                // activation (`TokenList.value` read over a token tree's
+                // nodes): the property wins over every read below, so it's
+                // called now.
+                // A generator's fast step can't run one (it has no switch):
+                // it declines at once, as every read below would.
+                if (*st).sw.is_null() && ms.getter(ver).is_some() {
+                    return CALL_DECLINED;
+                }
+                if !(*st).sw.is_null() && !site.direct.is_null() {
+                    if let Some(getter) = ms.getter(ver).map(|(f, _)| f) {
+                        if let Some(r) = property_call(
+                            &mut *st,
+                            pc,
+                            slot,
+                            at,
+                            u64::from(local),
+                            site.direct,
+                            getter,
+                        ) {
+                            return r;
+                        }
+                    }
+                }
+            }
         }
         if let Some(v) = attr_miss_quick(site, &*at, local, running)
             .or_else(|| builtin_attr_read(st, site, &*at, local))
+            .or_else(|| leaf_property_read(st, site, &*at, local))
         {
             if local {
                 (*st).stack.add(site.slot as usize).write(v);
@@ -8697,7 +9908,86 @@ unsafe fn field_hit<'a>(site: &AttrSite, inst: &'a crate::types::PyInstance) -> 
         if want == ver && want != 0 {
             return inst.split_field(idx as usize);
         }
+        if inst.dict.published().is_some() {
+            return pub_hit(site, inst);
+        }
         None
+    }
+}
+
+/// The value at the position [`AttrSite::pub_hint`] remembers in `inst`'s
+/// published dict, if the class is at the hint's version (so no data
+/// descriptor has come to shadow the dict) and that entry is still the
+/// site's name.
+///
+/// # Safety
+///
+/// As [`attr_hit`].
+#[inline(never)]
+unsafe fn pub_hit<'a>(site: &AttrSite, inst: &'a crate::types::PyInstance) -> Option<&'a Object> {
+    let (ver, idx) = site.pub_hint.get();
+    if ver == 0 || inst.cls_raw().attr_version.get() != ver {
+        return None;
+    }
+    // SAFETY: the caller's contract; the site's code is live.
+    unsafe {
+        let (k, v) = inst.attr_peek_index(idx as usize)?;
+        let code = &*site.code;
+        crate::slot_name_matches(code, code.instructions[site.pc as usize].arg, k).then_some(v)
+    }
+}
+
+/// A read at `site` of an exception's pseudo-slot (`e.args`): the value
+/// its slot storage holds, when the class resolves the site's name to a
+/// slot descriptor (a data descriptor: no instance dict shadows it), as
+/// the site last found for the class's version; an unset one's default
+/// (a never-raised exception's `__traceback__` is `None`). `None` for
+/// anything else, an unset slot with no default included.
+fn exc_slot_read(site: &AttrSite, inst: &crate::types::PyInstance) -> Option<Object> {
+    let cls = inst.cls_raw();
+    if !cls.flags.is_exception {
+        return None;
+    }
+    // SAFETY: the site's code is live.
+    let code = unsafe { &*site.code };
+    let name = code
+        .names
+        .get(code.instructions[site.pc as usize].arg as usize)?;
+    let ver = cls.attr_version.get();
+    if ver == 0 {
+        return None;
+    }
+    if site.exc_slot.get() != ver {
+        if !matches!(cls.lookup(name), Some(Object::SlotDescriptor(_))) {
+            return None;
+        }
+        site.exc_slot.set(ver);
+    }
+    inst.slot_get(name).or_else(|| match cls.lookup(name) {
+        Some(Object::SlotDescriptor(sd)) => sd.default.clone(),
+        _ => None,
+    })
+}
+
+/// A read at `site` of an instance with a published dict, resolved as the
+/// leaf path resolves it: the dict's own value, its position remembered for
+/// [`pub_hit`]; `None` for anything else.
+///
+/// # Safety
+///
+/// As [`attr_hit`].
+unsafe fn pub_note(site: &AttrSite, inst: &crate::types::PyInstance) -> Option<Object> {
+    inst.dict.published()?;
+    // SAFETY: the site's code is live.
+    let code = unsafe { &*site.code };
+    let arg = code.instructions[site.pc as usize].arg;
+    let ver = inst.cls_raw().attr_version.get();
+    match Interpreter::leaf_resolve_instance_attr_ix(code, inst, arg)? {
+        (crate::LeafAttr::Value(v), Some(ix)) if ver != 0 => {
+            site.pub_hint.set((ver, ix));
+            Some(v)
+        }
+        _ => None,
     }
 }
 
@@ -8741,6 +10031,53 @@ unsafe extern "C" fn h_attr_local(st: *mut State, site: *const AttrSite) -> u32 
     }
 }
 
+/// A native method of the instance's class that the site last bound (an
+/// `RLock`'s `__exit__`, read to be called with `*args`; see
+/// `Interpreter::leaf_attr_resolve_site`), which the instance doesn't
+/// shadow: bound to the receiver `recv`.
+///
+/// # Safety
+///
+/// The site's code and extension are live.
+unsafe fn inst_builtin_bound(
+    site: &AttrSite,
+    inst: &crate::types::PyInstance,
+    recv: &Object,
+) -> Option<Object> {
+    // SAFETY: the caller's contract.
+    let (code, ext) = unsafe { (&*site.code, &*site.ext) };
+    let b = ext
+        .method_slot(site.pc as usize)?
+        .get_inst_builtin(inst.cls_raw().attr_version.get())?;
+    if crate::inst_may_shadow(inst, code, code.instructions[site.pc as usize].arg) {
+        return None;
+    }
+    Some(Object::BoundMethod(Rc::new(
+        crate::object::BoundMethod::new(recv.clone(), Object::Builtin(b)),
+    )))
+}
+
+/// A `__slots__` member the site's field slot names for the instance's
+/// class at its version (`p.x` of a global's, after `slot_note`): read off
+/// the instance's laid-out slots.
+#[inline]
+unsafe fn slot_field_hit<'a>(
+    site: &AttrSite,
+    inst: &'a crate::types::PyInstance,
+) -> Option<&'a Object> {
+    if site.field.is_null() {
+        return None;
+    }
+    // SAFETY: the site's field slot lives as long as the code does.
+    let (want, idx) = unsafe { (*site.field).get() };
+    if want == 0 || want != inst.cls_raw().attr_version.get() || idx & crate::SLOT_FIELD == 0 {
+        return None;
+    }
+    // SAFETY: as in `h_attr_local_slot`: the position was noted for this
+    // class at this version (`slot_field_note`), over its own layout.
+    unsafe { inst.laid_out_slot((idx & !crate::SLOT_FIELD) as usize) }
+}
+
 /// [`h_attr_local`] past its commonest shape.
 #[inline(never)]
 unsafe extern "C" fn attr_local_slow(st: *mut State, site: *const AttrSite) -> u32 {
@@ -8764,6 +10101,46 @@ unsafe extern "C" fn attr_local_slow(st: *mut State, site: *const AttrSite) -> u
             }
             // (A class attribute the site has read before.)
             Object::Instance(inst) => {
+                // A natively served value's public field (`dt.hour`), read
+                // off its packed state: every read of one comes here (the
+                // site keeps nothing for it), so it goes ahead of the
+                // lanes that probe the site's other memos.
+                if inst.cls_raw().native_kind.get() != 0 {
+                    if let Some(v) = native_field_read(site, inst) {
+                        (*st).stack.add(slot).write(v);
+                        return 0;
+                    }
+                }
+                // A polymorphic site's third class and on: the instance's
+                // own field at the position the site's table holds for the
+                // class version, at which the class resolved the name to
+                // the instance (no data descriptor, the default
+                // `__getattribute__`), so nothing below would answer
+                // otherwise. Reached only after the whole miss chain, such
+                // a read cost about a thousand instructions (a site reading
+                // `action.dest` over three action classes).
+                if let Some(v) = field_hit_slow(site, inst) {
+                    (*st).stack.add(slot).write(crate::clone_hot(v));
+                    return 0;
+                }
+                // `inst.__dict__`, as the site answered it before.
+                if let Some(v) = inst_dict_known(site, inst) {
+                    (*st).stack.add(slot).write(v);
+                    return 0;
+                }
+                // A named tuple's field (a data descriptor: no instance
+                // shadows it), as the site's stamp remembers it.
+                if let Some(v) = (*site.ext)
+                    .stamp_slot(site.pc as usize)
+                    .and_then(|s| crate::tuple_field_hit(s, inst))
+                    .or_else(|| inst_builtin_bound(site, inst, &*at))
+                {
+                    (*st).stack.add(slot).write(v);
+                    return 0;
+                }
+                if site_property_leaf(&mut *st, site, at, true) {
+                    return 0;
+                }
                 if let Some(v) =
                     class_poly_hit(site, inst).or_else(|| instance_class_read(site, inst))
                 {
@@ -8821,7 +10198,9 @@ unsafe extern "C" fn h_attr_stack(st: *mut State, site: *const AttrSite) -> u32 
         let s = &*site;
         let at = (*st).stack.add(s.slot as usize);
         let v = match &*at {
-            Object::Instance(inst) => field_hit(s, inst).map(crate::clone_hot),
+            Object::Instance(inst) => field_hit(s, inst)
+                .or_else(|| slot_field_hit(s, inst))
+                .map(crate::clone_hot),
             // A class's constant the site memoized (`Direction.FORWARD`).
             Object::Type(cls) => type_attr_memo(s, cls),
             // A module's value the site noted (`os.path`).
@@ -8898,6 +10277,44 @@ unsafe fn builtin_attr_read(
         *memo = Some((tag, b.clone()));
     }
     Some(bind(&b))
+}
+
+/// A plain instance's read of a property whose getter is a builtin
+/// registered as a leaf for any arguments (a struct sequence's field, as
+/// `os.stat_result.st_mode`): the getter's result, or `None` for the full
+/// path (which raises what the getter would).
+unsafe fn leaf_property_read(
+    st: *mut State,
+    site: &AttrSite,
+    recv: &Object,
+    local: bool,
+) -> Option<Object> {
+    let Object::Instance(inst) = recv else {
+        return None;
+    };
+    if (!local && !droppable(recv)) || !Interpreter::default_getattribute(inst.cls_raw()) {
+        return None;
+    }
+    // SAFETY: the site's code is live.
+    let code = unsafe { &*site.code };
+    let name: &str = code
+        .names
+        .get(code.instructions[site.pc as usize].arg as usize)?;
+    if name.starts_with("__") {
+        return None;
+    }
+    let Some(Object::Property(p)) = inst.cls_raw().lookup(name) else {
+        return None;
+    };
+    let Object::Builtin(b) = p.fget() else {
+        return None;
+    };
+    // SAFETY: the interpreter outlives the code it runs.
+    let interp = unsafe { &*(*st).interp };
+    if !matches!(interp.leaf_call_kind(&b), Some(crate::LeafKind::Opaque)) {
+        return None;
+    }
+    (b.call)(std::slice::from_ref(recv)).ok()
 }
 
 /// The classes an attribute site's polymorphic class-attribute memo holds.
@@ -8999,20 +10416,27 @@ fn class_poly_prove(site: &AttrSite, inst: &crate::types::PyInstance, code: &Cod
 ///
 /// `site`'s code is live.
 unsafe fn class_poly_note(site: &AttrSite, inst: &crate::types::PyInstance, v: &Object) {
-    if !matches!(
-        v,
+    // (Values a read through an instance gives back as they are: plain
+    // data, or an object or class whose type has no `__get__`, such as a
+    // compiled pattern a class keeps.)
+    let plain = match v {
         Object::Str(_)
-            | Object::Int(_)
-            | Object::Float(_)
-            | Object::Bool(_)
-            | Object::None
-            | Object::Bytes(_)
-            | Object::Tuple(_)
-            | Object::FrozenSet(_)
-            | Object::List(_)
-            | Object::Dict(_)
-            | Object::Set(_)
-    ) {
+        | Object::Int(_)
+        | Object::Float(_)
+        | Object::Bool(_)
+        | Object::None
+        | Object::Bytes(_)
+        | Object::Tuple(_)
+        | Object::FrozenSet(_)
+        | Object::List(_)
+        | Object::Dict(_)
+        | Object::Set(_) => true,
+        Object::Instance(_) | Object::Type(_) => {
+            crate::builtins::class_of(v).lookup("__get__").is_none()
+        }
+        _ => false,
+    };
+    if !plain {
         return;
     }
     let cls = inst.cls_raw();
@@ -9071,9 +10495,21 @@ fn type_attr_memo(site: &AttrSite, cls: &Rc<crate::types::TypeObject>) -> Option
             && m.meta == meta_version(cls)
             && !matches!(*m.val, Object::Unbound) =>
         {
-            Some(crate::clone_hot(&m.val))
+            Some(memo_value(&m.val, cls))
         }
         _ => None,
+    }
+}
+
+/// The read of a class's memoized value: the value itself, or, for a
+/// native class method's descriptor, a method bound to the class.
+#[inline]
+fn memo_value(val: &Object, cls: &Rc<crate::types::TypeObject>) -> Object {
+    match val {
+        Object::ClassMethod(cm) => Object::BoundMethod(Rc::new(
+            crate::object::BoundMethod::py_method(Object::Type(cls.clone()), cm.func()),
+        )),
+        v => crate::clone_hot(v),
     }
 }
 
@@ -9092,8 +10528,7 @@ fn instance_class_read(site: &AttrSite, inst: &Rc<crate::types::PyInstance>) -> 
         return None;
     }
     let cls = inst.cls_raw();
-    (inst.c_body.get() == 0 && !cls.flags.is_builtin && cls.class_attr_is_plain())
-        .then(|| Object::Type(inst.cls()))
+    (inst.c_body.get() == 0 && cls.class_read_is_plain()).then(|| Object::Type(inst.cls()))
 }
 
 /// `x.__class__` of the value at `src` into the stack slot `dst` (the same
@@ -9108,14 +10543,19 @@ unsafe extern "C" fn h_class_read(dst: *mut Object, src: *const Object) -> u32 {
             return 1;
         };
         let cls = inst.cls_raw();
-        if inst.c_body.get() != 0 || cls.flags.is_builtin || !cls.class_attr_is_plain() {
+        if inst.c_body.get() != 0 || !cls.class_read_is_plain() {
             return 1;
         }
         let ty = Object::Type(inst.cls());
         if std::ptr::eq(dst.cast_const(), src) && !plain_release(&*src) {
-            // (The receiver's last reference: its release is the helper's.)
-            drop(ty);
-            return 1;
+            // The receiver's last reference (a fresh `super(C, obj)`'s): it
+            // dies here, and a finalizer its release queues runs before the
+            // next instruction (the code checks after the read).
+            if !droppable(&*src) {
+                drop(ty);
+                return 1;
+            }
+            crate::drop_hot_at(src);
         }
         dst.write(ty);
         0
@@ -9124,14 +10564,14 @@ unsafe extern "C" fn h_class_read(dst: *mut Object, src: *const Object) -> u32 {
 
 /// Whether `site` reads one of the names every class answers with a string
 /// of its own (`cls.__name__`, as logging, reprs and error messages read
-/// it), which [`type_name_note`] memoizes. (Not `__qualname__`: assigning
-/// it leaves the class's version where it was.)
+/// it), which [`type_name_note`] memoizes. (Assigning any of them moves
+/// the class's version.)
 fn type_name_site(site: &AttrSite) -> bool {
     // SAFETY: the site's code is live (the caller's code runs it).
     let code = unsafe { &*site.code };
     code.names
         .get(code.instructions[site.pc as usize].arg as usize)
-        .is_some_and(|name| matches!(name.as_str(), "__name__" | "__module__"))
+        .is_some_and(|name| matches!(name.as_str(), "__name__" | "__module__" | "__qualname__"))
 }
 
 /// Remember what the full lookup just read for `cls.__name__` (or
@@ -9140,7 +10580,10 @@ fn type_name_site(site: &AttrSite) -> bool {
 /// assignment to a class attribute, these among them, moves it).
 fn type_name_note(site: &AttrSite, cls: &Rc<crate::types::TypeObject>, value: &Object) {
     let ver = cls.attr_version.get();
-    if ver == 0 || !matches!(value, Object::Str(_)) || !cls.metaclass_is_type() {
+    if ver == 0
+        || !matches!(value, Object::Str(_))
+        || !(cls.metaclass_is_type() || meta_leaves_names(cls))
+    {
         return;
     }
     if let Ok(mut memo) = site.type_attr.try_borrow_mut() {
@@ -9148,6 +10591,41 @@ fn type_name_note(site: &AttrSite, cls: &Rc<crate::types::TypeObject>, value: &O
             TypeMemo::owned(Rc::as_ptr(cls) as usize, ver, value.clone()).under(meta_version(cls)),
         );
     }
+}
+
+/// Whether `cls`'s metaclass is a Python subclass of `type` (`ABCMeta`)
+/// that leaves `__name__` and `__module__` to `type`: no class on its MRO
+/// before `type` defines them or `__getattribute__`. (The memo is held
+/// under the metaclass's version, which an assignment there moves.)
+fn meta_leaves_names(cls: &crate::types::TypeObject) -> bool {
+    // SAFETY: GIL-serialized raw read; the reference ends with the check.
+    let Some(meta) = (unsafe { (*cls.metaclass.as_ptr()).as_ref() }) else {
+        return false;
+    };
+    let Ok(mro) = meta.mro.try_borrow() else {
+        return false;
+    };
+    for t in mro.iter() {
+        if t.flags.is_builtin {
+            return t.name == "type";
+        }
+        let Ok(d) = t.dict.try_borrow() else {
+            return false;
+        };
+        // (A metaclass's own `__module__` is a string, which a class's read
+        // passes over: only a descriptor would intercept it.)
+        if d.get(&crate::object::StrKey("__getattribute__")).is_some()
+            || ["__name__", "__module__"].iter().any(|n| {
+                !matches!(
+                    d.get(&crate::object::StrKey(n)),
+                    None | Some(Object::Str(_) | Object::None)
+                )
+            })
+        {
+            return false;
+        }
+    }
+    false
 }
 
 /// A class attribute an [`AttrSite`] memoized: the class's address and
@@ -9209,7 +10687,7 @@ fn type_attr_read(site: &AttrSite, cls: &Rc<crate::types::TypeObject>) -> Option
         if let Some(m) = memo.as_ref() {
             if m.cls == p && m.ver == ver && ver != 0 && m.meta == meta {
                 // (`Unbound`: a read this path declined under that version.)
-                return (!matches!(*m.val, Object::Unbound)).then(|| crate::clone_hot(&m.val));
+                return (!matches!(*m.val, Object::Unbound)).then(|| memo_value(&m.val, cls));
             }
         }
     }
@@ -9312,6 +10790,34 @@ fn type_attr_resolve(
         }
         return Some(b);
     }
+    // A native class method (`dict.fromkeys`,
+    // `itertools.chain.from_iterable`), which the memo holds as the
+    // descriptor and binds to the class at each read (a fresh bound
+    // method, as `classmethod.__get__` makes), or a native static method's
+    // function (`str.maketrans`). Owned, as a builtin is.
+    let v = match v {
+        Object::ClassMethod(cm) => {
+            if !matches!(cm.func(), Object::Builtin(_)) {
+                return None;
+            }
+            let entry = Object::ClassMethod(cm);
+            let out = memo_value(&entry, cls);
+            if let Ok(mut memo) = site.type_attr.try_borrow_mut() {
+                *memo = Some(TypeMemo::owned(p, ver, entry).under(meta_ver));
+            }
+            return Some(out);
+        }
+        Object::StaticMethod(w) => {
+            let b @ Object::Builtin(_) = w.func() else {
+                return None;
+            };
+            if let Ok(mut memo) = site.type_attr.try_borrow_mut() {
+                *memo = Some(TypeMemo::owned(p, ver, b.clone()).under(meta_ver));
+            }
+            return Some(b);
+        }
+        v => v,
+    };
     let plain = matches!(
         v,
         Object::Int(_)
@@ -9449,6 +10955,36 @@ unsafe fn module_attr_note(site: &AttrSite, m: &crate::object::PyModule) {
     }
 }
 
+/// Put the value `v` a read found in its stack receiver's slot `at`,
+/// releasing the receiver: by a plain decrement where another owner keeps
+/// it and nothing observes releases, else as the core loop releases an
+/// operand (which runs no code). `false`, with `v` dropped and the
+/// receiver in place, when neither applies. The second form matters once
+/// reference counts are shared between threads, where a plain decrement
+/// is never allowed: every such read then went on through the whole miss
+/// chain (`Condition.__exit__`'s `self._lock.__exit__`, twice for every
+/// item a queue hands over).
+///
+/// # Safety
+///
+/// `at` is an initialized stack slot the caller owns.
+#[inline(always)]
+unsafe fn receiver_leaves(at: *mut Object, v: Object) -> bool {
+    // SAFETY: the caller's contract.
+    unsafe {
+        if plain_release(&*at) {
+            at.write(v);
+            return true;
+        }
+        if droppable(&*at) {
+            crate::drop_hot(std::mem::replace(&mut *at, v));
+            return true;
+        }
+    }
+    drop(v);
+    false
+}
+
 /// [`h_attr_stack`] past its commonest shape.
 #[inline(never)]
 unsafe extern "C" fn attr_stack_slow(st: *mut State, site: *const AttrSite) -> u32 {
@@ -9460,15 +10996,46 @@ unsafe extern "C" fn attr_stack_slow(st: *mut State, site: *const AttrSite) -> u
         match &*at {
             Object::Frame(_) | Object::Code(_) => {
                 if let Some(v) = frame_code_attr(st, site, &*at) {
-                    if plain_release(&*at) {
-                        at.write(v);
+                    if receiver_leaves(at, v) {
                         return 0;
                     }
-                    drop(v);
                 }
             }
             // (A class attribute the site has read before.)
             Object::Instance(inst) => {
+                // A polymorphic site's third class and on, as
+                // `attr_local_slow` reads it first (a receiver whose
+                // release could run code takes the lanes below).
+                if droppable(&*at) {
+                    if let Some(v) = field_hit_slow(site, inst) {
+                        let v = crate::clone_hot(v);
+                        crate::drop_hot(std::mem::replace(&mut *at, v));
+                        return 0;
+                    }
+                }
+                // A plain class value the site memoized for the class (no
+                // descriptor or native method shares its version), or a
+                // named tuple's field, as the local read's path finds them
+                // first.
+                if let Some(v) = class_poly_hit(site, inst).or_else(|| {
+                    (*site.ext)
+                        .stamp_slot(site.pc as usize)
+                        .and_then(|s| crate::tuple_field_hit(s, inst))
+                }) {
+                    if receiver_leaves(at, v) {
+                        return 0;
+                    }
+                }
+                if let Some(v) =
+                    inst_dict_known(site, inst).or_else(|| inst_builtin_bound(site, inst, &*at))
+                {
+                    if receiver_leaves(at, v) {
+                        return 0;
+                    }
+                }
+                if site_property_leaf(&mut *st, site, at, false) {
+                    return 0;
+                }
                 let v = class_poly_hit(site, inst)
                     .or_else(|| instance_class_read(site, inst))
                     .or_else(|| {
@@ -9478,21 +11045,17 @@ unsafe extern "C" fn attr_stack_slow(st: *mut State, site: *const AttrSite) -> u
                         })?
                     });
                 if let Some(v) = v {
-                    if plain_release(&*at) {
-                        at.write(v);
+                    if receiver_leaves(at, v) {
                         return 0;
                     }
-                    drop(v);
                 }
             }
             // (A class's name, as the site read it before.)
             Object::Type(cls) => {
                 if let Some(v) = type_attr_memo(site, cls) {
-                    if plain_release(&*at) {
-                        at.write(v);
+                    if receiver_leaves(at, v) {
                         return 0;
                     }
-                    drop(v);
                 }
             }
             Object::Module(m) => module_attr_note(site, m),
@@ -9941,13 +11504,15 @@ const MAX_NATIVE_TUPLE: usize = 16;
 const FSTRING_CONVERT: u64 = 0;
 const FSTRING_FORMAT: u64 = 1;
 const FSTRING_JOIN: u64 = 2;
+const FSTRING_FORMAT_SPEC: u64 = 3;
 
 /// Whether the native code runs the f-string instruction `op` (`arg`):
-/// a conversion, a spec-less format, or a join of up to eight parts.
+/// a conversion, a format (with a spec, but no conversion), or a join of
+/// up to eight parts.
 fn fstring_native(op: OpCode, arg: u32) -> bool {
     match op {
         OpCode::ConvertValue => matches!(arg & 0x03, 1 | 2),
-        OpCode::FormatValue => arg == 0,
+        OpCode::FormatValue => arg == 0 || arg == 4,
         OpCode::BuildString => (1..=8).contains(&arg),
         _ => false,
     }
@@ -9964,6 +11529,7 @@ unsafe extern "C" fn h_fstring(at: *mut Object, kind: u64) -> u32 {
         match kind & 0xff {
             FSTRING_CONVERT => crate::convert_in_place(at, (kind >> 8) as u32),
             FSTRING_FORMAT => crate::format_simple_in_place(at),
+            FSTRING_FORMAT_SPEC => crate::format_spec_in_place(at),
             _ => crate::build_string_at(at, (kind >> 8) as usize),
         }
     };
@@ -9987,7 +11553,9 @@ unsafe extern "C" fn h_build(st: *mut State, at: *mut Object, n: u64, list: u32)
             }
             let items: Vec<Object> = (0..n).map(|j| at.add(j).read()).collect();
             let obj = Object::new_list(items);
-            crate::gc_trace::track(&obj);
+            // (Deferred as a built list is, a collection promoting it once
+            // it can anchor a cycle.)
+            crate::gc_trace::track_built(&obj);
             at.write(obj);
             return 0;
         }
@@ -10041,7 +11609,7 @@ unsafe extern "C" fn h_build_set(at: *mut Object, n: u64) -> u32 {
             let _ = crate::object::key_cmp_scope(|| data.insert(item));
         }
         let obj = Object::Set(Rc::new(crate::sync::RefCell::new(data)));
-        crate::gc_trace::track(&obj);
+        crate::gc_trace::track_built(&obj);
         at.write(obj);
     }
     0
@@ -10065,13 +11633,34 @@ unsafe extern "C" fn h_build_map(at: *mut Object, n: u64) -> u32 {
         }
         let mut d =
             crate::object::DictData::with_capacity_and_hasher(n, crate::fasthash::FxBuildHasher);
+        // `str` and `int` keys whose hashes differ from every earlier key's
+        // go in without the probe for an equal one (a repeated key, or a
+        // `bool` or `None` among them, takes it: `True` equals `1`).
+        let mut seen = [0i64; 8];
+        let plain = n <= seen.len()
+            && (0..n).all(|j| matches!(&*at.add(2 * j), Object::Str(_) | Object::Int(_)));
         for j in 0..n {
             let k = at.add(2 * j).read();
             let v = at.add(2 * j + 1).read();
+            if plain {
+                let h = match &k {
+                    Object::Str(s) => crate::shared_value::SharedStr::hash_cached(s),
+                    Object::Int(i) => crate::object::py_hash_long_i64(*i),
+                    _ => unreachable!("checked above"),
+                };
+                let fresh = !seen[..j].contains(&h);
+                seen[j] = h;
+                if fresh {
+                    d.insert_unique_hashed(h, crate::object::DictKey(k), v);
+                    continue;
+                }
+            }
             d.insert(crate::object::DictKey(k), v);
         }
         let obj = Object::Dict(Rc::new(crate::sync::RefCell::new(d)));
-        crate::gc_trace::track(&obj);
+        // (Deferred as a built dict is, a collection promoting it once it
+        // can anchor a cycle.)
+        crate::gc_trace::track_built(&obj);
         at.write(obj);
     }
     0
@@ -10884,6 +12473,34 @@ unsafe extern "C" fn h_binop_dunder(
     }
 }
 
+/// `GET_ITER` (the `pc`th instruction of `code`) of the plain instance at
+/// stack slot `slot`, which [`h_get_iter`] declined, whose class's
+/// `__iter__` is a plain Python function: the method called directly
+/// ([`dunder_call`]), its result (checked to be an iterator) at `slot`.
+/// `0` done, `CALL_DECLINED` declined untouched, `RAISED` or `RELOAD` as
+/// [`h_call`]'s.
+unsafe extern "C" fn h_iter_dunder(
+    st: *mut State,
+    pc: u64,
+    slot: u64,
+    site: *mut DirectSite,
+) -> u32 {
+    // SAFETY: the code passes its live state, one of its `GET_ITER`s, the
+    // operand's slot (nothing virtual below it), and the site's cache.
+    unsafe {
+        let st = &mut *st;
+        let (pc, slot) = (pc as usize, slot as usize);
+        // (The call takes the slot above the operand for the method.)
+        if st.sw.is_null() || slot + 2 > st.cap {
+            return CALL_DECLINED;
+        }
+        let Some(f) = Interpreter::iter_dunder(&*st.stack.add(slot)) else {
+            return CALL_DECLINED;
+        };
+        dunder_call(st, pc, slot, 1, f, site, Some(records::MethodOp::Iter))
+    }
+}
+
 /// `BINARY_SUBSCR` (the `pc`th instruction of `code`) of the plain
 /// instance and key at stack slots `slot` and above it, which the in-place
 /// helpers declined, whose class's `__getitem__` is a plain Python
@@ -10961,6 +12578,73 @@ unsafe extern "C" fn h_slice_dunder(
     }
 }
 
+/// `super().name` (the attribute form of the `LOAD_SUPER_ATTR` at `pc` of
+/// `code`) of a property, which `h_super_attr` declined, its three
+/// operands from stack slot `slot` up (nothing virtual below them): the
+/// getter `Interpreter::super_property_getter` finds called on the
+/// receiver as [`dunder_call`] calls a special method, the result at
+/// `slot`. `ssite` is the instruction's [`SuperSite`]. Returns as
+/// `h_slice_dunder` does (a decline leaves the operands as they were).
+unsafe extern "C" fn h_super_property(
+    st: *mut State,
+    code: *const CodeObject,
+    pc: u64,
+    slot: u64,
+    site: *mut DirectSite,
+    ssite: *const SuperSite,
+) -> u32 {
+    // SAFETY: the code passes its live state, its own code and one of its
+    // `LOAD_SUPER_ATTR`s, the operands' slot (nothing virtual below them),
+    // and the site's cache.
+    unsafe {
+        let st = &mut *st;
+        if st.sw.is_null() {
+            return CALL_DECLINED;
+        }
+        let (pc, slot) = (pc as usize, slot as usize);
+        let at = st.stack.add(slot);
+        let code = &*code;
+        // The getter `h_super_attr` cached for the receiver's class, or
+        // the lookup's.
+        let ssite = &*ssite;
+        let cached = match (&*at, &*at.add(1), &*at.add(2), &ssite.getter) {
+            (g, Object::Type(cls), Object::Instance(inst), Some(f))
+                if Rc::as_ptr(cls) as usize == ssite.cls
+                    && std::ptr::from_ref(inst.cls_raw()) as usize == ssite.recv
+                    && inst.cls_raw().attr_version.get() == ssite.ver
+                    && crate::is_super_callable(g)
+                    && Interpreter::lean_getter_ok(f) =>
+            {
+                Some(f.clone())
+            }
+            _ => None,
+        };
+        let Some(f) = cached.or_else(|| {
+            Interpreter::super_property_getter(
+                code,
+                code.instructions[pc],
+                std::slice::from_raw_parts(at, 3),
+            )
+        }) else {
+            return CALL_DECLINED;
+        };
+        // The receiver moves down to the operands' first slot; `super` and
+        // the class are held here until the call settles (each is held
+        // elsewhere too: the builtins, the class cell).
+        let (g, cls) = (at.read(), at.add(1).read());
+        at.write(at.add(2).read());
+        let r = dunder_call(st, pc, slot, 1, f, site, None);
+        if r == CALL_DECLINED {
+            at.add(2).write(at.read());
+            at.write(g);
+            at.add(1).write(cls);
+        } else {
+            drop((g, cls));
+        }
+        r
+    }
+}
+
 /// The `n` (at most three) operands from stack slot `slot` up, as the
 /// instruction at `pc` leaves them, called as `f(*operands)` for a class's
 /// Python special method `f` (an instance operator's, `op` its
@@ -10991,6 +12675,7 @@ unsafe fn dunder_call(
     // SAFETY: the caller's contract.
     unsafe {
         let at = st.stack.add(slot);
+        // (What the operator owes a result returned in place: `true` raised.)
         let not_implemented = |st: &mut State, v: &Object| match op {
             Some(records::MethodOp::Binary(op, inplace, a, b))
                 if v.is_same(&crate::vm_singletons::not_implemented()) =>
@@ -11000,6 +12685,15 @@ unsafe fn dunder_call(
                 st.err = Some(crate::binop_type_error(op, inplace, a, b));
                 true
             }
+            Some(records::MethodOp::Iter) => match crate::iter_result_check(v) {
+                Ok(_) => false,
+                Err(e) => {
+                    st.len = slot;
+                    st.pc = pc + 1;
+                    st.err = Some(e);
+                    true
+                }
+            },
             _ => false,
         };
         // A pure leaf (no native body of its own: it never runs as an
@@ -11017,7 +12711,10 @@ unsafe fn dunder_call(
                 at.add(1).cast_const(),
                 at.add(2).cast_const(),
             ];
-            if let Some(v) = (*st.interp).pure_leaf_eval::<false, false>(code, &f, &ptrs[..n]) {
+            // (Through the frameless call's entry: a warm plan runs as its
+            // native code.)
+            let depth = crate::recursion::current_depth();
+            if let Some(v) = (*st.interp).pure_leaf_call(code, &f, &ptrs[..n], false, depth) {
                 for k in (0..n).rev() {
                     crate::drop_hot_at(at.add(k));
                 }
@@ -11083,7 +12780,19 @@ unsafe extern "C" fn h_property(
     unsafe {
         let st = &mut *st;
         if st.sw.is_null() {
-            return CALL_DECLINED;
+            // A generator's fast step: only a getter that runs no
+            // activation (it can't switch).
+            return match property_leaf_here(
+                st,
+                code,
+                pc as usize,
+                slot as usize,
+                recv,
+                local & !PROPERTY_ONLY,
+            ) {
+                Some(()) => 0,
+                None => CALL_DECLINED,
+            };
         }
         let only = local & PROPERTY_ONLY != 0;
         let local = local & !PROPERTY_ONLY;
@@ -11142,32 +12851,41 @@ unsafe extern "C" fn h_property(
                 return 0;
             }
         }
+        if property_leaf_here(st, code, pc, slot, recv, local).is_some() {
+            return 0;
+        }
         let Object::Instance(inst) = &*recv else {
             return lane(st);
         };
-        let Some((getter, gcode)) = crate::code_vm_ext(&*code)
+        let Some((getter, _)) = crate::code_vm_ext(&*code)
             .and_then(|ext| ext.method_slot(pc))
             .and_then(|ms| ms.getter(inst.cls_raw().attr_version.get()))
         else {
             return lane(st);
         };
+        property_call(st, pc, slot, recv, local, site, getter).unwrap_or_else(|| lane(st))
+    }
+}
+
+/// [`h_property`]'s call of `getter`, the `property` getter the site
+/// cached for the receiver's class, directly ([`direct_call_out`]): its
+/// status, or `None` declined untouched.
+///
+/// # Safety
+///
+/// As [`h_property`]'s, with a switch, `local` without [`PROPERTY_ONLY`].
+unsafe fn property_call(
+    st: &mut State,
+    pc: usize,
+    slot: usize,
+    recv: *const Object,
+    local: u64,
+    site: *mut DirectSite,
+    getter: Rc<crate::object::PyFunction>,
+) -> Option<u32> {
+    // SAFETY: the caller's contract.
+    unsafe {
         let at = st.stack.add(slot);
-        // A pure leaf getter (no native body of its own: it never runs as
-        // an activation) evaluates in place, as the core loop's arm does.
-        if crate::code_is_pure_leaf(&gcode)
-            && crate::pure_leaf_warm(&gcode)
-            && crate::recursion::current_depth() < crate::recursion::recursion_limit()
-            && (local != 0 || droppable(&*recv))
-        {
-            let interp = &*st.interp;
-            if let Some(v) = interp.pure_leaf_eval::<false, false>(&gcode, &getter, &[recv]) {
-                if local == 0 {
-                    crate::drop_hot_at(at);
-                }
-                at.write(v);
-                return 0;
-            }
-        }
         // `[recv]` becomes the method call `[getter, recv]`.
         if local != 0 {
             at.add(1).write(crate::clone_hot(&*recv));
@@ -11175,27 +12893,132 @@ unsafe extern "C" fn h_property(
             at.add(1).write(at.read());
         }
         at.write(Object::Function(getter));
-        match direct_call_out(st, pc, slot, slot + 2, &mut *site, None) {
-            None => {
-                let f = at.read();
-                // The getter of compiled code runs as a switched call: it
-                // warms as one (see `Slot::warm_switched`).
-                if let Object::Function(f) = &f {
-                    let code = f.code();
-                    if let Some(ext) = crate::code_vm_ext(&code) {
-                        ext.frame_jit
-                            .warm_switched(&code, ext, code.varnames.len().max(1));
-                    }
+        let r = direct_call_out(st, pc, slot, slot + 2, &mut *site, None);
+        if r.is_none() {
+            let f = at.read();
+            // The getter of compiled code runs as a switched call: it
+            // warms as one (see `Slot::warm_switched`).
+            if let Object::Function(f) = &f {
+                let code = f.code();
+                if let Some(ext) = crate::code_vm_ext(&code) {
+                    ext.frame_jit
+                        .warm_switched(&code, ext, code.varnames.len().max(1));
                 }
-                if local != 0 {
-                    crate::drop_hot_at(at.add(1));
-                } else {
-                    at.write(at.add(1).read());
-                }
-                drop(f);
-                lane(st)
             }
-            Some(r) => r,
+            if local != 0 {
+                crate::drop_hot_at(at.add(1));
+            } else {
+                at.write(at.add(1).read());
+            }
+            drop(f);
+        }
+        r
+    }
+}
+
+/// [`h_property`]'s read through the site's cached getter when it's a pure
+/// leaf (no native body of its own: it never runs as an activation), which
+/// evaluates in place, as the core loop's arm does: `Some` with the value
+/// written to `slot`, `None` with nothing done.
+///
+/// # Safety
+///
+/// As [`h_property`]'s.
+unsafe fn property_leaf_here(
+    st: &mut State,
+    code: *const CodeObject,
+    pc: usize,
+    slot: usize,
+    recv: *const Object,
+    local: u64,
+) -> Option<()> {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let Object::Instance(inst) = &*recv else {
+            return None;
+        };
+        let (getter, gcode) = crate::code_vm_ext(&*code)
+            .and_then(|ext| ext.method_slot(pc))
+            .and_then(|ms| ms.getter(inst.cls_raw().attr_version.get()))?;
+        if !(crate::code_is_pure_leaf(&gcode)
+            && crate::pure_leaf_warm(&gcode)
+            && crate::recursion::current_depth() < crate::recursion::recursion_limit()
+            && (local != 0 || droppable(&*recv)))
+        {
+            return None;
+        }
+        let interp = &*st.interp;
+        let v = interp.pure_leaf_eval::<false, false>(&gcode, &getter, &[recv])?;
+        let at = st.stack.add(slot);
+        if local == 0 {
+            crate::drop_hot_at(at);
+        }
+        at.write(v);
+        Some(())
+    }
+}
+
+/// A read at `site` of the receiver at `at` (a local's when `local`, the
+/// result then going to the site's slot) through the pure leaf getter the
+/// site last ran in place for the receiver's class version (see
+/// [`site_property_note`]): `true` with the value written, `false` with
+/// nothing done. The class holds the property while its version stands,
+/// and the property its getter while the getter cell still holds it.
+///
+/// # Safety
+///
+/// As [`h_property`]'s.
+#[inline]
+unsafe fn site_property_leaf(
+    st: &mut State,
+    site: &AttrSite,
+    at: *mut Object,
+    local: bool,
+) -> bool {
+    // SAFETY: the caller's contract; the pointers are live while the checks
+    // above each use hold.
+    unsafe {
+        let Object::Instance(inst) = &*at else {
+            return false;
+        };
+        let (ver, f, code, cell) = site.prop_leaf.get();
+        if ver == 0 || inst.cls_raw().attr_version.get() != ver {
+            return false;
+        }
+        if !matches!(&*(cell as *const Object), Object::Function(g) if Rc::as_ptr(g) as usize == f)
+            || (!local && !droppable(&*at))
+            || crate::recursion::current_depth() >= crate::recursion::recursion_limit()
+        {
+            return false;
+        }
+        let interp = &*st.interp;
+        let Some(v) = interp.pure_leaf_eval::<false, false>(
+            &*(code as *const CodeObject),
+            &*(f as *const crate::object::PyFunction),
+            &[at.cast_const()],
+        ) else {
+            return false;
+        };
+        let dst = st.stack.add(site.slot as usize);
+        if !local {
+            crate::drop_hot_at(dst);
+        }
+        dst.write(v);
+        true
+    }
+}
+
+/// Remember at `site` the pure leaf getter its slot holds for the class
+/// version `ver`, which [`property_leaf_here`] just ran (see
+/// [`site_property_leaf`]).
+fn site_property_note(site: &AttrSite, ver: u64) {
+    // SAFETY: the site's code and extension are live.
+    let ext = unsafe { &*site.ext };
+    if let Some((f, held, cell)) = crate::property_site_getter(ext, site.pc as usize) {
+        if held == ver {
+            let code = Rc::as_ptr(&f.code()) as usize;
+            site.prop_leaf
+                .set((ver, Rc::as_ptr(&f) as usize, code, cell as usize));
         }
     }
 }
@@ -11282,6 +13105,40 @@ unsafe extern "C" fn h_countdown(countdown: *mut u32) -> u32 {
     0
 }
 
+/// The `CALL` at `pc` (its operands from `start` up a `len`-deep stack)
+/// of a builtin container type with one argument, which
+/// `Interpreter::core_type_lane` builds (see `core_type_lane_class`),
+/// run there with the frame synced as `h_call` syncs it: `0` or `RELOAD`
+/// as `h_call` answers after the lane, `None` when the lane declined.
+///
+/// # Safety
+///
+/// As `h_call`'s, with a running activation's switch in `st`.
+unsafe fn type_lane_direct(st: *mut State, pc: u64, len: usize, start: usize) -> Option<u32> {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let st = &mut *st;
+        if st.sw.is_null() {
+            return None;
+        }
+        let frame = &mut *st.frame;
+        frame.stack.set_len(len);
+        frame.pc = pc as u32;
+        settle(st);
+        *(*st.sw).last = st.last;
+        let sw = &mut *st.sw;
+        let interp = &mut *st.interp.cast_mut();
+        if !interp.core_type_lane(sw) {
+            return None;
+        }
+        Some(if finished_in_place(st, start) {
+            0
+        } else {
+            RELOAD
+        })
+    }
+}
+
 /// `CALL` of a Python class: a class whose memoized plan proved its
 /// construction to be a store-only `__init__`'s stores runs them straight
 /// from here (`Interpreter::core_store_init`, as the core loop's
@@ -11323,6 +13180,14 @@ unsafe extern "C" fn h_call_ctor(
                     s.stack.add(start).write(v);
                     s.len = start + 1;
                     return 0;
+                }
+                // `list(it)`, `tuple(it)` ... of anything else: straight to
+                // the core loop's lane, as `h_call` would take it after
+                // the same attempt again.
+                if argc == 1 && Interpreter::core_type_lane_class(t) {
+                    if let Some(r) = type_lane_direct(st, pc, len as usize, start) {
+                        return r;
+                    }
                 }
             }
         }
@@ -11731,7 +13596,7 @@ pub(crate) unsafe fn register_lazy(st: &mut State) {
 /// thread's may: it stays alive for good once threads run, which so rare an
 /// assignment can afford.
 pub(crate) fn retire_code(code: Rc<CodeObject>) {
-    if crate::sync::rc_shared_flag().load(Ordering::Relaxed) {
+    if crate::sync::threads_started() {
         std::mem::forget(code);
     }
 }
@@ -12962,7 +14827,15 @@ unsafe extern "C" fn h_call(
                 let args = std::slice::from_raw_parts(base.add(first), len - first);
                 if Interpreter::core_all_droppable(args) {
                     let r = match kind {
-                        Some(LeafKind::Fast(f)) => f(args),
+                        // (`next(it)` of a Python iterator class's instance,
+                        // as `FOR_ITER` steps it.)
+                        Some(LeafKind::Fast(f)) => f(args).or_else(|| {
+                            if b.name == "next" {
+                                (*st.interp).leaf_next_instance(args)
+                            } else {
+                                None
+                            }
+                        }),
                         _ => Interpreter::core_isinstance(args),
                     };
                     match r {
@@ -13076,6 +14949,15 @@ unsafe extern "C" fn h_call(
                 if slot.get_leaf(b).is_some() {
                     return None;
                 }
+                // A leaf builtin called unbound (`heapreplace(h, x)`): the
+                // site remembers it, as a settled leaf's (the leaf lanes
+                // below take it, without asking each call).
+                if let (Object::Builtin(_), Object::Unbound) = (&ops[0], &ops[1]) {
+                    if let Some(kind) = interp.leaf_call_kind(b) {
+                        slot.set_leaf(b, kind);
+                        return None;
+                    }
+                }
                 let via_call = interp.builtin_lane(b, recv)?;
                 slot.set_native_body(b, via_call);
                 Some(via_call)
@@ -13098,10 +14980,7 @@ unsafe extern "C" fn h_call(
                 let sw = &mut *st.sw;
                 let interp = &mut *st.interp.cast_mut();
                 if interp.core_builtin_lane(sw, pc, via_call) {
-                    if finished_in_place(st, start) {
-                        return 0;
-                    }
-                    return RELOAD;
+                    return lane_outcome(st, pc, start);
                 }
             }
         }
@@ -13134,6 +15013,14 @@ unsafe extern "C" fn h_call(
                 }
                 (LeafKind::ListPop, 0) => match items.pop() {
                     Some(v) => (v, len),
+                    // (Raised in place, for the code's handler.)
+                    None if !st.sw.is_null() => {
+                        crate::release_run(base.add(start), len - start);
+                        st.len = start;
+                        st.pc = pc + 1;
+                        st.err = Some(crate::error::index_error("pop from empty list"));
+                        return RAISED;
+                    }
                     None => return CALL_DECLINED,
                 },
                 _ => return CALL_DECLINED,
@@ -13269,8 +15156,26 @@ fn len_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
             [Object::Dict(d)] => d.peek()?.len(),
             [Object::Set(s)] => s.peek()?.len(),
             [Object::Bytes(b)] => b.len(),
+            [Object::ByteArray(b)] => b.peek()?.len(),
+            [Object::FrozenSet(s)] => s.len(),
             // A dict's keys, values or items view: the dict's size.
             [Object::DictView(v)] => v.dict.peek()?.len(),
+            // A machine-word range's count.
+            [Object::Range(r)] if r.big.is_none() => {
+                usize::try_from(crate::object::range_len_i128(r)).ok()?
+            }
+            // A builtin subclass's own `__len__`: its payload's.
+            [Object::Instance(inst)] => {
+                let native = Interpreter::native_payload_for(
+                    inst,
+                    crate::types::vm_key::NATIVE_LEN,
+                    "__len__",
+                )?;
+                if matches!(native, Object::Instance(_)) {
+                    return None;
+                }
+                return len_fast(std::slice::from_ref(native));
+            }
             _ => return None,
         }
     };
@@ -13346,7 +15251,23 @@ unsafe fn call_kernel_in_place(s: &mut State, site: &BuiltinSite, lenu: usize) -
             _ => std::ptr::null(),
         };
         if let (false, Some(kernel), false) = (recv.is_null(), site.kernel, s.sw.is_null()) {
-            if (*recv).tag() == site.recv_tag {
+            // A builtin subclass's instance (a `Counter`'s `get`, a list
+            // subclass's `append`): the kernel on the native value backing
+            // it, as the method's receiver unwrapping runs the body. A dict
+            // view keeps the instance (its body unwraps it); an opaque body
+            // isn't run on one.
+            use crate::LeafKind as K;
+            let (recv, tag) = match &*recv {
+                Object::Instance(inst) => match (inst.native.get(), site.kind) {
+                    (None, _) | (_, Some(K::Opaque) | None) => (recv, (*recv).tag()),
+                    (Some(native), Some(K::DictKeys | K::DictValues | K::DictItems)) => {
+                        (recv, native.tag())
+                    }
+                    (Some(native), _) => (std::ptr::from_ref(native), native.tag()),
+                },
+                r => (recv, r.tag()),
+            };
+            if tag == site.recv_tag {
                 let arg = |k: usize| {
                     if k <= site.argc {
                         base.add(start + 1 + k).cast_const()
@@ -13445,6 +15366,20 @@ unsafe fn call_leaf_in_place(
                     site.argc + 1,
                 ))
             }
+            // An instance whose class's native `__call__` is the builtin
+            // (`key(elem)` of an `itemgetter(1)`): the instance first, as
+            // the call's rewrite in `h_call` would pass it.
+            (Object::Instance(inst), Object::Unbound)
+                if site.argc < bound.len() && Interpreter::instance_calls_native(inst, site.f) =>
+            {
+                let slots = bound.as_mut_ptr();
+                slots.write(base.add(start).read());
+                std::ptr::copy_nonoverlapping(base.add(start + 2), slots.add(1), site.argc);
+                Some(std::slice::from_raw_parts(
+                    slots.cast_const(),
+                    site.argc + 1,
+                ))
+            }
             _ => None,
         };
         if (hit || bound_args.is_some()) && !s.sw.is_null() {
@@ -13469,8 +15404,21 @@ unsafe fn call_leaf_in_place(
                 })
             };
             let r = match site.kind {
-                Some(LeafKind::Fast(f)) => f(args),
-                Some(LeafKind::Len) => len_fast(args),
+                // (`next(it)` of a Python iterator class's instance, as
+                // `FOR_ITER` steps it.)
+                Some(LeafKind::Fast(f)) => f(args).or_else(|| {
+                    if b.name == "next" {
+                        (*s.interp).leaf_next_instance(args)
+                    } else {
+                        None
+                    }
+                }),
+                // (An instance's frameless `__len__`, as the full call's
+                // leaf half would find it.)
+                Some(LeafKind::Len) => len_fast(args).or_else(|| match args {
+                    [Object::Instance(_)] => (*s.interp).leaf_instance_len(&args[0]).map(Ok),
+                    _ => None,
+                }),
                 Some(LeafKind::Isinstance) => Interpreter::core_isinstance(args),
                 Some(LeafKind::Opaque) => body(),
                 Some(LeafKind::Scalar) => {
@@ -13550,7 +15498,19 @@ unsafe extern "C" fn h_call_type(
                 crate::release_operands(interp, base.add(start), lenu - start);
                 base.add(start).write(v);
                 s.len = start + 1;
+                // A dying argument's finalizer runs before the next
+                // instruction, as after the full call (`bool(Dying())`).
+                if (*s.maybe_dead).get() {
+                    return left_marked(st, pc as u32, start + 1);
+                }
                 return 0;
+            }
+            // `list(it)`, `tuple(it)`, `set(it)` ... of anything else
+            // (`list(map(f, xs))`): straight to the core loop's lane.
+            if site.argc == 1 && Interpreter::core_type_lane_class(&site.cls) {
+                if let Some(r) = type_lane_direct(st, pc, lenu, start) {
+                    return r;
+                }
             }
         }
         h_call(st, code, ext, pc, len)
@@ -13652,9 +15612,11 @@ unsafe fn native_body_here(
         frame.stack.set_len(lenu);
         // A lazily running activation stays so unless something looks while
         // the body runs, which a body that runs no Python code rarely makes
-        // happen. (Other threads can look without settling it: it registers
-        // first once there are any.)
-        let lazy = !s.lazy.is_null() && !crate::sync::rc_shared_flag().load(Ordering::Relaxed);
+        // happen. (Another thread looks only once this one releases the
+        // GIL, which settles it first, see `gil::before_gil_release`; a
+        // watchdog that reads frames without the GIL makes it register
+        // first.)
+        let lazy = !s.lazy.is_null() && !crate::sync::cells_unguarded();
         if !lazy {
             settle(s);
             *(*s.sw).last = s.last;
@@ -13748,11 +15710,43 @@ unsafe fn leaf_call_lane(st: &mut State, pc: usize, start: usize, len: usize) ->
         if !interp.core_leaf_call_lane(sw) {
             return CALL_DECLINED;
         }
+        lane_outcome(st, pc, start)
+    }
+}
+
+/// How compiled code goes on after a core-loop lane ran the `CALL` at `pc`
+/// (its operands from `start`): `0` the result in place at `start` (see
+/// [`finished_in_place`]); `RAISED` for an exception the lane raised in
+/// place, the operands gone, which the code's own handler takes (see
+/// [`h_catch`]), as a native body's raise is; `RELOAD` for anything else.
+///
+/// # Safety
+///
+/// As [`finished_in_place`]'s.
+unsafe fn lane_outcome(st: &mut State, pc: usize, start: usize) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe {
         if finished_in_place(st, start) {
-            0
-        } else {
-            RELOAD
+            return 0;
         }
+        let sw = &mut *st.sw;
+        if std::ptr::eq(sw.cur, st.frame)
+            && crate::hot_gates::loop_gen() == st.snap_gen
+            && !(*st.maybe_dead).get()
+            && (*st.frame).stack.len() == start
+        {
+            if let Some(crate::CoreExit::Stop(crate::LeafStop::Raised(_))) = &sw.pending {
+                let Some(crate::CoreExit::Stop(crate::LeafStop::Raised(e))) = sw.pending.take()
+                else {
+                    unreachable!("matched above")
+                };
+                st.len = start;
+                st.pc = pc + 1;
+                st.err = Some(e);
+                return RAISED;
+            }
+        }
+        RELOAD
     }
 }
 
@@ -13982,7 +15976,8 @@ unsafe extern "C" fn h_call_kw(st: *mut State, code: *const CodeObject, pc: u64,
         let ops = std::slice::from_raw_parts(base.add(start), len - start);
         let interp = &*st.interp;
         let r = match &ops[0] {
-            Object::Type(ty) if ty.native_kind.get() != 0 => {
+            // (A natively served class, or an exact `itertools` one.)
+            Object::Type(ty) if ty.native_kind.get() != 0 || ty.lazy_ctor.get() != 0 => {
                 Interpreter::core_native_ctor_kw(ops, argc, true)
             }
             Object::Builtin(_)
@@ -14002,7 +15997,10 @@ unsafe extern "C" fn h_call_kw(st: *mut State, code: *const CodeObject, pc: u64,
             // (`sorted` with a `key=` lambda, `xs.sort(key=f)`,
             // `enumerate(xs, start=1)`): the core loop's lane for it, the
             // activation published, the result in place.
-            if Interpreter::kw_lane_callee(&ops[0], &ops[1]) && !st.sw.is_null() {
+            if (Interpreter::kw_lane_callee(&ops[0], &ops[1])
+                || interp.native_ctor_kw_callee(&ops[0], &ops[1]))
+                && !st.sw.is_null()
+            {
                 let frame = &mut *st.frame;
                 frame.stack.set_len(len);
                 frame.pc = pc as u32;
@@ -14315,6 +16313,33 @@ unsafe fn spread_on_frame(st: &mut State, pc: usize, start: usize) -> Option<u32
 ///
 /// As [`h_call_ex`]'s, `st.sw` set.
 #[inline(never)]
+/// A forwarding call (`f(*args)`, the mapping empty) of a
+/// `functools.lru_cache` wrapper whose cache holds the result: the value in
+/// place of the four operands at `start`; `None`, nothing touched, else.
+///
+/// # Safety
+///
+/// As [`spread_native`]'s.
+unsafe fn spread_lru_hit(st: &mut State, start: usize) -> Option<u32> {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let ops = std::slice::from_raw_parts(st.stack.add(start), 4);
+        let (Object::Instance(inst), Object::Unbound, Object::Tuple(args)) =
+            (&ops[0], &ops[1], &ops[2])
+        else {
+            return None;
+        };
+        if !Interpreter::core_all_droppable(ops) {
+            return None;
+        }
+        let v = crate::stdlib::functools_mod::lru_hit_if_wrapper(inst, args)?;
+        crate::release_run(st.stack.add(start), 4);
+        st.stack.add(start).write(v);
+        st.len = start + 1;
+        Some(0)
+    }
+}
+
 unsafe fn spread_native(st: &mut State, pc: usize, start: usize) -> Option<u32> {
     use crate::LeafKind;
     // SAFETY: the caller's contract: four initialized operand slots, and
@@ -14567,6 +16592,9 @@ unsafe extern "C" fn h_call_forward(
             })
         {
             st.stack.add(len).write(Object::Unbound);
+            if let Some(r) = spread_lru_hit(st, start) {
+                return r;
+            }
             if let Some(r) = spread_direct(st, pc + 3, start, &mut *site) {
                 return r;
             }
@@ -14607,7 +16635,7 @@ unsafe extern "C" fn h_call_forward(
         *sw.last = st.last;
         let saved_last = sw.last;
         let interp = &mut *st.interp.cast_mut();
-        if !interp.core_call_forward(sw, pc) {
+        if !interp.core_call_forward(sw, pc, st.snap_gen) {
             return if sw.pending.is_some() || stack_moved(st) {
                 RELOAD
             } else {
@@ -14701,6 +16729,24 @@ unsafe extern "C" fn h_await_iter(st: *mut State, at: *mut Object, kind: u64) ->
         if ok {
             return 0;
         }
+        // `yield from xs` of a builtin container: its iterator, in place
+        // (an iterator is its own).
+        if kind == 1
+            && matches!(
+                top,
+                Object::List(_)
+                    | Object::Tuple(_)
+                    | Object::Range(_)
+                    | Object::Str(_)
+                    | Object::Iter(_)
+            )
+            && Interpreter::core_droppable(top)
+        {
+            if let Some(Ok(it)) = crate::seqiter::iter_fast(std::slice::from_ref(top)) {
+                crate::drop_hot(std::mem::replace(&mut *at, it));
+                return 0;
+            }
+        }
         if matches!(top, Object::Instance(_)) && Interpreter::core_droppable(top) {
             let name = if kind == 0 { "__await__" } else { "__iter__" };
             if let Some(gen) = (*st.interp).instance_gen_call(top, name) {
@@ -14731,6 +16777,28 @@ unsafe extern "C" fn h_send(st: *mut State, pc: u64, len: u64) -> u32 {
     unsafe {
         let st = &mut *st;
         let len = len as usize;
+        // A list's or tuple's cursor (`yield from xs`) steps in place: its
+        // next item takes the sent `None`'s place for this code's
+        // `YIELD_VALUE`, and at its end the `None` stays as the result for
+        // the `END_SEND`, as CPython's `SEND` steps an iterator.
+        if len >= 2 {
+            if let (Object::Iter(rc), Object::None) =
+                (&*st.stack.add(len - 2), &*st.stack.add(len - 1))
+            {
+                if let Some(cur) = rc.peek_mut() {
+                    if let Some(v) = cur.pure_peek() {
+                        cur.pure_skip();
+                        st.stack.add(len - 1).write(v);
+                        st.len = len;
+                        return SEND_YIELDED;
+                    }
+                }
+                if crate::seqiter::cursor_at_end(&*st.stack.add(len - 2)) {
+                    st.len = len;
+                    return 0;
+                }
+            }
+        }
         if st.sw.is_null()
             || len < 2
             || !matches!(
@@ -15520,6 +17588,27 @@ unsafe extern "C" fn h_get_iter(at: *mut Object) -> u32 {
             v,
             Object::Iter(_) | Object::LazyIter(_) | Object::Generator(_)
         ) {
+            return 0;
+        }
+        // A list or tuple subclass inheriting `__iter__`: its value's
+        // iterator, as `Interpreter::make_iter` makes it.
+        if let Object::Instance(inst) = v {
+            let Some(native @ (Object::List(_) | Object::Tuple(_))) = inst.native.get() else {
+                return 1;
+            };
+            let cls = inst.cls_raw();
+            if cls.native_kind.get() != 0
+                || cls.c_ext_ptr.get() != 0
+                || !cls.dunder(crate::types::Dunder::Iter).builtin_owner()
+                || !droppable(v)
+            {
+                return 1;
+            }
+            let Ok(it) = native.make_iter() else {
+                return 1;
+            };
+            let it = Object::Iter(Rc::new(crate::sync::RefCell::new(it)));
+            crate::drop_hot(std::mem::replace(&mut *at, it));
             return 0;
         }
         if !matches!(
@@ -18378,6 +20467,12 @@ impl<'a> Lower<'a> {
             OpCode::ListAppend if ins.arg != 0 && (ins.arg as usize) < self.depth => {
                 return self.list_append(pc, ins.arg as usize)
             }
+            OpCode::MapAdd if ins.arg != 0 && (ins.arg as usize) + 2 <= self.depth => {
+                return self.map_add(pc, ins.arg as usize)
+            }
+            OpCode::SetAdd if ins.arg != 0 && (ins.arg as usize) < self.depth => {
+                return self.set_add(pc, ins.arg as usize)
+            }
             OpCode::ListAppend
             | OpCode::ListExtend
             | OpCode::SetAdd
@@ -18634,7 +20729,47 @@ impl<'a> Lower<'a> {
                     .call(h_get_iter as *const () as usize, &[at], true)
                     .expect("returns");
                 let out = self.exit_with(pc, &[], INTERP);
-                self.branch_out(r, out);
+                // An instance whose class's `__iter__` is a Python function,
+                // at a site that has run one: the method, called directly
+                // (it can raise or switch, which leaves the whole stack on
+                // the frame's).
+                let raisable =
+                    !self.inlining() && self.vs.iter().all(|i| matches!(i, Item::Mem(_)));
+                if raisable && crate::instance_site(self.ext, pc) {
+                    let dunder = self.b.create_block();
+                    let ok = self.b.create_block();
+                    self.b.ins().brif(r, dunder, &[], ok, &[]);
+                    self.b.switch_to_block(dunder);
+                    let site: Box<DirectSite> = Box::default();
+                    let site_at = self
+                        .b
+                        .ins()
+                        .iconst(self.ptr, std::ptr::from_ref::<DirectSite>(&site) as i64);
+                    self.direct_sites.push(site);
+                    let pcv = self.b.ins().iconst(types::I64, pc as i64);
+                    let slotv = self.b.ins().iconst(types::I64, s as i64);
+                    let d = self
+                        .call(
+                            h_iter_dunder as *const () as usize,
+                            &[self.st, pcv, slotv, site_at],
+                            true,
+                        )
+                        .expect("returns");
+                    let other = self.b.create_block();
+                    self.b.ins().brif(d, other, &[], ok, &[]);
+                    self.b.switch_to_block(other);
+                    let declined = self
+                        .b
+                        .ins()
+                        .icmp_imm(IntCC::Equal, d, i64::from(CALL_DECLINED));
+                    let leave = self.b.create_block();
+                    self.b.ins().brif(declined, out, &[], leave, &[]);
+                    self.b.switch_to_block(leave);
+                    self.leave(d);
+                    self.b.switch_to_block(ok);
+                } else {
+                    self.branch_out(r, out);
+                }
                 self.set_last(pc);
                 self.check_released(pc + 1);
                 true
@@ -18898,7 +21033,7 @@ impl<'a> Lower<'a> {
                 // an inlined body runs only what can't see its frame.)
                 if !self.method_inlined(pc + 1) {
                     self.method_kernel(pc);
-                    if !self.inlining() {
+                    if !self.inlining() && self.simple_call_ahead(pc + 2) {
                         self.method_call(pc)
                     }
                 }
@@ -18943,6 +21078,29 @@ impl<'a> Lower<'a> {
                     return n >= i.arg as usize
                         && matches!(crate::call_site_builtin(self.ext, k), Some((_, None, _)));
                 }
+                _ => return false,
+            }
+        }
+        false
+    }
+
+    /// Whether the instructions from `pc` are argument loads the fused
+    /// method call can take (locals, constants, small ints, and binary
+    /// operations it may fold) up to a positional `CALL`: every shape
+    /// `Interpreter::core_local_method` serves is one of these, so a call
+    /// with any other argument (an attribute, a subscript, a keyword)
+    /// skips the fused attempt, which would walk the instructions, decline
+    /// and leave the call to the method site anyway (about 450
+    /// instructions a call for a native method with a keyword).
+    fn simple_call_ahead(&self, pc: usize) -> bool {
+        for i in self.code.instructions.iter().skip(pc).take(16) {
+            match i.op {
+                OpCode::LoadFast
+                | OpCode::LoadFastBorrow
+                | OpCode::LoadConst
+                | OpCode::LoadSmallInt
+                | OpCode::BinaryOp => {}
+                OpCode::Call => return true,
                 _ => return false,
             }
         }
@@ -19014,9 +21172,7 @@ impl<'a> Lower<'a> {
                         Arg::Small(v) => (false, u32::MAX - v.min(u32::MAX - 1)),
                     })
                     .collect();
-                if args.iter().all(|&(local, v)| local || v < u32::MAX / 2) {
-                    self.inst_native_call(pc, call_pc, &args, ver, fast, f);
-                }
+                self.inst_native_call(pc, call_pc, &args, ver, fast, f);
             }
             return;
         };
@@ -19086,12 +21242,13 @@ impl<'a> Lower<'a> {
         self.b.switch_to_block(declined);
     }
 
-    /// `LOAD_FAST x; x.m(<local or constant arguments>); CALL` on an
-    /// instance whose method site cached a native method: the receiver's
-    /// tag checked in line and the method called through [`h_inst_native`]
-    /// on the operands in place, continuing after the `CALL`. Lowering
-    /// continues (at the general fused call) where the receiver is
-    /// something else or the helper declines.
+    /// `LOAD_FAST x; x.m(<local, constant or small int arguments>); CALL`
+    /// on an instance whose method site cached a native method: the
+    /// receiver's tag checked in line and the method called through
+    /// [`h_inst_native`] on the operands in place (a small int, `(false,
+    /// u32::MAX - v)` in `args`, in the slot it would take), continuing
+    /// after the `CALL`. Lowering continues (at the general fused call)
+    /// where the receiver is something else or the helper declines.
     fn inst_native_call(
         &mut self,
         pc: usize,
@@ -19112,7 +21269,7 @@ impl<'a> Lower<'a> {
             .icmp_imm(IntCC::NotEqual, t, i64::from(self.tags.instance));
         self.branch_out(other, declined);
         let mut addrs = Vec::with_capacity(2);
-        for &(local, i) in args {
+        for (j, &(local, i)) in args.iter().enumerate() {
             let at = if local {
                 let at = self.local_addr(i);
                 if self.maybe_unbound[i as usize] && !self.bound[i as usize] {
@@ -19123,6 +21280,13 @@ impl<'a> Lower<'a> {
                             .icmp_imm(IntCC::Equal, t, i64::from(self.tags.unbound));
                     self.branch_out(unbound, declined);
                 }
+                at
+            } else if i >= u32::MAX / 2 {
+                // A small int, in the slot the argument would take.
+                let at = self.slot_addr(slot + 2 + j);
+                self.write_tag(at, self.tags.int);
+                let v = self.b.ins().iconst(types::I64, i64::from(u32::MAX - i));
+                self.b.ins().store(FLAGS, v, at, 8);
                 at
             } else {
                 self.const_addr(i)
@@ -19450,9 +21614,10 @@ impl<'a> Lower<'a> {
         if native {
             return self.binary_helper(pc, kind, ai, bi);
         }
+        // (A small int operand, `b * 3`, is boxed onto the stack.)
         if crate::heap_site(self.ext, pc)
-            && matches!(ai, Item::Local(_) | Item::Const(_))
-            && matches!(bi, Item::Local(_) | Item::Const(_))
+            && !matches!(ai, Item::Mem(_))
+            && !matches!(bi, Item::Mem(_))
         {
             return self.binary_helper(pc, kind, ai, bi);
         }
@@ -19730,6 +21895,20 @@ impl<'a> Lower<'a> {
     /// the values in registers written there here, the helper copying the
     /// rest. `arg` is the helper's operation.
     fn operand_site(&mut self, pc: usize, arg: u32, ai: Item, bi: Item, dunder: bool) -> Value {
+        self.operand_site_growing(pc, arg, ai, bi, dunder, NO_GROW)
+    }
+
+    /// [`Self::operand_site`], with the local a `BINARY_OP`'s result is
+    /// stored into next (see [`BinopSite::grow_local`]).
+    fn operand_site_growing(
+        &mut self,
+        pc: usize,
+        arg: u32,
+        ai: Item,
+        bi: Item,
+        dunder: bool,
+        grow_local: u32,
+    ) -> Value {
         let slot = self.depth;
         let mut copies = Vec::new();
         // (No method runs in an inlined body, whose locals aren't in the
@@ -19779,6 +21958,8 @@ impl<'a> Lower<'a> {
             last: self.last_pc.map_or(NO_LAST, |l| l as u32),
             direct,
             dunder,
+            // (An inlined body's locals aren't in the state's array.)
+            grow_local: if in_line { NO_GROW } else { grow_local },
         });
         let c = self
             .b
@@ -19791,7 +21972,24 @@ impl<'a> Lower<'a> {
     /// [`Self::operand_site`] for a `BINARY_OP`.
     fn binop_site(&mut self, pc: usize, kind: u8, ai: Item, bi: Item) -> Value {
         let flag = self.code.instructions[pc].arg & weavepy_compiler::BINARY_OP_INPLACE_FLAG;
-        self.operand_site(pc, u32::from(kind) | flag, ai, bi, true)
+        // `x = x + t` with the store next: `x` may grow in place. (Not
+        // when a load of `x` further down the stack is still to be made:
+        // it must see the old value.)
+        let grow = match self.code.instructions.get(pc + 1) {
+            Some(next)
+                if kind == BinOpKind::Add as u8
+                    && next.op == OpCode::StoreFast
+                    && (next.arg as usize) < self.nlocals
+                    && !self
+                        .vs
+                        .iter()
+                        .any(|i| matches!(i, Item::Local(x) if *x == next.arg)) =>
+            {
+                next.arg
+            }
+            _ => NO_GROW,
+        };
+        self.operand_site_growing(pc, u32::from(kind) | flag, ai, bi, true, grow)
     }
 
     /// The other shapes of a `BINARY_OP` whose in-line arithmetic declined
@@ -19901,6 +22099,7 @@ impl<'a> Lower<'a> {
             .iconst(self.ptr, std::ptr::from_ref(self.code) as i64);
         let pcv = self.b.ins().iconst(types::I64, pc as i64);
         let len = self.b.ins().iconst(types::I64, self.depth as i64);
+        let mut super_site = None;
         let n = if self.code.instructions[pc].op == OpCode::LoadSuperAttr {
             // `super().name`, through its site's cache.
             let site: Box<SuperSite> = Box::default();
@@ -19908,6 +22107,7 @@ impl<'a> Lower<'a> {
                 .b
                 .ins()
                 .iconst(self.ptr, std::ptr::from_ref::<SuperSite>(&site) as i64);
+            super_site = Some(at);
             self.supers.push(site);
             self.call_typed(
                 h_super_attr as *const () as usize,
@@ -19930,11 +22130,19 @@ impl<'a> Lower<'a> {
         // A slice of an instance whose class's `__getitem__` is a Python
         // function, at a site that has sliced one: the method, called
         // directly (see `h_slice_dunder`).
-        if !self.inlining()
-            && self.code.instructions[pc].op == OpCode::BinarySlice
-            && self.depth >= 3
-            && crate::instance_site(self.ext, pc)
-        {
+        // `super().name` of a property likewise: its getter, called
+        // directly (see `h_super_property`).
+        let ins_at = self.code.instructions[pc];
+        let dunder_helper = match ins_at.op {
+            OpCode::BinarySlice if crate::instance_site(self.ext, pc) => {
+                Some(h_slice_dunder as *const () as usize)
+            }
+            OpCode::LoadSuperAttr if ins_at.arg & 1 == 0 => {
+                Some(h_super_property as *const () as usize)
+            }
+            _ => None,
+        };
+        if let (false, true, Some(helper)) = (self.inlining(), self.depth >= 3, dunder_helper) {
             let dunder = self.b.create_block();
             let fine = self.b.create_block();
             self.b.ins().brif(declined, dunder, &[], fine, &[]);
@@ -19946,13 +22154,9 @@ impl<'a> Lower<'a> {
                 .iconst(self.ptr, std::ptr::from_ref::<DirectSite>(&site) as i64);
             self.direct_sites.push(site);
             let slotv = self.b.ins().iconst(types::I64, self.depth as i64 - 3);
-            let d = self
-                .call(
-                    h_slice_dunder as *const () as usize,
-                    &[self.st, code, pcv, slotv, site_at],
-                    true,
-                )
-                .expect("returns");
+            let mut args = vec![self.st, code, pcv, slotv, site_at];
+            args.extend(super_site);
+            let d = self.call(helper, &args, true).expect("returns");
             let done = self.b.create_block();
             let other = self.b.create_block();
             self.b.ins().brif(d, other, &[], done, &[]);
@@ -20038,12 +22242,13 @@ impl<'a> Lower<'a> {
         let restore: Vec<Item> = (slot..slot + n).map(Item::Mem).collect();
         let out = self.exit_with(pc, &restore, INTERP);
         // A subscript of an instance whose class's `__getitem__` is a
-        // Python function, at a site that has run one: the method, called
-        // directly (it can raise or switch, which leaves the whole stack
-        // on the frame's).
+        // Python function, at a site that has run one (or that no run has
+        // settled: code compiled at its loop's first back edges): the
+        // method, called directly (it can raise or switch, which leaves
+        // the whole stack on the frame's).
         if raisable
             && self.code.instructions[pc].op == OpCode::BinarySubscr
-            && crate::instance_site(self.ext, pc)
+            && (crate::instance_site(self.ext, pc) || !crate::native_site(self.ext, pc))
         {
             let dunder = self.b.create_block();
             let ok = self.b.create_block();
@@ -20168,12 +22373,12 @@ impl<'a> Lower<'a> {
         let h = self.b.ins().load(types::I64, FLAGS, k, l.str_hash);
         let unknown = self.b.ins().icmp_imm(IntCC::Equal, h, -1);
         self.branch_out(unknown, helper_block);
-        let nslots = self.b.ins().load(types::I64, FLAGS, obj, l.slots_len);
-        let small = self.b.ins().icmp_imm(IntCC::Equal, nslots, 0);
+        // (A table without slots keeps 64 for its shift.)
+        let shift = self.b.ins().uload32(FLAGS, obj, l.shift);
+        let small = self.b.ins().icmp_imm(IntCC::Equal, shift, 64);
         self.branch_out(small, helper_block);
         // The home slot: the mixed hash's top bits.
         let m = self.b.ins().imul_imm(h, l.mix);
-        let shift = self.b.ins().uload32(FLAGS, obj, l.shift);
         let pos = self.b.ins().ushr(m, shift);
         let slots = self.b.ins().load(self.ptr, FLAGS, obj, l.slots);
         let at = self.b.ins().ishl_imm(pos, 3);
@@ -20750,6 +22955,27 @@ impl<'a> Lower<'a> {
     /// `LIST_APPEND` through [`h_list_append`] (the value leaves the stack
     /// into the list `arg` below it).
     fn list_append(&mut self, pc: usize, arg: usize) -> bool {
+        // A local's or constant's value is read in place (no copy to the
+        // stack first) when the list is on the frame's stack.
+        if self.slot_on_stack(self.depth - 1 - arg) && !self.inlining() {
+            let list = self.slot_addr(self.depth - 1 - arg);
+            let vi = self.pop();
+            let slot = self.depth;
+            let (value, own) = self.ref_or_own(vi, slot);
+            let owned = self.b.ins().iconst(types::I32, i64::from(own));
+            let r = self
+                .call(
+                    h_list_append_ref as *const () as usize,
+                    &[list, value, owned],
+                    true,
+                )
+                .expect("returns");
+            let restore = if own { Item::Mem(slot) } else { vi };
+            let out = self.exit_with(pc, &[restore], INTERP);
+            self.branch_out(r, out);
+            self.set_last(pc);
+            return true;
+        }
         self.flush();
         let list = self.slot_addr(self.depth - 1 - arg);
         let value = self.slot_addr(self.depth - 1);
@@ -20759,6 +22985,65 @@ impl<'a> Lower<'a> {
         let out = self.exit_with(pc, &[], INTERP);
         self.branch_out(r, out);
         self.depth -= 1;
+        self.set_last(pc);
+        true
+    }
+
+    /// Whether stack slot `s` holds its value on the frame's stack (not a
+    /// virtual item waiting to be written there).
+    fn slot_on_stack(&self, s: usize) -> bool {
+        let base = self.depth - self.vs.len();
+        s < base || matches!(self.vs.get(s - base), Some(Item::Mem(m)) if *m == s)
+    }
+
+    /// `SET_ADD` through [`h_set_add`], or out to the core loop with the
+    /// operands as they were.
+    fn set_add(&mut self, pc: usize, arg: usize) -> bool {
+        if !self.slot_on_stack(self.depth - 1 - arg) || self.inlining() {
+            self.flush();
+        }
+        let set = self.slot_addr(self.depth - 1 - arg);
+        let vi = self.pop();
+        let slot = self.depth;
+        let (value, own) = self.ref_or_own(vi, slot);
+        let owned = self.b.ins().iconst(types::I32, i64::from(own));
+        let r = self
+            .call(h_set_add as *const () as usize, &[set, value, owned], true)
+            .expect("returns");
+        let restore = if own { Item::Mem(slot) } else { vi };
+        let out = self.exit_with(pc, &[restore], INTERP);
+        self.branch_out(r, out);
+        self.set_last(pc);
+        true
+    }
+
+    /// `MAP_ADD` through [`h_map_add`], or out to the core loop with the
+    /// operands as they were.
+    fn map_add(&mut self, pc: usize, arg: usize) -> bool {
+        if !self.slot_on_stack(self.depth - 2 - arg) || self.inlining() {
+            self.flush();
+        }
+        let dict = self.slot_addr(self.depth - 2 - arg);
+        let vi = self.pop();
+        let ki = self.pop();
+        let slot = self.depth;
+        let (key, own_k) = self.ref_or_own(ki, slot);
+        let (value, own_v) = self.ref_or_own(vi, slot + 1);
+        let owned = self.b.ins().iconst(
+            types::I32,
+            i64::from(u8::from(own_k) | u8::from(own_v) << 1),
+        );
+        let r = self
+            .call(
+                h_map_add as *const () as usize,
+                &[dict, key, value, owned],
+                true,
+            )
+            .expect("returns");
+        let rk = if own_k { Item::Mem(slot) } else { ki };
+        let rv = if own_v { Item::Mem(slot + 1) } else { vi };
+        let out = self.exit_with(pc, &[rk, rv], INTERP);
+        self.branch_out(r, out);
         self.set_last(pc);
         true
     }
@@ -21486,6 +23771,9 @@ impl<'a> Lower<'a> {
             no_shadow_keys: Cell::new(0),
             no_shadow_limit: Cell::new(0),
             builtin_attr: std::cell::RefCell::new(None),
+            prop_leaf: Cell::new((0, 0, 0, 0)),
+            pub_hint: Cell::new((0, 0)),
+            exc_slot: Cell::new(0),
         });
         let c = self
             .b
@@ -21621,6 +23909,11 @@ impl<'a> Lower<'a> {
         }
         self.push(Item::Mem(slot));
         self.set_last(pc);
+        // (A receiver `h_class_read` released last may have queued a
+        // finalizer.)
+        if class_read {
+            self.check_released(pc + 1);
+        }
         true
     }
 
@@ -21726,7 +24019,144 @@ impl<'a> Lower<'a> {
         if let Some(r) = self.inline_method(pc) {
             return r;
         }
+        if !self.is_gen() && crate::method_site_in_place(self.ext, pc) {
+            self.stack_method_kernel(pc);
+        }
         self.load_method_site(pc)
+    }
+
+    /// [`Self::method_kernel`] for a receiver on the stack rather than in a
+    /// local (`self.items.append(x)`, `d[k].append(v)`): `x.m(<up to two
+    /// local, constant or small-int arguments>); CALL` at the method load
+    /// `pc` on an exact `list`, `dict`, `set` or `str`, its tag checked in
+    /// line and the kernel called with the result in the slot above it;
+    /// the receiver then released as `POP_TOP` releases one (checked
+    /// droppable first, so nothing declines after the kernel ran) and the
+    /// result moved into its slot, continuing after the `CALL`. Lowering
+    /// continues (at the general method load) where the receiver is
+    /// something else or the kernel declines.
+    fn stack_method_kernel(&mut self, pc: usize) {
+        #[derive(Clone, Copy)]
+        enum Arg {
+            Local(u32),
+            Const(u32),
+            Small(u32),
+        }
+        let code = self.code;
+        let ins = &code.instructions;
+        let n = ins.len();
+        let mut args: Vec<Arg> = Vec::new();
+        let mut k = pc + 1;
+        let call_pc = loop {
+            let Some(i) = ins.get(k) else {
+                return;
+            };
+            match i.op {
+                OpCode::LoadFast | OpCode::LoadFastBorrow if (i.arg as usize) < self.nlocals => {
+                    args.push(Arg::Local(i.arg));
+                }
+                OpCode::LoadConst if (i.arg as usize) < self.ext.objects.len() => {
+                    args.push(Arg::Const(i.arg));
+                }
+                OpCode::LoadSmallInt => args.push(Arg::Small(i.arg)),
+                OpCode::Call if i.arg as usize == args.len() => break k,
+                _ => return,
+            }
+            if args.len() > 2 {
+                return;
+            }
+            k += 1;
+        };
+        if call_pc + 1 >= n || !self.starts.get(call_pc + 1).copied().unwrap_or(false) {
+            return;
+        }
+        let Some((tag, kind, f)) = crate::builtin_method_site(self.ext, pc, call_pc) else {
+            return;
+        };
+        let Some(kernel) = kernel_for(tag, kind, args.len()) else {
+            return;
+        };
+        let want = match tag {
+            1 => self.tags.list,
+            2 => self.tags.dict,
+            3 => self.tags.set,
+            _ => self.tags.str,
+        };
+        self.flush();
+        let slot = self.depth - 1;
+        let declined = self.b.create_block();
+        let recv = self.slot_addr(slot);
+        let t = self.tag_at(recv);
+        let other = self.b.ins().icmp_imm(IntCC::NotEqual, t, i64::from(want));
+        self.branch_out(other, declined);
+        let mut addrs = Vec::with_capacity(2);
+        for (j, arg) in args.iter().enumerate() {
+            let at = match *arg {
+                Arg::Local(i) => {
+                    let at = self.local_addr(i);
+                    if self.maybe_unbound[i as usize] && !self.bound[i as usize] {
+                        let t = self.tag_at(at);
+                        let unbound =
+                            self.b
+                                .ins()
+                                .icmp_imm(IntCC::Equal, t, i64::from(self.tags.unbound));
+                        self.branch_out(unbound, declined);
+                    }
+                    at
+                }
+                Arg::Const(c) => self.const_addr(c),
+                // A scalar in a slot above the result's.
+                Arg::Small(v) => {
+                    let at = self.slot_addr(slot + 2 + j);
+                    self.write_tag(at, self.tags.int);
+                    let v = self.b.ins().iconst(types::I64, i64::from(v));
+                    self.b.ins().store(FLAGS, v, at, 8);
+                    at
+                }
+            };
+            addrs.push(at);
+        }
+        // (The receiver leaves after the kernel runs: one whose release
+        // could run code takes the general path.)
+        let keep = self
+            .call(h_droppable as *const () as usize, &[recv], true)
+            .expect("returns");
+        self.branch_out(keep, declined);
+        let null = self.b.ins().iconst(self.ptr, 0);
+        let a = addrs.first().copied().unwrap_or(null);
+        let b = addrs.get(1).copied().unwrap_or(null);
+        let fp = self.b.ins().iconst(self.ptr, Rc::as_ptr(&f) as i64);
+        self.held.push(f);
+        let out = self.slot_addr(slot + 1);
+        let r = self
+            .call(kernel as *const () as usize, &[out, recv, a, b, fp], true)
+            .expect("returns");
+        let ran = self.b.create_block();
+        self.b.ins().brif(r, declined, &[], ran, &[]);
+        // Ran: the receiver released and the result moved into its slot,
+        // as after the `CALL`.
+        self.b.switch_to_block(ran);
+        let recv = self.slot_addr(slot);
+        let out = self.slot_addr(slot + 1);
+        let pcv = self.b.ins().iconst(types::I32, call_pc as i64);
+        let lenv = self.b.ins().iconst(types::I32, (slot + 1) as i64);
+        let r = self
+            .call(
+                h_kernel_result as *const () as usize,
+                &[self.st, recv, out, pcv, lenv],
+                true,
+            )
+            .expect("returns");
+        self.after_helper(r);
+        let (depth, last) = (self.depth, self.last_pc);
+        self.depth = slot;
+        self.push(Item::Mem(slot));
+        self.set_last(call_pc);
+        self.goto(call_pc + 1);
+        self.depth = depth;
+        self.last_pc = last;
+        self.vs.clear();
+        self.b.switch_to_block(declined);
     }
 
     /// `LOAD_ATTR` with the method flag at `pc` through [`h_method`].
@@ -21757,6 +24187,8 @@ impl<'a> Lower<'a> {
             own: (0, 0, 0),
             desc: None,
             desc_miss: 0,
+            type_attr: None,
+            stream: None,
         });
         let c = self
             .b
@@ -21951,6 +24383,69 @@ impl<'a> Lower<'a> {
         true
     }
 
+    /// [`Self::field_store_in_line`]'s replacement of the value at `place`
+    /// (an instance's laid-out value, `inst` the instance) by the one at
+    /// `value`, going on to `done`: the value there now a scalar or a heap
+    /// one another owner keeps (not an unset one), and the new one a
+    /// scalar or the instance tracked; anything else to `helper`,
+    /// untouched. (The release gates were checked clear.)
+    fn replace_field_in_line(
+        &mut self,
+        place: Value,
+        value: Value,
+        inst: Value,
+        deferred_at: i32,
+        done: Block,
+        helper: Block,
+    ) {
+        let old = self.tag_at(place);
+        let unset = self
+            .b
+            .ins()
+            .icmp_imm(IntCC::Equal, old, i64::from(self.tags.unbound));
+        self.branch_out(unset, helper);
+        let plain_old = self.is_scalar(old);
+        let heap = self.b.create_block();
+        let checked = self.b.create_block();
+        self.b.ins().brif(plain_old, checked, &[], heap, &[]);
+        self.b.switch_to_block(heap);
+        let word = self.b.ins().load(self.ptr, FLAGS, place, 8);
+        let n = self.b.ins().load(types::I64, FLAGS, word, 0);
+        let last = self.b.ins().icmp_imm(IntCC::SignedLessThanOrEqual, n, 1);
+        self.branch_out(last, helper);
+        self.b.ins().jump(checked, &[]);
+        self.b.switch_to_block(checked);
+        let new = self.tag_at(value);
+        let plain_new = self.is_scalar(new);
+        let deferred = self.b.ins().uload8(types::I32, FLAGS, inst, deferred_at);
+        let tracked = self.b.ins().icmp_imm(IntCC::Equal, deferred, 0);
+        let ok = self.b.ins().bor(plain_new, tracked);
+        let barrier = self.b.ins().icmp_imm(IntCC::Equal, ok, 0);
+        self.branch_out(barrier, helper);
+        self.release_checked_old(Some(plain_old), place);
+        self.copy16(place, value);
+        self.b.ins().jump(done, &[]);
+    }
+
+    /// The plain decrement [`Self::field_store_in_line`] checked for the
+    /// heap value at `place` (`plain_old` its scalar test), if it isn't a
+    /// scalar.
+    fn release_checked_old(&mut self, plain_old: Option<Value>, place: Value) {
+        let Some(plain_old) = plain_old else {
+            return;
+        };
+        let heap = self.b.create_block();
+        let done = self.b.create_block();
+        self.b.ins().brif(plain_old, done, &[], heap, &[]);
+        self.b.switch_to_block(heap);
+        let word = self.b.ins().load(self.ptr, FLAGS, place, 8);
+        let n = self.b.ins().load(types::I64, FLAGS, word, 0);
+        let n = self.b.ins().iadd_imm(n, -1);
+        self.b.ins().store(FLAGS, n, word, 0);
+        self.b.ins().jump(done, &[]);
+        self.b.switch_to_block(done);
+    }
+
     /// `STORE_ATTR` at `pc` of the value at `value` into the instance at
     /// `recv` (a local's slot, or with `release_recv` the stack's, whose
     /// reference then goes), in line when the site settled on one field of
@@ -22009,6 +24504,22 @@ impl<'a> Lower<'a> {
             // The next value of values laid out over the class's names,
             // with room for it, of an instance with no native body.
             inline::FieldMemo::Split { block, len } if append => {
+                // (Already there, from an earlier pass over the same
+                // instances: replaced in place, as a replacing site's.)
+                if !release_recv && !cfg!(debug_assertions) {
+                    let present =
+                        self.b
+                            .ins()
+                            .icmp_imm(IntCC::UnsignedGreaterThan, len, i64::from(idx));
+                    let replace = self.b.create_block();
+                    let add = self.b.create_block();
+                    self.b.ins().brif(present, replace, &[], add, &[]);
+                    self.b.switch_to_block(replace);
+                    let off = i64::from(idx) * 16 + i64::from(l.split_values);
+                    let place = self.b.ins().iadd_imm(block, off);
+                    self.replace_field_in_line(place, value, inst, deferred_at, done, helper);
+                    self.b.switch_to_block(add);
+                }
                 let cap = self.b.ins().uload32(FLAGS, block, l.split_cap);
                 let body = self.b.ins().uload8(types::I64, FLAGS, inst, l.inst_c_body);
                 let next = self.b.ins().icmp_imm(IntCC::NotEqual, len, i64::from(idx));
@@ -22030,12 +24541,33 @@ impl<'a> Lower<'a> {
             }
             memo => (self.field_place(memo, idx, helper), None),
         };
-        if grown.is_none() {
+        // A heap value there now goes by a plain decrement (another owner
+        // keeping it, no release gate): checked here, before anything is
+        // written, and given up as the new value moves in.
+        let heap_old = if grown.is_none() && !cfg!(debug_assertions) {
             let old = self.tag_at(place);
             let plain_old = self.is_scalar(old);
-            let held = self.b.ins().icmp_imm(IntCC::Equal, plain_old, 0);
+            let heap = self.b.create_block();
+            let checked = self.b.create_block();
+            self.b.ins().brif(plain_old, checked, &[], heap, &[]);
+            self.b.switch_to_block(heap);
+            let word = self.b.ins().load(ptr, FLAGS, place, 8);
+            let n = self.b.ins().load(types::I64, FLAGS, word, 0);
+            let last = self.b.ins().icmp_imm(IntCC::SignedLessThanOrEqual, n, 1);
+            let held = self.b.ins().bor(last, gates);
             self.branch_out(held, helper);
-        }
+            self.b.ins().jump(checked, &[]);
+            self.b.switch_to_block(checked);
+            Some(plain_old)
+        } else {
+            if grown.is_none() {
+                let old = self.tag_at(place);
+                let plain_old = self.is_scalar(old);
+                let held = self.b.ins().icmp_imm(IntCC::Equal, plain_old, 0);
+                self.branch_out(held, helper);
+            }
+            None
+        };
         let new = self.tag_at(value);
         let plain_new = self.is_scalar(new);
         let deferred = self.b.ins().uload8(types::I32, FLAGS, inst, deferred_at);
@@ -22049,10 +24581,12 @@ impl<'a> Lower<'a> {
             let n = self.b.ins().load(types::I64, FLAGS, inst, 0);
             let last = self.b.ins().icmp_imm(IntCC::SignedLessThanOrEqual, n, 1);
             self.branch_out(last, helper);
+            self.release_checked_old(heap_old, place);
             self.copy16(place, value);
             let n = self.b.ins().iadd_imm(n, -1);
             self.b.ins().store(FLAGS, n, inst, 0);
         } else {
+            self.release_checked_old(heap_old, place);
             self.copy16(place, value);
         }
         if let Some(block) = grown {
@@ -22106,6 +24640,7 @@ impl<'a> Lower<'a> {
         };
         let site = Box::new(TruthSite {
             ver: std::cell::Cell::new(0),
+            native: std::cell::Cell::new((0, crate::NativeTruthPlan::NONE)),
             pc: pc as u32,
             slot: slot as u32,
             local,
@@ -22728,10 +25263,11 @@ impl<'a> Lower<'a> {
     /// f-string's pieces) through [`h_fstring`], which runs the core
     /// loop's arm; the core loop takes any other shape.
     fn fstring_op(&mut self, pc: usize, op: OpCode, arg: u32) -> bool {
-        let n = if op == OpCode::BuildString {
-            arg as usize
-        } else {
-            1
+        let n = match op {
+            OpCode::BuildString => arg as usize,
+            // (The value and its spec.)
+            OpCode::FormatValue if arg & 4 != 0 => 2,
+            _ => 1,
         };
         if n == 0 || n > self.depth || !fstring_native(op, arg) {
             self.exit(INTERP, pc);
@@ -22741,6 +25277,7 @@ impl<'a> Lower<'a> {
         let at = self.slot_addr(self.depth - n);
         let kind = match op {
             OpCode::ConvertValue => FSTRING_CONVERT | u64::from(arg) << 8,
+            OpCode::FormatValue if arg & 4 != 0 => FSTRING_FORMAT_SPEC,
             OpCode::FormatValue => FSTRING_FORMAT,
             _ => FSTRING_JOIN | (n as u64) << 8,
         };

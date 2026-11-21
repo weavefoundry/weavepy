@@ -845,8 +845,11 @@ fn admit(
         return Err("no dispatch");
     }
     // A callee that has barely run doesn't pay for its compile time here, and
-    // shows little of what it does.
-    if !crate::callee_warm(code, ext) {
+    // shows little of what it does. (A callee of a callee lowered in line,
+    // `path` holding the root and that caller, counts once the frameless
+    // evaluator has run it: a warm helper's own helper runs there, nested
+    // in its caller's evaluation, and leaves no other count.)
+    if !crate::callee_warm(code, ext) && !(path.len() > 1 && crate::leaf_plan_built(ext)) {
         return Err("not warm");
     }
     // A callee whose loops tier 2 compiled and runs better than this

@@ -163,6 +163,26 @@ impl ThreadRegistry {
         g.remove(&native_id);
     }
 
+    /// The join handles of `ident`'s thread and of every finished one,
+    /// taken, with the finished entries dropped: nothing reads an entry
+    /// once its thread has finished and been joined (a late `join()` waits
+    /// on the thread handle's own state), and a program that starts
+    /// thousands of threads would otherwise scan them all at every reap.
+    pub fn take_finished_handles(&self, ident: u64) -> Vec<JoinHandle<()>> {
+        let mut handles = Vec::new();
+        let mut g = self.entries.write();
+        g.retain(|_, e| {
+            let finished = !e.is_alive();
+            if finished || e.native_id == ident {
+                if let Some(h) = e.take_handle() {
+                    handles.push(h);
+                }
+            }
+            !finished
+        });
+        handles
+    }
+
     pub fn get(&self, native_id: u64) -> Option<Arc<ThreadEntry>> {
         let g = self.entries.read();
         g.get(&native_id).cloned()

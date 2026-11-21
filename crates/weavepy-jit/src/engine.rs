@@ -600,7 +600,7 @@ impl JitEngine {
             &mut |_| None,
             &mut |_| None,
             &mut |_, _, _| None,
-            &mut |_| false,
+            &mut |_| SiteLayout::default(),
         )
     }
 
@@ -614,7 +614,9 @@ impl JitEngine {
     /// arguments of those lanes, runs in line once its guard holds (see
     /// [`InlineMethod::of`]). `slot_member(site)` says whether an attribute
     /// site's receiver keeps the attribute in a laid-out member slot (see
-    /// [`AttrSiteMeta::slot_member`]).
+    /// [`AttrSiteMeta::slot_member`]), and whether the site has a position
+    /// compiled code reads or writes in line (see
+    /// [`AttrSiteMeta::in_line`]).
     #[allow(clippy::too_many_arguments)]
     pub fn compile_frame_direct(
         &mut self,
@@ -624,7 +626,7 @@ impl JitEngine {
         direct: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
         direct_method: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
         inline_method: &mut dyn FnMut(u32, &[JitType], u32) -> Option<InlineMethod>,
-        slot_member: &mut dyn FnMut(&AttrSiteMeta) -> bool,
+        slot_member: &mut dyn FnMut(&AttrSiteMeta) -> SiteLayout,
     ) -> Result<CompiledFrame, JitVerdict> {
         let tfunc = analyze_admitted(code, resolve, probes, slot_member)?;
         self.compile_tfunc_methods(&tfunc, direct, direct_method, inline_method)
@@ -644,7 +646,7 @@ impl JitEngine {
         direct: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
         direct_method: &mut dyn FnMut(u32) -> Option<DirectLeaf>,
         inline_method: &mut dyn FnMut(u32, &[JitType], u32) -> Option<InlineMethod>,
-        slot_member: &mut dyn FnMut(&AttrSiteMeta) -> bool,
+        slot_member: &mut dyn FnMut(&AttrSiteMeta) -> SiteLayout,
     ) -> Result<CompiledFrame, JitVerdict> {
         let tfunc = analyze_admitted(code, resolve, probes, slot_member)?;
         if engine.is_none() {
@@ -1086,6 +1088,16 @@ fn calls_dynamically(tfunc: &TFunc) -> bool {
 /// through a helper that redoes the lookups the interpreter's caches
 /// remember, while each typed one saves only a dispatch. A loop-free
 /// body is left alone: other compiled code calls it directly.
+/// What the embedder knows of an attribute site's storage when its code
+/// is compiled (see [`AttrSiteMeta::slot_member`],
+/// [`AttrSiteMeta::in_line`] and [`AttrSiteMeta::position`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SiteLayout {
+    pub slot_member: bool,
+    pub in_line: bool,
+    pub position: Option<(u64, u32, usize)>,
+}
+
 /// The [`JitEngine::compile_frame_lazily`] verdict for a host the code
 /// generator can't target.
 pub const NO_HOST_ENGINE: &str = "no code generator for the host";
@@ -1096,9 +1108,20 @@ fn analyze_admitted(
     code: &CodeObject,
     resolve: &mut dyn FnMut(&str) -> ResolvedGlobal,
     probes: &mut Probes<'_>,
-    slot_member: &mut dyn FnMut(&AttrSiteMeta) -> bool,
+    slot_member: &mut dyn FnMut(&AttrSiteMeta) -> SiteLayout,
 ) -> Result<TFunc, JitVerdict> {
     let mut tfunc = crate::analyze::analyze_frame(code, resolve, probes)?;
+    for site in &mut tfunc.attr_sites {
+        let layout = slot_member(site);
+        site.slot_member = layout.slot_member;
+        site.in_line = layout.in_line;
+        site.position = layout.position;
+    }
+    // A callee's analysis ran out of work budget: what this one made of
+    // the callee (an untyped call) reflects the budget, not the code.
+    if crate::analyze::work_short() {
+        return Err(JitVerdict::ProbeMiss(crate::analyze::OVER_BUDGET));
+    }
     if calls_dynamically(&tfunc) {
         return Err(JitVerdict::UnsupportedOpcode("dynamic call (loop-free)"));
     }
@@ -1108,11 +1131,14 @@ fn analyze_admitted(
     if attr_bound(&tfunc) {
         return Err(JitVerdict::UnsupportedOpcode("attribute-bound loop"));
     }
+    if call_bound(&tfunc) {
+        return Err(JitVerdict::UnsupportedOpcode("call-bound loop"));
+    }
+    if method_bound(&tfunc) {
+        return Err(JitVerdict::UnsupportedOpcode("method-bound loop"));
+    }
     if unpacks_pairs(&tfunc) {
         return Err(JitVerdict::UnsupportedOpcode("tuple-target loop"));
-    }
-    for site in &mut tfunc.attr_sites {
-        site.slot_member = slot_member(site);
     }
     Ok(tfunc)
 }
@@ -1217,12 +1243,16 @@ fn loop_blocks(tfunc: &TFunc) -> impl Iterator<Item = &crate::ir::TBlock> {
 }
 
 /// Whether `tfunc`'s loops access attributes more often than they do
-/// typed arithmetic: each attribute read or write of a tier-2 loop goes
-/// through a helper that redoes its guards (about 50 host instructions),
-/// where the frame JIT reads or writes the field in line, so a loop of
-/// attribute traffic runs faster in the frame JIT unless typed work in
-/// registers repays it. (Calls don't count: a driver loop that calls
-/// compiled functions keeps them native-to-native in tier 2.)
+/// typed arithmetic: an attribute read or write of a tier-2 loop that
+/// has no in-line position goes through a helper that redoes its guards
+/// (about 50 host instructions), where the frame JIT reads or writes the
+/// field in line, so a loop of such attribute traffic runs faster in the
+/// frame JIT unless typed work in registers repays it. An access tier 2
+/// makes in line itself (a scalar field of a split-layout instance or a
+/// laid-out member slot, see [`AttrSiteMeta::in_line`]) doesn't count:
+/// a loop of those, and of the methods it then runs in line, took 1.45
+/// times as long in the frame JIT. (Calls don't count: a driver loop
+/// that calls compiled functions keeps them native-to-native in tier 2.)
 /// `WEAVEPY_T2_ATTRS=0` turns the rule off, a tuning aid.
 fn attr_bound(tfunc: &TFunc) -> bool {
     use crate::ir::TOp;
@@ -1237,6 +1267,11 @@ fn attr_bound(tfunc: &TFunc) -> bool {
     let (mut attrs, mut typed) = (0usize, 0usize);
     for st in loop_blocks(tfunc).flat_map(|b| &b.stmts) {
         match st.op {
+            TOp::AttrGet { site, .. } | TOp::AttrSet { site }
+                if tfunc
+                    .attr_sites
+                    .get(site as usize)
+                    .is_some_and(|s| s.in_line) => {}
             TOp::AttrGet { .. }
             | TOp::AttrSet { .. }
             | TOp::DynAttrGet { .. }
@@ -1253,6 +1288,129 @@ fn attr_bound(tfunc: &TFunc) -> bool {
         }
     }
     attrs > typed
+}
+
+/// Whether `tfunc`'s loops make dynamic calls of Python functions that
+/// outweigh what tier 2 does better: a Python callee called through tier
+/// 2's generic call helper (one held in a local, say) costs about 800
+/// host instructions more than the frame JIT's call of it, which checks
+/// and enters the callee directly or inlines it (`f(1, 2, 3)` of a local
+/// `f`: 932 instructions against 114), where each typed operation saves
+/// tier 2 only a few, and each guarded call (a global function's, a
+/// method's) it makes native-to-native. So a loop with fewer than
+/// [`call_weight`] typed operations, counting a guarded call as that
+/// many, for each such dynamic call runs faster in the frame JIT. Calls
+/// of builtins don't count: tier 2's helper runs those about as fast. A
+/// loop-free body is left alone, as for [`attr_bound`].
+fn call_bound(tfunc: &TFunc) -> bool {
+    use crate::ir::TOp;
+    let weight = call_weight();
+    if weight == 0
+        || tfunc.py_dyn_calls.is_empty()
+        || GENERIC_LOOPS_ADMITTED.load(std::sync::atomic::Ordering::Relaxed)
+        || !has_loop(tfunc)
+    {
+        return false;
+    }
+    let (mut calls, mut typed) = (0usize, 0usize);
+    for st in loop_blocks(tfunc).flat_map(|b| &b.stmts) {
+        match st.op {
+            // (A guarded call the analysis marked runs its callee
+            // frameless, which costs as much as a dynamic call.)
+            TOp::CallDyn { .. } | TOp::CallPy { .. }
+                if tfunc.py_dyn_calls.binary_search(&st.pc).is_ok() =>
+            {
+                calls += 1;
+            }
+            TOp::CallPy { .. } | TOp::CallPyKw { .. } | TOp::CallMethod { .. } => typed += weight,
+            TOp::IntArith(_)
+            | TOp::FloatArith(_)
+            | TOp::IntTrueDiv
+            | TOp::IntCmp(_)
+            | TOp::FloatCmp(_)
+            | TOp::IntNeg
+            | TOp::FloatNeg
+            | TOp::IntInvert => typed += 1,
+            _ => {}
+        }
+    }
+    calls * weight > typed
+}
+
+/// Whether `tfunc`'s loops call methods through the generic load and call
+/// more than tier 2 repays: a method of a value whose class the compile
+/// didn't resolve (`d.pop(k)`, `out.add(x)`, `line.split()`) is a generic
+/// attribute load and a generic call, two helper round trips where the
+/// frame JIT's method site makes one cached call (about 270 host
+/// instructions more for a builtin value's method, more for others), and
+/// each typed operation saves tier 2 only a few. So a loop with fewer
+/// than [`method_weight`] typed operations for each such call runs
+/// faster in the frame JIT.
+fn method_bound(tfunc: &TFunc) -> bool {
+    use crate::ir::TOp;
+    let weight = method_weight();
+    if weight == 0
+        || tfunc.null_spans.is_empty()
+        || GENERIC_LOOPS_ADMITTED.load(std::sync::atomic::Ordering::Relaxed)
+        || !has_loop(tfunc)
+    {
+        return false;
+    }
+    let (mut methods, mut typed) = (0usize, 0usize);
+    for st in loop_blocks(tfunc).flat_map(|b| &b.stmts) {
+        match st.op {
+            // (A method-form load: the marker span of its call opens at it.)
+            TOp::DynAttrGet { .. } if tfunc.null_spans.iter().any(|s| s.live_from == st.pc) => {
+                methods += 1;
+            }
+            TOp::CallPy { .. } | TOp::CallPyKw { .. } | TOp::CallMethod { .. } => {
+                typed += call_weight();
+            }
+            TOp::IntArith(_)
+            | TOp::FloatArith(_)
+            | TOp::IntTrueDiv
+            | TOp::IntCmp(_)
+            | TOp::FloatCmp(_)
+            | TOp::IntNeg
+            | TOp::FloatNeg
+            | TOp::IntInvert => typed += 1,
+            _ => {}
+        }
+    }
+    methods * weight > typed
+}
+
+/// How many typed operations a loop needs for each generic method call
+/// before tier 2 takes it (see [`method_bound`]): 4 unless
+/// `WEAVEPY_T2_METHODS` says otherwise (`0` turns the rule off), a tuning
+/// aid. (At 4 a dict's pop and re-insert loop went from 138 ns to the
+/// frame JIT's 92 and a queue worker's loop ran 4% faster, while the
+/// suite's loops that mix such calls with typed work, `chaos`, `go` and
+/// `raytrace`, stayed within 1% either way; the instruction counts would
+/// allow a larger weight, but nothing measured asks for one.)
+fn method_weight() -> usize {
+    static WEIGHT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WEIGHT.get_or_init(|| {
+        std::env::var("WEAVEPY_T2_METHODS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4)
+    })
+}
+
+/// How many typed operations a loop needs for each dynamic call before
+/// tier 2 takes it (see [`call_bound`]): 24 unless `WEAVEPY_T2_CALLS`
+/// says otherwise (`0` turns the rule off), a tuning aid. (A float
+/// operation saves tier 2 about 30 instructions over the frame JIT, so
+/// some 27 of them repay one generic call; integer ones save less.)
+fn call_weight() -> usize {
+    static WEIGHT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WEIGHT.get_or_init(|| {
+        std::env::var("WEAVEPY_T2_CALLS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(24)
+    })
 }
 
 /// The generic share [`mostly_generic`] admits, in percent, and whether it

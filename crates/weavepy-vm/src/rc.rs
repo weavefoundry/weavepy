@@ -2,21 +2,28 @@
 //!
 //! [`Rc`] and [`Weak`] wrap [`std::sync::Arc`] and [`std::sync::Weak`]
 //! with the same API, but a strong-count increment or decrement is a plain
-//! load and store instead of a locked read-modify-write while one thread
-//! owns every object. That's the common case: a program that never starts a
-//! second thread, running under the GIL. A `lock xadd` pair costs about four
-//! times a plain pair on x86, and the interpreter performs roughly one pair
-//! per bytecode, so atomics were a leading cost of every workload.
+//! load and store instead of a locked read-modify-write while nothing
+//! updates a count concurrently. That's the common case: a program that
+//! never starts a second thread, and one whose threads all run under the
+//! GIL. A `lock xadd` pair costs about four times a plain pair on x86, and
+//! the interpreter performs roughly one pair per bytecode, so atomics were
+//! a leading cost of every workload, and of everything a program did once
+//! it had started a thread.
 //!
-//! The bias is the one [`crate::sync`] already maintains for cell borrows:
-//! it holds until a second thread registers to run VM code or free-threading
-//! starts, and it's never restored. The registering thread revokes the bias
-//! while holding the GIL; the previous owner released the GIL before that,
-//! and reacquires it before touching another object, so every plain update
-//! happens before the revocation and every later update is atomic. Threads
-//! that touch objects without the GIL announce themselves with
-//! [`crate::sync::mark_cells_shared`] before they begin, and code that
-//! spawns a thread which will run VM code revokes the bias first (see
+//! With one thread, that thread owns every count. With several, the GIL
+//! orders their updates: a thread the VM starts takes the GIL before its
+//! first touch of an object and keeps it through its thread-local
+//! destructors, a blocking call's GIL-released bracket touches no object,
+//! and a hand-off of the GIL is a synchronizing operation. Counts turn
+//! atomic, under the GIL, as soon as something will touch one outside it
+//! (see `gil_orders_counts` in [`crate::sync`]): free-threading, a thread
+//! the VM didn't start, a watcher that reads state without the GIL (it
+//! announces itself with [`crate::sync::mark_cells_shared`]), or a thread
+//! whose outermost GIL scope ends while others run. The thread that flips
+//! the flag holds the GIL, and every other thread acquires it before its
+//! next update, so every plain update happens before the flip and every
+//! later one is atomic. Code that spawns a thread which touches objects
+//! before it takes the GIL makes counts atomic first (see
 //! [`revoke_refcount_bias`]).
 //!
 //! Deallocation always goes through `Arc`'s own drop, so the payload,
@@ -237,6 +244,28 @@ pub(crate) unsafe fn increment_strong<T: ?Sized>(value: *const T) {
 pub(crate) unsafe fn try_release_shared<T: ?Sized>(value: *const T) -> bool {
     // SAFETY: live allocation, per the caller.
     unsafe { try_release_word(strong_word(value)) }
+}
+
+/// Release an owner through the strong count `word` with a locked update,
+/// unless it's the last one: `false`, with the count unchanged. The
+/// release ordering is `Arc`'s for an owner that isn't the last.
+///
+/// # Safety
+///
+/// `word` is the strong count of a live `Arc` allocation the caller owns
+/// a reference to; on `true` that reference is released.
+#[inline]
+pub(crate) unsafe fn release_unless_last(word: *const AtomicUsize) -> bool {
+    // SAFETY: per the caller.
+    let count = unsafe { &*word };
+    let mut n = count.load(Ordering::Relaxed);
+    while n > 1 {
+        match count.compare_exchange_weak(n, n - 1, Ordering::Release, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(now) => n = now,
+        }
+    }
+    false
 }
 
 /// Free the `Arc` allocation holding `value` when this is its last owner
@@ -604,6 +633,12 @@ impl<T: ?Sized + 'static> Rc<T> {
     unsafe fn drop_last(&mut self) {
         // SAFETY: the caller's contract.
         unsafe {
+            // Without the bias, an owner that isn't the last gives its
+            // reference up with one locked update, as `Arc`'s drop would,
+            // without the last owner's checks below.
+            if !refcounts_biased() && release_unless_last(strong_word(Arc::as_ptr(&self.0))) {
+                return;
+            }
             // The last reference to an object that owes a finalizer moves
             // to the finalizer queue instead: the object stays alive, at
             // its address, until its `__del__` (or generator close) has
@@ -614,9 +649,13 @@ impl<T: ?Sized + 'static> Rc<T> {
                 return;
             }
             if nesting_kind::<T>() {
-                // A list of scalars releases nothing through its items:
-                // they're forgotten, not dropped one call at a time, and
-                // the list frees without the trashcan.
+                // A list whose items all outlive it (scalars, and values
+                // other owners hold: a list of shared strings) releases them
+                // with plain decrements, not one drop call at a time, and
+                // frees without the trashcan. An item this release would
+                // free leaves it and the rest to the full release, the items
+                // released here already gone (none of them died, so the
+                // order of deaths is the full release's).
                 if std::any::TypeId::of::<T>()
                     == std::any::TypeId::of::<crate::sync::RefCell<Vec<crate::object::Object>>>()
                     && Arc::strong_count(&self.0) == 1
@@ -626,10 +665,26 @@ impl<T: ?Sized + 'static> Rc<T> {
                     // The last strong reference: nothing else reads the
                     // items while this release, which runs no code, does.
                     let items = &mut *(*cell).as_ptr();
-                    if items.iter().all(|o| o.strong_word().is_none()) {
+                    // (Up to the first item that would die: the usual list
+                    // has none, and then no slot needs rewriting.)
+                    let biased = refcounts_biased();
+                    let mut released = 0;
+                    for o in items.iter() {
+                        match o.strong_word() {
+                            None => {}
+                            Some(word) if biased && plain_release(word) => {}
+                            Some(_) => break,
+                        }
+                        released += 1;
+                    }
+                    if released == items.len() {
                         items.set_len(0);
                         drop_arc_in(&mut self.0);
                         return;
+                    }
+                    // (Released: those slots become scalars.)
+                    for o in &mut items[..released] {
+                        ptr::write(o, crate::object::Object::None);
                     }
                 }
                 release_nested(LastOwner(ManuallyDrop::new(ManuallyDrop::take(

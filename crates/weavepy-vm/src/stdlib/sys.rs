@@ -1305,9 +1305,10 @@ thread_local! {
     // limit on conversion, but `sys.get/set_int_max_str_digits` must round-trip
     // (test_int reads/sets it; many modules query it at import).
     static INT_MAX_STR_DIGITS: std::cell::Cell<i64> = const { std::cell::Cell::new(4300) };
-    // `sys.setswitchinterval` value: advisory for WeavePy's GIL (the
-    // holder yields on bytecode-count boundaries, not a timer), but the
-    // set/get pair must round-trip (test_sys test_switchinterval).
+    // `sys.setswitchinterval` value as it was given, for the set/get
+    // pair's round trip (test_sys test_switchinterval). The GIL's own
+    // copy (`EvalBreaker::switch_interval`) is what a busy holder's
+    // checkpoints time a hand-off against.
     static SWITCH_INTERVAL: std::cell::Cell<f64> = const { std::cell::Cell::new(0.005) };
 }
 
@@ -1335,6 +1336,13 @@ fn sys_setswitchinterval(args: &[Object]) -> Result<Object, RuntimeError> {
         ));
     }
     SWITCH_INTERVAL.with(|c| c.set(interval));
+    // (At least a microsecond, CPython's unit; at most what a duration
+    // holds.)
+    crate::gil::global_gil_ref()
+        .breaker
+        .set_switch_interval(std::time::Duration::from_secs_f64(
+            interval.clamp(1e-6, 1e9),
+        ));
     Ok(Object::None)
 }
 
@@ -1418,8 +1426,24 @@ fn sys_setrecursionlimit(args: &[Object]) -> Result<Object, RuntimeError> {
 thread_local! {
     // (Fx-hashed: interning runs for every name of every code object a
     // module loads, and SipHash showed in import profiles.)
-    static INTERN_POOL: RefCell<std::collections::HashSet<SharedStr, crate::fasthash::FxBuildHasher>> =
-        const { RefCell::new(std::collections::HashSet::with_hasher(crate::fasthash::FxBuildHasher)) };
+    // (Released under the GIL at its thread's exit: it holds strings.)
+    static INTERN_POOL: crate::gil::ReleaseUnderGil<
+        RefCell<std::collections::HashSet<SharedStr, crate::fasthash::FxBuildHasher>>,
+    > = const {
+        crate::gil::ReleaseUnderGil::new(RefCell::new(std::collections::HashSet::with_hasher(
+            crate::fasthash::FxBuildHasher,
+        )))
+    };
+}
+
+/// Empty the calling thread's intern pool: a worker's last act while it
+/// still holds the GIL (see [`crate::vm_singletons::clear_thread_python_tls`]).
+pub(crate) fn forget_thread_interns() {
+    let _ = INTERN_POOL.try_with(|pool| {
+        if let Ok(mut pool) = pool.try_borrow_mut() {
+            pool.clear();
+        }
+    });
 }
 
 /// Canonicalize `name` through the interpreter's intern pool, seeding it
@@ -1453,6 +1477,39 @@ pub(crate) fn intern_shared(text: &SharedStr) -> SharedStr {
             text.clone()
         }
     })
+}
+
+/// [`intern_shared`] through a per-thread memo of recent names by
+/// identity: a setter called with the same name object again (a frozen
+/// dataclass's `object.__setattr__(self, 'x', x)`, a `setattr` in a loop)
+/// skips the pool's hash and probe. Each entry holds the name it was
+/// asked for, so no other string can come to sit at its address.
+pub(crate) fn intern_shared_memo(text: &SharedStr) -> SharedStr {
+    const N: usize = 64;
+    thread_local! {
+        static MEMO: crate::gil::ReleaseUnderGil<std::cell::RefCell<[Option<(SharedStr, SharedStr)>; N]>> = const { crate::gil::ReleaseUnderGil::new(std::cell::RefCell::new([const { None }; N])) };
+    }
+    let slot = (text.as_ptr() as usize >> 4) % N;
+    let hit = MEMO
+        .try_with(|m| {
+            let m = m.try_borrow().ok()?;
+            match &m[slot] {
+                Some((asked, pooled)) if SharedStr::ptr_eq(asked, text) => Some(pooled.clone()),
+                _ => None,
+            }
+        })
+        .ok()
+        .flatten();
+    if let Some(pooled) = hit {
+        return pooled;
+    }
+    let pooled = intern_shared(text);
+    let _ = MEMO.try_with(|m| {
+        if let Ok(mut m) = m.try_borrow_mut() {
+            m[slot] = Some((text.clone(), pooled.clone()));
+        }
+    });
+    pooled
 }
 
 /// CPython's `intern_string_constants` rule (codeobject.c): a str
@@ -1855,7 +1912,7 @@ pub fn audit_event(event: &str, args: &[Object]) -> Result<(), RuntimeError> {
     // interpreter mutably. Mutation from this thread is exclusive
     // because the VM holds the GIL across the whole audit event.
     let interp = unsafe { &mut *ptr };
-    let arg_tuple = Object::new_tuple(args.to_vec());
+    let arg_tuple = Object::tuple_from_slice(args);
     let outer = interp.builtins_dict();
     // `PyThreadState_EnterTracing`: hooks run untraced by default.
     let _suppress = crate::trace::TracingSuppressGuard::enter();
@@ -2878,8 +2935,7 @@ fn sys_set_coroutine_origin_tracking_depth(args: &[Object]) -> Result<Object, Ru
 thread_local! {
     /// PEP 525 `sys.set_asyncgen_hooks` — `(firstiter, finalizer)`.
     /// Per-thread in CPython (a `PyThreadState` field).
-    static ASYNCGEN_HOOKS: std::cell::RefCell<(Object, Object)> =
-        const { std::cell::RefCell::new((Object::None, Object::None)) };
+    static ASYNCGEN_HOOKS: crate::gil::ReleaseUnderGil<std::cell::RefCell<(Object, Object)>> = const { crate::gil::ReleaseUnderGil::new(std::cell::RefCell::new((Object::None, Object::None))) };
 }
 
 /// The currently-installed `(firstiter, finalizer)` asyncgen hooks.

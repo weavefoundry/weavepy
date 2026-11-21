@@ -359,8 +359,20 @@ fn hasher_update(args: &[Object]) -> Result<Object, RuntimeError> {
     let data = args
         .get(1)
         .ok_or_else(|| type_error("update: missing data"))?;
-    let bytes = bytes_of(data)?;
     let state = lookup_hasher(id)?;
+    data.check_simple_buffer()?;
+    // (A `bytearray`'s or a live `memoryview`'s bytes hashed where they
+    // are: hashing runs no code while it reads.)
+    if matches!(
+        data,
+        Object::Bytes(_) | Object::ByteArray(_) | Object::MemoryView(_)
+    ) {
+        let mut hasher = state.borrow_mut();
+        if data.with_bytes_view(|d| hasher.update(d)).is_some() {
+            return Ok(Object::None);
+        }
+    }
+    let bytes = bytes_of(data)?;
     state.borrow_mut().update(&bytes);
     Ok(Object::None)
 }
@@ -401,12 +413,7 @@ fn hasher_hexdigest(args: &[Object]) -> Result<Object, RuntimeError> {
     let st = state.borrow();
     let length = digest_length(&st, args)?;
     let bytes = st.digest(length);
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        use std::fmt::Write;
-        write!(out, "{b:02x}").unwrap();
-    }
-    Ok(Object::from_str(out))
+    Ok(Object::from_str(crate::object::hex_lower(&bytes)))
 }
 
 fn hasher_copy(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -670,21 +677,6 @@ fn seed_arg_checked(
         .cloned())
 }
 
-/// The digest seed passed to a constructor: positional index 0, or the
-/// `data=`/`string=` keyword, validated with clinic precedence.
-/// `usedforsecurity=` is accepted and ignored (we never link OpenSSL, so
-/// FIPS mode is moot).
-fn seed_arg(
-    fname: &str,
-    args: &[Object],
-    kwargs: &[(String, Object)],
-) -> Result<Option<Vec<u8>>, RuntimeError> {
-    match seed_arg_checked(fname, 0, args, kwargs, &[])? {
-        None => Ok(None),
-        Some(o) => Ok(Some(bytes_of(&o)?)),
-    }
-}
-
 fn algos_set() -> Object {
     Object::new_set_from(
         [
@@ -939,7 +931,7 @@ fn parse_blake2_params(
             "last_node",
         ],
     )?
-    .map(|o| bytes_of(&o))
+    .map(|o| bytes_of(&o).map(std::borrow::Cow::into_owned))
     .transpose()?;
     // Integer parameter with clinic-style range enforcement. `hard_max`
     // distinguishes a *representation* overflow (leaf_size ≥ 2**32,
@@ -971,7 +963,7 @@ fn parse_blake2_params(
     let bytes_kw = |name: &str| -> Result<Vec<u8>, RuntimeError> {
         match kw(kwargs, name) {
             None => Ok(Vec::new()),
-            Some(o) => bytes_of(o),
+            Some(o) => bytes_of(o).map(std::borrow::Cow::into_owned),
         }
     };
 
@@ -1243,26 +1235,47 @@ fn make_sha512(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, R
     seeded(AnyHasher::Sha512(Sha512::new()), args, kwargs)
 }
 
+/// A constructor's hasher, fed its seed: positional index 0, or the
+/// `data=`/`string=` keyword, validated with clinic precedence.
+/// `usedforsecurity=` is accepted and ignored (we never link OpenSSL, so
+/// FIPS mode is moot).
 fn seeded(
     mut hasher: AnyHasher,
     args: &[Object],
     kwargs: &[(String, Object)],
 ) -> Result<Object, RuntimeError> {
-    if let Some(bytes) = seed_arg(hasher.name(), args, kwargs)? {
-        hasher.update(&bytes);
+    match seed_arg_checked(hasher.name(), 0, args, kwargs, &[])? {
+        None => {}
+        // (A `bytes`, `bytearray` or contiguous `memoryview` hashed where
+        // it is.)
+        Some(o)
+            if matches!(
+                o,
+                Object::Bytes(_) | Object::ByteArray(_) | Object::MemoryView(_)
+            ) =>
+        {
+            o.check_simple_buffer()?;
+            if o.with_bytes_view(|d| hasher.update(d)).is_none() {
+                hasher.update(&bytes_of(&o)?);
+            }
+        }
+        Some(o) => hasher.update(&bytes_of(&o)?),
     }
     Ok(make_hasher_instance(hasher))
 }
 
-fn bytes_of(obj: &Object) -> Result<Vec<u8>, RuntimeError> {
+fn bytes_of(obj: &Object) -> Result<std::borrow::Cow<'_, [u8]>, RuntimeError> {
+    use std::borrow::Cow;
+    obj.check_simple_buffer()?;
     // Hashers consume the buffer protocol only: `bytes`, `bytearray`,
     // `memoryview` (and their subclasses). A `str` is rejected with
     // CPython's exact message — `test_hmac` asserts `update("…")` raises.
-    if let Some(v) = obj.as_bytes_view() {
+    // (A `bytes` object's bytes are hashed where they are.)
+    if let Some(v) = obj.bytes_cow() {
         return Ok(v);
     }
     if let Some(v) = obj.native_value().as_ref().and_then(Object::as_bytes_view) {
-        return Ok(v);
+        return Ok(Cow::Owned(v));
     }
     // Buffer-protocol fallback for objects that expose memory but aren't
     // bytes/bytearray/memoryview themselves (`array.array`, `mmap`, …):
@@ -1283,7 +1296,7 @@ fn bytes_of(obj: &Object) -> Result<Vec<u8>, RuntimeError> {
             if let Some(mv_ctor) = mv_ctor {
                 if let Ok(mv) = interp.call_object(mv_ctor, &[obj.clone()], &[]) {
                     if let Some(v) = mv.as_bytes_view() {
-                        return Ok(v);
+                        return Ok(Cow::Owned(v));
                     }
                 }
             }
@@ -1362,7 +1375,7 @@ fn file_digest(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, R
         };
         let chunk = {
             let all = buf.as_bytes_view().unwrap_or_default();
-            Object::new_bytes(all[..n.min(all.len())].to_vec())
+            Object::new_bytes(&all[..n.min(all.len())])
         };
         interp.call_object(update.clone(), &[chunk], &[])?;
     }

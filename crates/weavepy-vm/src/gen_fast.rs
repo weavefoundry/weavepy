@@ -132,6 +132,16 @@ fn op_native(code: &CodeObject, pc: usize) -> bool {
     }
 }
 
+/// Native steps of one body that stopped partway, net of those that ran to
+/// a yield, past which [`Interpreter::gen_native_next`] declines the body's
+/// steps (a `for` loop over a generator whose body calls a Python
+/// `__getitem__`: the loop's switched resume calls it, where each step
+/// would stop at it and finish on the general path). One step in
+/// [`STALL_RETRY`] past the limit runs again, and one that reaches a yield
+/// starts the count over.
+pub(crate) const STALL_LIMIT: u32 = 64;
+const STALL_RETRY: u32 = 256;
+
 /// [`code_ok`]'s verdicts (kept in the code's extension table).
 const CODE_NO: u8 = 1;
 const CODE_OK: u8 = 2;
@@ -404,6 +414,74 @@ fn scalar_truth(v: &Object) -> Option<bool> {
     })
 }
 
+/// A `SEND` of `None` to `it`, a `yield from`'s range, tuple or list
+/// iterator: `Some(Some(item))` its next item, `Some(None)` its end (a
+/// range's or tuple's, which frees nothing), `None` for the general path
+/// (another iterator, or a list's end, which detaches the list and may free
+/// a subclass's owner). Nothing here runs code.
+#[inline]
+pub(crate) fn send_iter_step(it: &Rc<crate::sync::RefCell<PyIterator>>) -> Option<Option<Object>> {
+    let mut it = it.try_borrow_mut().ok()?;
+    match &mut *it {
+        PyIterator::Range { .. } | PyIterator::Tuple { .. } => Some(it.next_value()),
+        PyIterator::List { items, index, .. } => {
+            let v = items.try_borrow().ok()?.get(*index).cloned()?;
+            *index += 1;
+            Some(Some(v))
+        }
+        _ => None,
+    }
+}
+
+/// [`send_iter_step`] for a whole run: the remaining items of a range,
+/// tuple or list iterator (up to a bound) appended to `out`, the cursor
+/// left past them, for a `yield from` whose every yield a collecting
+/// consumer would take. `false`, nothing taken, for any other iterator.
+pub(crate) fn send_iter_drain(
+    it: &Rc<crate::sync::RefCell<PyIterator>>,
+    out: &mut Vec<Object>,
+) -> bool {
+    const MAX: usize = 1 << 16;
+    let Ok(mut it) = it.try_borrow_mut() else {
+        return false;
+    };
+    match &mut *it {
+        PyIterator::Tuple { items, index } => {
+            let rest = items.get(*index..).unwrap_or(&[]);
+            let rest = &rest[..rest.len().min(MAX)];
+            out.extend_from_slice(rest);
+            *index += rest.len();
+        }
+        PyIterator::List {
+            items,
+            index,
+            owner: None,
+        } => {
+            let Ok(v) = items.try_borrow() else {
+                return false;
+            };
+            let rest = v.get(*index..).unwrap_or(&[]);
+            let rest = &rest[..rest.len().min(MAX)];
+            out.extend_from_slice(rest);
+            *index += rest.len();
+        }
+        PyIterator::Range {
+            current,
+            stop,
+            step,
+        } if *step > 0 => {
+            let mut n = 0;
+            while *current < *stop && n < MAX {
+                out.push(Object::Int(*current));
+                *current = current.wrapping_add(*step);
+                n += 1;
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
 /// How deep a chain of `yield from` delegations steps directly (see
 /// `Interpreter::gen_chain_step`).
 #[cfg(feature = "jit")]
@@ -521,7 +599,8 @@ impl Interpreter {
         if stack.capacity() < want {
             stack.reserve(want - stack.len());
         }
-        let (base, cap) = (stack.as_mut_ptr(), stack.capacity());
+        #[cfg_attr(not(feature = "jit"), allow(unused_mut))]
+        let (mut base, mut cap) = (stack.as_mut_ptr(), stack.capacity());
         let mut len = stack.len();
         let mut pc = frame.pc as usize;
         if pc >= ninstrs {
@@ -761,6 +840,20 @@ impl Interpreter {
                         ext.frame_jit
                             .warm(code, ext, nlocals, crate::frame_jit::Heat::Step);
                         native = ext.frame_jit.get(nlocals);
+                        // The native form arrived in the middle of the
+                        // step, whose stack was sized without it: it grows
+                        // now, as the next step's would (no view of it is
+                        // built yet). Left small, every entry of a fold
+                        // that drains the body in this one step would get
+                        // nowhere, and the entries would be given up.
+                        if let Some(n) = native.filter(|n| cap < n.need()) {
+                            // SAFETY: the first `len` slots are initialized,
+                            // as at the step's end.
+                            unsafe { frame.stack.set_len(len) };
+                            frame.stack.reserve(n.need() - len);
+                            base = frame.stack.as_mut_ptr();
+                            cap = frame.stack.capacity();
+                        }
                     }
                 }
                 // `iter()` of an iterator or a generator is itself.
@@ -1241,14 +1334,38 @@ impl Interpreter {
                 break 'lean;
             };
             let pc = frame.pc as usize;
-            // Resting in a `yield from` over a generator (its delegate tops
-            // its stack): the delegate steps directly (see
-            // `gen_chain_step`).
-            if level < CHAIN_LEVELS
-                && matches!(frame.stack.last(), Some(Object::Generator(_)))
-                && crate::yield_from_resend(&code.instructions, pc).is_some()
-            {
-                return self.gen_chain_step(g, snap_gen, dead, depth_cell, level);
+            // (A loop's iterator tops the stack at most plain yields: the
+            // shortcuts below are for a `yield from`'s resume point alone.)
+            if crate::yield_from_resend(&code.instructions, pc).is_some() {
+                match frame.stack.last() {
+                    // Resting in a `yield from` over a generator (its
+                    // delegate tops its stack): the delegate steps directly
+                    // (see `gen_chain_step`).
+                    Some(Object::Generator(_)) if level < CHAIN_LEVELS => {
+                        return self.gen_chain_step(g, snap_gen, dead, depth_cell, level);
+                    }
+                    // Resting in a `yield from` over a range, tuple or list
+                    // iterator with an item left: the item, the frame
+                    // untouched (a `SEND` of `None` to it and the
+                    // `YIELD_VALUE` after are just that). Its end, and every
+                    // other iterator, take the general resume.
+                    Some(Object::Iter(it)) => {
+                        if let Some(v) = Self::yield_from_iter_item(frame, code, pc, it) {
+                            return GenNext::Yielded(v);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // A body whose steps keep stopping partway: declined untouched,
+            // for the caller's resume (but one in `STALL_RETRY`).
+            let stalls = ext.gen_stalls.load(Ordering::Relaxed);
+            if stalls >= STALL_LIMIT {
+                ext.gen_stalls
+                    .store(stalls.saturating_add(1), Ordering::Relaxed);
+                if !(stalls - STALL_LIMIT).is_multiple_of(STALL_RETRY) {
+                    return GenNext::Declined;
+                }
             }
             let Some(native) = ext.frame_jit.get(frame.locals.len()) else {
                 break 'lean;
@@ -1304,21 +1421,83 @@ impl Interpreter {
             frame.stack.push_fast(Object::None);
             // SAFETY: the checks above.
             let ran = unsafe { self.gen_native_run(frame, native, locals, snap_gen, 0, dead) };
+            let stalls = ext.gen_stalls.load(Ordering::Relaxed);
             return match ran {
-                Ok((v, false)) => {
-                    Self::park_stepped(g, boxed);
-                    GenNext::Yielded(v)
-                }
-                Ok((v, true)) => {
-                    self.retire_gen(g, boxed);
-                    GenNext::Exhausted(v)
+                Ok((v, done)) => {
+                    if stalls != 0 {
+                        // (A retry past the limit that ran clean starts over.)
+                        let next = if stalls >= STALL_LIMIT { 0 } else { stalls - 1 };
+                        ext.gen_stalls.store(next, Ordering::Relaxed);
+                    }
+                    if done {
+                        self.retire_gen(g, boxed);
+                        GenNext::Exhausted(v)
+                    } else {
+                        Self::park_stepped(g, boxed);
+                        GenNext::Yielded(v)
+                    }
                 }
                 Err(at) => {
+                    if stalls < STALL_LIMIT {
+                        ext.gen_stalls.store(stalls + 1, Ordering::Relaxed);
+                    }
                     self.gen_resume_rest(g, boxed, ext, start, false, at, snap_gen, 0, None, dead)
                 }
             };
         }
         self.gen_fast_next(g, snap_gen, 0, dead)
+    }
+
+    /// The next item of `it`, the native iterator a generator's suspended
+    /// `frame` (at `pc` of `code`) rests on in a `yield from`, when stepping
+    /// it runs no code and doesn't end it (see `gen_native_next`).
+    #[inline]
+    pub(crate) fn yield_from_iter_item(
+        frame: &Frame,
+        code: &CodeObject,
+        pc: usize,
+        it: &Rc<crate::sync::RefCell<PyIterator>>,
+    ) -> Option<Object> {
+        // (A loop's iterator tops the stack at a plain yield: only a
+        // `yield from`'s resume point goes on.)
+        let send = crate::yield_from_resend(&code.instructions, pc)?;
+        Self::yield_from_iter_step(frame, code, send, it)
+    }
+
+    /// [`Self::yield_from_iter_item`] past its resume-point check (`send`
+    /// is the `SEND`'s pc).
+    #[inline(never)]
+    fn yield_from_iter_step(
+        frame: &Frame,
+        code: &CodeObject,
+        send: usize,
+        it: &Rc<crate::sync::RefCell<PyIterator>>,
+    ) -> Option<Object> {
+        use std::sync::atomic::Ordering;
+        if code.instructions[send].arg & crate::GEN_SEND != 0
+            || frame.sent_consumed
+            || frame.py_frame.is_some()
+            || frame.has_saved_exc_info()
+            || frame.parked_native.is_some()
+            || frame
+                .shell_cache
+                .as_ref()
+                .is_some_and(|c| c.has_materialized.load(Ordering::Relaxed))
+            || crate::trace::eval_frame_record_active()
+        {
+            return None;
+        }
+        let mut it = it.try_borrow_mut().ok()?;
+        match &mut *it {
+            PyIterator::Range { .. } | PyIterator::Tuple { .. } => it.next_value(),
+            // (A list's end detaches it and may free a subclass owner.)
+            PyIterator::List { items, index, .. } => {
+                let v = items.try_borrow().ok()?.get(*index).cloned()?;
+                *index += 1;
+                Some(v)
+            }
+            _ => None,
+        }
     }
 
     /// [`Self::gen_native_next`] for a generator resting in a `yield from`
@@ -1375,7 +1554,10 @@ impl Interpreter {
                     .is_some_and(|c| c.has_materialized.load(Ordering::Relaxed))
                 || crate::trace::eval_frame_record_active()
                 || Rc::ptr_eq(d, g)
-                || !may_step(d)
+                // (A delegate whose body no fast step runs may still rest in
+                // a `yield from` of its own, which steps it the same way; one
+                // that doesn't declines at once, touching nothing.)
+                || d.chain.get() != 0
             {
                 break 'chain;
             }

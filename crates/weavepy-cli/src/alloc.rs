@@ -39,32 +39,35 @@ pub(crate) struct Mimalloc;
 unsafe impl GlobalAlloc for Mimalloc {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        #[cfg(target_vendor = "apple")]
+        if layout.size() > large::MIN {
+            // SAFETY: the caller's contract.
+            return unsafe { large::alloc(layout, false) };
+        }
         // SAFETY: plain FFI allocation calls.
-        let p: *mut u8 = unsafe {
-            if plain(layout.size(), layout.align()) {
-                mi_malloc(layout.size()).cast()
-            } else {
-                mi_malloc_aligned(layout.size(), layout.align()).cast()
-            }
-        };
-        p
+        unsafe { mi_alloc(layout) }
     }
 
     #[inline]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: as in `alloc`.
-        let p: *mut u8 = unsafe {
-            if plain(layout.size(), layout.align()) {
-                mi_zalloc(layout.size()).cast()
-            } else {
-                mi_zalloc_aligned(layout.size(), layout.align()).cast()
-            }
-        };
-        p
+        #[cfg(target_vendor = "apple")]
+        if layout.size() > large::MIN {
+            // SAFETY: the caller's contract.
+            return unsafe { large::alloc(layout, true) };
+        }
+        // SAFETY: plain FFI allocation calls.
+        unsafe { mi_alloc_zeroed(layout) }
     }
 
     #[inline]
-    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        #[cfg(target_vendor = "apple")]
+        if layout.size() > large::MIN {
+            // SAFETY: the caller's contract.
+            return unsafe { large::free(ptr) };
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        let _ = layout;
         // SAFETY: `ptr` came from this allocator (the caller's contract).
         unsafe { mi_free(ptr.cast::<c_void>()) }
     }
@@ -83,8 +86,215 @@ unsafe impl GlobalAlloc for Mimalloc {
     }
 }
 
+/// A block for `layout` from mimalloc's plain or aligned entry point.
+///
+/// # Safety
+///
+/// As [`GlobalAlloc::alloc`]'s.
+#[inline(always)]
+unsafe fn mi_alloc(layout: Layout) -> *mut u8 {
+    // SAFETY: plain FFI allocation calls.
+    unsafe {
+        if plain(layout.size(), layout.align()) {
+            mi_malloc(layout.size()).cast()
+        } else {
+            mi_malloc_aligned(layout.size(), layout.align()).cast()
+        }
+    }
+}
+
+/// [`mi_alloc`], zeroed.
+///
+/// # Safety
+///
+/// As [`GlobalAlloc::alloc_zeroed`]'s.
+#[inline(always)]
+unsafe fn mi_alloc_zeroed(layout: Layout) -> *mut u8 {
+    // SAFETY: as in `mi_alloc`.
+    unsafe {
+        if plain(layout.size(), layout.align()) {
+            mi_zalloc(layout.size()).cast()
+        } else {
+            mi_zalloc_aligned(layout.size(), layout.align()).cast()
+        }
+    }
+}
+
+/// Freed blocks too large for mimalloc's arenas, kept a while for reuse.
+///
+/// mimalloc maps a block over [`ARENA_MAX_OBJECT_KIB`] from the OS and
+/// unmaps it when it's freed, so a program that builds and drops such a
+/// buffer over and over (`b"x" * 4_000_000`, a whole-file read, `[0] *
+/// 1_000_000`) faulted every page of it in again each time: five to eight
+/// times CPython's time, whose allocator keeps freed large blocks for
+/// reuse as this does. A few blocks stay, each taken by an allocation of
+/// about its size, and [`trim`] frees any idle past the purge delay, so
+/// a block nothing reuses leaves the resident set soon after.
+#[cfg(target_vendor = "apple")]
+mod large {
+    use super::{mi_free, mi_usable_size};
+    use std::ffi::c_void;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Blocks above this many bytes are mapped from the OS.
+    pub(super) const MIN: usize = super::ARENA_MAX_OBJECT_KIB as usize * 1024;
+    /// The largest block kept, and the most kept in all.
+    const MAX: usize = 32 << 20;
+    const TOTAL: usize = 64 << 20;
+    const SLOTS: usize = 4;
+
+    struct Cache {
+        /// (block, usable size, when it was kept in microseconds).
+        slots: [(usize, usize, u64); SLOTS],
+    }
+
+    static LOCK: AtomicBool = AtomicBool::new(false);
+    static mut CACHE: Cache = Cache {
+        slots: [(0, 0, 0); SLOTS],
+    };
+
+    /// The cache under its spin lock (held for a few instructions).
+    fn with<R>(f: impl FnOnce(&mut Cache) -> R) -> R {
+        while LOCK
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            std::hint::spin_loop();
+        }
+        // SAFETY: the lock gives exclusive access.
+        let r = f(unsafe { &mut *std::ptr::addr_of_mut!(CACHE) });
+        LOCK.store(false, Ordering::Release);
+        r
+    }
+
+    /// Microseconds on a monotonic clock that doesn't allocate.
+    fn now() -> u64 {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: a plain clock read into a local.
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &raw mut ts) };
+        ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1000
+    }
+
+    /// [`super::Mimalloc`]'s allocation of more than [`MIN`] bytes: a kept
+    /// block of about the size (zeroed if asked), else mimalloc's. Out of
+    /// line, so the small allocations' path stays a compare and a jump.
+    ///
+    /// # Safety
+    ///
+    /// As [`std::alloc::GlobalAlloc::alloc`]'s.
+    #[cold]
+    #[inline(never)]
+    pub(super) unsafe fn alloc(layout: std::alloc::Layout, zeroed: bool) -> *mut u8 {
+        if layout.align() <= super::MAX_ALIGN {
+            if let Some(p) = take(layout.size()) {
+                if zeroed {
+                    // (Zeroing resident pages costs a fraction of faulting
+                    // in fresh ones.)
+                    // SAFETY: the block holds at least `layout.size()` bytes.
+                    unsafe { std::ptr::write_bytes(p, 0, layout.size()) };
+                }
+                return p;
+            }
+        }
+        // SAFETY: the caller's contract.
+        unsafe {
+            if zeroed {
+                super::mi_alloc_zeroed(layout)
+            } else {
+                super::mi_alloc(layout)
+            }
+        }
+    }
+
+    /// [`super::Mimalloc`]'s release of a block of more than [`MIN`] bytes:
+    /// kept if there's room, else freed.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` is a live block of this allocator.
+    #[cold]
+    #[inline(never)]
+    pub(super) unsafe fn free(ptr: *mut u8) {
+        if !keep(ptr) {
+            // SAFETY: the caller's contract.
+            unsafe { mi_free(ptr.cast::<c_void>()) };
+        }
+    }
+
+    /// A kept block of at least `size` bytes, and not much more.
+    fn take(size: usize) -> Option<*mut u8> {
+        if size > MAX {
+            return None;
+        }
+        with(|c| {
+            let i = c.slots.iter().position(|&(p, usable, _)| {
+                p != 0 && usable >= size && usable - size <= size / 4
+            })?;
+            let p = c.slots[i].0;
+            c.slots[i] = (0, 0, 0);
+            Some(p as *mut u8)
+        })
+    }
+
+    /// Keep the freed block `ptr` if there's room: `false` to free it.
+    fn keep(ptr: *mut u8) -> bool {
+        // SAFETY: `ptr` is a live mimalloc block being freed.
+        let usable = unsafe { mi_usable_size(ptr.cast::<c_void>().cast_const()) };
+        if usable > MAX {
+            return false;
+        }
+        let at = now();
+        with(|c| {
+            let held: usize = c.slots.iter().map(|s| s.1).sum();
+            match c.slots.iter().position(|&(p, _, _)| p == 0) {
+                Some(i) if held + usable <= TOTAL => {
+                    c.slots[i] = (ptr as usize, usable, at);
+                    true
+                }
+                _ => false,
+            }
+        })
+    }
+
+    /// Free the kept blocks idle for longer than `idle_micros`.
+    pub(super) fn trim(idle_micros: u64) {
+        let at = now();
+        let mut old = [0usize; SLOTS];
+        with(|c| {
+            for (slot, out) in c.slots.iter_mut().zip(old.iter_mut()) {
+                if slot.0 != 0 && at.saturating_sub(slot.2) > idle_micros {
+                    *out = slot.0;
+                    *slot = (0, 0, 0);
+                }
+            }
+        });
+        for p in old.into_iter().filter(|&p| p != 0) {
+            // SAFETY: a block this cache owned.
+            unsafe { mi_free(p as *mut c_void) };
+        }
+    }
+}
+
+/// Free the large blocks kept for reuse that have sat idle past the purge
+/// delay (see [`large`]): from the runtime's memory ticks.
+pub(crate) fn trim_large_blocks() {
+    #[cfg(target_vendor = "apple")]
+    large::trim(
+        if PURGE_DELAY_OURS.load(std::sync::atomic::Ordering::Relaxed) {
+            PURGE_DELAY_MS as u64 * 1000
+        } else {
+            LARGE_PURGE_DELAY_MS as u64 * 1000
+        },
+    );
+}
+
 extern "C" {
     fn mi_option_set(option: c_int, value: c_long);
+    #[cfg(target_vendor = "apple")]
+    fn mi_usable_size(p: *const c_void) -> usize;
     fn mi_collect(force: bool);
     #[cfg(unix)]
     #[allow(clippy::too_many_arguments)]

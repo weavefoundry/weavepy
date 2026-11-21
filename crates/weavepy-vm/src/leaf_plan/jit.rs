@@ -18,8 +18,8 @@
 //! natively too once the callee's own plan is compiled).
 
 use super::{
-    binary, compare, is_same, new_container, new_tuple, norm, plan_store, subscr, truth, unary,
-    LeafPlan, LeafRet, Op, Owned, Pending, NEST, V,
+    binary, compare, is_same, new_container, new_slice, new_tuple, norm, plan_store, subscr, truth,
+    unary, LeafPlan, LeafRet, Op, Owned, Pending, NEST, V,
 };
 use crate::object::{Object, PyFunction};
 use crate::sync::Rc;
@@ -52,7 +52,12 @@ const T_B: u64 = 6;
 const T_N: u64 = 7;
 
 /// A compiled plan: `(ctx, argument words) -> status`, where `0` returned
-/// (the result's words in `ctx.out`) and anything else declined.
+/// (the result's words in `ctx.out`), [`STOPPED`] ended an iterator step
+/// as exhausted, and anything else declined.
+/// The status of a frameless iterator step that ended at a bare `raise
+/// StopIteration` (see `Op::StopIter`).
+const STOPPED: u32 = 2;
+
 type NativeFn = unsafe extern "C" fn(*mut Ctx<'static>, *const u64) -> u32;
 
 /// A plan's native code and what it was compiled against.
@@ -373,6 +378,19 @@ fn enter<const EFFECT: bool>(
         )
     };
     if status != 0 {
+        // A frameless iterator step's bare `raise StopIteration` (see
+        // `Op::StopIter`): the stores buffered ahead of it land first, as
+        // a return's do (one that can't declines with nothing done).
+        if status == STOPPED {
+            if ctx.pend.n > 0
+                && interp
+                    .plan_finish::<EFFECT>(code, ext, plan, &ctx.owned, &mut ctx.pend, V::N)
+                    .is_none()
+            {
+                return Some(None);
+            }
+            return Some(Some(LeafRet::Owned(Object::Unbound)));
+        }
         return Some(None);
     }
     let v = value(ctx.out[0], ctx.out[1]);
@@ -397,6 +415,19 @@ unsafe fn cx<'a>(ctx: *mut Ctx<'static>) -> &'a mut Ctx<'a> {
 #[inline(always)]
 fn stamps(ext: &CodeConstObjects) -> crate::Sites<'_, crate::StampSlot> {
     ext.stamp_sites()
+}
+
+/// `Op::StopIter`: `0` when the raise of the value in words `(t, p)`
+/// ends the evaluation as an exhausted iterator step (see
+/// `stop_ends_step`; the stores buffered ahead of it land in [`run`]);
+/// `1` to decline.
+unsafe extern "C" fn h_stop_iter(ctx: *mut Ctx<'static>, t: u64, p: u64) -> u32 {
+    // SAFETY: called by native code with its context.
+    let c = unsafe { cx(ctx) };
+    // SAFETY: the evaluation's own frame is live.
+    let (code, _, _) = unsafe { c.top.parts() };
+    let lands = c.pend.n == 0 || c.interp.leaf_stop.get().2;
+    u32::from(!(lands && super::stop_ends_step(c.interp, code, c.nest, c.args, value(t, p))))
 }
 
 unsafe extern "C" fn h_global(
@@ -544,6 +575,11 @@ unsafe extern "C" fn h_field<const EFFECT: bool>(
                 let hit = unsafe {
                     if idx & SLOT_FIELD != 0 {
                         inst.laid_out_slot((idx & !SLOT_FIELD) as usize)
+                    } else if idx & DICT_FIELD != 0 {
+                        let (_, ext, _) = (*fr).parts();
+                        ext.name_objs
+                            .get((pc_name >> 16) as usize)
+                            .and_then(|n| inst.published_field((idx & !DICT_FIELD) as usize, n))
                     } else {
                         inst.split_field(idx as usize)
                     }
@@ -572,7 +608,11 @@ unsafe extern "C" fn h_field<const EFFECT: bool>(
         // The instance's own field (not a class value or descriptor),
         // from its split layout.
         let found = match Interpreter::leaf_resolve_instance_attr_ix(code, inst, pc_name >> 16) {
-            Some((_, Some(idx))) => inst.dict.published().is_none().then_some((idx, 0)),
+            // (A published dictionary's position, checked by name as read.)
+            Some((_, Some(idx))) if inst.dict.published().is_some() => {
+                (idx & (SLOT_FIELD | DICT_FIELD) == 0).then_some((idx | DICT_FIELD, 0))
+            }
+            Some((_, Some(idx))) => Some((idx, 0)),
             // A class value or descriptor.
             Some(_) => None,
             // A `__slots__` member laid out over its class's names.
@@ -594,6 +634,12 @@ unsafe extern "C" fn h_field<const EFFECT: bool>(
 /// class's slot layout (see [`crate::types::PyInstance::laid_out_slot`])
 /// rather than a split field's.
 const SLOT_FIELD: u32 = 1 << 31;
+
+/// A [`FieldCache`] position in the instance's published dictionary (see
+/// [`crate::types::PyInstance::published_field`]), which the read checks
+/// by name. Native code's in-line read never takes one: it reads split
+/// values only.
+const DICT_FIELD: u32 = 1 << 30;
 
 /// Where `inst` keeps the attribute `code.names[name]` when reading it
 /// means reading a `__slots__` member its class (at version `ver`) lays
@@ -751,7 +797,51 @@ unsafe extern "C" fn h_tuple(
     }
 }
 
+/// A slice of the first `n` of three bounds (see [`new_slice`]).
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn h_slice(
+    ctx: *mut Ctx<'static>,
+    ta: u64,
+    pa: u64,
+    tb: u64,
+    pb: u64,
+    tc: u64,
+    pc: u64,
+    n: u32,
+) -> u32 {
+    // SAFETY: called by native code with its context.
+    let c = unsafe { cx(ctx) };
+    let items = [value(ta, pa), value(tb, pb), value(tc, pc)];
+    match new_slice(&mut c.owned, items, n as u8) {
+        Some(v) => {
+            c.put(v);
+            0
+        }
+        None => 1,
+    }
+}
+
 /// `a[b]` (see [`subscr`]).
+/// `Op::Contains`: `0` the answer put, `1` declined.
+unsafe extern "C" fn h_contains(
+    ctx: *mut Ctx<'static>,
+    ta: u64,
+    pa: u64,
+    tb: u64,
+    pb: u64,
+    invert: u32,
+) -> u32 {
+    // SAFETY: called by native code with its context.
+    let c = unsafe { cx(ctx) };
+    match super::contains(value(ta, pa), value(tb, pb)) {
+        Some(found) => {
+            c.put(V::B(found != (invert != 0)));
+            0
+        }
+        None => 1,
+    }
+}
+
 unsafe extern "C" fn h_subscr(ctx: *mut Ctx<'static>, ta: u64, pa: u64, tb: u64, pb: u64) -> u32 {
     // SAFETY: called by native code with its context.
     let c = unsafe { cx(ctx) };
@@ -869,6 +959,9 @@ unsafe extern "C" fn h_call<const EFFECT: bool>(
     if n > 8 {
         return 1;
     }
+    // (A builtin type's pure constructor half, as the plan's interpreter
+    // calls it: `list(self.items)`, `str(n)`.)
+    let mut ctor = None;
     let (fp, native) = match reg(0) {
         V::Fn(fp) => (fp, None),
         V::Bi(b) => (std::ptr::null(), Some((b, None))),
@@ -876,6 +969,10 @@ unsafe extern "C" fn h_call<const EFFECT: bool>(
         V::R(p) => match unsafe { &*p } {
             Object::Function(func) => (Rc::as_ptr(func), None),
             Object::Builtin(b) => (std::ptr::null(), Some((Rc::as_ptr(b), Some(b)))),
+            Object::Type(t) if t.flags.is_builtin => {
+                ctor = Some(t);
+                (std::ptr::null(), None)
+            }
             _ => return 1,
         },
         _ => return 1,
@@ -898,7 +995,7 @@ unsafe extern "C" fn h_call<const EFFECT: bool>(
         };
         ptrs[k] = staged[k].write(o);
     }
-    if let Some((b, rc)) = native {
+    if native.is_some() || ctor.is_some() {
         // A read-only builtin, on borrowed copies of the arguments: never
         // dropped, so no reference moves.
         let mut copies = [const { std::mem::MaybeUninit::<Object>::uninit() }; 8];
@@ -909,7 +1006,12 @@ unsafe extern "C" fn h_call<const EFFECT: bool>(
         }
         // SAFETY: the first `n` copies were written.
         let args = unsafe { std::slice::from_raw_parts(copies.as_ptr().cast::<Object>(), n) };
-        let Some(r) = c.interp.leaf_pure_builtin(code, pc as usize, b, rc, args) else {
+        let r = match (native, ctor) {
+            (Some((b, rc)), _) => c.interp.leaf_pure_builtin(code, pc as usize, b, rc, args),
+            (None, Some(t)) => crate::seqiter::builtin_ctor_pure(t, args),
+            (None, None) => None,
+        };
+        let Some(r) = r else {
             return 1;
         };
         return match c.owned.own(r) {
@@ -2283,6 +2385,22 @@ impl Lower<'_> {
                 self.check(st);
                 self.set_out(fl, dst, 0);
             }
+            Op::Contains {
+                dst,
+                item,
+                cont,
+                invert,
+            } => {
+                let (ta, pa) = self.get(fl, item);
+                let (tb, pb) = self.get(fl, cont);
+                let inv = self.u32c(u32::from(invert));
+                let st = self.call(
+                    h_contains as *const () as usize,
+                    &[self.ctx, ta, pa, tb, pb, inv],
+                );
+                self.check(st);
+                self.set_out(fl, dst, 0);
+            }
             Op::Subscr { dst, a, b } => {
                 let (ta, pa) = self.get(fl, a);
                 let (tb, pb) = self.get(fl, b);
@@ -2302,8 +2420,34 @@ impl Lower<'_> {
                 self.check(st);
                 self.set_out(fl, dst, 0);
             }
+            Op::Slice { dst, a, b, c, n } => {
+                let (ta, pa) = self.get(fl, a);
+                let (tb, pb) = self.get(fl, b);
+                let (tc, pc) = self.get(fl, c);
+                let nv = self.u32c(u32::from(n));
+                let st = self.call(
+                    h_slice as *const () as usize,
+                    &[self.ctx, ta, pa, tb, pb, tc, pc, nv],
+                );
+                self.check(st);
+                self.set_out(fl, dst, 0);
+            }
             Op::Decline => {
                 self.b.ins().jump(self.decline, &[]);
+                return Some(false);
+            }
+            Op::StopIter { src } => {
+                // (An in-line callee's raise declines: only the step's own
+                // frame may end it.)
+                if fl.ret.is_some() {
+                    self.b.ins().jump(self.decline, &[]);
+                    return Some(false);
+                }
+                let (t, p) = self.get(fl, src);
+                let st = self.call(h_stop_iter as *const () as usize, &[self.ctx, t, p]);
+                self.check(st);
+                let two = self.b.ins().iconst(types::I32, i64::from(STOPPED));
+                self.b.ins().return_(&[two]);
                 return Some(false);
             }
             Op::StoreAttr {

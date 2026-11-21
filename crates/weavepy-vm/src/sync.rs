@@ -287,6 +287,7 @@ std::thread_local! {
             thread_id: std::cell::Cell::new(0),
             cell_id: std::cell::Cell::new(0),
             live_guards: std::cell::Cell::new(0),
+            parked_guards: std::cell::Cell::new(0),
         }
     };
 }
@@ -324,6 +325,9 @@ pub(crate) struct CellTls {
     cell_id: std::cell::Cell<u32>,
     /// Live [`Ref`]/[`RefMut`] guards on this thread.
     live_guards: std::cell::Cell<usize>,
+    /// This thread's lock-free guards while it is without the GIL (see
+    /// [`gil_given_up`]).
+    parked_guards: std::cell::Cell<usize>,
 }
 
 impl CellTls {
@@ -365,16 +369,20 @@ impl CellTls {
     }
 }
 
-/// Whether more than one OS thread has ever run VM code (a second
-/// thread acquired the GIL, or free-threading is on). Until then every
-/// cell is touched by exactly one thread, and a borrow skips the lock
+/// Whether a borrow must take the cell's lock word: some thread may
+/// touch a cell without the GIL (free-threading, a thread the VM didn't
+/// start, a watcher, a thread outside its outermost GIL scope beside
+/// others; see [`gil_orders_counts`]). Until then a borrow skips the lock
 /// word: no compare-exchange to take it, no release store to drop it.
-/// Set by [`note_vm_thread`] *before* the second thread touches any
-/// cell; the first thread cannot hold a borrow across a GIL release
-/// (the hand-off refuses while guards are live), so no guard taken
-/// lock-free is ever live once another thread runs. A guard remembers
-/// whether it took the lock, so a flip while one is live (impossible
-/// per the invariant) still releases correctly.
+/// With one thread nothing else reaches a cell. With several under the
+/// GIL, the GIL orders every borrow and release, and the borrow counter
+/// alone keeps a shared and an exclusive borrow apart, across threads as
+/// within one (a thread can hold a borrow across a blocking call; the
+/// lock word made another thread's borrow of that cell spin with the GIL
+/// held, where the counter makes it fail like a nested borrow). Set by
+/// [`share_all`], under the GIL or before a second thread exists; a guard
+/// remembers whether it took the lock, so a flip while one is live still
+/// releases correctly.
 static CELLS_SHARED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[inline]
@@ -470,9 +478,9 @@ pub(crate) fn release_gates_ptr() -> *const u32 {
 /// but the reference-count bias's `rc_shared`).
 pub(crate) const RELEASE_OBSERVER_GATES: u32 = u32::from_ne_bytes([0, 0xff, 0xff, 0xff]);
 
-/// Whether reference counts must be updated atomically: set whenever the
-/// cell bias is revoked, and also before spawning a thread that may touch
-/// objects before it registers (see [`crate::rc`]). Never cleared.
+/// Whether reference counts must be updated atomically: set once a thread
+/// may touch a count without the GIL (see [`gil_orders_counts`], and
+/// [`crate::rc`]). Cleared again only by [`restore_bias`].
 static RC_SHARED: &std::sync::atomic::AtomicBool = &RELEASE_GATES.rc_shared;
 
 /// The flag [`bias_held`] reads (native code that takes references in
@@ -481,35 +489,199 @@ pub(crate) fn rc_shared_flag() -> &'static std::sync::atomic::AtomicBool {
     RC_SHARED
 }
 
-/// True while one thread owns every reference count (see [`crate::rc`]).
+/// True while reference counts are updated with plain loads and stores:
+/// one thread owns every count, or the GIL orders every update (see
+/// [`crate::rc`]).
 #[cfg_attr(debug_assertions, allow(dead_code))]
 #[inline(always)]
 pub(crate) fn bias_held() -> bool {
     // A plain read (one compare with memory, where a relaxed load is a load,
-    // a test and an address computation): the flag changes before a second
-    // thread touches an object, and that thread's GIL acquire orders the
-    // change before this thread's next read. Nothing can hold the value
-    // across a GIL release, which is a synchronizing call.
+    // a test and an address computation): the flag is set by a thread that
+    // holds the GIL (or before a second thread exists), and every other
+    // thread's GIL acquire orders the change before its next read. Nothing
+    // can hold the value across a GIL release, which is a synchronizing
+    // call.
     // SAFETY: a `bool` in a live static (see above for the ordering).
     !unsafe { RC_SHARED.as_ptr().read() }
 }
 
-/// Make reference counting atomic before spawning a thread that will run
-/// VM code. Cell borrows keep their bias until the thread registers: the
-/// spawner may hold a lock-free guard now, and it can't hand the GIL to the
-/// new thread until that guard is released.
+/// Whether a thread other than the first runs VM code, or was spawned to:
+/// set with the first worker's spawn or a second thread's first GIL
+/// acquire, cleared by [`restore_bias`]. Another thread can then look at
+/// this one's frames and mutate what it reads whenever it gives up the
+/// GIL, whether or not reference counts are atomic (see
+/// [`gil_orders_counts`]).
+static VM_THREADS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether more than one thread runs VM code (see [`VM_THREADS`]).
+#[inline]
+pub(crate) fn threads_started() -> bool {
+    VM_THREADS.load(Ordering::Relaxed)
+}
+
+/// Whether the GIL alone orders reference-count updates, so that counts
+/// stay plain with several threads: every thread that touches an object
+/// holds the GIL while it does, and a hand-off of the GIL orders one
+/// thread's updates before the next one's.
+///
+/// That holds for the threads the VM starts and for the first thread
+/// while it stays inside the VM (see [`counts_leave_gil`]). It doesn't
+/// with free-threading, with a watcher that reads state from outside the
+/// GIL, or after a thread the VM didn't start appeared, whose discipline
+/// is its own; counts are atomic then, as they are on Windows (whose
+/// blocking paths haven't been checked against the rule) and under
+/// `WEAVEPY_ATOMIC_COUNTS=1`. Cell borrows follow the same rule (see
+/// [`CELLS_SHARED`]). Once counts are atomic the answer stays no until
+/// [`restore_bias`].
+fn gil_orders_counts() -> bool {
+    static ALLOWED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // (Not in a debug or test build: the unit-test binary's threads run
+    // interpreters with no GIL between them.)
+    *ALLOWED.get_or_init(|| {
+        !cfg!(any(windows, debug_assertions, test))
+            && std::env::var_os("WEAVEPY_ATOMIC_COUNTS").is_none_or(|v| v == "0")
+    }) && !RC_SHARED.load(Ordering::SeqCst)
+        && !CELLS_UNGUARDED.load(Ordering::SeqCst)
+        && !FOREIGN_SEEN.load(Ordering::SeqCst)
+        && !crate::gil::free_threading_enabled()
+}
+
+/// Make reference counting atomic before spawning a thread that may touch
+/// objects without the GIL. Cell borrows keep their bias until the thread
+/// registers: the spawner may hold a lock-free guard now, and it can't
+/// hand the GIL to the new thread until that guard is released.
 pub(crate) fn revoke_bias_for_spawn() {
+    VM_THREADS.store(true, Ordering::SeqCst);
     RC_SHARED.store(true, Ordering::SeqCst);
+}
+
+/// Before spawning a worker that takes the GIL ahead of its first touch
+/// of an object, and keeps it through its last: counts stay plain when
+/// the spawner holds the GIL too (see [`gil_orders_counts`]).
+pub(crate) fn note_worker_spawn(spawner_holds_gil: bool) {
+    VM_THREADS.store(true, Ordering::SeqCst);
+    if !spawner_holds_gil || !gil_orders_counts() {
+        RC_SHARED.store(true, Ordering::SeqCst);
+    }
+}
+
+/// The calling thread, holding the GIL, is about to give it up outside a
+/// blocking call's bracket (its outermost scope ends) and may touch
+/// objects afterwards: an embedder reading a result, the command line
+/// reporting an exception. With other threads running, counts are atomic
+/// and borrows locked from here on. Every other thread is parked outside
+/// the VM or in a blocking call now, and takes the GIL, which orders
+/// these stores, before its next update.
+pub(crate) fn counts_leave_gil() {
+    if VM_THREADS.load(Ordering::Relaxed)
+        && !(RC_SHARED.load(Ordering::Relaxed) && CELLS_SHARED.load(Ordering::Relaxed))
+    {
+        share_all();
+    }
+}
+
+/// The calling thread is about to give up the GIL for real (its last
+/// guard goes): [`SOLE_GUARDS`] counts the GIL holder's lock-free
+/// guards, so the ones this thread still holds (a borrow kept across a
+/// blocking call) leave the count with it and come back in
+/// [`gil_taken`]. Left in, they'd make every other thread refuse the
+/// cooperative hand-off (see [`cell_guards_live`]) until this one ran
+/// again, which it couldn't.
+#[inline]
+pub(crate) fn gil_given_up() {
+    let n = SOLE_GUARDS.load(Ordering::Relaxed);
+    if n != 0 {
+        park_sole_guards(n);
+    }
+}
+
+#[cold]
+fn park_sole_guards(n: usize) {
+    let _ = CELL_TLS.try_with(|t| {
+        // (A debug or test build's threads run without a GIL between
+        // them, and only the first takes lock-free guards: the count is
+        // that thread's alone.)
+        if cfg!(any(debug_assertions, test)) && FIRST.load(Ordering::Relaxed) != t.thread_id() {
+            return;
+        }
+        t.parked_guards.set(t.parked_guards.get() + n);
+        SOLE_GUARDS.store(0, Ordering::Release);
+        PARKED_GUARDS.fetch_add(n, Ordering::SeqCst);
+    });
+}
+
+/// Lock-free guards held by threads that are without the GIL (see
+/// [`gil_given_up`]): blocked in a call with a borrow live, or waiting to
+/// take the GIL back after one.
+static PARKED_GUARDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How long [`retry_past_parked`] waits when the caller holds borrows of
+/// its own, so that its failure may be a nested borrow and not another
+/// thread's.
+const PARKED_WAIT_UNSURE: Duration = Duration::from_millis(2);
+
+/// `attempt` again, for as long as it fails and a borrow held by a
+/// thread blocked without the GIL may be why: the GIL goes to that
+/// thread between tries, so that it can finish and release. `None` once
+/// no other thread holds a borrow (the failure is this thread's own
+/// nested borrow, the caller's to handle as before), and at once in any
+/// mode but GIL-ordered lock-free borrows.
+///
+/// For a caller at a point where other threads may run: it holds no
+/// guardless view of any cell, as around any blocking call. (CPython
+/// lets the second thread's operation through at once; here it waits
+/// for the first's, as it would for a per-object lock. With the lock
+/// word, it spun for that thread with the GIL held, a deadlock.)
+pub(crate) fn retry_past_parked<T>(mut attempt: impl FnMut() -> Option<T>) -> Option<T> {
+    if cells_shared() || PARKED_GUARDS.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    if !crate::gil::try_current_thread_holds_gil() {
+        return None;
+    }
+    // With no borrow of its own the caller can only have met another
+    // thread's, and waits it out.
+    let unsure = SOLE_GUARDS.load(Ordering::Relaxed) != 0;
+    let start = Instant::now();
+    let mut pause = Duration::from_micros(20);
+    loop {
+        crate::gil::allow_threads_then(|| std::thread::sleep(pause));
+        pause = (pause * 2).min(Duration::from_millis(2));
+        if let Some(v) = attempt() {
+            return Some(v);
+        }
+        if cells_shared()
+            || PARKED_GUARDS.load(Ordering::Relaxed) == 0
+            || (unsure && start.elapsed() >= PARKED_WAIT_UNSURE)
+        {
+            return None;
+        }
+    }
+}
+
+/// The calling thread has just taken the GIL for real (see
+/// [`gil_given_up`]).
+#[inline]
+pub(crate) fn gil_taken() {
+    let _ = CELL_TLS.try_with(|t| {
+        let n = t.parked_guards.get();
+        if n != 0 {
+            t.parked_guards.set(0);
+            SOLE_GUARDS.store(SOLE_GUARDS.load(Ordering::Relaxed) + n, Ordering::Release);
+            PARKED_GUARDS.fetch_sub(n, Ordering::SeqCst);
+        }
+    });
 }
 
 /// The first thread to run VM code (see [`note_vm_thread`]).
 static FIRST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Live borrow guards taken lock-free (while the bias held). Only the
-/// biased thread takes such guards, but [`revoke_bias`] reads the count
-/// from another thread, so both sides are sequentially consistent: the
-/// drain below and the re-check in the borrow fast paths must not miss
-/// each other.
+/// Live borrow guards taken lock-free (while [`CELLS_SHARED`] was clear)
+/// by the thread that holds the GIL: a thread's own leave the count while
+/// it is without the GIL (see [`gil_given_up`]). Plain updates, ordered by
+/// the GIL; [`share_all`] may read the count from a thread that has none,
+/// so its drain and the re-check in the borrow fast paths are
+/// sequentially consistent and can't miss each other.
 static SOLE_GUARDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The `tls` tag of a guard counted in [`SOLE_GUARDS`].
@@ -545,7 +717,7 @@ fn biased_here() -> bool {
     // invariant above does not hold there, and only the first registered
     // thread may take the lock-free path. (Without it, two threads' plain
     // updates of `SOLE_GUARDS` can lose one, and the next thread to
-    // register spins in `revoke_bias` forever, holding the GIL.) A release
+    // register spins in `share_all` forever, holding the GIL.) A release
     // build has one VM thread under the GIL and pays nothing.
     #[cfg(any(debug_assertions, test))]
     {
@@ -559,7 +731,7 @@ fn biased_here() -> bool {
 }
 
 /// Publish a lock-free guard and re-check that the bias still holds.
-/// Both accesses are `SeqCst`, so this and [`revoke_bias`] linearise:
+/// Both accesses are `SeqCst`, so this and [`share_all`] linearise:
 /// whichever runs second observes the other's write, and a borrow is
 /// therefore never held lock-free once a revoker has moved on.
 #[inline]
@@ -568,7 +740,7 @@ fn publish_sole_guard() {
     // whole cost. It needs no barrier: a revoker that can race this
     // thread is one that touches cells without the GIL, which is outside
     // the contract `biased_here` documents -- and for the backstop in
-    // `try_borrow_locked` that catches such a thread anyway, `revoke_bias`
+    // `try_borrow_locked` that catches such a thread anyway, `share_all`
     // runs a barrier on *every* thread first, which makes this store
     // visible to its drain.
     let n = SOLE_GUARDS.load(Ordering::Relaxed);
@@ -636,7 +808,7 @@ fn heavy_barrier() {
         // cannot fail with EPERM; on any other outcome fall back to a
         // local fence *and* keep the flag, because readers may already be
         // relying on it -- the fence below then orders this side, and the
-        // spin in `revoke_bias` still waits for every published guard.
+        // spin in `share_all` still waits for every published guard.
         let rc = unsafe {
             libc::syscall(
                 libc::SYS_membarrier,
@@ -674,18 +846,37 @@ fn retract_sole_guard() {
     SOLE_GUARDS.store(n.saturating_sub(1), Ordering::Release);
 }
 
-/// Take every cell off the biased path, then wait for the biased
-/// thread's lock-free guards to drain. Only the thread that performs
-/// the transition drains, so a thread that already sees cells shared —
-/// including the biased thread backing out of its own fast path — never
-/// waits on a guard it is itself holding.
-fn revoke_bias() {
+/// A second thread runs VM code. Under the GIL nothing else changes:
+/// counts stay plain and borrows lock-free (see [`gil_orders_counts`]).
+#[cold]
+fn second_thread(thread_id: u64) {
+    if !VM_THREADS.load(Ordering::Relaxed) {
+        if std::env::var_os("WEAVEPY_CELLS_TRACE").is_some() {
+            eprintln!(
+                "[cells] thread {thread_id:#x} joins {:#x}",
+                FIRST.load(Ordering::Relaxed)
+            );
+        }
+        VM_THREADS.store(true, Ordering::SeqCst);
+    }
+    if !gil_orders_counts() {
+        share_all();
+    }
+}
+
+/// Make counts atomic and take every cell off the lock-free path: some
+/// thread will touch objects without the GIL. Only the thread that
+/// performs the transition drains, so a thread that already sees cells
+/// shared, including one backing out of its own fast path, never waits
+/// on a guard it is itself holding.
+fn share_all() {
+    VM_THREADS.store(true, Ordering::SeqCst);
     RC_SHARED.store(true, Ordering::SeqCst);
     if CELLS_SHARED.swap(true, Ordering::SeqCst) {
         return;
     }
     if std::env::var_os("WEAVEPY_CELLS_TRACE").is_some() {
-        eprintln!("[cells] shared: bias revoked");
+        eprintln!("[cells] shared: borrows take the lock word from here on");
     }
     // After this every thread has executed a full barrier: a borrow that
     // read the flag as clear did so before it, and its guard store --
@@ -694,28 +885,130 @@ fn revoke_bias() {
     // first time a barrier is due.)
     enable_asymmetric_barrier();
     heavy_barrier();
+    // A caller that holds the GIL has nothing to wait for: the counted
+    // guards are its own (every other thread's left the count when it
+    // gave the GIL up), and none of them can go while it waits here.
+    // (Waiting was a hang whenever one was live: a thread registering
+    // beside a main thread blocked in a call with a borrow held.)
+    if crate::gil::holds_gil_lock() {
+        return;
+    }
+    // Without the GIL (free-threading starting up, a thread that runs
+    // the VM with no GIL at all) the drain is what makes the transition
+    // safe. With cells touched outside the GIL it waits for good; while
+    // the GIL guards every cell a count that stays up can only be a lost
+    // update, and past a bound the caller goes on.
+    let bounded = !CELLS_UNGUARDED.load(Ordering::SeqCst) && !crate::gil::free_threading_enabled();
+    let start = std::time::Instant::now();
+    let mut spins = 0u32;
     while SOLE_GUARDS.load(Ordering::SeqCst) > 0 {
         std::hint::spin_loop();
+        spins = spins.wrapping_add(1);
+        if bounded && spins.is_multiple_of(1024) && start.elapsed() >= DRAIN_BOUND {
+            if std::env::var_os("WEAVEPY_CELLS_TRACE").is_some() {
+                eprintln!(
+                    "[cells] drain gave up after {:?}: {} guard(s) outstanding",
+                    start.elapsed(),
+                    SOLE_GUARDS.load(Ordering::SeqCst)
+                );
+            }
+            break;
+        }
     }
 }
 
+/// How long [`share_all`] waits for lock-free guards while the GIL guards
+/// every cell.
+const DRAIN_BOUND: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Record that `thread_id` is about to run VM code. Called from the GIL
 /// acquire path (and free-threading start-up); the first thread to
-/// register is the sole owner of every cell until a second one appears.
+/// register is the only one until a second appears (see
+/// [`second_thread`]).
+#[inline]
 pub fn note_vm_thread(thread_id: u64) {
     if CELLS_SHARED.load(Ordering::Relaxed) {
         return;
     }
-    match FIRST.compare_exchange(0, thread_id, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => {}
-        Err(first) if first == thread_id => {}
-        Err(first) => {
-            if std::env::var_os("WEAVEPY_CELLS_TRACE").is_some() {
-                eprintln!("[cells] shared: thread {thread_id:#x} joins {first:#x}");
-            }
-            revoke_bias();
+    let first = FIRST.load(Ordering::Relaxed);
+    if first == thread_id {
+        return;
+    }
+    if first == 0 {
+        match FIRST.compare_exchange(0, thread_id, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return,
+            Err(first) if first == thread_id => return,
+            Err(_) => {}
         }
     }
+    second_thread(thread_id);
+}
+
+/// Set once a thread the VM didn't start (a C thread entering through
+/// `PyGILState_Ensure`, say) takes the GIL: nothing says when it's gone, so
+/// the bias is never restored (see [`restore_bias`]).
+static FOREIGN_SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+std::thread_local! {
+    /// Whether this thread is known to the VM: the first to register, or a
+    /// worker it started (see [`note_vm_worker`]). Checked at its first
+    /// GIL acquire ([`note_gil_thread`]).
+    static KNOWN_THREAD: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+/// Mark the calling thread as a worker the VM started, before it first
+/// takes the GIL.
+pub(crate) fn note_vm_worker() {
+    KNOWN_THREAD.with(|k| k.set(1));
+}
+
+/// Called with the GIL just taken (after [`note_vm_thread`]): a thread
+/// that is neither the first to register nor a worker the VM started is
+/// foreign (see [`FOREIGN_SEEN`]).
+#[inline]
+pub(crate) fn note_gil_thread(thread_id: u64) {
+    let _ = KNOWN_THREAD.try_with(|k| {
+        if k.get() == 0 {
+            k.set(1);
+            if FIRST.load(Ordering::Acquire) != thread_id {
+                // (Under the GIL just taken: counts are atomic and
+                // borrows locked before this thread, whose discipline
+                // is its own, touches an object.)
+                FOREIGN_SEEN.store(true, Ordering::SeqCst);
+                share_all();
+            }
+        }
+    });
+}
+
+/// Back to one thread: the caller, `thread_id`, has joined every worker's
+/// OS thread, so nothing else can touch an object until a new thread
+/// registers or is spawned. Counts go back to plain and borrows to
+/// lock-free if they had left (a spawn made without the GIL, a thread
+/// that left its outermost scope beside workers). Declined (`false`)
+/// after a foreign thread or a thread that touches objects without the
+/// GIL appeared, or while this thread holds a cell borrow taken on the
+/// locked path.
+pub(crate) fn restore_bias(thread_id: u64) -> bool {
+    if !VM_THREADS.load(Ordering::SeqCst)
+        || CELLS_UNGUARDED.load(Ordering::SeqCst)
+        || FOREIGN_SEEN.load(Ordering::SeqCst)
+        || FIRST.load(Ordering::SeqCst) != thread_id
+    {
+        return false;
+    }
+    if CELLS_SHARED.load(Ordering::SeqCst)
+        && (cell_guards_live() || SOLE_GUARDS.load(Ordering::SeqCst) != 0)
+    {
+        return false;
+    }
+    if std::env::var_os("WEAVEPY_CELLS_TRACE").is_some() {
+        eprintln!("[cells] thread {thread_id:#x} is the only one again");
+    }
+    CELLS_SHARED.store(false, Ordering::SeqCst);
+    RC_SHARED.store(false, Ordering::SeqCst);
+    VM_THREADS.store(false, Ordering::SeqCst);
+    true
 }
 
 /// Every cell is shared from now on (free-threading, a foreign thread
@@ -728,14 +1021,15 @@ pub fn note_vm_thread(thread_id: u64) {
 /// tier-2 attribute tests would then report as deopts.
 #[cfg(test)]
 pub(crate) fn revoke_bias_for_test() {
-    revoke_bias();
+    share_all();
 }
 
 pub fn mark_cells_shared() {
     // Ordered before the revocation: a thread that observes the bias
-    // gone must also observe that guardless reads are off.
+    // gone must also observe that guardless reads are off. (With the
+    // flag set, the revocation makes counts atomic too.)
     CELLS_UNGUARDED.store(true, Ordering::SeqCst);
-    revoke_bias();
+    share_all();
 }
 
 // `try_with`, not `with`, throughout: guards can be dropped from TLS
@@ -765,8 +1059,12 @@ fn note_cell_guard_released(tls: *const CellTls) {
 /// this is true (see [`CELL_TLS`]).
 #[inline]
 pub fn cell_guards_live() -> bool {
+    // (The count is the GIL holder's, so the caller's; in a debug or test
+    // build, whose threads run without a GIL between them, the first
+    // thread's.)
     if SOLE_GUARDS.load(Ordering::Relaxed) > 0
-        && FIRST.load(Ordering::Relaxed) == crate::gil::current_thread_id()
+        && (cfg!(not(any(debug_assertions, test)))
+            || FIRST.load(Ordering::Relaxed) == crate::gil::current_thread_id())
     {
         return true;
     }
@@ -965,7 +1263,7 @@ impl<T: ?Sized> GilCell<T> {
     pub fn try_borrow(&self) -> Result<Ref<'_, T>, BorrowError> {
         if biased_here() {
             // Publish the guard *before* claiming the counter, so a
-            // revoker's drain (see `revoke_bias`) covers the claim.
+            // revoker's drain (see `share_all`) covers the claim.
             publish_sole_guard();
             if self.borrow_shared(false) {
                 // SAFETY: the counter is `>= 1`, so no `&mut T` to the
@@ -1475,6 +1773,16 @@ pub struct RealLock {
 struct LockState {
     held: bool,
     owner: Option<u64>,
+    /// Threads blocked in [`RealLock::acquire`] or
+    /// [`RealLock::acquire_timeout`]: waiters past their turn (see
+    /// `thread_real::acquire_contended`), whom a release hands the lock.
+    starving: u32,
+    /// Released while a waiter was starving: free, and kept for one of
+    /// them. [`RealLock::try_acquire`] fails meanwhile, so the releasing
+    /// thread can't take the lock back before the waiter it woke has run
+    /// (it did every time once that thread's code got fast enough, and a
+    /// waiter's acquire took a third of a second).
+    reserved: bool,
 }
 
 impl Default for RealLock {
@@ -1494,7 +1802,7 @@ impl RealLock {
     /// Try once without blocking. Returns `true` if acquired.
     pub fn try_acquire(&self, owner: u64) -> bool {
         let mut state = self.state.lock();
-        if state.held {
+        if state.held || state.reserved {
             false
         } else {
             state.held = true;
@@ -1503,12 +1811,16 @@ impl RealLock {
         }
     }
 
-    /// Acquire, blocking forever if necessary.
+    /// Acquire, blocking forever if necessary. A release while this
+    /// waits keeps the lock for it (see [`LockState::reserved`]).
     pub fn acquire(&self, owner: u64) {
         let mut state = self.state.lock();
+        state.starving += 1;
         while state.held {
             self.cv.wait(&mut state);
         }
+        state.starving -= 1;
+        state.reserved = false;
         state.held = true;
         state.owner = Some(owner);
     }
@@ -1518,24 +1830,44 @@ impl RealLock {
     pub fn acquire_timeout(&self, owner: u64, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         let mut state = self.state.lock();
+        state.starving += 1;
         while state.held {
             let now = Instant::now();
-            if now >= deadline {
-                return false;
-            }
-            let remaining = deadline - now;
-            let result = self.cv.wait_for(&mut state, remaining);
-            if result.timed_out() && state.held {
+            let gone = now >= deadline
+                || (self.cv.wait_for(&mut state, deadline - now).timed_out() && state.held);
+            if gone {
+                state.starving -= 1;
                 return false;
             }
         }
+        state.starving -= 1;
+        state.reserved = false;
         state.held = true;
         state.owner = Some(owner);
         true
     }
 
+    /// Block until the lock is free (without taking it) or `timeout`
+    /// runs out: the GIL-released half of a contended acquire (see
+    /// `thread_real::acquire_contended`).
+    pub fn wait_free(&self, timeout: Option<Duration>) {
+        let deadline = timeout.map(|d| Instant::now() + d);
+        let mut state = self.state.lock();
+        while state.held || state.reserved {
+            match deadline {
+                None => self.cv.wait(&mut state),
+                Some(dl) => {
+                    if self.cv.wait_until(&mut state, dl).timed_out() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     /// Release the lock. Returns `Ok(())` on success, `Err` if
-    /// the lock isn't held.
+    /// the lock isn't held. With a waiter starving, the lock is kept
+    /// for it (see [`LockState::reserved`]).
     pub fn release(&self) -> Result<(), &'static str> {
         let mut state = self.state.lock();
         if !state.held {
@@ -1543,13 +1875,22 @@ impl RealLock {
         }
         state.held = false;
         state.owner = None;
+        let handed = state.starving > 0;
+        state.reserved = handed;
         drop(state);
-        self.cv.notify_one();
+        if handed {
+            // (Every waiter: one that only watches for the lock to come
+            // free must not swallow the starving one's wake-up.)
+            self.cv.notify_all();
+        } else {
+            self.cv.notify_one();
+        }
         Ok(())
     }
 
     pub fn is_locked(&self) -> bool {
-        self.state.lock().held
+        let state = self.state.lock();
+        state.held || state.reserved
     }
 
     /// Forcibly return the lock to the fresh, unlocked state, ignoring any
@@ -1604,6 +1945,9 @@ pub struct RealRLock {
 struct RLockState {
     owner: Option<u64>,
     depth: usize,
+    /// As [`LockState::starving`] and [`LockState::reserved`].
+    starving: u32,
+    reserved: bool,
 }
 
 impl Default for RealRLock {
@@ -1627,7 +1971,7 @@ impl RealRLock {
                 state.depth += 1;
                 true
             }
-            None => {
+            None if !state.reserved => {
                 state.owner = Some(owner);
                 state.depth = 1;
                 true
@@ -1638,44 +1982,57 @@ impl RealRLock {
 
     pub fn acquire(&self, owner: u64) {
         let mut state = self.state.lock();
-        loop {
-            match state.owner {
-                Some(o) if o == owner => {
-                    state.depth += 1;
-                    return;
-                }
-                None => {
-                    state.owner = Some(owner);
-                    state.depth = 1;
-                    return;
-                }
-                _ => self.cv.wait(&mut state),
-            }
+        if state.owner == Some(owner) {
+            state.depth += 1;
+            return;
         }
+        state.starving += 1;
+        while state.owner.is_some() {
+            self.cv.wait(&mut state);
+        }
+        state.starving -= 1;
+        state.reserved = false;
+        state.owner = Some(owner);
+        state.depth = 1;
     }
 
     pub fn acquire_timeout(&self, owner: u64, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         let mut state = self.state.lock();
-        loop {
-            match state.owner {
-                Some(o) if o == owner => {
-                    state.depth += 1;
-                    return true;
-                }
-                None => {
-                    state.owner = Some(owner);
-                    state.depth = 1;
-                    return true;
-                }
-                _ => {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        return false;
-                    }
-                    let result = self.cv.wait_for(&mut state, deadline - now);
-                    if result.timed_out() && state.owner.is_some() && state.owner != Some(owner) {
-                        return false;
+        if state.owner == Some(owner) {
+            state.depth += 1;
+            return true;
+        }
+        state.starving += 1;
+        while state.owner.is_some() {
+            let now = Instant::now();
+            let gone = now >= deadline
+                || (self.cv.wait_for(&mut state, deadline - now).timed_out()
+                    && state.owner.is_some());
+            if gone {
+                state.starving -= 1;
+                return false;
+            }
+        }
+        state.starving -= 1;
+        state.reserved = false;
+        state.owner = Some(owner);
+        state.depth = 1;
+        true
+    }
+
+    /// Block until `owner` could take the lock (it is free, or already
+    /// `owner`'s) without taking it, or until `timeout` runs out (see
+    /// [`RealLock::wait_free`]).
+    pub fn wait_free(&self, owner: u64, timeout: Option<Duration>) {
+        let deadline = timeout.map(|d| Instant::now() + d);
+        let mut state = self.state.lock();
+        while state.owner.is_some_and(|o| o != owner) || (state.owner.is_none() && state.reserved) {
+            match deadline {
+                None => self.cv.wait(&mut state),
+                Some(dl) => {
+                    if self.cv.wait_until(&mut state, dl).timed_out() {
+                        return;
                     }
                 }
             }
@@ -1690,8 +2047,14 @@ impl RealRLock {
                 state.depth -= 1;
                 if state.depth == 0 {
                     state.owner = None;
+                    let handed = state.starving > 0;
+                    state.reserved = handed;
                     drop(state);
-                    self.cv.notify_one();
+                    if handed {
+                        self.cv.notify_all();
+                    } else {
+                        self.cv.notify_one();
+                    }
                     Ok(0)
                 } else {
                     Ok(state.depth)

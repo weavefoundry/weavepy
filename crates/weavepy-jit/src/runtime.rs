@@ -196,6 +196,10 @@ pub struct ObjLayout {
     pub guard_ver: i32,
     pub guard_split_idx: i32,
     pub guard_slot_layout: i32,
+    /// A guard's hint (a word): the pin that held the value its site last
+    /// read into the object, `str` or `bytes` lane. A read that finds the
+    /// same value in the field takes that pin again in line.
+    pub guard_last_pin: i32,
     /// Object tags (the first byte of a value); a word payload is at 8, a
     /// `bool`'s at 1.
     pub tag_instance: u8,
@@ -203,6 +207,8 @@ pub struct ObjLayout {
     pub tag_float: u8,
     pub tag_bool: u8,
     pub tag_none: u8,
+    pub tag_str: u8,
+    pub tag_bytes: u8,
     /// A class value's tag (its payload pointer is the class pointer).
     pub tag_type: u8,
     /// An instance value's payload pointer → the instance's class pointer,
@@ -260,6 +266,10 @@ pub struct ObjLayout {
     pub method_upd_inc: i32,
     pub method_upd_code_at: i32,
     pub method_upd_code: i32,
+    /// The slot layout's word (a word) of an update whose field is a
+    /// `__slots__` member: its index then carries [`SLOT_FIELD`] and is
+    /// the member's position in that layout, as an attribute guard's.
+    pub method_upd_layout: i32,
     /// Words (or a byte, for `dict_watchers`) that are nonzero while a
     /// call can't be skipped: an observer may be active, a dict watcher
     /// is, or a class may hold an exotic key.
@@ -302,6 +312,14 @@ pub fn set_obj_layout(layout: ObjLayout) {
 #[must_use]
 pub(crate) fn obj_layout() -> Option<&'static ObjLayout> {
     OBJ_LAYOUT.get()
+}
+
+/// Whether an object layout is published, and if so whether it covers
+/// member slots (see [`ObjLayout::slots_ok`]): what an embedder needs to
+/// tell which attribute sites compiled code handles in line.
+#[must_use]
+pub fn obj_layout_published() -> Option<bool> {
+    OBJ_LAYOUT.get().map(|l| l.slots_ok)
 }
 
 /// The exchange buffer the VM passes to a compiled frame.

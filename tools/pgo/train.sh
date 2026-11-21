@@ -4,8 +4,8 @@
 #   tools/pgo/train.sh BIN
 #
 # Runs every tools/pybench benchmark at its default size, for the hot
-# paths' frequencies, then the bundled regression tests, for breadth. A
-# benchmark that fails is reported and skipped.
+# paths' frequencies, then the everyday battery and the bundled regression
+# tests, for breadth. A run that fails is reported and skipped.
 #
 # Each benchmark runs twice, a short run (the first call and two more) and
 # a long one (six more): what the long run executes more often is what the
@@ -33,6 +33,14 @@ for f in tools/pybench/benchmarks/*.py; do
     done
 done
 unset LLVM_PROFILE_FILE
+
+# The everyday battery (files, text, data formats, classes, threads and
+# common library modules), for the paths ordinary programs run that the
+# benchmarks don't. Its profile merges with the rest, as the regression
+# tests' does: it shapes branch weights and inlining, not the order file's
+# hot group.
+"$bin" tools/pybench/everyday.py >/dev/null 2>&1 \
+    || echo "training run failed: everyday" >&2
 
 "$bin" regrtest --mode subprocess --workers 4 -q >/dev/null 2>&1 \
     || echo "training run failed: regrtest" >&2

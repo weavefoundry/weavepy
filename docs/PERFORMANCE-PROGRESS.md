@@ -7,6 +7,87 @@ plan, what's done, and what's next, so a new session can pick up the work.
 
 ## Where WeavePy stands
 
+Measured on November 19, 2026, at `c69d14ad` (PR #112), a PGO build from a
+fresh training run against CPython 3.14.8 (load averages between 2 and 5).
+The everyday battery: 0.966 times CPython's time over three runs (0.956,
+0.957 and 0.984), against 1.258 at `83efee9b` four days earlier. WeavePy is
+ahead on 28 of the 54 cases, past one and a half times CPython's time on 5
+and past twice on one: `threading_queue_ops` 2.2, `argparse_ops` 1.9,
+`inspect_typing_ops` 1.7, `email_html_ops` 1.6, `exceptions_ops` 1.5. A plain
+release build of the same tree reads 1.18: the profile-guided layout is
+worth a fifth of the battery's time (see the instruction-cache figures
+under "Done"). The suite, with the `83efee9b` PGO build in the same run:
+warm time 0.843 (that build 0.851), cold time 0.957 (0.952), peak RSS 1.183
+(1.144) by the suite's runner and 1.172 (1.174) with footprint 1.252
+(1.269) by three runs a workload under `/usr/bin/time`; the new build runs
+the suite in 0.990 of the older one's warm time. The published 1.13 for
+peak RSS doesn't reproduce with either build today: CPython's own figure
+moves between sessions.
+
+Measured on November 20, 2026, at `f96980aa` (PR #112), a PGO build beside
+the `c69d14ad` one in the same runs: the battery in 0.996 of that build's
+time (best of three runs a case), `threading_queue_ops` at 1.9 times
+CPython's time where it was 2.2. Against CPython this session read both
+builds about a tenth slower than the day before's (1.04 to 1.12 a run for
+each), so the 0.97 above stands as the last quiet-machine figure. What the
+day's work moves is outside the battery: a program with a second thread
+(under 1% slower than without one, from 13% to 55%), a thread back from a
+blocking call (the GIL after one switch interval, not two), a contended lock
+(handed to its waiter after 5 ms), and attribute-heavy loops in tier 2 (the
+`attr_access` fixture at 0.66 of its instructions), and dicts that lose keys
+from the front or the middle (an LRU cache, a queue of pending work: one to
+two orders of magnitude slower than CPython before, level to twice its time
+now).
+
+Measured on November 15, 2026, at `83efee9b` (PR #112), a PGO build
+against CPython 3.14.8 on a host that wasn't idle (load averages between
+2 and 9). The everyday battery: 1.258 times CPython's time over three runs
+(1.236, 1.258 and 1.265), within the earlier build's spread; by
+instructions (synchronous compiles, quick builds) 1.282 times CPython's
+against 1.297 at the start of the day. WeavePy is ahead on 21 cases (20
+before), past twice CPython's time on 9 and past three times on none (2
+before): `file_read_binary_chunks` 2.9, `class_features` 2.9,
+`enum_dataclass_ops` 2.8, `email_html_ops` 2.7, `configparser_ops` 2.7,
+`threading_queue_ops` 2.7, `inspect_typing_ops` 2.7, `bigint_ops` 2.2 and
+`argparse_ops` 2.1. The suite in the same session: warm time 0.842, cold
+time 0.952, peak RSS 1.129. The commits after `83efee9b` (see "Done")
+weren't in the build.
+
+Measured on November 15, 2026, at `98339f92` (PR #112), two PGO builds of
+that commit on the same idle host against CPython 3.14.8: one from the
+usual training, one from a training that also runs the everyday battery
+(the training now does, see "Done"). The everyday battery: 1.228 times
+CPython's time over two runs (1.228 and 1.227) for the battery-trained
+build, 1.265 (1.252 and 1.278) for the other, against 1.357 at
+`2ce79fa5`. WeavePy is ahead on 20 cases (17 before), past twice CPython's
+time on 9 (12 before) and past three times on 2: `enum_dataclass_ops` 3.1
+and `class_features` 3.1, then `email_html_ops` 2.8,
+`file_read_binary_chunks` 2.8 (its time is in the reads),
+`inspect_typing_ops` 2.6, `threading_queue_ops` 2.6 (3.4 before),
+`configparser_ops` 2.5 and `argparse_ops` 2.5. The suite in the same
+session, battery-trained build: warm time 0.847, cold time 0.955, peak RSS
+1.135, and 1.000 of the other build's time, so the battery in the
+training costs the suite nothing. The commits after `98339f92` (see
+"Done") weren't in either build.
+
+Measured on November 14, 2026, at `2ce79fa5` (PR #112), a PGO build from a
+fresh training run against CPython 3.14.8 on the same idle host, beside
+the November 13 PGO build PR #110's figures came from. The everyday
+battery: 1.357 times CPython's time over two runs (1.345 and 1.369),
+against 1.431 for the earlier build in the same session. WeavePy is
+ahead on 17 cases (16 before), past twice CPython's time on 12 (14
+before) and past three times on 5: `inspect_typing_ops` 4.0,
+`threading_queue_ops` 3.4, `class_features` 3.3, `weakref_gc_ops` 3.2
+and `file_read_binary_chunks` 3.0 (1.5 by instructions: its time is in
+the reads). The cases this PR went after moved the most:
+`datetime_time_ops` 2.02 to 0.75, `bytes_ops` 2.36 to 1.36, `csv_ops`
+2.15 to 1.40, `threading_queue_ops` 4.11 to 3.38, `glob_fnmatch` 1.61 to
+1.36. The suite in the same session: warm time 0.849, cold time 0.949,
+peak RSS 1.123, and 1.004 of the earlier build's time, so the battery's
+fixes cost the suite nothing. The commits after `2ce79fa5` (see "Done")
+weren't in that build; by instructions on quick builds the battery
+stands at 1.34 times CPython's against 1.45 at the start of this PR.
+
 Measured on November 13, 2026, at `4e230310` (this PR), a PGO build from a
 fresh training run against CPython 3.14.8 on the same idle host. The
 benchmark suite: warm time 0.850, cold time 0.959, peak RSS 1.137, and
@@ -426,6 +507,2223 @@ branch and pull request.
    `logging_mix`, `class_creation`).
 
 ## Done
+
+- **Container operators, iteration adapters, and class method sites**
+  (PR #112, November 17). Ratios are instructions, WeavePy's over
+  CPython's; cycles where noted.
+  - A `BINARY_OP` that built a heap value on the generic path didn't mark
+    its site, so compiled code took the numbers' helper and left at the
+    next instruction (`d1 | d2`, `k & s`, `b * 3`). The site is marked
+    now, and compiled code serves dict union, `bytes` repetition and
+    `bytes % args` natively. `plain_compare` answers two exact dicts' `==`
+    (1,135 cycles to 215, CPython 160), two sets' comparisons (1,444 to
+    710, against 400) and a keys view against a set (1,083 to 753,
+    against 542) when no key or value can run Python.
+  - `zip` replaced its result tuple whenever it built one, so `for t in
+    zip(xs, ys)`, which still holds the last tuple, never reused one; it
+    keeps the tuple before as a spare now, indexes tuple and list cursors
+    directly, and stops in compiled code when its release frees nothing
+    that could finalize: a ten-item `for t in zip(t, t)` 3,878 cycles to
+    2,460 (1,770), three sources unpacked 5,366 to 3,788 (1,917).
+    `list(islice(lst, 10))` takes the slice at once (7,879 instructions to
+    4,620, against 3,679), a collecting consumer takes a `yield from` over
+    a sequence in one run (12,506 to 8,171, against 5,490), and
+    `dict(zip(ks, gen))` takes its pairs straight from the sources
+    (16,066 to 11,355, against 6,247).
+  - A method load on a user class receiver resolved `C.s(x)` and
+    `C.make()` through the type lanes every time: the site remembers a
+    class's plain function, static or class method now, keyed by the
+    class's and its metaclass's versions, a metaclass method of the same
+    name being a non-data descriptor the class overrides (`C.s(1)` 919 to
+    297, against 678; `Color(1)` 5,491 to 3,917, against 2,672).
+    `object.__setattr__` stores into a plain instance natively, which a
+    frozen dataclass's `__init__` calls per field (`Key(i, "x")` 5,135 to
+    3,956, against 3,392), and the current interpreter, which 248 builtin
+    sites look up, is one thread-local load.
+  - A frameless call of a pure leaf with keyword-only parameters cached no
+    call shape, so the frame JIT never knew the callee: `fkw(i)` for `def
+    fkw(a, b=2, *, c=3)` 901 to 356 (677). `None` and `bool` keys take the
+    native dict probe (argparse's `registry[None] = cls`), a list's
+    unit-step slice assignment splices in place, the type cache compares
+    names up to 32 bytes in line (17-byte dunders went to `memcmp`), and
+    tier 2 stops analyzing code from its back edges once it has handed the
+    code to the frame JIT (argparse's `_parse_known_args` was analyzed
+    ten times, twice each).
+  - Later the same day. `decimal` keeps the context it found last under a
+    `contextvars` generation, which every change of the current context
+    and every mapping write moves (unique across threads): `D1 * D2` 1,466
+    to 1,306 (1,028), and `decimal_telco` in the suite 1.17 to 1.07.
+    Exited threads leave their type cache and literal-string cache to the
+    next threads instead of zeroing and dropping them (a thread's start
+    and join 728,556 to 523,657, against 182,851). A named tuple's field
+    read off a local answers from its site's stamp first (two reads 1,076
+    to 382, against 821). `MAP_ADD` and `SET_ADD` have their own helpers,
+    as `LIST_APPEND` had, and the three read a local's value in place
+    (`{x: x for x in t}` 6,803 to 5,994; `{x for x in t}` 5,842 to
+    4,659). Keyword dicts and dict literals insert keys whose hashes
+    differ pairwise without probing, and every container compiled code or
+    the core loop builds defers its collector tracking without scanning
+    its elements (a collection promotes the deferred ones that can anchor
+    a cycle first): `{'a': i, 'b': 2}` 1,331 to 1,119 (937). `bytes.strip`
+    tests membership through a table, and `dict(zip(ks, gen))` takes its
+    pairs straight from the sources. Tier 2 gives up OSR entries that
+    average fewer than 16 iterations (the floor was 8): `difflib`'s
+    `find_longest_match` entered its inner loop about nine times a pass,
+    paying a hand-off and a frame rebuild each time while the frame JIT,
+    which had left the code to tier 2, kept its outer loop interpreted;
+    `SequenceMatcher(...).ratio()` ran 10,265,084 instructions to
+    4,195,398 (CPython 4,487,196).
+  - That evening. Compiled code stores into an `OrderedDict` through the
+    leaf half of its own `__setitem__`, which the class caches under its
+    attribute version, instead of the general store: `od[k] = v` in a
+    tier-2 loop 1,325 to 897 (701), in a called function 1,178 to 947
+    (996). The frame JIT's direct call of a built-in subclass instance's
+    native method takes small int arguments (`od.move_to_end(5)` 786 to
+    492, against 434). A method site remembers a callable an instance holds
+    in a materialized dict, by position and name, as it did for a split one:
+    a `threading.Condition` over a lock with `_release_save` assigns its
+    names out of the class's order, so `self._is_owned()` took the full
+    method load (`notify()` 2,427 to 1,751, against 1,057). Reading a native
+    method off such an instance (`self._lock.__exit__`, to call with
+    `*args`) answers from the site's cached builtin before three slow
+    paths, and the leaf registry remembers its last hit: `with cond:` 4,312
+    to 3,124 (2,415), a `Queue` put and get 16,368 to 14,016 (11,764).
+    `test_set` failed about once in 40 runs: a set mutated from an
+    element's `__eq__` while another operation held it queued the mutation
+    by address alone, so a later set at the same address replayed a stale
+    `clear()` on its next `add`. The queue now holds a weak handle and drops
+    a dead set's ops. `re.match(compiled, s)` went through `re._compile`,
+    which raises and catches a `KeyError` before handing a compiled pattern
+    back; the native cache front now returns it (16,572 to 1,703, against
+    7,626; `ConfigParser.write` 3.46 M to 1.60 M, against 1.94 M). A method
+    site keeps a native stream's method for its kind (three `StringIO`
+    writes and a `getvalue()` 8,450 to 7,737, against 4,663), and a subclass
+    of `str`, `int`, `float`, `tuple`, `bytes` or `frozenset` that keeps its
+    base's `__new__` wraps an argument of the base's exact type directly
+    (4,995 to 2,254, against 1,409).
+  - Loops over opaque iterators. Tier 2 stepped a set through its fully
+    general iterator step and dict keys after that step's setup; it now
+    steps list, tuple, range, set and dict iterators in place for any lane
+    (10 set items 6,691 to 3,188, against 1,978; 10 keys 5,498 to 4,553,
+    against 1,976). `for a, b in pairs` reads each pair where it sits (4,821
+    to 3,069, against 1,657), `enumerate` over a list or tuple reads its
+    pairs in place in both JITs (a tier-2 `i * x` sum 7,565 to 4,293,
+    against 6,342), and an exhausted `reversed(xs)` leaves compiled code's
+    loop in place instead of through the interpreter (3,891 to 2,192,
+    against 2,230). The frame JIT runs these loops for less than tier 2
+    still does, but handing tier 2's code with such loops to it cost
+    `pyaes` 2.6 times its instructions, `deque_ops` 1.6 and `richards` 1.5:
+    their int work wins back more than the iterator steps cost.
+  - Container methods. A frozenset of atomic values isn't registered with
+    the collector (it can't change, so it can never close a cycle;
+    `gc.is_tracked` registers it on asking): `frozenset((1, 2, 3))` 2,181
+    to 1,446 (1,432). `dict.update` from a plain dict whose keys run no
+    code, `dict.copy`, and `set.add` and `set.update` of natively hashed
+    values have leaf halves, which call sites run in place instead of
+    through the general call (`set.update` also cloned the whole set as a
+    snapshot on every call): `x = {}; x.update(sd)` 2,237 to 1,771 (1,500),
+    `x = set(); x.update(t)` 3,598 to 1,978 (1,700).
+  - Strings and collection. `str.partition` and `rpartition` return the
+    separator and an unsplit string themselves, as CPython does, and build
+    their pieces from slices; `splitlines` and `split` scan short ASCII
+    strings by byte; one-character pieces are the shared strings
+    (`partition` 1,266 to 838, against 987; `splitlines` 1,574 to 1,215,
+    against 997). `list(enumerate(xs))` over a list or tuple builds its
+    pairs at once (6,843 to 4,853, against 4,521). `min`, `max`, `sorted`
+    and `list.sort` call a leaf builtin key's body directly and read a
+    built-in value's length natively for `key=len` (`min(l, key=abs)` 5,515
+    to 3,587, against 3,573; `sorted(w, key=len)` 6,715 to 5,767, against
+    4,510), and `hex`, `oct` and `bin` of a machine int format in a stack
+    buffer (1,354 to 793, against 786).
+  - Leaks found on the way. A cycle through a list or dict that a builtin
+    built was never collected when the builtin didn't register it: list
+    slices and starred targets in the core loop, `list.copy()`, `dir()`,
+    `json.loads`, `re.findall`, `dict.fromkeys`, the generic `dict | dict`,
+    `+` and `*` of lists, and every binder's `**kwargs` dict. They now
+    defer their tracking as other built containers do (`json_bench` pays
+    4% for it). A `**kwargs` dict that its code only ever feeds to a `**`
+    spread (a decorator's wrapper) can't outlive its call and skips the
+    registration; one that may escape pays about 170 instructions.
+  - Builtin subclasses and getters. A compiled call site settled on a
+    container's or string's method declined an instance of a subclass (a
+    `Counter`, an `OrderedDict`, a `class L(list)`) and sent it through
+    the general call, which found the method's receiver shim, checked the
+    receiver and unwrapped it. The site now runs its kernel on the
+    instance's native payload (a dict view keeps the instance), and
+    `len()` and `in` read the payload when the class keeps the base's own
+    `__len__` or `__contains__`: `d.get(k)` 1,990 to 432 (CPython 671), a
+    list subclass's `append` and `pop` 3,521 to 652 (767), `len(d)` 2,014
+    to 400 (359), `k in d` 1,666 to 319 (573), `d.items()` 1,801 to 861
+    (880). A site settled on `itemgetter`'s or `attrgetter`'s native
+    `__call__` takes the instance itself, which it had passed to the
+    general call to rewrite: `ig(t)` 737 to 477 (484). A differential
+    sweep against CPython found `round(True)` returning `True` and
+    `float.hex` and `int.bit_length` accepting an argument.
+  - Bytes and binary files. A sized read of a buffered binary file made
+    one `read(2)` per call into a vector, then copied that into the
+    `bytes` object; a read of less than half a buffer is now served from
+    the stream's read-ahead, which one `read(2)` of a buffer's worth fills
+    (CPython's `BufferedReader` does the same, and line reads already
+    shared it), and a larger read lands in the result's own storage. A
+    read to the end of a regular file is sized by `fstat` and read into
+    the result directly instead of through 64 KiB chunks and two copies,
+    a write of at least a buffer's worth with nothing staged goes to the
+    descriptor without passing through the write buffer, and `bytes * n`
+    builds in the result's storage (a fill for one byte). Reading 4 MB in
+    8 KiB chunks went from 5.9 million instructions to 3.6 million
+    (CPython 1.7 million), reading it whole from 12.8 to 4.4 (1.5),
+    writing it from 8.6 to 4.2 (4.2), and `b"x" * 4_000_000` from 9.4 to
+    4.7 (1.0). The rest of the last two was page faults: mimalloc maps
+    blocks over 2 MiB from the OS and unmaps them when freed (see
+    `alloc.rs`), where macOS's allocator keeps a freed large block for
+    reuse, so each round faulted its 4 MB in again. The allocator now
+    keeps up to four such blocks (32 MiB each, 64 MiB in all) for an
+    allocation of about their size, freeing any idle past the purge delay
+    at the runtime's memory ticks. In wall time, `b"x" * 4_000_000` went
+    from 1.9 ms to 0.08 (CPython 0.33), a 4 MB whole-file read from 2.3 to
+    0.22 (0.52), and `bytearray(4_000_000)` from 1.4 to 0.08 (0.31), with
+    the suite's peak RSS unchanged. `[0] * 1_000_000` also copied each
+    item through an iterator: a unit of values without a reference count
+    now copies bitwise, doubling (58 million instructions to 5.1, against
+    13.2; 10.3 ms to 1.3, against 1.3). `bytes.split()` and `bytes.hex()`
+    without options build their pieces and digits directly (5,284 to
+    3,546 against 3,386, and 2,197 to 1,377 against 1,185).
+  - Loops calling a function held in a local. Tier 2 compiled such a loop
+    and called the function through its generic call helper, about 800
+    instructions more a call than the frame JIT's direct entry: `f(1, 2,
+    3)` of a local `f` ran 932 instructions an iteration under tier 2 and
+    114 with it off (CPython 515). The analysis now records which of a
+    loop's dynamic calls have a Python callee, and a loop whose typed
+    arithmetic and guarded calls don't repay them (24 typed operations,
+    or one guarded call, for each) is left to the frame JIT: 932 to 198.
+    A float-heavy loop with such a call stays in tier 2, which saves it
+    about 30 instructions a float operation. Fixtures, suite and battery
+    are flat. A call of a global function tier 2 can't compile (one with
+    keyword-only parameters, `*args` or `**kwargs`) took the same generic
+    path; the analysis now recognizes those too, by the `LOAD_GLOBAL`
+    ahead of the call's self-or-null slot (`fkw(i, c=4)` 1,115 to 350,
+    against 697). Only callees of at most 64 instructions count: the
+    first version of the rule also turned away `nbody`'s driver loop,
+    whose callee is a long function tier 2 compiles itself (+37%).
+    Tier 2 now compiles functions with keyword-only parameters too: they
+    are locals the caller's binding fills before the body runs, so the
+    analysis seeds and guards them like the positional ones. A loop in
+    `def f(n, *, scale=2, off=1)` ran under the frame JIT at 67 ms for
+    twenty calls of 200,000 steps (plus a float loop of the same shape)
+    and runs at 36 ms in tier 2 (CPython 351). Direct native calls still
+    take only positional callees.
+  - Helpers that call helpers. A loop calling a short global function
+    that calls another (`g_mid(t)` with `return g_leaf(x)`) ran 1,045
+    instructions an iteration (CPython 932): tier 2 took the loop and
+    called `g_mid` through the frameless evaluator, which interpreted
+    both bodies. The analysis now asks, for each guarded call of a
+    global, whether its callee would run that way (a short loop-free
+    function tier 2 hasn't compiled as a scalar leaf and that isn't one
+    of the evaluator's tiny shapes), and the call-bound rule counts such
+    calls as it counts dynamic ones. The frame JIT then took the loop,
+    but lowered only `g_mid` in line: `g_leaf` had run only nested in
+    `g_mid`'s frameless evaluations, which counted nothing toward its
+    warmth, and its call went through the inlined body's call helper
+    (377 instructions). A callee of a callee lowered in line now counts
+    as warm once the evaluator has built its plan (a counter in the
+    evaluator's in-place call path instead cost `call_overhead` 10% of
+    its cycles at the same instruction count). The chain runs at 342
+    (a closure chain 833 to 358), `g_two` with a branch 651 to 252, and a
+    float loop around a tiny callee keeps tier 2's 155. Code whose
+    loops have run but that tier 2 still holds nothing for (`argparse`'s
+    `_get_values`, whose comprehensions it only ever left cold) went on
+    waiting for tier 2 for good; the frame JIT now takes it after 16
+    such triggers. The battery runs 0.6% fewer instructions (`email`,
+    `traceback` and generator cases 5%); fixtures are flat.
+  - Constructors. A sweep of 45 common constructions against CPython
+    found builtin types two to four times slower to build: their calls
+    went through the type call, the instance plan and `__new__`/`__init__`
+    dispatch even when they only make an object. A builtin type now
+    carries a pure constructor for the arguments that run no Python code
+    (the pure arms `builtin_ctor_pure` already had, one per type, so a
+    type without one misses at a load instead of after twenty
+    comparisons): `object()` 2,314 to 815 instructions (CPython 727),
+    `threading.Lock()` 2,797 to 1,547 (965), `io.BytesIO()` 3,875 to 2,015
+    (972), `io.StringIO()` 4,014 to 2,124 (2,028), `complex(1, 2)` 3,115 to
+    724 (1,525), `memoryview(b)` 2,816 to 1,189 (1,523).
+    `threading.RLock()` forwarded an empty `*args, **kwargs` to the native
+    lock: 8,398 to 3,032. Still slow: `array.array` (a pure-Python module,
+    9.6 times CPython), and classes partly in Python (`defaultdict(list)`
+    2.9, `OrderedDict()` 4.6, `functools.partial` 2.9, `itemgetter` 2.8).
+    `os.scandir` and `os.listdir` validate names as UTF-8 before the
+    lossy decoder, which cost about 300 instructions a name.
+    `OrderedDict()` returns from `__init__` when there's nothing to add
+    (4,762 to 3,077, against 1,039).
+  - Smaller single operations, from a sweep of 80 common statements.
+    `sum(d.values())` and `sum(d.keys())` read the dict in place (3,734 to
+    1,548 for three items, against 1,678). The pure `zip` steps, which
+    only produce an item when every source has one, take strict zips too,
+    as the end where `strict=` is checked stays the general step's (a
+    `for a, b in zip(x, y, strict=True)` loop over five items 16,909 to
+    7,255, against 4,973). `del xs[a:b]` of a unit step drains by its
+    bounds instead of building every index, and compiled code deletes
+    such a run itself when its items release without running code
+    (`L.extend(x); del L[-5:]` 2,873 to 1,460, against 1,399); the items
+    now release last first, as CPython's do. Finished, joined threads
+    leave the runtime's thread registry, which every reap scanned in full
+    (thread start and join 663k to 545k instructions over a thousand
+    threads, still 3.2 times CPython's).
+  - A second sweep, of 104 statements over the standard library's
+    smaller types and builtins. Complex arithmetic left compiled code for
+    the core loop's operator dispatch each time; the frame JIT's
+    binary-operation helper now computes `+ - * /` of an exact `complex`
+    with a number itself (`c1 * c2` 2,008 instructions to 584, against
+    540). `setattr(obj, name, v)` of a plain instance is a leaf builtin
+    that stores into the instance dictionary as the generic path does,
+    the name interned (1,953 to 1,211, against 699). `functools.reduce`
+    joins the builtins compiled code and the core loop run in place
+    instead of leaving for the full call path (`reduce(operator.add,
+    xs)` 4,641 to 1,916, against 2,033). `sorted(d)` reads a dict's keys
+    directly rather than through an iterator (4,121 to 2,160);
+    `{**d}` and `f(**kw)` copy the source's table into the empty target
+    whole; `str.center`, `ljust`, `rjust` and `zfill` build in one
+    allocation and return an exact `str` that needs no padding as itself
+    (`center` 2,208 to 868, against 923); `bytes.join` of a list or tuple
+    of `bytes` reads the parts in place (3,153 to 2,316); and
+    `struct.unpack` of `bytes` skips the buffer adapter (2,536 to 2,074).
+    `itertools.accumulate` and `product` stay 2.4 and 2.0 times CPython's:
+    their iterator steps spread over a dozen helpers. Container methods
+    without an in-place lane paid the method-call protocol, about 250
+    instructions around a cheap body: `dict.copy` and `set.copy` now run
+    as opaque bodies compiled code calls directly, `dict.pop` of a `str`
+    or `int` key is a leaf (778 to 588, against 542), and `list.remove`
+    has a kernel when the items up to the match compare natively and the
+    removed one releases without running code (2,005 to 1,329, against
+    1,289; the full path scans the same way first). `dict.pop()` and
+    `dict.copy(1)` now raise CPython's messages.
+  - Keyword calls. Compiled code constructing a class with keywords
+    (`Parameter(name, kind, default=d)`) worked out the keywords'
+    permutation onto `__init__`'s parameters, comparing every name, on
+    each call (about 330 instructions); a per-thread memo keyed by the
+    function, its code, the names tuple and the argument count keeps it,
+    asking afresh for a function whose defaults may have been reassigned.
+    The keyword binder also reads keyword-only defaults by position when
+    they line up with the parameters, as positional calls already did.
+    `P("a", 1, default=i)` with two keyword-only parameters 3,294
+    instructions to 2,838 (CPython 3,365).
+  - User-class protocols, from a third sweep of 83 statements. `bool(x)`
+    of an instance took the type call's dispatch and several method
+    lookups (a plain instance 3,933 instructions to CPython's 422): it is
+    the truth test now, the in-place `__bool__`/`__len__` evaluation
+    first and `PyObject_IsTrue`'s protocol after (465; through a Python
+    `__len__` 4,534 to 1,398). A missing attribute that a pure-leaf
+    `__getattr__` answers ran it as an activation behind a cascade of
+    lanes that each missed; compiled code and the core loop now evaluate
+    it frameless first (3,869 to 1,319, against 1,010). Frameless
+    evaluation also runs `x in c` and `not in` over a native container
+    (anything that could run code declines), so a `__contains__` that
+    tests its own list evaluates in place: `2 in box` 3,759 to 1,047
+    (1,026). `__bool__ = None` now raises CPython's "cannot be interpreted
+    as a boolean". `int(text, base)` of plain digits is the pure
+    constructor's (`int('ff', 16)` 2,503 to 814, against 986), and
+    `"".join(reversed(s))` reads the string's characters into the
+    snapshot directly and joins the rest of it at once (10,403 to 7,664,
+    against 4,362); `str.join`'s error for a non-`str` item now names its
+    index, as CPython's does. `list(obj)` of an instance whose `__iter__`
+    returns `iter(self.items)` ran `__len__` (the length hint) and
+    `__iter__` as full calls and stepped the iterator one item at a time;
+    both now evaluate as pure leaves when they can (`iter()` joins the
+    builtins a frameless evaluation may call: it mutates nothing), and a
+    list's or tuple's iterator drains at once (8,138 instructions to
+    5,073, against 2,736). An `__iter__` that returns a list or another
+    non-iterator now raises CPython's `TypeError` on every path; a `for`
+    loop used to iterate it. Each loop over a dict registered its
+    iterator's mutation watch in a thread-local hash map and removed it
+    after (about 200 instructions a loop); the first eight watched dicts
+    now sit in a vector scanned in place, the map holding any beyond
+    (`[k for k in d]` of three keys 2,541 to 2,410 under callgrind).
+    `min(xs, key=len)` ran `len` through the general call for each item,
+    the key path taking only some of the leaf builtins' kinds; it takes
+    every kind now, and compares machine-int keys directly (5,756 to
+    3,929, against 3,864). `format(x, 'g')` computed `str(x)`, a shortest
+    repr nothing used, before parsing the spec, then formatted the fixed
+    form a second time after the scientific one: a plain `g`, `G` or
+    `.Ng` spec of a float now goes straight to the general format, which
+    lays the fixed form out from the scientific digits (rounded at the
+    same place), and `format()` of an exact `float`, `int` or `str` is a
+    leaf builtin (5,272 to 3,874, against 2,417). A non-`str` spec raises
+    CPython's message. `list(zip(a, b, c))` over lists and tuples stepped
+    the zip one tuple at a time through the pure steps; it drains in one
+    pass now, then takes the end step CPython's does (one more item from
+    each source before the first exhausted one), so the sources are left
+    exactly as stepping leaves them (9,056 to 6,069, against 4,556).
+  - A fifth sweep (74 statements over I/O buffers, dates, regular
+    expressions, `itertools` and `functools` variants). `date.fromisoformat`
+    was the pure-Python parse (14,759 instructions to CPython's 1,513); the
+    exact class's `YYYY-MM-DD` and `YYYYMMDD` now parse natively beside
+    `datetime.fromisoformat`'s, every other spelling and every error the
+    Python method's (1,056). `math.fsum` and `math.dist` stepped their
+    argument through the interpreter's iterator, publishing the
+    interpreter for each item; a list or tuple of floats and ints is read
+    in place (7,043 to 2,850, against 1,590), and their `TypeError` now
+    reads as CPython's. `str.maketrans` joins the builtins run in place
+    (7,615 to 5,968), and `sum(reversed(xs))` of ints adds the rest of the
+    reversed snapshot at once (3,558 to 2,286, against 1,755). A `for`
+    loop over a Python iterator class ran its `__next__` as a full
+    activation through the general step for every item, compiled code
+    having no lane for it (440 instructions an item to CPython's 136): a
+    `__next__` that evaluates as a pure or effect leaf (`self.i += 1;
+    return x`, its stores committed at the return) now runs frameless from
+    compiled loops and from the native consumers (`list`, `sum`), its
+    `raise StopIteration` still the full path's (248 an item; `list(it)`
+    of ten items 3,279 to 2,738). The core loop's `FOR_ITER` takes the
+    same shortcut, so a cold loop over one runs 282 an item instead of
+    532.
+  - A native class method read through a class (`dict.fromkeys`,
+    `itertools.chain.from_iterable`, which `itertools` installs over the
+    Python one) resolved through every frame JIT read lane before the
+    general one bound it, about 3,000 instructions a read to CPython's
+    700. The site's class memo now holds the descriptor and binds a fresh
+    method at each read, as `classmethod.__get__` does, and a native
+    static method's function (`str.maketrans`) is memoized as a builtin
+    is (645 instructions, 0.93 of CPython's). `dict.fromkeys` of an ASCII
+    string, a dict, or a set builds in place as a list's keys do (6,821
+    to 1,582, against 2,352).
+  - `islice` steps its source in place when the source is a plain list
+    or tuple cursor, but a `chain` source always took the general step,
+    about 480 instructions an item through both adapters. A `chain` whose
+    current source is a cursor with an item left, or whose next source is
+    a list or tuple with items (the spent cursor's release freeing
+    nothing), now steps in place for one-source adapters, so
+    `list(islice(chain(xs, xs), 4))` runs 10,011 instructions instead of
+    13,365 (CPython 4,837).
+  - A Python descriptor with `__get__` but no `__set__` or `__delete__`
+    (a non-data descriptor, `functools.cached_property` among them) left
+    every read through its instances to the full path, since the
+    instance's own entry may shadow it: a read that ran its `__get__`
+    took 5,235 instructions to CPython's 924, and one that found the
+    cached value 936 to 409. The class attribute cache now records such a
+    descriptor beside the data descriptors, the instance's own entry
+    answers ahead of it in the in-place lanes, and on a certain miss its
+    `__get__` runs through the data descriptors' call lane (1,002 and
+    395 instructions; a fresh object's first `cached_property` read
+    11,087 to 5,952, against 3,899).
+  - `itertools.starmap` had no in-place step, so each item took the
+    general one (about 2,000 instructions). Over a list or tuple of
+    tuples with a callback that runs as a pure leaf it now steps as
+    `map` does: `list(starmap(operator.add, pairs))` of eight pairs
+    18,403 to 8,135 (CPython 4,572).
+  - `dict(**d)` copied the keyword mapping the call had just built,
+    passing each key through a Rust string on the way. That mapping is
+    held by nothing else, so with all its keys exact strings it is now
+    the new dict (5,948 instructions to 2,367, against 2,443). An exact
+    string's `template.format(**d)` likewise formats from that mapping as
+    `format_map` does, in place, when its values render plainly (8,523 to
+    7,013, against 3,943); every error stays the general call's.
+  - `getattr(obj, name)` with no default declined its in-place lane for
+    every built-in receiver, so `getattr(s, 'upper')()` took the full
+    call (3,013 instructions to CPython's 1,291). A string's or
+    container's method now binds in place as the attribute load binds it
+    (1,589).
+  - `member in SomeEnum` bound `EnumType.__contains__` to the class and
+    called the bound method generically; a metaclass's plain-function
+    `__contains__` is now called with the class directly, through the
+    dunder lane that evaluates pure leaves in place (4,455 instructions to
+    2,718, against 1,141).
+  - Python 3.14's `heapq.nsmallest` and `nlargest` call the new max-heap
+    accelerators (`heapify_max`, `heapreplace_max`), which the native
+    body lane didn't list, so every call asked twice whether it could
+    take one and then went through the full call. They join `heappush`
+    and the rest, and a call site remembers a leaf builtin called
+    unbound the first time (`heapq.nsmallest(2, xs)` 27,568 instructions
+    to 18,258, against 11,260).
+  - A crash fixed on the way, present since before this PR:
+    `test_statistics.TestKDE` segfaulted in most runs outside the gate.
+    `statistics.kde`'s cumulative `cdf` runs `sum(W(...) for x_i in
+    supported)` from compiled callers; the generator's call of `W` put
+    its frame on the pending list before the lazily running callers
+    (`p_expected`, `cdf`) registered theirs above it. When `W` returned
+    the generator's entry wasn't on top and stayed behind, naming an
+    activation gone from the native stack, and a later flush wrote
+    through it (found with memcheck on a system-allocator build). An
+    entry now leaves the list from wherever it sits.
+  - `BytesIO.write` had an in-place half only for buffered file writers,
+    so every write to a `BytesIO` took the full native body (1,464
+    instructions to CPython's 545); a write at the stream's end with
+    nothing exported now appends in place (850). `getvalue()` of an open
+    `BytesIO` or `StringIO` gets a leaf half too (1,097 to 922).
+  - `OrderedDict` is a Python class over a native order dict that starts
+    on the first store. The store's leaf half declined while there was
+    none, so every fresh `OrderedDict`'s first store took the full path;
+    it now starts the order in place (three stores into a fresh one
+    12,212 instructions to 7,246, against 2,956). Construction from an
+    iterable unpacks an exact 2-tuple directly, the other shapes still
+    stepping as CPython's `odict` does for its errors (from a generator of
+    five pairs 47,414 to 36,109, against 10,146). `list(od)` of an exact
+    `OrderedDict` called its `len` and its `__iter__` through the generic
+    protocol and stepped the order's iterator; it takes the order's keys
+    at once now (8,647 to 3,392, against 2,437), and `list(od.items())`
+    and the other views take their entries likewise where every key looks
+    up natively (14,502 to 6,980, against 4,469).
+  - `obj.__dict__` reached the reader that answers it from the site's
+    memo only after a dozen other lanes (properties, class values,
+    published dicts) declined; a site that has read the managed dict
+    for the instance's class at its version now reads it first (811
+    instructions to 255 in the container). `for k in d` over a plain dict
+    steps its keys directly once the iterator's watch is set, without
+    the views' and `OrderedDict`'s checks (20 keys 5,167 to 4,341).
+  - `SomeEnum(value)` ran `EnumType.__call__` and `Enum.__new__` in
+    Python for every lookup (`inspect.Parameter` converts its kind that
+    way, `re` its flags): 5,642 instructions for `Color(1)` to CPython's
+    2,659. Where a class's metaclass `__call__` and its `__new__` are
+    `enum`'s own and it has members, a member of the class comes back as
+    it is, and a value that hashes natively is looked up in
+    `_value2member_map_` (the verdict and the maps remembered under the
+    class's and metaclass's versions); anything else is the Python
+    call's (`Color(1)` 1,530, `Color(member)` 960 to 2,521).
+  - A dataclass's `__eq__`, evaluated in place, read `other.__class__`
+    and `self.__class__` through the general instance-attribute
+    resolution each time; the in-place read answers `__class__` first
+    where `object`'s descriptor does (`dc == dc2` 2,362 instructions to
+    1,944 in the container).
+  - `itertools.takewhile`, `dropwhile` and `filterfalse` had no in-place
+    step; over a list or tuple cursor with a predicate that runs as a
+    pure leaf they step as `filter` does, `takewhile` consuming the item
+    that stops it as CPython's does (`list(takewhile(lambda x: x < 3,
+    xs))` 8,673 instructions to 6,181 in the container).
+  - A compiled `for i, x in enumerate(xs)` stepped its pairs in place
+    but took its end through the general step, which in a generator
+    expression materialized the generator's frame shell and finished the
+    run in the general loop, once per generator. The end of a list or
+    tuple cursor now retires the iterator in place as those cursors'
+    ends do, detaching from the list where nothing its release frees
+    could finalize (`sum(i * v for i, v in enumerate(xs))` of five
+    items 8,697 instructions to 6,226 in the container). The core loop's
+    `enumerate` arm ends in place the same way (`_strptime`'s loop).
+  - The battery's slow-step census (`WEAVEPY_BURST_STATS=1` over every
+    case) showed slices of `bytearray`s and of `str` subclasses (`re`'s
+    `_plain_slice` over `email`'s header tokens) taking the full step at
+    every call. The core loop's slice arms take a `bytearray` (a new
+    one), and a `str`, `list` or `tuple` subclass keeping its base's
+    `__getitem__` (the base's exact slice, as CPython's). `str.encode`'s
+    leaf half reads a `str` subclass's text too (`email.utils`'s
+    `_has_surrogates` over header values), and the core loop's
+    `GET_ITER` iterates a `list` or `tuple` subclass's payload when its
+    class inherits the base's `__iter__`, as compiled code already did
+    (`email`'s token lists). `os.stat`, `lstat`, `fspath`, `getcwd`,
+    `access`, `listdir` and `locale.setlocale` join the native-body lane
+    (through the interpreter's call, for a path-like's `__fspath__`), so
+    a call no longer takes the full step and its frame shell
+    (`os.path.exists(p)` about 4,000 instructions fewer, 1.34 to 1.12 of
+    CPython's; `locale.getlocale()` 1.24 to 1.05). So do `fsdecode`,
+    `fsencode` and `dir`, the hash constructors and `zlib`'s functions,
+    `sys.audit`, `weakref`'s dead-entry callback, `json`'s encoder
+    constructor and the import system's module locks, the rest of the
+    census's builtin calls (`hashlib_zlib` 1% fewer instructions,
+    `file_small_open_close` 2%, `os_stat_exists` 12%). `with open(p) as
+    f` loaded the file's `__enter__` and `__exit__` through the full step;
+    `LOAD_SPECIAL` takes a native file's own methods in place (another
+    1.5% of `file_small_open_close`). A function-level `import m` or
+    `from m import x` of an imported module, in place in compiled code
+    already, is the core loop's helper's too, for interpreted callers
+    (`shlex.__init__`'s imports at every construction).
+  - A loop over a Python iterator class whose `__next__` isn't a leaf
+    (`email.feedparser`'s `BufferedSubFile`) took the full step for
+    every item, compiled code exiting to the core loop to take it. The
+    `FOR_ITER` lane calls such a `__next__` with the activation waiting
+    on the pending list, its `StopIteration` the loop's end, and compiled
+    code takes the lane in place (`Parser().parsestr(msg)` 8% fewer
+    instructions).
+  - Tier 2's item store into an exact dict went through the generic
+    store and rechecked every guard afterward, where its item read had a
+    leaf path; a store by a key that hashes and compares natively now
+    goes straight into the dict (`d[k] += 1` in a compiled loop 1,276
+    instructions to 1,024, against 743).
+  - `defaultdict` construction and misses ran its native `__init__` and
+    `__missing__` through the generic paths: `defaultdict()` 4,817
+    instructions to CPython's 1,484, a miss 6,888 to 2,105. The exact
+    class's plain calls build the instance in place through its own
+    constructor hook, which the native-constructor lane now consults for
+    Python classes too, and compiled code's item read stores and returns
+    a miss's value where the factory is a common builtin type, as
+    `__missing__` does (1,972 and 2,720; `defaultdict(list)` with one
+    miss 11,452 to 4,034, against 3,192). `OrderedDict()` of the exact
+    class, whose `__init__` does nothing without arguments, builds through
+    the same hook (2,983 to 1,636, against 1,049), and so does
+    `functools.partial(func, *args)` over a callable that isn't itself a
+    partial, laid out as its native `__new__` lays it (4,837 to 2,317,
+    against 1,801), and `deque()` and `deque(xs)` of a list or tuple, laid
+    out as its `__init__` lays it (3,713 to 1,960 and 5,694 to 2,326,
+    against 2,283 and 4,228).
+  - `email`'s header parsing ran three of its common steps through the
+    full handler on every call. A compiled pattern's `findall` declined a
+    str subclass's instance (the parser's tokens), so `_validate_xtext`
+    cost 43,662 instructions to CPython's 2,945; `findall` and `split`
+    now read the instance as its string and return exact strs, as
+    CPython's slices do (2,671). `super().value` of a property built the
+    super proxy each time; the getter now runs as an inline activation in
+    the core loop and as a direct call from compiled code, its site
+    remembering the property for the receiver's class (6,885 to 2,106,
+    against 1,201). The core loop's subscript arm had slice cases for
+    `bytearray`s and str, list and tuple subclasses that its own type
+    check never let through, so `token[:]` took the slow step (2,895 to
+    1,718, against 831). Setting a `From` header on a new message went
+    from 1,092,000 instructions to 941,000 (CPython 553,000).
+  - A getter like `return list(self.defects)` stopped evaluating in place
+    once its leaf plan compiled: the compiled plan's call step lacked the
+    interpreted plan's builtin-constructor case, so every call declined,
+    and 64 declines in a row withdraw a function's leaf verdict for good.
+    With the case added, the read costs 1,683 instructions instead of
+    1,944 (CPython 1,089). Inside a generator's step, which can't call a
+    getter that runs as an activation, the miss had also walked every
+    other attribute read before declining; it now declines at once.
+    Together, `sum((x.all_defects for x in xs), [])` over four items went
+    from 36,700 instructions to 14,800 (CPython 7,700). `sum()` of lists
+    extends the list it built after the first item instead of building a
+    new one per item, as the intermediate totals are unobservable.
+  - `os.walk` stepped its directory listing with `next(scandir_it)`
+    through the general call; `next()` now steps a scandir iterator in
+    place, and `os.scandir` takes the builtin lane (a warm walk of a
+    42-entry tree from 764,000 instructions to 738,000, against 565,000).
+    A walk's remaining time is mostly system calls.
+  - Only about half of the linker order file's names still matched the
+    binary's functions, so start-up on Linux touched 10.5 MB of code (the
+    kernel maps 64 KiB around each page a fault touches) and peaked at
+    17 MB against CPython's 9. Extending the order with callgrind
+    profiles of start-up, import mixes, the bench fixtures and ten
+    battery cases (`scripts/extend-order-file.py`) halves the resident
+    code: peak RSS goes from 17.1 to 12.0 MB at start-up and from 23.6
+    to 17.4 MB after importing `json`, `re` and `collections`, and
+    start-up is about 3% faster. On macOS, which faults single pages,
+    peak RSS drops 2-4%.
+  - `inspect.signature` read a function's `__defaults__`,
+    `__kwdefaults__` and `__code__`, and probed the names it lacks
+    (`getattr(func, "__signature__", None)`, `hasattr(func,
+    "__wrapped__")`), through the full attribute lookup. The fields now
+    read in place, and a miss the full lookup found on a function that
+    stores nothing under the name is remembered on the function type
+    (`inspect.signature` of a one-parameter function from 105,600
+    instructions to 87,100; `f.__defaults__, f.__kwdefaults__` from 4,870
+    to 2,733, against 1,136).
+  - Compiling a regular expression that isn't in the on-disk program
+    cache cost about 2.7 million instructions per pattern, against
+    CPython's 580,000. Three steps took the general paths every time:
+    `int(c)` over the program's named opcode constants (an `int`
+    subclass), `charmap[i] = 1` on the charset's `bytearray`, and
+    iteration over the parser's `SubPattern`, which has `__getitem__` but
+    no `__iter__`, so each item went through the sequence protocol's
+    Python iterator and a Python `__getitem__` call. `int()` of an `int`
+    subclass that keeps `int`'s `__int__` now answers in place, the core
+    loop stores bytes into a `bytearray`, and `SubPattern` iterates its
+    list (400 uncached patterns from 1,101 million instructions to 930
+    million, against 233 million: the parser's two largest functions
+    still run interpreted). A start-up also no longer calls `globals()`
+    195 times in `posix`'s re-export loop (0.9% of its instructions).
+  - Compiled code read a receiver that isn't a local (`p.x` of a global)
+    through a slower helper than a local's: a `__slots__` member, a
+    class's plain value through an instance, and a named tuple's field
+    were each found only after the helper had tried the other kinds. The
+    stack helper now checks the slot the site recorded and, first, the
+    class value and field its local twin checks (a loop reading a global
+    slotted instance's field from 520 instructions an iteration to 251,
+    a class value from 390 to 302, a named tuple field from 699 to 288;
+    CPython 282, 278 and 417). A `functools.partial` call found its
+    fields by comparing their names on every call; it now remembers the
+    slot layout as `deque`'s methods do (1,870 instructions a call to
+    1,693, against 939).
+  - A `for` loop over a generator first tries the generator's native
+    step, which has no switch and so can't call Python code: a body that
+    subscripts an object with a Python `__getitem__` (as
+    `collections.abc.Sequence.__iter__` does, behind `x in path.parents`)
+    stopped partway at every item and finished on the general path. A
+    body whose steps keep stopping now skips them, and the loop resumes it
+    through its switched path, which calls the method directly (one step
+    in 256 retries). A five-item generator of that shape went from 33,800
+    instructions to 19,500 (CPython 7,600) and `Path.relative_to` from
+    337,000 to 303,000 (169,000); the lazy resume's own cost is most of
+    what's left.
+  - A struct sequence (`os.stat_result`, `time.struct_time`,
+    `sys.version_info`, `os.terminal_size`) keeps its fields in its
+    instance dict, but its class answers each name with a property whose
+    getter is a native function, so `st.st_mode` was a descriptor call
+    through the general attribute path. The attribute caches now treat
+    those properties as the instance's own field, the fields' keys are the
+    interned names compiled code holds, and the type rejects `del` of a
+    field as CPython does ("readonly attribute"). A struct sequence
+    compares with a tuple as its own tuple, without a method call. Reads
+    went from about 2,100 instructions to 500-800 (CPython 270-390) and
+    `sys.version_info >= (3, 8)` from 3,740 to 2,310 (700).
+  - `shutil.get_terminal_size()`, which argparse's help formatter calls
+    for every formatter it makes, cost 62,600 instructions against
+    CPython's 29,500. Three of its steps left compiled code: the
+    `os.environ` misses (`_Environ.__getitem__` subscripts a dict keyed by
+    `bytes`, whose missing key only the interpreter raised), the
+    `OSError` from `os.get_terminal_size()` (a builtin the core loop
+    didn't call in place), and `os.terminal_size(fallback)`, which went
+    through the general class call into the type's `__init__`. A missing
+    `bytes` key now raises where the code catches it, the call runs in the
+    core loop's lane, and a struct sequence built from a tuple or list of
+    plain values is made directly (6,000 instructions to 3,640, against
+    1,930). The call as a whole now costs 49,300.
+  - Releasing containers. A dying dict dropped each key and value through
+    a call to its drop glue, even an `int` key, and a list did the same for
+    each item unless all of them were scalars; a tuple from the free list
+    was refilled through checks a parked tuple can't fail. A dict now
+    gives each entry up in line (a plain decrement for a value someone
+    else still holds), a list does the same for items it doesn't own last
+    (a dying one still goes through the nested release), and a pooled
+    tuple's slots are written directly. `d.copy()` of a 100-entry dict
+    with its release went from 8,270 instructions to 5,010 (CPython
+    4,400), `dict(d)` of 20 entries from 3,080 to 2,500 (1,910),
+    `list(t)` of 100 strings from 5,810 to 3,760 (4,490), and a loop over
+    `enumerate` of ten items from 6,400 to 5,760 (4,120).
+  - Dunder reads that took the full attribute lookup. A never-raised
+    exception's `__traceback__`, `__cause__` and `__context__` are unset
+    slots, which the slot reads in compiled code and the interpreter
+    declined, so each read cost about 4,000 instructions (CPython 200);
+    they now answer the slot descriptor's default. A bound method's
+    `__self__`, `__func__`, `__name__`, `__qualname__` and `__doc__` read
+    in place (1,690 instructions to 490 compiled, 1,750 to 615
+    interpreted, against 530), and `cls.__qualname__` joins the per-site
+    memo `__name__` has, now that assigning it moves the class's version
+    (1,380 to 230, against 420; interpreted, the core loop reads a class's
+    names directly, 1,700 to 1,080). `cls.__mro__` and `__bases__` still
+    build a tuple per read (3.4 and 4 times CPython's cost) because
+    keeping one on the class needs the collector to see it.
+  - A class now keeps the tuples `__mro__` and `__bases__` read as, while
+    its links stay the same (the collector visits and clears them with the
+    MRO), so `C.__mro__ is C.__mro__` as in CPython and a read no longer
+    allocates (1,480 instructions to 1,090 compiled, 1,100 to 760
+    interpreted).
+  - Native code calling back into Python. `max(xs, key=attrgetter("x"))`
+    called the getter through the general call, a bound method for each
+    item, where `sorted` already evaluated such keys in place; `min` and
+    `max` now do too (25,750 instructions for ten items to 8,960, against
+    5,350; `itemgetter` 18,500 to 4,870, against 3,970). A dict or set
+    store of a key whose `__hash__` is Python (an `Enum` member, a frozen
+    dataclass) left compiled code at every store, and every hash ran a
+    reentrant call; a `__hash__` that evaluates as a pure leaf now runs in
+    place, and compiled code stores the key with that hash when it meets
+    the entry by identity or the slot is free (`x[Color.RED] = v` 3,780
+    to 1,500, against 1,230; a ten-entry dict comprehension of such keys
+    35,900 to 16,700, against 10,300).
+  - `"%r" % x` sent every `%r` through the general conversion, which
+    formats through a spec with alignment even for a bare `int`; an `int`,
+    `bool`, `None` or `str` now renders in place (`"P(%r)" % 5` from 2,820
+    instructions to 1,140, against 1,730). A container's repr found each
+    item's Python `__repr__` by walking the class's MRO and called it as a
+    bound method; it now calls the memoized function directly, and a
+    pure-leaf `__hash__` is tried before the native kinds' checks
+    (`repr(p)` of an instance whose `__repr__` is `"P(%r)" % self.x` from
+    6,230 to 4,500, against 2,390; `set(xs)` of ten such keys from 22,500
+    to 19,700, against 8,800).
+  - `functools.cmp_to_key(f)` built a new class for every call (the
+    pure-Python fallback's, which the native function forwarded to), so
+    `sorted(xs, key=cmp_to_key(f))` of ten items cost 253,000 instructions
+    against CPython's 18,000. It now returns a key factory of one shared
+    class. And `self._cmp(a, b)` in that class's methods, a call of a
+    function a `__slots__` member holds, left compiled code at every call:
+    the method load now reads a laid-out slot member and remembers its
+    position. The sort now costs 88,000 instructions; CPython's C key
+    wrapper makes no Python calls but `f`'s, which the rest of the gap
+    is.
+  - Native modules that call back into Python (`bisect`'s `key`, about a
+    hundred other call sites) went through `Interpreter::call_object`,
+    the embedder's entry, which publishes the interpreter and activates
+    its thread handles (cloning four of them) for every call. From a frame
+    of the same interpreter both are in effect already, so the call goes
+    straight on (`bisect_left` with a `key` over a 34-item list from
+    8,090 instructions to 6,310, against 4,050). Every comparison of two
+    instances also paid 28 instructions to rule out a struct sequence;
+    only instances of builtin classes check now.
+  - A memory leak: every `threading.Thread` (each makes a
+    `_thread._ThreadHandle`) left its handle's state, a lock among it, in
+    a process-wide registry that nothing ever removed from, so a program
+    that keeps starting threads grew without bound and paid an ever larger
+    map's inserts. The registry now holds the states weakly (the handle's
+    methods keep them alive) and sweeps dead entries when it doubles.
+  - Iterator classes written in Python. `next(it)` of one went from the
+    compiled call site through the builtin's full call path to a bound
+    `__next__` call, about 900 instructions more than a `for` loop's step
+    of the same iterator; it now steps a frameless `__next__` as `FOR_ITER`
+    does (`self.i += 1; return self.i`: 2,046 instructions to 1,574,
+    against 1,124). And a bare `raise StopIteration` that ends a
+    frameless `__next__` built and unwound the exception through a full
+    call: when a `for` loop, `list()` or `next(it, default)` is the
+    catcher and nothing could see it (no store buffered, no tracer), the
+    step now reports the end itself. Ending a loop over a used-up
+    iterator went from 7,600 instructions to 1,700 (CPython 3,240), a
+    20-item loop over a fresh one from 1,424 an item to 1,082 (1,080),
+    and `list()` of it from 1,635 to 1,332 (1,107).
+  - The frozen `itertools` classes' `__next__` (`return
+    next(self._core)`) is now native, so `c.__next__()` of a `count`, as
+    `threading` names its threads, costs 850 instructions instead of
+    2,783 (CPython 554). Their `__iter__` returned the native core rather
+    than the object, so a subclass's own `__next__` was skipped by `for`
+    loops and `islice`; it returns the object now, as CPython's do.
+  - `reversed(s)` of a string took the general type call, which built
+    a new native constructor object for the call and released it again
+    (taking the descriptor registry's write lock on the way out, though
+    its comment promised a read probe), and copied the characters one
+    `chars()` step at a time. Its pure constructor now admits `str` and
+    `bytes`, the type-call path reuses one constructor per type, the
+    registry's release probes under the read lock first, and an ASCII
+    string's characters are copied by index: `reversed(s)` from 4,158
+    instructions to 1,557 (CPython 907), `''.join(reversed(s))` from
+    7,547 to 4,984 (4,340).
+  - An `accumulate` without a function ended each loop through the
+    general step (its pure step declined at the end): it now ends in
+    place, as `zip`'s does (`for` over five items 5,297 to 4,155 against
+    2,600), and so does a `pairwise`. A compiled `list(x)`, `tuple(x)`,
+    `set(x)`, `dict(x)` or `str(x)` whose pure constructor declined (`x`
+    a `map`, a generator) tried the same attempt again and three more
+    before reaching the container lane; it goes there directly now, about
+    380 instructions a call (`list(accumulate(xs))` 6,837 to 5,643
+    against 3,147, `list(pairwise(xs))` 8,105 to 6,837 against 3,760).
+  - `yield from xs` of a list in compiled code left at
+    `GET_YIELD_FROM_ITER` and at the delegation's end in every generator:
+    a three-item one cost 12,515 instructions against 2,303. Compiled code
+    now takes a builtin sequence's iterator in place and steps a list's or
+    tuple's cursor without leaving (5,734, the same as the equivalent
+    `for` loop of yields), and a class whose `__iter__` is such a
+    generator iterates in 6,299 instructions instead of 13,055 (2,538).
+  - Keyword calls of the `itertools` classes (`product(xs, repeat=2)`,
+    `accumulate(xs, initial=0)`) left compiled code at `CALL_KW` and bound
+    their keywords through the general call, about 2,700 instructions:
+    the adapter is now built in place (5,945 to 3,074, CPython 3,354).
+    The combinatoric adapters also build each tuple straight from its
+    items, without an intermediate vector (`list(product(xs, xs))` 12,046
+    to 9,524).
+  - `iter(obj)` of a class with a Python `__iter__` looked the method up
+    twice uncached and called it as a bound method; it now calls the
+    cached function directly, as `for` loops do (3,159 instructions to
+    2,273, against 1,284). `struct.unpack` was a Python wrapper over the
+    native one; like `pack`, it now reads a `bytes` or `bytearray` buffer
+    natively and keeps the wrapper for other buffers and errors (2,088
+    to 1,229, against 1,061).
+  - A dict iterator under `zip` or `enumerate` (`heapq.nlargest(n,
+    d.items())`, as `Counter.most_common` calls it) took the general
+    step for every item, since only sequence cursors counted as ready to
+    step in place. A dict iterator past its first, checked, step now
+    counts too while its dict is unchanged (`zip(range(3), it)` over a
+    dict's items 15,122 instructions to 12,227, `most_common(3)` 38,153
+    to 33,766, against 18,348).
+  - `isinstance(x, C)` for an ABC `C` asked, on every call, whether the
+    metaclass keeps `type`'s `__instancecheck__`, by a string lookup
+    through its MRO; the answer is now remembered per metaclass version
+    (`isinstance(o, Base)` 1,238 instructions to 1,009, against 2,179;
+    `issubclass(Impl, Base)` 2,442 to 1,922, against 2,052). A
+    class-like instance's plain Python `__instancecheck__` or
+    `__subclasscheck__` (the `typing` aliases') is called directly rather
+    than as a fresh bound method (`isinstance(i, typing.Hashable)` 8,130
+    to 7,753, against 4,649; the rest is its two Python calls).
+  - A compiled `obj.attr = value` stored in line only over a scalar; one
+    that replaced an object (`node.next = other`, `self.current = node`)
+    took a helper, about 124 instructions more, even when another owner
+    kept the old value. The in-line store now gives the old value up by a
+    plain decrement when it isn't the last reference. A site that first
+    added its attribute (a loop's first pass) settled on appending and
+    took the helper for every later pass's replacement; it now replaces
+    in line too. Replacing an object in 100 instances went from 30,957
+    instructions to 17,297 (CPython 17,669), and a second pass's stores
+    from 54,605 to 29,666 (29,001).
+  - Fixed: the core loop's instance attribute stores left a finalizer the
+    replaced value queued for the next safe point, so `holder.d =
+    Dying()` ran the old object's `__del__` one statement late (at the
+    next call) in every tier.
+  - `dict(x)` from compiled code reached the general type call after the
+    container lane declined it; the lane builds it now (a mapping, a
+    lazy iterable of pairs, or an eager container).
+  - A function's first call decides whether it is a frameless leaf; the
+    decision allocated four vectors to walk the body, about 1,000
+    instructions of a first call's 6,000 (CPython's first call costs about
+    150). It walks the body (at most 64 instructions) in stack buffers
+    now, and only generator-shaped code scans its body for a generator
+    start: a first call of a fresh function went from 7,937 instructions
+    to 6,611. The rest is building the code's tables and the first pass's
+    site caches, which CPython does when it quickens the code.
+  - Fixed: the frozen standard library's code cache named its artifacts by
+    module alone, so two builds whose embedded sources differ (a merge
+    base and a PR in the bench gate, a developer's branches) recompiled
+    and replaced each other's artifacts at every start, about 14 million
+    instructions a run (it also made whole-process A/B counts of two
+    builds misleading). Artifacts are now named by module and source
+    hash, and a write removes the module's day-old artifacts for other
+    sources.
+  - Stepping an instance whose class has a native `__next__` (an
+    `io.StringIO` under `csv.reader`, a `for` loop over one) looked the
+    method up by name on every step; it is found once per class version
+    now. The CSV reader also updates its per-row state (`line_num` and
+    its re-entry flag) in place rather than re-inserting it: reading 200
+    rows went from 1,568,659 instructions to 1,482,021 (CPython 912,416).
+  - Fixed: a `StopIteration` thrown into a generator that never started
+    was converted to `RuntimeError`; CPython's PEP 479 conversion covers
+    only the body past its start, so it escapes as it is there.
+  - `setattr(obj, name, value)` of an attribute already there interned
+    and hashed the name and stored it through a dictionary insert; it now
+    replaces the value at the position it found (1,193 instructions to
+    891, against 726). Fixed alongside: when the replaced value was its
+    last reference, its `__del__` ran one statement late; that case now
+    takes the full path, which runs it at once.
+  - `format(x, 'g')` (and `%g`, the type-omitted form with a precision)
+    copied the digits through four strings; it lays them out from the one
+    scientific formatting and strips zeros in place (3,850 instructions to
+    3,283, against 2,416). A test pins the output for 6,000 values and 15
+    specs to CPython's.
+  - A compiled `len(obj)` site whose leaf half declined an instance went
+    through the builtin's lane to reach a frameless `__len__`; it
+    evaluates it in place now (1,670 instructions to 1,245, against
+    1,004). Operator and subscript dunder calls enter a warm leaf's
+    compiled plan rather than its interpreted one.
+  - The bench gate's A/B legs ran in a fixed order, PR, base, CPython,
+    so every PR sample followed another program's run and every base
+    sample a near-identical one's; a PR that changed no code could fail
+    it, and this PR's Linux gate flagged `fib` and `richards` three runs
+    in a row while both builds executed the same instruction counts with
+    the same simulated cache misses and branch mispredictions (the PR's
+    slightly fewer). The legs now run in a balanced order (PR, base,
+    base, PR, then the mirror), two samples each a round.
+  - Where the everyday battery's worst cases stand, measured on
+    `argparse_ops` (2.1 times CPython's instructions): its 60 iterations
+    are 85% warm-up. In steady state an iteration costs 2.1M
+    instructions against CPython's 1.5M (1.37 times); iterations 2 to 60
+    average 4.8M against 1.7M. Interpreted, an iteration costs 2.9M (the
+    core loop averages 39 instructions a bytecode: its pc and
+    instruction pointer live on the stack, so dispatch alone is about
+    ten), and through iteration 60 the JITs add about 1M an iteration
+    more than they save: tier 2's analysis of code it then rejects is
+    about 8% of the case, the frame JIT's compiles 2%. `import argparse`
+    costs 30M to CPython's 11M, spread over decoding cached code,
+    interning its names and running module bodies, with nothing over
+    3%.
+  - A sweep of 198 more single statements (string, `re`, dict, list,
+    call, `os.path`, `pathlib`, `datetime` and small standard-library
+    operations) reads a geomean of 0.95 times CPython's instructions.
+    From its tail: tier 2's generic `BINARY_OP` helper always took the
+    interpreter's full operator dispatch, where compiled frames have
+    direct helpers; it now builds two lists' or tuples' concatenation, two
+    dicts' union, sets' algebra and `bytes` concatenation off its
+    borrowed operands (`xs + [y]` in a loop 2,992 instructions to 2,251,
+    against 1,461; `d | e` 3,261 to 2,340, against 1,727). `len()` of a
+    range joined the builtin's fast half (2,026 to 1,053, against 980),
+    and `dict(mapping, **kw)` copies the mapping once and interns its
+    keyword names (4,329 to 3,712, against 1,560; the keyword call's own
+    route is the rest).
+  - Fixed: compiled code's check that an attribute certainly misses (ahead
+    of calling `__getattr__`) probed the instance dictionary with a
+    comparison that runs a colliding key's Python `__eq__`, from a
+    frameless activation: the `__eq__` saw its caller's caller in
+    `sys._getframe`, and ran four times a lookup instead of once. The
+    probe now runs no Python and leaves such a dictionary to the full
+    lookup. This was the bug that a stricter generic-share limit for tier
+    2 had exposed; that limit still isn't adopted, since it now costs
+    the `nbody` fixture 38% (tier 2 runs its boxed float arithmetic
+    faster than the frame JIT does).
+  - Tier 2's analysis runs on the thread that runs the program, and a
+    trace of `argparse` building and running a parser 180 times
+    (`WEAVEPY_JIT_TRACE=1`, about 200 ms in all) showed 44 ms of it
+    there: 104 functions analyzed to compile 12 trivial ones. Three
+    things cut that to about 20 ms (5% of the battery case's
+    instructions, with the bench fixtures unchanged):
+    - A method site that doesn't resolve types the method's body, a
+      whole analysis of its own, and the answer wasn't kept: the analyzer
+      asked again on every pass over every such site (12 analyses of one
+      callee in a 22-instruction function). An attempt now remembers
+      the sites that didn't resolve, as it did those that did (44 ms to
+      32).
+    - An analysis starts over for each loop it carves out, each retry
+      with other assumptions and each callee it types, and nothing
+      bounded the product: `_parse_known_args2`, 169 instructions, took
+      160 passes an attempt, twice. Each attempt now has a work budget,
+      counted in instructions passed over: 1,024 units and eight passes
+      over the code itself, plus what the code's own calls and loop
+      iterations have paid for (one unit for every eight). The costliest
+      kernel among the bench fixtures uses half its allowance. An attempt
+      that runs out stands as a rejection, so the frame JIT takes the
+      code at once; code whose calls run long loops (16 iterations a
+      call) waits instead, interpreted, until its work pays for twice the
+      budget. `WEAVEPY_T2_FREE`, `WEAVEPY_T2_PASSES` and `WEAVEPY_T2_WPP`
+      set the three numbers.
+    - The plan's set of jump targets is a bitmap instead of a hash set
+      built on every pass (the hottest line of the analysis; 1.2% of the
+      case).
+    What's left is mostly the cost of running the analyzer cold: about
+    150 microseconds an attempt, most of it instruction-cache misses in
+    code that last ran thousands of calls ago, on 100 attempts that
+    reject. Cheaper rates were tried and cost the short numeric fixtures
+    too much (work alone paying for analysis: `spectral_norm` 2.1 times
+    slower, `nbody` 1.7), as did a budget summed over a function's
+    attempts (`difflib`'s `find_longest_match` compiles on its second
+    loop entry, after a first that fails).
+  - A field of a natively served value (`dt.hour`) has no site memo, so
+    every read takes the compiled site's slow path, where two lanes
+    added on this branch (a bound native method's memo, a property's
+    cached getter) had gone ahead of it: the `datetime_ops` fixture ran
+    4.7% more instructions than the merge base on Linux. The native
+    field is read first again (352.5M instructions to 340M).
+  - Fixed: the `generators` fixture ran either 667M or 763M instructions,
+    run to run, on any build (and always the higher with synchronous
+    compiles), which the bench gate read as a regression one run in two.
+    `sum(gen)` drains a generator's whole body in one step; the body gets
+    hot and compiles during that step, and its native code needs more
+    value-stack room than the step had sized the stack for. Every native
+    entry was then turned away, and after 32 at one instruction the entry
+    was given up for the rest of the run; how many entries were lost
+    depended on where the step's periodic check happened to end it. The
+    step now grows the stack when the native code arrives, and an entry a
+    small stack turned away no longer counts against the entry (680M in
+    every run of a quick build, 673M synchronous).
+  - A compiled attribute read keeps two classes' field positions in line
+    and up to four more in the site's table, but the table was consulted
+    last: a third class's read went through the whole miss chain (the
+    property, class-attribute and descriptor lanes, then the table, then
+    an attempt to memoize the value as a class attribute, which a field
+    never is) at about 1,000 instructions. `argparse` reads `action.dest`
+    and its neighbors over three action classes: 120 such reads an
+    iteration, 7% of its steady state. The table is now the first thing
+    the slow path tries for an instance (an entry is for a class version
+    at which the name resolved to the instance, so nothing ahead of it
+    would answer otherwise): 1.908M instructions an iteration to 1.796M.
+  - `getattr(cls, name[, default])`, which `inspect`, `typing`, `functools`
+    and `dataclasses` call on every object they handle, cost three to
+    four times CPython's instructions whenever the answer wasn't a plain
+    hit: a missing name with a default (`getattr(cls, "__wrapped__",
+    None)`) 1,761 against 579, `getattr(cls, "__name__")` 2,444 against
+    558. Each call classified the name against two lists of dunders by
+    comparing strings (some forty comparisons), asked `type` itself for
+    the name, walked the class's MRO three more times, and for
+    `__name__` gave up and took the full call. Now the two lists are one
+    hashed table, `type`'s answer is remembered by name, `__name__` and
+    `__qualname__` are read where they live, and the whole answer is
+    kept for a class under plain `type` by its attribute version and the
+    name object. The memo owns only scalars and builtin functions; any
+    other value it borrows from the Python class whose dictionary holds
+    it, so a value a class drops dies when it does. All six shapes
+    measured now cost 610 to 630 instructions (CPython 560 to 600); in
+    the `inspect_typing_ops` case this helper was 6% of the instructions.
+  - Programs with a second thread. The battery's slowest case on a
+    profile-guided build is `threading_queue_ops` (2.6 times CPython's
+    time): a thread started and joined costs 180 microseconds against
+    60, and an item handed to a worker through a `queue.Queue` 20,900
+    instructions against 14,200. In the hand-off, `Condition.__exit__`'s
+    `self._lock.__exit__(*args)` read a native method off a temporary
+    and found the site's memo, then threw the answer away: the receiver
+    could only leave by a plain decrement, which is never allowed once
+    reference counts are shared between threads, so each read went on
+    through the whole miss chain (1,750 instructions, twice an item).
+    The read now releases the receiver as the core loop releases any
+    operand when the plain decrement doesn't apply: 22,200 instructions
+    an item to 19,300.
+  - What a second thread costs everything else, measured by running
+    single-threaded battery cases with one idle thread alive: 13% to 55%
+    more cycles (`list_dict_basics` 13%, `collections_ops` 26%,
+    `class_features` 34%, `enum_dataclass_ops` 55%), where CPython's
+    don't move. Keeping reference counts plain in an experiment took
+    back four fifths of it, the borrow counters' bias the rest: counts
+    go atomic for every thread as soon as a second one registers (a
+    locked increment or decrement costs about twenty cycles on x86), and
+    compiled code's in-line releases and clones, which test that flag,
+    call their helpers instead (5% to 20% more instructions). Under the
+    GIL the counts could stay plain if no thread ever touched one
+    without holding it; that isn't established today (118 blocks run
+    with the GIL released, and a thread's start and its thread-local
+    state's teardown run outside it), so it is the next piece of work
+    of its size rather than a change to make in passing.
+  - First steps toward plain counts with several threads. An audit build
+    (a check, in the shared-count paths, that the updating thread holds
+    the GIL) run over the thread tests found no update outside the GIL
+    while a program runs, and two places at its edges. The main thread
+    gave the GIL back when the main module returned and ran
+    `threading._shutdown`, the exit handlers and the finalizers without
+    it, beside daemon threads that still held it: it now holds the GIL
+    from the main module through shutdown, as CPython's finalization
+    does (a join inside gives it up while it waits). And a thread's
+    thread-local caches were dropped by its destructors after it had
+    given the GIL back: its entry in the traceback dumper's registry
+    (its frame and exception stacks) and its interned names are now
+    released by the worker while it still holds the GIL, and the
+    docstring cache, the static-string table, the empty tuple and the
+    `getattr` memo take the GIL to drop. The sixty-odd other
+    thread-local caches that hold objects or strings (class handles,
+    key tables, registries, memos) now take it too, and the command
+    line's run holds the GIL from before the interpreter is built until
+    it is released. With that, the audit over 24 groups of CPython's
+    tests (threads, queues, futures, asyncio, sockets, subprocesses,
+    multiprocessing, the C API) records no update outside the GIL by
+    any thread while it lives, and none at a worker's exit; what is
+    left is the main thread's last steps after the run (reading the
+    exit status off the exception, its own destructors at process exit)
+    and a fatal-error dump from a foreign thread. Still to do before
+    counts can stay plain with several threads: those last steps, the
+    same audit on Linux and Windows (their blocking calls differ), a
+    flag of its own for "other threads exist" (the shared-counts flag
+    stands in for it in two places), and a test job that runs the audit.
+  - Reference counts stay plain with several threads. Under the GIL a
+    count needs no atomic update as long as every thread that touches an
+    object holds the GIL while it does, and that now holds by
+    construction: a worker takes the GIL before its first touch of an
+    object and keeps it on its guard stack through its thread-local
+    destructors (the stack is the first thread-local the thread uses,
+    so the last one destroyed), and no block that runs with the GIL
+    released builds or drops an object (all 118 were read; one, a
+    blocking `channel_send`, built its exceptions and dropped a
+    withdrawn item inside the block, and now hands the outcome back
+    out). Counts turn atomic, under the GIL, only when something will
+    touch one outside it: free-threading, a thread the VM didn't start,
+    the traceback watchdog, or a thread whose outermost GIL scope ends
+    while others still run (an embedder reading a result, the command
+    line's last steps beside daemon threads). Windows keeps atomic
+    counts until its blocking paths get the same audit, and
+    `WEAVEPY_ATOMIC_COUNTS=1` restores them anywhere. "Other threads
+    exist" is a flag of its own now, for the three places that asked
+    the shared-counts flag that question (frames made whole before a
+    blocking call, retired code objects, pickle's pins). An audit
+    build that checks the GIL at every count update ran over 36 groups
+    of CPython's tests and the bundled thread tests with no plain
+    update outside the GIL, on macOS and on Linux. On a release build
+    one idle thread now costs the four battery cases measured before 3%
+    to 8% more cycles (`list_dict_basics` 3%, `enum_dataclass_ops` 4%,
+    `class_features` 5%, `collections_ops` 8%) where atomic counts
+    cost 12% to 30%, and an item through a `queue.Queue` with three
+    consumers 19,300 instructions to 16,800 (CPython 14,200). What is
+    left is the cell borrows' lock word, which a second thread still
+    turns on.
+  - A thread back from a blocking call waited two switch intervals for
+    a busy thread, and `sys.setswitchinterval` changed neither. The
+    hand-off wants both clocks run out, the holder's turn and the
+    waiter's wait, but the waiter's only started at the first
+    checkpoint after the holder's had expired: 10 ms where CPython
+    waits about 6. The two now run side by side, and the interval a
+    program sets is the one the checkpoints use: 5.2 ms at the default,
+    0.2 ms at 10 microseconds (CPython 6.2 and 0.18). A test that
+    sleeps beside two busy threads took 21.5 s and takes 0.23 s
+    (CPython 0.29 s).
+  - A thread's interpreter shares its parent's table of leaf builtins
+    instead of copying it (two hash maps and a vector of handles built
+    at each start and dropped at each exit, a twentieth of a start and
+    join). Starting and joining a thread: 522,000 instructions to
+    463,000 with the change above (CPython 192,000, kernel included;
+    in user space the cost is spread over the thread module's Python,
+    a fresh allocator heap and interpreter for each thread, and their
+    teardown).
+  - Cell borrows stay lock-free with several threads too. A borrow took
+    its cell's lock word (a compare-exchange, a thread-local read and a
+    release store) from the moment a second thread registered: 93,000
+    locked instructions a call of `collections_ops` with an idle thread
+    alive, all of them these. Under the GIL the lock word orders nothing
+    the GIL doesn't, and the borrow counter alone keeps a shared and an
+    exclusive borrow apart, across threads as within one, so borrows
+    now take the lock only once some thread may touch a cell without
+    the GIL (the cases that turn counts atomic). The count of live
+    lock-free guards, which decides whether a thread may hand the GIL
+    over at a checkpoint, is the GIL holder's: a thread's own leave it
+    when it really gives the GIL up and return with it. The lock word
+    was also a deadlock: a thread blocked inside a set's membership
+    test (its `__eq__` sleeping, writing or taking a lock) held the
+    set's word, and another thread adding to the set spun on it with
+    the GIL held, forever. Now the add waits for the first thread with
+    the GIL released and then happens (CPython lets it through at once;
+    the deferred-operation path that covers a nested mutation would
+    have dropped it). The audit build, which now checks the GIL at
+    every lock-free borrow as well, found none outside it over 45
+    groups of CPython's tests on macOS and the thread modules on Linux.
+    One idle thread no longer shows in the four cases: 0% to 0.6% more
+    instructions, cycles within the 2% the runs spread over (3% to 8%
+    more cycles before this, 13% to 55% two days ago).
+  - A lock's waiter is handed the lock. Past five milliseconds a
+    contended `Lock` or `RLock` acquire waited on the lock itself, GIL
+    released, and got it only by waking in the gap between the
+    holder's release and its next acquire. That gap is a few bytecodes,
+    and it shrank as threaded code got faster: the first acquire
+    against a holder that retakes the lock at once went from 10 to 40
+    ms to 80 to 450 ms, and the hand-off test started to fail one run
+    in three. A release now keeps the lock for a waiter that is past
+    its turn (nobody else can take it meanwhile), as CPython's lock
+    hands itself to a waiter of over a millisecond, and the waiter goes
+    from its grace period to that wait without coming back for the GIL:
+    5 ms for that first acquire (CPython 6 to 8).
+  - A method that adds to a `__slots__` member runs in line. Tier 2 ran
+    `self.a += 1; return self.a` in line only when `a` was an instance
+    dictionary field; for a slot member each call went through the
+    method helper (538 instructions against 128). The in-line form now
+    covers a member slot of a class whose instances have no dictionary:
+    126 instructions, a slotted `tick()` loop 4.2 times as fast.
+  - Tier 2 keeps loops whose attribute traffic it handles in line. Its
+    admission rule left any loop with more attribute operations than
+    typed ones to the frame JIT, on the grounds that each attribute
+    access costs tier 2 a helper call. Scalar fields of split-layout
+    instances and laid-out slot members have been read and written in
+    line for a while, so those accesses no longer count: the
+    `attr_access` fixture's loop runs 1,183 instructions an iteration
+    in tier 2 against 1,333 in the frame JIT (362 cycles against about
+    400; CPython 3,329 and 1,115), the fixture 0.885 of its
+    instructions. Both figures are still a hundred instructions an
+    attribute operation: each access redoes its receiver's guard chain
+    (about 60 instructions), and the two string field reads go through
+    a helper (172 each); the next entry takes those on.
+  - Tier 2's attribute accesses check less each time. Three cuts in
+    the in-line path, measured on the `attr_access` fixture's loop (two
+    scalar reads, two float fields read and rewritten, two `tick()`
+    updates, two string fields compared):
+    a string, bytes or object field that still holds the value its site
+    read last finds that value's pin again in line (the helper's own
+    first answer, 172 instructions each time before): 1,182 to 972
+    instructions an iteration;
+    an instance validated by one access of a local's field (an instance
+    pin with no published dictionary, its values split over its class's
+    names) stays validated for the accesses of that local that follow
+    in the block, through in-line stores and field updates too, until
+    something that can run code or reshape it (a helper's store, any
+    other call, the local's rebinding): 972 to 874, a field read then
+    written 161 to 118;
+    and a site's class version and index are constants in its code
+    instead of loads from the guard table (a guard never changes once
+    made): 874 to 786. Cycles went 348 to 228 an iteration; the frame
+    JIT ran this loop at 1,333 instructions and about 400 cycles, and
+    CPython runs it at 3,329 and 1,115.
+  - Integers past 64 bits. The battery's `uuid_secrets_ops` (1.6 times
+    CPython's time) spends its time making and reading 128-bit values,
+    and each step cost two to four times CPython's:
+    `int(text, 16)` of 32 digits took 7,300 instructions, because the
+    constructor's quick arms try a machine-int parse, decline on its
+    overflow, and the full constructor's layers each try it again
+    before the big value is built; the arms now build it themselves
+    (2,800, 602 ns to 218; CPython 160 ns), as they do for long decimal
+    text (456 ns to 207; CPython 143). Hex text is then tried before the
+    general parse and read through a digit table (218 ns to 124).
+    Arithmetic of a big value with a machine int promoted both sides,
+    copying the big one: sums, differences, products, right shifts and
+    masks now read it in place (`big + 1` 977 instructions to 664).
+    `to_bytes` built a byte-order string and a copy of the value before
+    looking at its arguments; a non-negative value now goes straight
+    into the result, at any length. And a method called on a big
+    `int`, a float, a tuple or a `bytes` object went through the method
+    memo at every call from compiled code, whose per-site cache held
+    lists, dicts, sets and strs only: the site now keeps the method for
+    the receiver's kind, as it did for streams
+    (`big.bit_length()` 804 instructions to 589).
+  - Removing a key from a dict cost time in proportion to the keys behind
+    it. The table keeps positions dense (the i-th key is entry i, which
+    the iterators and the position caches rely on), so a removal moved
+    every later entry down and renumbered the slot table: a cache that
+    evicts its oldest key, a table of pending requests, an LRU touch
+    (`v = d.pop(k); d[k] = v`), `OrderedDict.popitem(last=False)` and
+    `move_to_end` were all quadratic. At 20,000 live keys, in ns an
+    operation (CPython's in brackets): `OrderedDict` LRU 77,900 (195),
+    `move_to_end` 87,100 (87), pop and re-insert 41,000 (155), add and pop
+    the oldest 40,000 (107), a `WeakValueDictionary` window 45,600 (829).
+    The removals a program makes in bulk (`del d[k]`, `d.pop(k)`, an
+    `OrderedDict`'s, a dead weak value's) now leave a tombstone in the
+    entry list, and positions stay dense through a rank index over the
+    tombstones: a bitmap, a Fenwick tree over it that is built only once
+    a tombstone sits past the front run (a queue's tombstones are all at
+    the front, where a position is its entry less the run), and the last
+    translation, which a walk by position continues from. The table
+    closes the gaps in one pass when its entry list fills or tombstones
+    outnumber keys, so each removal pays a constant share. Removals
+    elsewhere (a namespace's `del`, a class's attribute) still shift, so
+    a table that never takes a bulk removal has no tombstone and pays one
+    test per positional access; the bench fixtures read 1.000 of their
+    instructions. The same operations now: 378, 158, 143, 129 and 4,560
+    ns, flat from 1,000 keys to 20,000 (`dict` FIFO by `next(iter(d))`
+    282 ns, where CPython's own scan past its tombstones takes 6,400).
+    The index's pointer first took the table from 48 to 56 bytes, which
+    cost 16 bytes a dict in the allocator's size classes (a million
+    two-key dicts 262 MB to 277 MB). The slot table is now one word, a
+    pointer whose length is the shift's (compiled code tests the shift
+    for a table without slots, where it tested the length), so a table
+    is 48 bytes again and a dict takes what it took (262 MB); the
+    fixtures read 0.997 of their instructions, a probe's mask coming
+    from the shift it already loads.
+  - What is left on those loops is the call, not the dict. Tier 2 ran a
+    method call on a builtin value as two generic helpers: a load that
+    allocated a bound method and pinned it for the rest of the
+    activation, and a call that looked the builtin's kind up again
+    (`d[i] = i; d.pop(i - 1000)` 2,088 instructions an iteration against
+    the frame JIT's 1,247 and CPython's 1,248, and 169 ns against 108).
+    A builtin value's method table never changes and its lookup runs no
+    code, so for a method the core loop's leaf lane runs in place the
+    load now leaves the receiver where the bound method would go and the
+    call runs the builtin on it; an exit between the two rebuilds the
+    bound method the interpreter expects. 1,384 instructions (119 to 129
+    ns). The frame JIT still runs such a loop in 1,118: the two helper
+    calls cost about 270 more than its method site, and a loop of
+    container calls has no typed work for tier 2 to win that back with.
+    So tier 2 now leaves a loop to the frame JIT when it makes such a
+    call for fewer than four typed operations (`WEAVEPY_T2_METHODS`): the
+    pop loop runs in 1,102 instructions, under CPython's 1,248, and pop
+    and re-insert went 138 ns to 92 (CPython 130), a queue worker's loop
+    4% faster, with the suite's loops that mix such calls with typed
+    work (`chaos`, `go`, `raytrace`) within 1% either way.
+    `OrderedDict` calls were the next share: the frame JIT tried its
+    fused call (receiver, simple arguments, call in one helper) on every
+    method call of a local, and a call with a keyword or a computed
+    argument walked the instructions, declined, tried the native method
+    a second time, and then ran through the method site anyway, about
+    450 instructions each. Compiled code now makes the attempt only
+    where the arguments can be what it serves, the second try is gone,
+    and the fused arguments fold `%`, `//` and `>>` of two ints as they
+    did `+`, `-`, `*` and the bit operations (`od.move_to_end(i % n)`
+    1,594 instructions to 1,288, CPython 938; add and
+    `popitem(last=False)` 3,515 to 3,039, CPython 2,201; with a plain
+    key `move_to_end` is 1,050 against 941 and a store 824 against
+    1,120). A keyword call of a native method (`popitem(last=False)`)
+    also built a vector of cloned arguments for the method's leaf half,
+    which now reads them in place (the add-and-pop loop 313 ns to 272;
+    CPython 190). And `set.discard` and `set.remove` probed the set
+    once to see whether the call could run without Python and then ran
+    the general body, which probes again inside a comparison scope and
+    replays the deferred-operation queue: a `str`, `int` or `float` key
+    that one native probe settles is now removed by that probe
+    (`s.discard(k); s.add(k)` 2,252 instructions to 1,348, 197 ns to
+    111; CPython 1,530 and 122). Weak-value dictionaries (22,400
+    instructions an insertion and expiry against CPython's 7,900, spread
+    over the weak reference class's Python-level `__new__`, `__init__`
+    and callback) are what is left of this group.
+  - A scaling sweep (about 110 container and string operations timed at
+    n and 8n keys under both interpreters, flagging a cost per operation
+    that grows where CPython's doesn't) found more of the dict removal's
+    kind, each an everyday idiom:
+    Set operations copied their operands. A comparison (`a <= b`,
+    `a == b`) took a snapshot of both sets first, so sets of different
+    sizes took time in proportion to the larger to be told apart; the
+    methods (`intersection`, `difference`, `issubset`, `issuperset`,
+    the three `_update`s) built a new set from each operand, hashing
+    every key again; and `a -= b`, `a &= b` and `a ^= b` computed
+    `a - b` whole and copied it back into `a`. At 32,000 keys against
+    three: `small <= big` 19.9 µs (CPython 57 ns), `big -= small` 1.56
+    ms (243 ns), `big.intersection(small)` 1.46 ms (244 ns),
+    `small.issubset(big)` 875 µs (103 ns), `big == other` of another
+    size 37 µs (36 ns). The algebra now runs on the tables themselves
+    (`setalg`): a stored key carries its hash, so nothing is hashed
+    again and no `__hash__` runs; a pair of keys that needs a Python
+    `__eq__` defers, which leaves the operation to the old path with
+    nothing changed; and each operation walks the side it has to, the
+    smaller one for an intersection, a subset test or a disjointness
+    test, the right one for an in-place difference (planned with both
+    sets only read, then applied by position). The same figures: 83 ns,
+    331 ns, 162 ns, 111 ns and 61 ns, on a quick build. The method
+    forms now keep the elements CPython keeps where equal keys differ
+    (`{1, 2}.intersection({1.0, 2.0})` is `{1.0, 2.0}`, as the operator
+    already gave).
+    A dict's keys view did the same against a set: `small & d.keys()`
+    built the 32,000 keys as a set first (1.18 ms; CPython 242 ns; now
+    456 ns), as did `d.keys() >= small` and `isdisjoint`; they probe the
+    dict's table with the set's stored hashes. `small - d.keys()`, which
+    CPython answers by walking the dict (375 µs), takes 416 ns.
+    A string built by `s += piece` in a loop copied itself at every
+    append once the loop was compiled: the core loop grew a `str` local
+    in place when nothing else held it, but the compiled binary
+    operation didn't know its result was about to be stored back into
+    its left operand's local. Its site now carries that local, and the
+    helper lets the local go and appends where the string is (649 ns an
+    append at 32,000 appends, growing with the length, to 50 ns flat;
+    CPython 104 to 118). A concatenation whose left operand is a
+    temporary nothing else holds (`a + b + c`'s second `+`) grows that
+    one too.
+    A function with n parameters took n² to parse and to compile: both
+    duplicate-parameter checks scanned a vector, and every use of a
+    local searched the names for its index. CPython's own
+    `test_collections` makes a 150,000-field `namedtuple`, whose
+    constructor is such a function: 117 s, now 1.5 s (CPython 1.9).
+    And `int("x12")` in a `try`, the everyday test for a number, ran the
+    big-integer parser at each of the three layers that reach the
+    constructor's quick arms before the full constructor rejected it
+    (the arms had started building big values a few commits back): the
+    arms decline text that isn't digits at its first byte, 4% of the
+    `exceptions` workload's instructions.
+  - The sweep's constant factors, and two more cliffs found beside them.
+    Copying a sequence's items moved each one through an iterator: an
+    object returned by value travels as a tag byte and fifteen more,
+    stored and reloaded unaligned, about twenty instructions an item.
+    `tuple(xs)`, `a + b`, `t * n`, `(*xs,)`, slices, `list(xs)`,
+    `xs.copy()`, `extend` and the snapshots `min`, `max` and `sorted`
+    take now copy the items whole and take their counts in a second
+    pass, and a vector that becomes a tuple hands its items over in one
+    copy. At 1,000 ints: `tuple(xs)` 8.0 µs to 1.0 (CPython 1.9),
+    `t + t` 10.1 to 1.9 (2.8), `t * 2` 9.9 to 2.4 (2.6), `(*xs,)` 6.4
+    to 1.5 (3.6), `t[::-1]` 5.1 to 1.6 (1.6). A dict's or a set's
+    entries copy the same way (`dict(d)` and `d.copy()` 5.6 µs to 3.7;
+    CPython 3.2), and a list whose items all outlive it is released
+    without rewriting its slots.
+    `for x in reversed(xs)` in a loop tier 2 compiled stepped its
+    iterator through the interpreter's general `next`, 41 ns an item
+    (the same loop over the list itself 3.5): the reversed list's
+    iterator steps in place, as a list's does (7 ns; CPython 22).
+    A tuple's hash walked its items twice and reduced each int modulo
+    the hash prime, and `hash()` first checked each item's hashability
+    through a call: one pass, an int below the prime is its own hash,
+    and scalars are checked in line (34 instructions an item to 13;
+    `hash(t + (i,))` of 1,000 ints 9.0 µs to 2.8, CPython 3.4).
+    A `memoryview` slice left compiled code for the interpreter and
+    built four vectors on the way to a view that needs none (3,530
+    instructions to 1,536; 283 ns to 152, CPython 72: the view's own
+    copy, with its format string, is most of what is left).
+    `str.count` of one character ran the substring search per
+    occurrence (29 µs to 1.8 on a 33,600-character text, CPython 11.9).
+    The first cliff: `b[i:j] = data` on a `bytearray` rebuilt the whole
+    buffer as a list of int objects, spliced that, and wrote every byte
+    back, whatever the slice's size, and `del b[i:j]` removed the
+    slice's bytes one at a time, moving the tail for each. On a 1 MB
+    buffer a four-byte store took 9.1 ms (CPython 171 ns) and
+    `del b[:16]` 388 µs (72 ns). Both work on the bytes now: a store of
+    the same length writes in place, any other moves the tail once, and
+    an extended slice is stored or closed up in one pass (237 ns, and
+    23 µs for the delete, which still moves the megabyte: CPython keeps
+    a start offset, and that is what is left here).
+    The second: merging dicts. `d.update(other)` gave up its one-pass
+    merge when `d` held more than 32 keys (checking them for Python
+    `__eq__` was thought too dear) and then stored key by key through a
+    snapshot of `other`; `d.update(d)` did all of that to change
+    nothing; `dict(pairs)` and `d.update(pairs)` made an iterator and a
+    vector for every pair; and an items view was read as pairs like any
+    iterable. The merge now probes with each key's stored kind and
+    stops only at a key that needs Python (the keys before it are in,
+    and the general path merges them again harmlessly), a dict merged
+    into itself returns at once, a list or tuple of exact pairs is
+    walked in place under one borrow, `zip` of two plain sequences
+    builds its dict first, and an items view merges as its dict. At
+    1,000 keys: `d.update(other)` with half the keys shared 68 µs to 27
+    (CPython 34), `d |= other` the same, `d.update(d)` 46 µs to 66 ns
+    (63), `dict(pairs)` 110 µs to 33 (31), `d.update(pairs)` 74 to 26
+    (31), `d.update(other.items())` 103 to 4.0 (36), `dict(d.items())`
+    131 to 4.4 (36), `d.update(zip(ks, vs))` 92 to 24 (40).
+    Left: a generator of pairs (`d.update((k, v) for ...)` 136 µs
+    against 63, the generator's resumption from native code),
+    `dict(d, **kw)` (the keyword-spread call's own machinery, about
+    6,000 instructions), small-dict merges at 1.3 to 2 times CPython
+    (the new container's tracking and release), `list.pop(0)` and
+    `xs * 2` (16-byte items against 8), and the `bytearray` start
+    offset.
+  - Bytes-like values were copied whole before anything read them. A
+    second sweep, of 90 operations on 200,000-item buffers of each kind
+    (`bytes`, `bytearray`, `memoryview`, `array`, and the containers),
+    put `array[i]` at 870 times CPython's time, `struct.unpack_from` at
+    61 times and `bytearray.decode` at 33. One accessor was behind most
+    of it: the value's bytes as an owned vector, so a call that reads
+    four bytes of a buffer first copied the buffer; and `array` is a
+    Python class over a `bytearray`, each item read through
+    `struct.unpack_from`, so indexing a large array copied all of it per
+    item. The readers now borrow: `struct` reads and writes the buffer
+    where it is, with native halves for `unpack_from` and `pack_into`
+    (over a 200,000-byte `bytearray`: 5.1 µs to 109 ns, CPython 101;
+    706 ns to 76, CPython 105), hashing, `zlib`, the codecs' functions,
+    `int.from_bytes` and `str(b, encoding)` take a `bytes` object's own
+    bytes, a new `bytes` is built from a slice in one copy where it took
+    two (`a + b` and `bytes(bytearray)` at 200,000 bytes 11.2 µs to 4.6,
+    CPython 4.6), and the codec engine returns well-formed UTF-8, ASCII
+    and Latin-1 text as it is, where it decoded every byte to a code
+    point and encoded the lot again (`bytearray.decode()` of 200,000
+    bytes 636 µs to 15, CPython 26).
+    The `array` class's item methods are native for plain indexes and
+    values, as CPython's C type's are, each falling back to the Python
+    method it replaces for anything else (other index and value types,
+    every error): `a[i]` 26.7 µs to 61 ns on 200,000 ints (CPython 44),
+    `a[i] = x` 1.5 µs to 56 ns (49), `a.append(x)` 503 ns to 66 (76),
+    `a[i:j]` 3.4 µs to 526 ns (148), iteration 1.5 µs an item to 174 ns
+    (63), and `tolist`, `count`, `index`, `in` and `fromlist` unpack or
+    pack every item in one call.
+    A `memoryview`'s plain byte reads and writes skip the shape and
+    format machinery (`view[i]` 235 ns to 48, CPython 36; a run store
+    375 ns to 225). `frozenset(a_set)`, `set(a_frozenset)` and
+    `set(a_dict)` take the source's table with its stored hashes (11.9
+    ms to 1.3 for 200,000 keys, CPython 2.4); `dict(zip(xs, ys))` keeps
+    its direct build past 4,096 pairs (28 ms to 3.5 at 200,000, CPython
+    9.0); list and tuple comparison settles two machine ints in line
+    (425 µs to 211 for 200,000 items, CPython 192); `range(n)[k]` stays
+    at machine width when it can.
+    Two wrong answers came out of the new tests: `struct.unpack_from`
+    read a non-int offset (an object with `__index__`, or a `str`) as
+    zero, and unpacked from a released view; and a strided view is now
+    refused with `BufferError`, as CPython refuses it, not gathered.
+    Left: an array's slices and iteration (3.6 and 2.8 times CPython: a
+    slice of an instance leaves compiled code, and the iterator's step
+    goes through its slots), `view[i] = x` and `range(n)[k]` in compiled
+    code (4 and 2.9 times, the same exit), `bytearray` methods (no
+    native lane: `append` 130 ns against 41), SHA-256 itself (2 times:
+    the hash's throughput, not its argument), and about forty other
+    callers of the copying accessor (`io` has thirteen).
+  - A third sweep, of 130 I/O, codec, text and library operations on
+    large inputs, found the same kinds of cost in more places.
+    `zip(*rows)` was quadratic in its rows: each step checked that no
+    source was another's alias by comparing every pair, and a transpose
+    has a source per row (20,000 rows of three: 404 ms, CPython 2.1).
+    The answer can't change, so the zip keeps it from its first native
+    step (sorted addresses when there are many sources): 2.3 ms. The
+    grouping idiom that passes one iterator several times
+    (`zip(*[it] * n)`) is the aliased case, and steps as before.
+    A string slice with a negative bound or a step spread the whole
+    string into a vector of code points first, so `line[-20:]` and
+    `text[:-1]` cost the string's length: on 226,000 ASCII characters,
+    `s[-20:]` 295 µs to 60 ns (CPython 63), `s[:-1]` 641 µs to 12 µs
+    (5.8), `s[::-1]` 651 µs to 15 µs (101). ASCII text is sliced by its
+    bytes.
+    UTF-16 and UTF-32 went through the general codec engine's code
+    point vectors even for well-formed text: a `str` is encoded straight
+    from its text, ASCII as a byte and its zeros, and well-formed input
+    is decoded in one pass (226,000 characters: encode 809 µs to 93,
+    CPython 75; decode 878 µs to 166, CPython 67). Results match
+    CPython's on 447 cases of well-formed and malformed input under
+    every error handler.
+    `x in a_bytearray` copied the buffer before searching it (5.2 µs
+    to 0.17 for a hit near the front of 200,000 bytes; CPython 1.5).
+    `list(b)`, `memoryview.tolist()`, `bytes(a_list)` and
+    `bytearray(a_list)` converted item by item through the general
+    protocols (5.5 ms, 10.7 ms and 1.5 ms for 200,000 bytes; now about
+    0.2 ms each, CPython 0.8 to 0.9). `struct.iter_unpack`'s iterator
+    steps natively (17.2 ms to 5.7 for 50,000 records, CPython 1.75).
+    `bytearray` has a native method lane for `append`, `extend`, `pop`
+    and `decode` (`append` 77 ns to 63, CPython 36), and compiled code
+    reads `b[i]` and `len(b)` and stores `view[i] = x` in line (`b[i]`
+    189 ns to 25, CPython 31; the store 204 to 48, CPython 42).
+    `range(n)[k]` in compiled code 210 ns to 40 (77), `slice.indices`
+    at machine width 252 ns to 104 (130), a forward stride slice of
+    bytes checks its bounds once (`b[::2]` 137 µs to 52, CPython 25),
+    and `bytes.translate` maps in one pass (173 µs to 121, CPython 70).
+    Left from this sweep: `BytesIO.getvalue()` copies the buffer each
+    call (CPython hands out its own bytes object until the next write),
+    `re` on a `bytearray` or `memoryview` widens the whole subject per
+    call, `BytesIO` reads and writes at 2 to 3 times CPython,
+    `iter_unpack` at 3 times, UTF-16 decoding at 2.5 times.
+    One thing the native `array` methods broke, which the ecosystem lane
+    caught: the C API's `PySequence_Check` took an instance for a
+    sequence only when its class's `__getitem__` was a Python function,
+    so Pillow's `putdata(array(...))` refused the array. A natively
+    served `__getitem__` on a class that declares itself a sequence
+    counts too, as CPython's own `array` type does.
+  - Iterating byte strings and arrays. `for b in data` over a `bytes` or
+    `bytearray` left compiled code at every step for the interpreter's
+    general `next` (39 ns a byte, CPython 21); both tiers now step them
+    in place (8 ns). `sum`, `min` and `max` of one take its bytes
+    directly (`sum` 22 ns a byte to 0.2; CPython 5.3). The array
+    iterator's native step and the item methods read their instance's
+    slots where the class lays them out, not by name (`for x in a` 72 ns
+    an item to 42, CPython 35), and `list(a)`, `tuple(a)` and
+    `sorted(a)` unpack the array at once when its `__iter__` is its own
+    (91 ns an item to 21, CPython 15). An ASCII string's run with a
+    negative bound (`s[:-1]`) is copied once from the text, not through
+    a vector of bytes (14 µs to 6 for 226,000 characters, CPython 6.2).
+  - `io.BytesIO` reads, `readinto` and writes after a seek went through
+    the file layer's general path (its sibling stream, read-ahead and
+    write-buffer checks, and a vector per read): `read(64)` 164 ns to 68
+    (CPython 62), `readinto` 154 to 54 (44), a write over earlier bytes
+    165 to 64 (46), and a `bytearray` written 146 to 62 (51). Each is
+    now a fast half on the stream's buffer, declining a closed stream,
+    one with bytes parked ahead, an exported buffer, and a stream read
+    into its own buffer.
+  - A fourth sweep, of 55 interpreter-level operations at n and 8n
+    (compiling large and deeply nested code, calls with many arguments,
+    deep inheritance, recursion, tracebacks, formatting, library
+    algorithms), found two more growth cliffs. Compiling functions
+    nested `d` deep cost about `d` cubed: each enclosing scope asked for
+    each nested function's free names, recomputed from the whole subtree
+    every time (80 nested closures, 47 ms to compile, CPython 2.1). The
+    free names are kept for the compilation, by the function's place in
+    the tree: 3.6 ms. And `deque.rotate` made room at the front one
+    rotation's worth at a time, so every few rotations shifted the whole
+    deque item by item (`rotate(n // 3)` on 4,000 items: 17.6 µs, CPython
+    0.6); the room is now as large as the deque, made by moving its
+    items once, and a rotation trades its items with the free slots as
+    one block (4.0 µs). `extend` and `extendleft` of a list or tuple are
+    native (`extendleft` of two items 309 ns to 194, CPython 93); a
+    generator still goes in item by item, so an exception partway leaves
+    the items before it, as CPython does, which needed the dispatch's
+    by-name rule for `extend` (materialize the iterable first) to leave
+    a plain class's native methods alone. Generator chains, which cost
+    more per level the deeper they go (16 levels: 85 ns a level-step,
+    CPython 16), are left for now.
+  - `re` over a `bytearray` or a `memoryview` (how h11 and urllib3 parse
+    a socket's buffer) converted the whole subject to code points on
+    every call, so a search near the front of 200 KB cost 28 µs (CPython
+    0.27) and a `findall` over it 24 ms (0.17). The bodies that run no
+    Python code (`search`, `match`, `fullmatch`, `findall`, `split`,
+    `finditer`, and `sub` with a bytes replacement) now read a
+    `bytearray`, or a plain view's window of a `bytes` or `bytearray`,
+    where its bytes are, and return `bytes` pieces as CPython does (0.47
+    µs and 0.24 ms). Results equal the old ones on 524 cases over five
+    buffer kinds.
+    `bytes.fromhex` read its text as a vector of characters: ASCII text
+    is now read by its bytes through a digit table (51,200 bytes: 6.3 ms
+    to 1.4 for five, CPython 1.4 for five; errors still come from the
+    character reader, so their positions are unchanged).
+  - `{**d}` and `f(**kw)` into an empty dict inserted the source's keys
+    one at a time, rehashing and growing the table (200,000 int keys
+    13.3 ms, str keys 19.9 ms; CPython 1.9 and 2.8): both the core
+    loop's arm and the full handler now copy the source's table whole
+    when they can, and merge a display's `**d` into a non-empty dict as
+    `dict.update` does (1.9 and 3.4 ms). A deque's `in`, `count` and
+    `index` compare plain items (numbers, strings, bytes, `None`)
+    natively before the Python loop that any other item needs (`x in d`
+    of 200,000 ints 2.5 ms to 1.9; CPython 2.5), and `index`'s error
+    reads as CPython's.
+  - A sweep of 75 class-protocol operations against CPython (named
+    tuples, dataclasses, enums, getters, dunders, iterators) put
+    `operator.itemgetter` on a named tuple at 13.7x (479 ns, CPython
+    35): its fast half took only exact tuples, lists and dicts, so a
+    subclass declined through seven call lanes to the full body. It now
+    reads a subclass's payload when the class keeps the base's
+    `__getitem__` (96 ns). `methodcaller` read its three fields by name
+    and built a bound method and keyword list for every call; it now
+    reads them at their slots and calls a plain instance's Python method
+    with the instance first (502 ns to 358; CPython 99). `str(x)` of an
+    instance with only a Python `__repr__` looked `__str__` up along the
+    MRO and built a bound method to probe for `__repr__` (217 ns to 148;
+    CPython 64), and `f'{x!r}'` went through a bound method and a Rust
+    string (241 ns to 125; CPython 58): both call the function directly
+    now, and `str(x)`'s error for a non-string result is CPython's.
+  - A frameless `__next__` could end at a bare `raise StopIteration`
+    only with no attribute store buffered, so the usual shape (`self.i
+    += 1` ahead of the exhaustion test) ran the whole last step as a
+    frame, raised, and caught (`list(It())` of three items 1.87 µs,
+    CPython 0.62): the buffered stores now land as a return lands them,
+    and the step ends as exhausted (0.93 µs). `next(it)` without a
+    default still declines on such a step, since its full call raises
+    the exception with its traceback and would repeat the stores.
+  - A named tuple built with a default filled in (`P(1)` of
+    `namedtuple(..., defaults=...)` or a `typing.NamedTuple` with a
+    default) or with keywords (`P(x=1, y=2)`) ran the generated
+    `__new__` as a frame and went through `object.__new__`'s seeding
+    (743 and 914 ns; CPython 228 and 340): the construction lanes now
+    place keywords by field name and take the rest from `__new__`'s
+    defaults as they stand, building the tuple directly (256 and 279
+    ns). A rebound `__defaults__` or `__new__`, and every call that
+    binds otherwise, still runs the function.
+  - The frameless `f(*args)` path took only plain functions given
+    their exact arity, so `obj.m(*args)` (a method read as an attribute
+    first) ran as a frame, and a spread short of the arity went through
+    the keyword binder: a bound method's receiver now binds first, and
+    trailing parameters come straight from the positional defaults
+    (`obj.m(*args)` 243 ns to 136, CPython 87; `f(*(1,))` with a
+    default 84 to 74, CPython 45).
+  - `a > b` of a class that defines only `__lt__` looked up `__gt__`,
+    found `object`'s, bound and called it to get `NotImplemented`, then
+    went through the general protocol to the reflected `b.__lt__(a)`
+    (341 ns, CPython 130; `max()` over 50 such instances 11.7 µs,
+    CPython 5.6). `object`'s orderings are now recognized per class and
+    skipped, and two instances of one class call the reflected method
+    directly, in compiled code as a frameless leaf (73 ns; `max()` 5.5
+    µs). `weakref.ref` calls have a leaf half that calls the referent's
+    deref closure in place (78 ns to 45, CPython 26), and `r(1)` raises
+    CPython's `TypeError` instead of ignoring the argument.
+  - `for x in itertools.chain(xs, ys)` stepped each item through six
+    layers (the core loop's lazy step, the zip check, the itertools
+    machine's dispatch, then a peek and a skip of the active cursor):
+    349 instructions an item (two 100-item lists 6.3 µs, CPython 2.1).
+    The core loop's lazy step now takes `chain` first, and the active
+    list, tuple or range cursor is read and stepped in one call (173
+    instructions; 4.2 µs).
+  - A compiled frameless leaf (a getter, a `__hash__`, a comparison)
+    cached where an instance keeps a field only for split layouts. An
+    instance whose `__dict__` was materialized (a `cached_property`
+    computed, `vars(obj).update(...)`, anything `copy` or `pickle`
+    rebuilt) resolved the field by name and checked its class on every
+    read, about 500 instructions (`hash(obj)` of `return hash(self.x)`
+    151 ns against 105 for a split instance). Its position in the
+    published dictionary is cached too and checked by name as read
+    (116 ns).
+  - `shlex.split` reads its input one character at a time
+    (`instream.read(1)` of a `StringIO`), and each read took the text
+    layer's whole path: the characters' bytes copied out, checked as
+    UTF-8, newline-translated and un-bridged into a new string, about
+    650 instructions. A read of ASCII characters with no `\r` now copies
+    them straight out of the buffer as a leaf half (`shlex.split` of a
+    five-word command 25.5 µs to 21, CPython 14). A read past the end
+    keeps the position a seek left, and a closed `StringIO`'s error
+    drops the period, as CPython's does.
+  - Compiled code ran a container method's kernel in line only for a
+    receiver in a local (`x.append(v)`): one an expression left on the
+    stack (`self.items.append(v)`, `d[k].append(v)`) loaded the method
+    through the method-site helper and called it through the call-site
+    helper, about 145 instructions more (`o.l.append(1)` 34 ns, CPython
+    24; `d[k].append(1)` 40, CPython 31). The stack's receiver now has its
+    type checked in line too and the kernel called with the result in the
+    slot above; the receiver is released as the full call releases its
+    operands (a temporary's finalizers run before the next statement) and
+    the result moved into its slot (28.5 and 32.4 ns).
+  - `OrderedDict.fromkeys` stored its keys one subscript at a time in
+    Python (270 keys 21.2 µs; CPython's C loop 12.7). An exact
+    `OrderedDict` now takes a list's, tuple's or str's keys through
+    `dict.fromkeys` and its native update in one pass (10.0 µs);
+    subclasses keep the loop for their own `__setitem__`, and an
+    unhashable key still raises from the loop, which words the error as
+    CPython's `OrderedDict` does.
+  - Tier 2's `len()` and `next()` of an instance with a native leaf
+    dunder (`len(deque)`) looked the dunder up along the MRO on every
+    call (190 of the 270 instructions a `len(dq)` cost): the class now
+    caches the builtin it resolves per version.
+  - UTF-16 decoding of ASCII text checked each unit, gathered the low
+    bytes into a vector, then validated and copied them into the string
+    (110 KB 47 µs, CPython 19): it now checks eight bytes at a time and
+    packs each word's four low bytes straight into the string's
+    allocation (22.5 µs).
+  - The native pickler and unpickler knew `bytes` but not `bytearray`,
+    so protocol 5 (the default) sent any data holding one to the Python
+    pickler (64 KB `dumps` 35.8 µs and `loads` 39 µs; CPython 2.2 and
+    1.5). Both now handle `BYTEARRAY8`, memoized as CPython's pickler
+    memoizes it and framed as it frames one (8.2 and 3.2 µs; the bytes
+    written are the Python pickler's exactly).
+  - `int.from_bytes` of a short `bytearray` or `memoryview` took the full
+    method (2,000 four-byte memoryview slices 1.3 ms, CPython 0.46): the
+    leaf half now reads them in place (0.39 ms), and a released view
+    raises `ValueError` as CPython's does. `struct.iter_unpack`'s step
+    reads its iterator's state at the class's slot places instead of by
+    name (50,000 items 6.1 ms to 4.8; CPython 2.0), and a `bytes`
+    subclass reaches the core through a view instead of failing.
+    `array("d", floats)` checked its items' types in a Python loop:
+    a native check now (25,000 floats 967 µs to 299; CPython 429).
+  - `zlib.crc32`/`adler32` and `hashlib`'s constructors and `update`
+    copied a `bytearray`'s or `memoryview`'s whole buffer before reading
+    it: they read it in place now (`crc32` of 200 KB 13.2 µs to 7.5,
+    CPython 8.4). `adler32` took a modulo per byte; it reduces once per
+    5,552-byte block, as zlib does (473 µs to 72; CPython 12), and
+    reduces its starting value even for no data, as zlib does. A released
+    view raises `ValueError` and a strided one `BufferError` in all of
+    them, as CPython's do. (SHA-256 itself is the `sha2` crate's portable
+    code, about half OpenSSL's AVX2 speed on this machine.)
+  - Iterating a memoryview made an object of every element first, then
+    walked that snapshot (`for b in memoryview(data)` over 200 KB 9.6 ms,
+    CPython 4.9). A plain byte view of a `bytes` object now steps as the
+    bytes do, sharing their storage when it covers them (1.4 ms), and one
+    over a whole `bytearray` steps the bytearray live, so a store made
+    mid-loop is seen, as CPython's iterator sees it (the snapshot missed
+    it). A released view's error reads as CPython's in `iter`, `tobytes`
+    and `tolist`.
+  - `bytes.fromhex` now decodes runs of whole pairs, a bad digit found
+    from the table's high bits, before looking at whitespace (400,000
+    digits 520 µs to 347; CPython 263). `b"".join` of `bytearray` parts
+    reads them in place instead of copying each into a part list first
+    (2,000 parts 53 µs to 22.6; CPython 26).
+  - `memoryview.tobytes()` copied a contiguous view's bytes twice (200 KB
+    17.9 µs, CPython 5.8): once now (6.0 µs). A strided one-dimensional
+    view is gathered in one read of its buffer instead of a buffer read
+    per element (`mv[::2].tobytes()` 3.0 ms to 0.37; CPython 0.64).
+    `bytearray.extend` of a list or tuple of ints took the full method
+    (four ints onto 200 KB 563 ns, CPython about 220): the leaf half takes
+    them, all checked first (171 ns).
+  - `next(iter(d))` (a dict's first key) took `next`'s full call for a
+    dict or dict view's iterator, and `iter()` of a view the general
+    builtin path (`next(iter(d))` 188 ns, CPython 78; `iter(d.values())`
+    106 ns, CPython 61). `next`'s leaf half now steps a dict iterator as
+    `for` does, leaving a changed dict and the end to the full call, and
+    `iter`'s takes views and `mappingproxy` objects (118 ns and 64;
+    `next(iter(d.items()))` 291 ns to 180, CPython 141).
+  - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
+    merge base run after run (and `str_methods` 11% to 22%), at the 15%
+    limit, while on x86 both builds execute the same instruction counts
+    and time the same. For the next run that flags a fixture, the gate
+    job now prints each flagged fixture under five tier settings for
+    both binaries, with instructions and cycles on macOS
+    (`tools/bench_gate_counts.py`): equal counts with unequal times are
+    the runner or the layout, unequal counts name the tier.
+  - Looked at and left: the frame JIT waits 128 call heats before taking
+    code whose call entry tier 2 missed and whose loops haven't run
+    (`argparse`'s `take_action` and `_format_action`, the case's hottest
+    functions, are still interpreted after 2,500 iterations). Taking
+    them at the first heat changes the case by under 1.5%: their bodies
+    are calls and attribute reads that cost about the same compiled.
+  - Why wall time trails instruction counts on the battery's worst
+    cases, from a cache and branch simulation of `argparse` in steady
+    state (cachegrind, iterations 1,500 to 2,500): an iteration takes
+    99,500 first-level instruction-cache misses to CPython's 28,600,
+    38,600 data misses to 16,700 and 47,500 mispredicted branches to
+    31,900, on 1.91M instructions to 1.27M. At 12 cycles an instruction
+    miss, 8 a data miss and 18 a misprediction that models the measured
+    cycles of both (3.2M and 1.5M an iteration): the instruction misses
+    are 40% of WeavePy's time and most of its distance from CPython. They
+    are spread over 1,400 functions, the largest (compiled code) 11%, at
+    about one miss every 19 instructions, which is every cache line the
+    program fetches: the working set of an iteration is far beyond the
+    32 KB cache, so what counts is how many instructions run, not which.
+    Compiling the runtime with a quarter of the inlining (LLVM's
+    threshold at 60) changed nothing (2.9% more instructions, 0.9% more
+    misses).
+  - Looked at and left: thread start-up (a started and joined thread
+    costs about 470,000 instructions to CPython's 150,000; the main thread
+    waits on the GIL hand-off and the kernel's thread teardown, and a
+    smaller worker stack reserve changed nothing), the rest of
+    `threading.Thread()` (`_ThreadHandle()` 6,800 against 1,400, `Event()`
+    12,200 against 7,800), and `Enum` class creation (2.2 times CPython's
+    instructions, spread over `enum.py`'s Python code).
+  - What's left. Battery geomean 1.178 instructions and 1.052 cycles
+    (from 1.197 and about 1.08 at the day's start). The worst cases are
+    flat profiles of interpreted library code: argparse's per-iteration
+    cost is 2.3 times CPython's with both JITs off or on, since it runs
+    mostly cold code, where the core loop's call and return cost about
+    700 instructions to CPython's 200. Exceptions (a raise caught in the
+    caller 2.1, same frame 1.7) spread over about 40 helpers, creating the
+    instance alone about 680 instructions to 250; a generator resume's
+    trampoline is 291 instructions of checks and setup, `FOR_ITER`'s
+    dispatch to it 80 more.
+
+- **Generator drains, a warm-up gate, and email's token tree** (PR #112,
+  November 16, evening). Ratios are instructions, WeavePy's over
+  CPython's.
+  - An inlined `any(...)`, `all(...)`, `list(...)` or `tuple(...)` loop
+    over a generator expression drained it in place only when the fast
+    steps run its body; a body that calls a function (`any(pred(x) for x
+    in xs)`) was resumed lazily, about 1,000 instructions an item. Its
+    lean resume now folds the yields into the consumer, as `sum()`'s
+    does: `any(...)` over 30 items ran 34,480 instructions to 12,354
+    (CPython 19,519), `tuple(...)` 36,822 to 15,050 (21,752).
+  - The core loop's calls of a pure leaf took a full lean activation for
+    the callee's first 24 calls, so tier 2's warm compile could give
+    compiled callers a direct lane. Their evaluation already counts each
+    call toward that compile, as the frame JIT's leaf sites' do, so the
+    gate only cost code called a few times each, such as the methods
+    `dataclasses` makes for each class: `enum_dataclass_ops` 6% fewer
+    instructions. It showed up as tier 2 costing the battery 1.3% of its
+    instructions (`WEAVEPY_JIT=0`), while `WEAVEPY_TIER2=0`, which keeps
+    the gates, cost more; a sweep over the gates that ask whether the JIT
+    is on found this one. The other gates in the dunder lanes (`__eq__`,
+    `__hash__`, `__lt__`) keep the wait: dropping theirs cost
+    `oo_patterns` 3%, its leaf plans compiling before their field caches
+    warmed.
+  - `email`'s token tree reads `x.value` and `x.all_defects` over two node
+    classes, each with a property. The site's getter cache held one class,
+    so each switch took the full handler; it keeps two earlier getters by
+    class version now, and compiled code calls a cached getter that runs
+    as an activation right after the leaf attempt, past four lanes a
+    property always wins over. `str(x)` of a `str` subclass's instance
+    whose class keeps `str`'s own `__str__` (remembered per class version)
+    is its payload, from the pure constructor lane: 1,795 instructions to
+    541 (CPython 814). A tree's `value` ran 210,471 instructions to
+    138,758 (62,258).
+  - `dir()` gathered names into a `BTreeSet<String>`, copying each and
+    allocating it again as a `str`: it now collects the dict keys' own
+    strings and sorts once (`inspect.getmembers` of a class 211,206
+    instructions to 190,518, CPython 136,682). `s.encode(encoding="utf-8")`
+    took the codec lookup, normalizing the name each call (3,975 to 2,198,
+    against 1,494), and now raises CPython's `TypeError`s for unknown or
+    repeated keywords, which it ignored. A one-base class's MRO is the
+    base's with the class in front, no merge (`type()` 17,599 to 16,376).
+  - Where the time goes. `email`'s `HeaderRegistry` builds a new class
+    with `type()` for every header it makes, so every header's lookups
+    start on a cold class; WeavePy's `type()` is cheaper than CPython's
+    (17,537 instructions to 121,421), but an address header still costs
+    1.05 million instructions to CPython's 546,000, at 3.7 times its
+    cycles. In argparse, `parse_args` runs 2,200 bytecodes and 62 Python
+    calls a parse: interpreted, WeavePy spends about 150 instructions a
+    bytecode to CPython's 75, and 724 a call in the core loop's call and
+    return alone; compiled and warm it's 1.6 times CPython's. A plain
+    `for v in gen()` loop spends 685 instructions an item to CPython's
+    400, 291 of them in the resume's checks (`gen_native_next`).
+  - Across seven of the worst cases (`argparse`, `email`, `configparser`,
+    `enum_dataclass`, `inspect_typing`, `class_features`, `collections`;
+    synchronous compiles), compiling is 8.3% of the instructions, the core
+    loop's own code 10.9%, calls 10%, allocation 10.3%, attribute paths
+    10.3%, and the rest is spread over hundreds of functions: the largest
+    single one, `leaf_burst`, is 7.7%. Cachegrind puts `argparse_ops` at a
+    3.8% instruction-cache miss rate (32.7 million misses in 858 million
+    instructions); compiled code takes 1.6% of the misses and the VM's own
+    code 92%, so for short cases the footprint is the interpreter's and the
+    runtime's, not the JITs'. The core loop's dispatch jump mispredicts 1.9
+    million times there.
+  - Threads. A two-thread ping-pong through `queue.Queue` costs 173,884
+    instructions and 249,454 cycles a round trip to CPython's 65,984 and
+    67,867, with twice the context switches. While a second thread runs,
+    every container's cell borrow takes an atomic compare-and-swap
+    instead of the biased check; starting and joining a bare thread costs
+    281,455 instructions to 86,833 (per-thread tables zeroed and dropped,
+    the allocator's per-thread heap, the interpreter's fork).
+
+- **Configparser's constructions, compiled patterns, and where the short
+  cases spend** (PR #112, November 16, later). Ratios are instructions,
+  WeavePy's over CPython's.
+  - `re.match(p, s)` with a compiled pattern runs `re._compile`, which
+    probes its cache with `(type(p), p, flags)` and catches the
+    `KeyError`. A pattern hashed through the interpreter (a `__hash__`
+    call that built and hashed a tuple), and a tuple holding one wasn't a
+    key compiled code could probe, so the miss left for the core loop,
+    which hashed the key again before raising. A pattern now hashes
+    natively while its class keeps the native `__hash__`, and the miss
+    raises in place: `re._compile(p, 0)` ran 18,402 instructions to 11,430
+    (CPython 6,129), and `ConfigParser.write` 19% fewer.
+  - `functools.partial(f, k=v)` left compiled code (no keyword lane for a
+    Python class with a native `__new__`) and set its five slots one probe
+    at a time: 8,338 instructions to 5,749 (2,216). `for k in mapping`
+    over an instance whose `__iter__` is a Python function left too; it's
+    called directly now, its result checked as `iter()` checks it (5,812
+    to 2,814, against 1,786). Together, a `SectionProxy` ran 58,882 to
+    47,197 (24,155).
+  - A value type's subclass with a Python `__new__` (`configparser`'s
+    `_Line(str)`) went through the generic construction, with `__new__`
+    and `__init__` each a nested run: it now takes the inline activations
+    a plain class's does (10,000 instructions to 5,435, CPython 4,063).
+    The configparser case ran 7% fewer instructions.
+  - `(x,) * n` and `[x] * n` of a short sequence repeat in place in
+    compiled code and the core loop (argparse's metavar formatter left 13
+    times a parse).
+  - `dataclasses.replace` ends in `self.__class__(**changes)`, which had
+    no lane for a class: it left compiled code and took the generic call.
+    The mapping's keywords now bind to `__init__` as a keyword call's do,
+    and the call runs inline (27,452 instructions to 19,239, CPython
+    11,984; cycles 3.9 times CPython's to 2.1). The keyword and mapping
+    constructions share one body.
+  - `super(C, obj).__class__` built the proxy's dict one probe at a time,
+    and the class read, finding the proxy's last reference on the stack,
+    declined to release it and took the attribute miss path: it releases
+    it now, a queued finalizer running before the next instruction
+    (4,269 instructions to 1,785, CPython 1,236).
+  - A `list` or `tuple` subclass's `self[0]` (`email`'s `TokenList`) and
+    `for entry in os.scandir(...)` (`glob`) were slow steps; they read the
+    payload and step the iterator in place. Branch relaxation in the code
+    generator found each branch's place by binary search on every pass:
+    32% less of the compiles' finishing work.
+  - The battery stands at 1.233 times CPython's instructions on quick
+    builds (1.237 this morning): `class_features` ran 10% fewer,
+    `configparser_ops` 8%, `enum_dataclass_ops` 5%, `email_html_ops` 3%.
+  - Why the short cases trail. Argparse's case runs each operation 180
+    times. CPython's instructions an iteration are flat from the first
+    (1.5 million); WeavePy's fall from 5.6 million over the first 20 to
+    2.3 million after 600, with the frame JIT still compiling functions
+    for the first time after 300 iterations (functions run once an
+    iteration reach the threshold late). Turning either JIT tier off, or
+    both, leaves the case's instructions and time where they are: the
+    gap is the interpreter and the runtime. Even warm, an iteration takes
+    2.3 times CPython's cycles on 1.5 times its instructions: cachegrind
+    finds 5% of instructions missing the instruction cache and 13% of
+    conditional branches mispredicted, both spread over the interpreter,
+    the helpers and compiled code. Tier 2 analyzed 144 functions in the
+    case and compiled 11; the rejections (`dynamic call (loop-free)`
+    after a full analysis, and probe misses that carve loop by loop) took
+    most of its 44 ms of analysis, about 64 million instructions.
+    And calls from native code into Python (`map(partial(cls, k=v), xs)`)
+    cost about 1,200 instructions of nested-run overhead each, with
+    keyword names copied to `String`s at every hop: 11,300 instructions an
+    item to CPython's 6,200.
+
+- **Builtin subclasses, generator steps, and a misread fixture gate** (PR
+  #112, November 16). Ratios are instructions, WeavePy's over CPython's.
+  - The local fixture A/B tools ran every bench fixture at a work size of
+    one, so a tier-2 policy that weighed a loop's dynamic calls three times
+    read even locally and cost `nbody` 35% (the bench gate flagged it 41%
+    to 56% slower on all three platforms). The policy is reverted, and the
+    tools take the gate's work sizes from `fixtures.rs`.
+  - `email`'s header parser builds `TokenList`, a `list` subclass, and
+    `Terminal`, a `str` subclass, and runs generator expressions over them.
+    `super().__init__()` reaching `list.__init__` or `set.__init__` left
+    compiled code for the core loop on every call (only `dict.__init__`
+    was admitted), `GET_ITER` of a list subclass left too, a property read
+    in a generator's fast step declined outright although a pure getter
+    runs no activation, and `TO_BOOL` of a `str` subclass left because the
+    native truth admitted only one kind of builtin `__len__`. With those
+    fixed, and attribute sites remembering the pure getter they last ran,
+    a `TokenList()` ran 11,607 instructions to 5,375 (CPython 3,296),
+    `TokenList.value` 35,107 to 13,154 (6,339), and the email case 12%
+    fewer.
+  - An explicit `super(C, obj)` as a value built through every call lane
+    (5,540 instructions to 2,224 against CPython's 979), and its
+    `__class__` took the generic attribute path (9,790 to 3,951).
+  - `object.__new__` walked a builtin subclass's MRO five times a call; one
+    walk now answers all of its questions, memoized by class version.
+    `os.stat` laid its result's nineteen fields into a dict one probe at a
+    time and read ten back by name (13,457 instructions to 9,272).
+  - Objects whose `__dict__` was published (`copy`, `pickle`, `vars()`,
+    and `dir()`, which configparser's `ConverterMapping` runs on its
+    parser) lost compiled code's field reads: every attribute read went
+    the whole miss path, about 800 instructions. `dir()` no longer
+    publishes, and attribute sites remember where a name sat in a
+    published dict (two reads of a copied object: 1,875 instructions to
+    509, CPython 896). Class attributes read through an instance now
+    memoize objects without `__get__` too (configparser's compiled
+    patterns), and native `re` objects lay their slots over their
+    classes' own layouts. `ConfigParser.read_string` ran 10% fewer
+    instructions, `ConfigParser.get` 20%.
+  - `typing`'s subscripts (`List[int]`, `Optional[str]`) went through
+    `_tp_cache`, whose `f(*args, **kwds)` forward to an `lru_cache`
+    wrapper had no lane in compiled code, whose cache probe hashed only
+    builtin scalars, and whose subscript site, compiled before the core
+    loop ran it, had no direct `__getitem__` call: `typing.Optional[str]`
+    ran 13,031 instructions to 3,164 (CPython 2,683).
+  - The frame JIT now takes code tier 2 failed to compile three times
+    (argparse's `_parse_known_args` had stayed interpreted for good), and
+    `ref.__new__` and `_sre.exec_match` over a `str` run in place (a
+    100-entry `WeakValueDictionary`: 1,241,587 instructions to 877,688).
+  - Where compiled code still left for the core loop, per site: an
+    exception's `args` (its own slot layout), an f-string's `!r` of a
+    list, a generator expression's dict view at its end, an exhausted
+    tuple of objects (enum's `for flag in self, other`), and an `IntFlag`
+    operator (a builtin subclass's Python method). Enum flag operations
+    ran 14% fewer instructions, a dataclass's `repr` 25%,
+    `dataclasses.asdict` 24%, `e.args` 44%.
+  - Native helpers: `binascii.hexlify` ran a branch and a growing push a
+    digit (33 instructions a byte, now under CPython's), and `upper()`,
+    `lower()` and `casefold()` sent every character of non-ASCII text
+    through the Unicode tables (a mixed 400-character string: 36% fewer
+    instructions).
+  - Tried and dropped: native `LOAD_GLOBAL` hits in compiled code (the
+    helper costs as much as its guards would in line), native reads of
+    polymorphic split fields (their IR pushed `deltablue`'s hot functions
+    over the inline budget), and a Linux-only symbol order (the release
+    build's fat LTO renames most of what the profiles name; start-up RSS
+    moved 2%), and a lower frame-JIT threshold (60: the battery ran 1% more
+    instructions). The battery stands at 1.252 times CPython's
+    instructions on quick builds, against 1.285 at the start of the day;
+    `class_features` ran 21% fewer instructions, `email_html_ops` 13%,
+    `configparser_ops` 8%, `enum_dataclass_ops` 7%.
+
+- **Tier 2's wasted work, a start-up deadlock, and more cliffs** (PR #112,
+  November 15). Ratios are instructions, WeavePy's over CPython's unless
+  stated, with synchronous compiles.
+  - Tier 2 cost the everyday battery more than it gave it: with tier 2
+    off, the battery ran 2% fewer instructions, and no case ran more than
+    3% more. Three causes, each fixed. The analysis found each pc's
+    innermost loop by searching the whole loop forest per pc, once per
+    analysis and carving step, which made a failed attempt on a big
+    function expensive (the argparse case ran 13% more instructions with
+    tier 2 than without; now the two are even). A recompile at a loop the
+    compiled frame couldn't enter dropped the frame first, and when the new
+    analysis missed its probes the code went cold and compiled the same
+    frame again on the next call (difflib's `find_longest_match`, four
+    compiles a run, 7% of the case). And the frame JIT leaves code with
+    loops to tier 2, which left two kinds of code interpreted for good:
+    code whose call entry tier 2 had already missed (it never attempts
+    that entry again; `urllib.parse._checknetloc` ran interpreted on every
+    call) and compiled code whose activations mostly side-exit or fail
+    their entry guards, which waited for absolute budgets of 64. Call heat
+    now goes to the frame JIT once tier 2 has missed the call entry and
+    the code has got hot that way 128 times with none of its loops run
+    (taking it at the first such heat cost raytrace 8%: `Scene.trace`'s
+    loop runs only for rays that hit something, which the first rows
+    don't, and tier 2 compiles that loop by OSR later), and compiled code
+    retires once its misses reach 16 and outnumber its finished native
+    runs two to one. With tier 2 off the battery now runs
+    0.8% fewer instructions instead of 2%; the enum and dataclass case (8%)
+    and the threading and queue case (6%) are what's left. Tier 2 makes a
+    loop's dynamic calls through general helpers where the frame JIT runs
+    a Python callee in line (a keyword call in a range loop: 1,080
+    instructions an iteration under tier 2, 265 under the frame JIT), but
+    weighing those calls three times in the generic share cost the
+    `nbody` fixture 35% and `generators` 16%: a driver loop the frame JIT
+    takes runs its callee's float loop there too, where tier 2 entered it
+    by OSR. Still open: a share of 10% instead of 20% would send more loops
+    to the frame JIT (the battery 0.4% fewer instructions, the suite even),
+    but there a Python `__eq__` that a native instance-dict lookup runs
+    sees the wrong caller frame in an activation's first lookup: the core
+    loop publishes its activation only before the calls it makes itself.
+  - `os.environ.get(name)` and `name in os.environ` read the backing store.
+    `Mapping`'s versions find a missing variable through `__getitem__`,
+    which raises and catches two `KeyError`s, and programs probe unset
+    variables constantly (argparse's color and gettext checks probe 22 for
+    each parser): a miss is 0.31 of CPython's instructions instead of 2.2
+    times. An `ArgumentParser()` went from 2.66 to 1.96.
+  - Natively built instances (a `re.Match`, a `Decimal`, a `datetime`, an
+    ElementTree iterator) get their slots at birth instead of an all-unset
+    block that was dropped at once: an allocation, a fill and a free less
+    per object. A trivial `re.match` went from 1.25 to 0.92.
+  - `super().__repr__()` and the other names WeavePy keeps outside the type
+    dicts (`__str__`, `__dir__`, `type.mro`, `__prepare__`, the builtin
+    bases' dunders) resolve through `LOAD_SUPER_ATTR`'s direct path instead
+    of building the `super` proxy and reading it back: 5.2 to 2.2.
+  - Builtin subclasses. A `str`, `int`, `float`, `complex`, `bytes` or
+    `tuple` subclass's `__slots__` are laid out as `object`'s are: any
+    builtin base but `object` kept members in the keyed form, which
+    compiled code never reads in line, so each member read of a
+    `configparser` `_Line` (a `str` subclass) took the attribute miss path
+    (3.40 to 0.41). Constructing a builtin subclass's instance asks the
+    type cache whether `__init__` is overridden instead of probing each
+    class dict with a fresh key, and the collector's "not due yet" answer
+    comes from one load (a `str` subclass's construction, 4.1 to 3.4).
+  - `yield from` a range, tuple or list iterator steps it in place: the
+    core loop's `SEND` took the full step for any delegate but a
+    generator or an asyncio future, so every item went through the
+    general handler (`yield from range(100)`, 3.40 to 1.27). A list's end
+    keeps the general path, since it detaches the list and may free a
+    subclass's owner.
+  - Smaller ones: `object.__setattr__(self, name, value)` (a frozen
+    dataclass's `__init__`) passes the name object through a per-thread
+    memo to the intern pool instead of copying and re-interning its text,
+    and a method site keeps a builtin type's unbound or class method
+    (`object.__setattr__`, `dict.fromkeys`) for its version; `lru_cache`
+    keys holding a plain instance or a user class take the native lookup
+    (`typing`'s `_tp_cache`); `OrderedDict.__setitem__` called as a method
+    settles through its leaf half; a `weakref.ref` subclass's instances
+    share the class's `__call__` and `__repr__` instead of two closures
+    each (a `KeyedRef` per `WeakValueDictionary` item); and a thread's
+    interpreter fork takes its parent's leaf builtin table instead of
+    rebuilding it (a thread's start and join, about 10% fewer
+    instructions).
+  - Fixed: a process's first thread could deadlock at start-up. The thread
+    that revokes the cell bias spun, holding the GIL, until the first
+    thread's lock-free guards drained; a count that never drained hung
+    torch's DataLoader on macOS (its first queue feeder thread never
+    reached Python code), and the ecosystem shard ran out its 30 minutes.
+    While the GIL guards every cell the revoker can't race a guard holder,
+    so past 50 ms it goes on. A temporary torch-only CI job found it: the
+    ecosystem harness now sends a timed-out probe `SIGABRT` first, so a
+    probe with `faulthandler` on dumps every thread, and keeps the output's
+    tail in the row's reason.
+  - Fixed: `reversed()` of an iterator, a set or a native adapter raises
+    `TypeError`, as CPython's does; it read the source to the end first,
+    so `reversed(itertools.count())` hung.
+  - Looked at and left: an explicit `super` object (`super().__class__`,
+    which CPython doesn't compile to `LOAD_SUPER_ATTR` either) is about 8
+    times CPython's, through a dozen general layers, and rare; setting an
+    `EmailMessage` header is 3.4 times CPython's, a flat profile of
+    polymorphic attribute sites and frames with nothing dominant.
+
+- **Threads that have exited, lock hand-offs, and more cliffs** (PR #112,
+  November 15). Ratios are WeavePy's instructions over CPython's, before
+  and after, with synchronous compiles.
+  - Single-thread reference counting comes back. Starting any thread made
+    reference counts atomic and cell borrows locked for the rest of the
+    process, and frames register before every native body so other
+    threads can look. A `queue.Queue` put and get after one finished
+    thread cost 26,500 instructions instead of 16,000. A `join()` now
+    joins the OS threads of the workers that have finished, and once none
+    is left (and no thread the VM didn't start ever took the GIL) the
+    joining thread restores the bias. The everyday battery runs every
+    case in one process, so the six cases after `threading_queue_ops`
+    paid for it: by wall time on quick builds, `asyncio_ops` 0.69 of the
+    earlier build's, `print_to_buffer` 0.74, `weakref_gc_ops` 0.79,
+    `sqlite_ops` 0.80, `inspect_typing_ops` 0.81.
+  - Code that runs while a second thread is alive. Every release that
+    wasn't the last took the last owner's checks out of line, compiled
+    calls that bind defaults weren't entered directly, a direct call's
+    return released through the slow path, and lazily running frames
+    registered before every native body in case another thread looked.
+    Releases that aren't the last are now one locked update, the direct
+    call protocol makes locked updates instead of declining, and frames
+    register first only for a watchdog that reads them without the GIL:
+    every release of the GIL (C code's `PyEval_SaveThread` included)
+    settles them first. A queue put and get with an idle second thread
+    alive: 26,430 instructions to 18,695 (16,380 with none, CPython's
+    11,800). `threading_queue_ops` 1.82 to 1.64.
+  - Lock hand-offs. A contended acquire took the lock as soon as it was
+    free, while the GIL holder ran on; the holder then blocked at its next
+    acquire of the same lock, so a producer and a consumer sharing a
+    queue's mutex switched threads at every operation (34,000 context
+    switches for 60,000 items against CPython's 45). The waiter now waits
+    for the lock to come free with the GIL released and takes it only
+    once the GIL is back, as CPython's does. `threading_queue_ops` 2.79 to
+    1.82.
+  - `yield from` two levels deep. The direct chain step declined a
+    delegate whose own body no fast step runs, though a delegate resting
+    in a `yield from` of its own steps without running its body, so each
+    level resumed as an activation: 4.45 to 1.71 (one level was 1.85,
+    three or more 1.0 or less).
+  - A sweep of common idioms (`target/mb/idioms.py`-style loops, one
+    function a case) found `datetime.datetime.now()` at 6.1 times
+    CPython's instructions: `_pydatetime` ran `fromtimestamp` in Python
+    (`time.localtime()` unpacked, the constructor, and the fold probe's two
+    more `localtime` calls and datetime arithmetic). `now`, `fromtimestamp`
+    and `date.today` are native for the exact classes with no `tzinfo` or
+    an exact `timezone`, following `_fromtimestamp` step for step, with
+    results identical to the Python methods' across DST gaps and folds in
+    eight zones, and bound by the dispatch loop without the descriptor:
+    `now()` 6.14 to 1.15, `date.today()` 0.56. f-string fields with a
+    format spec left compiled code for the core loop at every field, and
+    the formatter rendered `str(value)` before reading the spec:
+    `f"{x:.2f}"` 1.49 to 0.46. `dict((k, v) for ...)` copied each pair into
+    a vector and set up a key-comparison scope per insert: 1.40 to 1.01.
+    `str.startswith` of a tuple took the generic call; a method read off a
+    built-in value hashed its name into the method memo at every call (164
+    instructions, 68 with a per-thread cache of each call site's last
+    answer); `zip` of three to eight sequences stepped each source through
+    the general checks (2.41 to 2.17).
+  - Two more idiom sweeps (about 90 operations: binary formats, hashing,
+    iteration helpers, application-level library calls). The cliffs, with
+    their ratios before and after: `struct.pack` 4.30 to about 1.0 (a
+    Python function forwarding `*v` to the packer, which copied and
+    SipHashed the format text each call; now a native that packs plain
+    values in place and calls the Python function for anything else);
+    unpacking a `namedtuple` 4.27 to 0.96 (compiled code left for the core
+    loop, which iterated the tuple subclass); `str.format_map` 3.72 to
+    1.17 (always the interpreter's format engine, by a generic call);
+    `list(reversed(xs))` 2.11 to 1.08 and `xs[::-1]` 1.94 to 1.10;
+    `next(itertools.count())` 1.90 to 0.90 (`next` wasn't a leaf);
+    `md5(b).hexdigest()` 2.06 to 1.53 (each byte formatted through
+    `core::fmt`); a `csv` writer's `writerow` reading the dialect's
+    attributes by name every row; a sort key's native `__call__` looked
+    up per item; `heapq` fetching the interpreter before comparisons that
+    don't need it.
+  - Python dunders from native code. `str(x)`, `len(x)`, f-string
+    formatting and `x in obj` of a plain instance call the class's
+    `__str__`, `__len__` or `__contains__` without a bound method, in
+    place when it's a pure leaf; a class without `__format__` is cached as
+    such. The frame JIT's fused `len(local)` read declined instances, so
+    each `len(obj)` reran the whole global load. `str(t)` 2.14 to 1.03,
+    `f"{t}"` 2.31 to 1.36, `len(t)` 1.43 to 1.05, `3 in obj` 1.86 to
+    0.68.
+  - Smaller ones: a Python `__next__` called without a bound method by
+    `for` and `next()` (and `iter()` of a builtin iterator subclass's
+    instance is the instance, which fixed a subclass's `__next__` being
+    skipped); `BUILD_SLICE` and slice subscripts in pure leaves; native
+    `re.Pattern` hashing and equality; a keyword leaf half for
+    `bytes.translate`; `list.sort()`'s leaf half comparing strings and
+    ints directly; a property with a native getter read in the compiled
+    attribute site.
+  - The PGO training runs the everyday battery too (`tools/pgo/train.sh`),
+    its profile merged with the rest rather than into the order file's
+    hot group: the library paths it runs get branch weights and inlining.
+    Two builds of one commit: the battery at 0.96 and 0.98 of the other's
+    time over two runs, the suite at 1.000.
+  - Fixed on the way: a method leaf called unbound with no receiver
+    (`list.pop()`) indexed an empty argument list and panicked
+    (`test_types.test_call_unbound_crash`).
+  - Tried and dropped: `LOAD_GLOBAL`'s cache hit emitted in line. A loop
+    reading a module global went from 182 instructions an iteration to
+    116, but in real code (`dataclasses.asdict`, whose 35 global reads a
+    call were all helper calls) the in-line guards cost what the helper
+    did, for more code.
+
+- **Operation-level cliffs in the everyday battery** (PR #112, November
+  14). Each case broken into single operations, each operation's
+  instructions counted against CPython's with synchronous compiles
+  (`WEAVEPY_FRAME_JIT_SYNC=1`), and the outliers profiled in the
+  container. Ratios are WeavePy's instructions over CPython's, before and
+  after.
+  - `bytes`. Methods read their receiver in place instead of copying it;
+    a short search skips `memmem`'s set-up (`replace` scanned with a
+    `memcmp` at every position); slices, indexing, plain `%` formatting,
+    `bytes(n)` and `bytearray(b)` have fast paths. `replace` 3.08 to
+    1.13, `b[5:20]` 3.08 to 0.93, `b"%d:%s" % args` 2.69 to 1.44,
+    `bytes(10)` 2.60 to 0.78.
+  - `datetime`. `astimezone` ran `_pydatetime`'s local-time search in
+    Python (six or seven `time.localtime` calls and datetime arithmetic);
+    `replace`, `timestamp` and `astimezone` are now native for exact
+    classes with no `tzinfo` or a fixed-offset `timezone`, following
+    `_mktime` and `_local_timezone` step for step, with results identical
+    to the Python methods' across DST gaps and folds in five zones.
+    `astimezone(utc)` 9.32 to 0.86.
+  - `OSError`. Its family's builtin `__init__` kept every construction
+    off the leaf path; the leaf path's instance already holds what that
+    `__init__` sets. `OSError(errno, msg)` 6.22 to 1.98. `gettext`
+    raises and catches one per catalog lookup, about 50 per
+    `argparse.ArgumentParser()`.
+  - Dunder reads by name. `getattr(cls, name)` and `hasattr(cls, name)`
+    declined every dunder off a short list, so `dataclasses`'
+    `hasattr(type(obj), "__dataclass_fields__")` took the full
+    type-attribute path; a dunder `type` doesn't define and the full path
+    doesn't synthesize now resolves in the class's MRO. 6.06 to 1.51.
+  - Comparison methods resolved once. `x in xs` and sorting instances of
+    one class with a Python `__eq__` or `__lt__` went through the whole
+    rich-comparison dispatch per element; the method is now resolved once
+    per scan or sort. `x in xs` 2.14 to 1.55, sorting 1.51 to 0.90.
+  - Builtins called through the generic path. A native function compiled
+    code calls without a leaf registration leaves for the interpreter's
+    general call, about 2,500 instructions. `WEAVEPY_BURST_STATS`'
+    "generic call" lines, summed over the battery minus an empty run,
+    rank them; those whose plain shapes run no code now have leaf halves:
+    `os.urandom`, `int.from_bytes` (one builtin per thread instead of a
+    fresh one per read), `binascii.hexlify`, `round`, `repr` of scalars,
+    `list.sort()` of strings or numbers, `weakref.ref.__init__`, and
+    `str`, `tuple` and `int` `__new__` of a value of the type. A builtin
+    method read off its type (`str.upper`) is a receiver-checking shim,
+    which now takes the method's leaf kind. `secrets.token_hex(8)` 2.29
+    to 0.97, `f = str.upper; f(s)` 2.49 to 0.96.
+  - Smaller ones: `weakref.ref(x)` as a pure constructor (3.19 to 1.53);
+    `dict(zip(xs, ys))` and `dict(d)` built directly (2.42 to 0.95);
+    `functools.partial` callbacks unwrapped in `map` (5.18 to 1.09);
+    `itertools.chain` of ranges drained at once (2.20 to 0.36); a
+    property read through `getattr` in the leaf lane (3.36 to 1.03);
+    `type(o).__name__` remembered under `ABCMeta` (3.45 to 0.56); the
+    csv writer's dialect read once per `writerows` and plain fields
+    copied whole (2.26 to 1.52); `os.stat`'s field names shared through
+    a per-thread cache of literal strings (1.53 to 1.40); `json.dumps`'s
+    `sort_keys` sorting `str` keys in place; a thread's type cache taken
+    from zeroed memory, and leaf-builtin registrations no longer making
+    every interpreter rebuild its map.
+  - Tried and dropped: leaving loops whose work is Python calls on
+    objects to the frame JIT. It cut one shape 4x (2,470 instructions an
+    iteration to 573) and was neutral on the suite and the battery, but
+    it handed loops whose calls tier 2 makes natively to the frame JIT,
+    and the bench gate read `nbody` at 1.6 times its base.
 
 - **Comparison methods, descriptors, thread-locals and queues** (this PR,
   November 13). The everyday battery's class and thread cases, taken one
@@ -2875,6 +5173,18 @@ slowdown in that run was the even-sized chunks, since fixed.
 
 ## What the measurements say
 
+- **The battery's whole-case profile is flat** (November 14, callgrind
+  over all 54 cases with synchronous compiles). The core loop's own body
+  is 4.9% of the instructions, allocation and release about 7%, and no
+  other function passes 2%; the layers around a native caller's call into
+  Python are 2.5%, and compiling about 2% (9% to 14% in the shortest
+  cases). What gave way was operation-level: a case broken into single
+  operations and each counted against CPython shows one or two at 3 to
+  9 times, a general path taken where a cached or native one was
+  missing. Two measuring traps: a breakdown script's loops must each sit
+  in a function of their own (one function with an `if` per case runs
+  them interpreted, 3 times slower), and short runs under load measure
+  loops still waiting for their background compile.
 - **A call from native code into Python costs four or five times a call
   from compiled code** (November 13). The same `__eq__` body costs 2,200
   instructions called directly from a compiled `COMPARE_OP`, 4,080 when
@@ -3466,6 +5776,71 @@ slowdown in that run was the even-sized chunks, since fixed.
   generators (below noise).
 
 ## Next
+
+What PR #112's breakdowns left (instructions against CPython, quick
+builds, synchronous compiles):
+
+- `typing` subscripts (`typing.List[int]` 6.1, `Optional[str]` 5.8): the
+  native subscript calls `_tp_cache`'s Python wrapper, which forwards
+  `*args, **kwds` to the `lru_cache`, through the nested native-to-Python
+  entry.
+- `email`'s header parsing (setting one header 3.0) and `configparser`
+  (`write` 2.8, `read_string` 2.0): flat profiles of interpreted library
+  code, the core loop's call and return about 1,000 instructions a call.
+- The remaining builtins called through the generic path, ranked by the
+  battery's "generic call" counts: `getattr` misses (an `AttributeError`
+  raised and caught), `str.join` and `list.extend` over generators,
+  `next` of a generator, `print` with keywords, `StringIO.write`,
+  `setattr` on plain instances, `len` and `hash` through Python methods.
+- A raise caught in its caller (2.2) and three frames up (2.4).
+- Thread start and join (4.6 times CPython's instructions): each thread
+  zeroes and later drops a 4,096-entry type cache (128 KB) and tier 2
+  analyzes again what another thread compiled. And code that runs while a
+  second thread is alive still costs about 15% more than with one: the
+  frame JIT's in-line reference-count updates go to helpers when counts
+  are shared (the code generator has no atomic instructions), and cell
+  borrows take the locked path.
+- Keyword calls of a function with keyword-only parameters in a tier-2
+  loop: tier 2's static binding requires `kwonly_count == 0`, so `f(i,
+  c=4)` goes through its dynamic keyword helper (1,240 instructions
+  against CPython's 1,060), where the frame JIT alone inlines the call in
+  330.
+- Exceptions raised in a callee (2.1 times CPython's instructions) and in
+  the same frame (1.6): about 40 layered helpers of 50 to 300 instructions
+  each (normalization, the instance, its traceback, frame shells for the
+  traceback, the handler search per frame), no single one dominant.
+- Generators: a resume through `gen_native_next` is about 300
+  instructions, `lazy_gen_resume` (a body that calls) about 360, and
+  creating one about 1,000, against CPython's 150 or so a resume (`for x
+  in gen` 1.63, `all(f(x) for x in xs)` 1.40, a generator created and
+  drained 1.94). Plan item 2.
+- `decimal`: each operation finds the current context through the
+  `contextvars` mapping and the context's fields, about 390 instructions
+  of a multiplication's 1,600 (CPython 1,100).
+- `dataclasses.asdict` (2.3) and `replace` (2.3), `IntFlag` `|` (1.7),
+  a dataclass `repr` (1.9): flat profiles of interpreted library code.
+- The frame JIT's generic call helper, `h_call` (about 250 to 300
+  instructions before the callee runs: a chain of shape checks for
+  `lru_cache` wrappers, `__call__`, `__reduce_ex__`, leaf builtins, then
+  the general path), which an instance with a native `__call__`
+  (`operator.itemgetter` 1.6), a builtin with keywords and
+  `functools.partial` (1.8) all take. A call site that remembered its
+  callee's shape could skip to it.
+- `pickle.dumps` of a small dict (1.8): every call re-verifies about 13
+  module functions the engine depends on (their code and defaults); a
+  global epoch bumped by `__code__`, `__defaults__` and `__kwdefaults__`
+  assignments would let it check a stamp instead.
+- `string.Template.substitute` (1.9), `itertools.groupby` (1.8),
+  `urllib.parse.quote` (1.6), `bisect.insort` (1.6), `random.randint`
+  (1.7): Python-level library code over callbacks.
+- Tier 2's method calls on built-in values it can't type: the counting
+  idiom `d[k] = d.get(k, 0) + 1` runs 1.9 times CPython's instructions in
+  tier 2 against 0.94 in the frame JIT alone, because tier 2 reads
+  `d.get` dynamically, builds a bound method every iteration and calls it
+  through its dynamic helper. A typed `DictGet` with a default (the
+  analyzer already lowers `d[k]` on a dict lane) would close it.
+- Two-argument `super(C, obj)` used other than for an immediate attribute
+  read (5.95), and `super(...).__class__` (7.8).
 
 What the everyday battery points at (`tools/pybench/everyday.py`; see
 "What the measurements say"):

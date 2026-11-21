@@ -31,8 +31,16 @@ impl TupleStorage {
     }
 
     /// Move a dynamically sized sequence into one reference-counted block.
-    pub fn from_vec(items: Vec<Object>) -> SharedTuple {
-        Self::from_exact_iter(items.into_iter())
+    pub fn from_vec(mut items: Vec<Object>) -> SharedTuple {
+        let len = items.len();
+        // SAFETY: the elements are moved whole into the tuple's slots and
+        // the vector forgets them at once (it keeps only its buffer).
+        unsafe {
+            Self::filled(len, |destination| {
+                std::ptr::copy_nonoverlapping(items.as_ptr(), destination, len);
+                items.set_len(0);
+            })
+        }
     }
 
     /// [`Self::from_vec`] straight from an iterator that knows its
@@ -44,13 +52,74 @@ impl TupleStorage {
     where
         I: ExactSizeIterator<Item = Object>,
     {
+        let len = items.len();
+        // SAFETY: the iterator yields exactly `len` elements, each moved
+        // into its slot.
+        unsafe {
+            Self::filled(len, |destination| {
+                for (index, item) in items.enumerate() {
+                    destination.add(index).write(item);
+                }
+            })
+        }
+    }
+
+    /// A tuple of clones of `items`: the elements copied whole in one
+    /// pass, then their counts taken in a second (an element moved
+    /// through an iterator goes by way of the stack in two unaligned
+    /// halves, which costs about twenty instructions each).
+    pub fn from_cloned_slice(items: &[Object]) -> SharedTuple {
+        // SAFETY: every slot is written by the copy (which neither runs
+        // code nor unwinds).
+        unsafe {
+            Self::filled(items.len(), |destination| {
+                crate::object::clone_objects_into(items, destination);
+            })
+        }
+    }
+
+    /// A tuple of clones of `count` runs of `items`, one after another
+    /// (`t * n`).
+    pub fn from_repeated_slice(items: &[Object], count: usize) -> SharedTuple {
+        let len = items
+            .len()
+            .checked_mul(count)
+            .expect("tuple elements exceed layout limit");
+        // SAFETY: the `count` runs fill exactly `len` slots.
+        unsafe {
+            Self::filled(len, |destination| {
+                for run in 0..count {
+                    crate::object::clone_objects_into(items, destination.add(run * items.len()));
+                }
+            })
+        }
+    }
+
+    /// A tuple of clones of `head`'s elements, then `tail`'s (`a + b`).
+    pub fn from_cloned_pair(head: &[Object], tail: &[Object]) -> SharedTuple {
+        // SAFETY: the two runs fill exactly the slots asked for.
+        unsafe {
+            Self::filled(head.len() + tail.len(), |destination| {
+                crate::object::clone_objects_into(head, destination);
+                crate::object::clone_objects_into(tail, destination.add(head.len()));
+            })
+        }
+    }
+
+    /// A tuple of `len` elements written by `fill` into its own
+    /// allocation.
+    ///
+    /// # Safety
+    ///
+    /// `fill` initializes all `len` slots at the pointer it's given, and
+    /// doesn't unwind.
+    #[inline(always)]
+    unsafe fn filled(len: usize, fill: impl FnOnce(*mut Object)) -> SharedTuple {
         let (prefix, _) = Layout::new::<usize>()
             .extend(Layout::new::<CachedHash>())
             .expect("tuple prefix exceeds layout limit");
         let (layout, _) = prefix
-            .extend(
-                Layout::array::<Object>(items.len()).expect("tuple elements exceed layout limit"),
-            )
+            .extend(Layout::array::<Object>(len).expect("tuple elements exceed layout limit"))
             .expect("tuple header exceeds layout limit");
         let layout = layout.pad_to_align();
         // Allocate words with exactly the target payload's alignment and
@@ -59,7 +128,8 @@ impl TupleStorage {
         macro_rules! allocate {
             ($($word:ty),*) => {
                 $(if layout.align() == std::mem::align_of::<$word>() {
-                    return Self::from_iter_aligned::<$word, I>(items, layout);
+                    // SAFETY: per the caller.
+                    return unsafe { Self::filled_aligned::<$word>(len, layout, fill) };
                 })*
             };
         }
@@ -67,13 +137,17 @@ impl TupleStorage {
         panic!("unsupported tuple payload alignment: {}", layout.align());
     }
 
-    fn from_iter_aligned<Word, I>(items: I, layout: Layout) -> SharedTuple
-    where
-        I: ExactSizeIterator<Item = Object>,
-    {
+    /// # Safety
+    ///
+    /// As [`Self::filled`].
+    #[inline(always)]
+    unsafe fn filled_aligned<Word>(
+        len: usize,
+        layout: Layout,
+        fill: impl FnOnce(*mut Object),
+    ) -> SharedTuple {
         assert_eq!(layout.align(), std::mem::align_of::<Word>());
         assert_eq!(layout.size() % std::mem::size_of::<Word>(), 0);
-        let len = items.len();
         let storage = Rc::<[Word]>::new_uninit_slice(layout.size() / std::mem::size_of::<Word>());
         let data = Rc::into_raw(storage).cast::<Object>().cast_mut();
         let tuple = std::ptr::slice_from_raw_parts_mut(data, len) as *mut Self;
@@ -85,8 +159,8 @@ impl TupleStorage {
         // layout without depending on Arc's private field layout.
         //
         // The raw pointer comes from the only Arc. No references to the
-        // uninitialized payload exist. These writes neither allocate nor
-        // run callbacks, and the Vec iterator yields exactly len elements.
+        // uninitialized payload exist. Per the caller, `fill` writes
+        // exactly len elements and doesn't unwind.
         // Changing the fat pointer's metadata preserves its data address
         // and provenance. The final Arc drops each moved Object once;
         // the original MaybeUninit words have no destructors.
@@ -94,9 +168,7 @@ impl TupleStorage {
             std::ptr::addr_of_mut!((*tuple).len).write(len);
             std::ptr::addr_of_mut!((*tuple).hash).write(CachedHash::default());
             let destination = std::ptr::addr_of_mut!((*tuple).items).cast::<Object>();
-            for (index, item) in items.enumerate() {
-                destination.add(index).write(item);
-            }
+            fill(destination);
             let result = Rc::from_raw(tuple);
             debug_assert_eq!(Layout::for_value(result.as_ref()), layout);
             ThinArc::from_arc(result)

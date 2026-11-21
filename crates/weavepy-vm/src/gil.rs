@@ -279,8 +279,11 @@ impl GilState {
         self.note_acquired();
         let me = current_thread_id();
         crate::sync::note_vm_thread(me);
+        crate::sync::note_gil_thread(me);
         self.holder.store(me, Ordering::Release);
-        self.depth.fetch_add(1, Ordering::AcqRel);
+        if self.depth.fetch_add(1, Ordering::AcqRel) == 0 {
+            crate::sync::gil_taken();
+        }
         // We must hold the parking_lot guard for the lifetime
         // of the GilGuard. Stash a transmuted-lifetime guard
         // inside the result, paired with a clone of the Arc to
@@ -310,8 +313,11 @@ impl GilState {
         self.note_acquired();
         let me = current_thread_id();
         crate::sync::note_vm_thread(me);
+        crate::sync::note_gil_thread(me);
         self.holder.store(me, Ordering::Release);
-        self.depth.fetch_add(1, Ordering::AcqRel);
+        if self.depth.fetch_add(1, Ordering::AcqRel) == 0 {
+            crate::sync::gil_taken();
+        }
         // SAFETY: as in `acquire`.
         let static_guard: parking_lot::ReentrantMutexGuard<'static, ()> =
             unsafe { std::mem::transmute(lock_guard) };
@@ -335,8 +341,11 @@ impl GilState {
         self.note_acquired();
         let me = current_thread_id();
         crate::sync::note_vm_thread(me);
+        crate::sync::note_gil_thread(me);
         self.holder.store(me, Ordering::Release);
-        self.depth.fetch_add(1, Ordering::AcqRel);
+        if self.depth.fetch_add(1, Ordering::AcqRel) == 0 {
+            crate::sync::gil_taken();
+        }
         let static_guard: parking_lot::ReentrantMutexGuard<'static, ()> =
             unsafe { std::mem::transmute(lock_guard) };
         Some(GilGuard {
@@ -451,8 +460,10 @@ impl Drop for GilGuard {
             // Never touched holder/depth on acquire.
             return;
         }
-        self.state.depth.fetch_sub(1, Ordering::AcqRel);
-        if self.state.depth.load(Ordering::Acquire) == 0 {
+        // (Still under the lock: the field that releases it drops after
+        // this body.)
+        if self.state.depth.fetch_sub(1, Ordering::AcqRel) == 1 {
+            crate::sync::gil_given_up();
             self.state.holder.store(0, Ordering::Release);
         }
     }
@@ -701,10 +712,33 @@ pub fn push_gil_guard(g: GilGuard) {
     GIL_GUARD_STACK.with(|cell| cell.borrow_mut().push(g));
 }
 
+/// Register the calling thread's guard stack for destruction now, ahead
+/// of its other thread-locals. A thread's destructors run in the reverse
+/// of the order its thread-locals were first used, so a guard a thread
+/// leaves on a stack armed first keeps the GIL through every other
+/// destructor of that thread, and gives it back in the stack's own.
+pub(crate) fn arm_guard_stack() {
+    let _ = GIL_GUARD_STACK.try_with(|_| ());
+}
+
 /// Pop and return the top guard. Returns `None` when the calling
 /// thread doesn't hold the GIL through this stack.
 pub fn pop_gil_guard() -> Option<GilGuard> {
     GIL_GUARD_STACK.with(|cell| cell.borrow_mut().pop())
+}
+
+/// [`current_thread_holds_gil`] for a caller that may run in a
+/// thread-local destructor (`false` once the guard stack is gone).
+pub(crate) fn try_current_thread_holds_gil() -> bool {
+    GIL_GUARD_STACK
+        .try_with(|cell| cell.try_borrow().is_ok_and(|v| !v.is_empty()))
+        .unwrap_or(false)
+}
+
+/// Whether the calling thread owns the GIL's lock, through the guard
+/// stack or not (a thread-local destructor's own acquire, say).
+pub(crate) fn holds_gil_lock() -> bool {
+    global_gil_ref().lock.is_owned_by_current_thread()
 }
 
 /// `True` if the calling thread holds the GIL via this stack.
@@ -765,6 +799,10 @@ impl GilScope {
 impl Drop for GilScope {
     fn drop(&mut self) {
         if self.engaged {
+            // This thread may touch objects after its outermost scope
+            // (an embedder reading a result): with other threads
+            // running, counts are atomic from here on.
+            crate::sync::counts_leave_gil();
             // The cooperative hand-off may have replaced the stack's
             // guards meanwhile, but it restores as many as it took.
             drop(GIL_GUARD_STACK.try_with(|cell| cell.borrow_mut().pop()));
@@ -819,6 +857,20 @@ impl<T> Drop for ReleaseUnderGil<T> {
     }
 }
 
+/// What a thread does before it releases the GIL to block: other threads
+/// may look at its frames meanwhile, so lean activations waiting for their
+/// shells and lazily running ones get them first. With no other thread (a
+/// second thread is recorded before it starts) and no dump armed, nothing can look until this thread runs again, and whatever
+/// looks then makes the spine whole first (an event loop's `select` blocks
+/// once a step). Every release of the GIL by a thread with frames goes
+/// through here (C code's `PyEval_SaveThread` too).
+#[inline]
+pub fn before_gil_release() {
+    if crate::sync::threads_started() || crate::stdlib::faulthandler_mod::may_read_frames() {
+        crate::builtins::sync_frame_spine();
+    }
+}
+
 /// RFC 0025: drop the GIL, run `f`, re-acquire the GIL, then
 /// return `f`'s result. Used by every blocking-I/O / lock-acquire
 /// path that would otherwise prevent other threads from running.
@@ -832,17 +884,7 @@ impl<T> Drop for ReleaseUnderGil<T> {
 /// Py_END_ALLOW_THREADS`. The C-API macros' expansion
 /// (`PyEval_SaveThread()` / `PyEval_RestoreThread()`) lands here.
 pub fn allow_threads_then<R>(f: impl FnOnce() -> R) -> R {
-    // Other threads may look at this one's frames while it blocks: lean
-    // activations waiting for their shells get them first. With no other
-    // thread (a second thread turns shared reference counts on before it
-    // starts) and no dump armed, nothing can look until this thread runs
-    // again, and whatever looks then makes the spine whole first (an event
-    // loop's `select` blocks once a step).
-    if crate::sync::rc_shared_flag().load(Ordering::Relaxed)
-        || crate::stdlib::faulthandler_mod::may_read_frames()
-    {
-        crate::builtins::sync_frame_spine();
-    }
+    before_gil_release();
     // Pop every guard we currently hold (a worker calls
     // `start_new_thread` -> builtin -> `allow_threads_then` with
     // exactly one guard; nested cases pop them all).
@@ -1090,8 +1132,13 @@ fn maybe_yield_gil() {
     // shared counter (the `test_release_task_refs` race). Both clocks must
     // have run out: the holder has held for the interval *and* the waiter
     // has waited for it (`WAITER_SEEN_SINCE`), which is what CPython's
-    // waiter-timed drop request amounts to.
-    if !switch_interval_elapsed() || !waiter_interval_elapsed() {
+    // waiter-timed drop request amounts to. The two run side by side:
+    // the waiter's clock starts at the first checkpoint that sees it,
+    // whatever the holder's says (started only once the holder's had run
+    // out, it made a thread back from a blocking call wait two intervals
+    // for a busy one, 10 ms where CPython waits 5).
+    let waited = waiter_interval_elapsed();
+    if !switch_interval_elapsed() || !waited {
         return;
     }
     // The next holder may look at this thread's frames (see

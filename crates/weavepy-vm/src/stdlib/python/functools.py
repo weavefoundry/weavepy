@@ -224,6 +224,44 @@ def _cmp_to_key_py(mycmp):
 
 cmp_to_key = _cmp_to_key_py
 
+
+# WeavePy: the native `cmp_to_key` (CPython's is C) returns one of these
+# instead of a class made per call: a callable `key(obj)` whose results
+# compare through the wrapped `mycmp`. Making a class for every
+# `sorted(xs, key=cmp_to_key(f))` cost far more than the sort.
+class _CmpKey:
+    __slots__ = ('obj', '_mycmp')
+    __hash__ = None
+
+    def __lt__(self, other):
+        return self._mycmp(self.obj, other.obj) < 0
+
+    def __gt__(self, other):
+        return self._mycmp(self.obj, other.obj) > 0
+
+    def __eq__(self, other):
+        return self._mycmp(self.obj, other.obj) == 0
+
+    def __le__(self, other):
+        return self._mycmp(self.obj, other.obj) <= 0
+
+    def __ge__(self, other):
+        return self._mycmp(self.obj, other.obj) >= 0
+
+
+class _CmpToKey:
+    __slots__ = ('_mycmp',)
+
+    def __init__(self, mycmp):
+        self._mycmp = mycmp
+
+    def __call__(self, obj):
+        key = _CmpKey.__new__(_CmpKey)
+        key.obj = obj
+        key._mycmp = self._mycmp
+        return key
+
+
 try:
     # The native version is a non-binding builtin (CPython's is a C
     # function); it calls back into `_cmp_to_key_py` for the K class.

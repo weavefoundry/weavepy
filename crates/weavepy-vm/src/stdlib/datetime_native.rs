@@ -42,7 +42,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::error::{overflow_error, type_error, RuntimeError};
 use crate::object::{BuiltinFn, DictKey, Object};
 use crate::shared_value::{SharedSlice, SharedStr};
-use crate::sync::{Rc, RefCell, Weak};
+use crate::sync::{Rc, Weak};
 use crate::types::{PyInstance, SlotStorage, TypeObject};
 
 pub(crate) const KIND_TIMEDELTA: u8 = 1;
@@ -562,7 +562,6 @@ struct Names {
     f_days: SharedStr,
     f_seconds: SharedStr,
     f_microseconds: SharedStr,
-    f_fromisoformat: SharedStr,
 }
 
 fn interned(s: &str) -> SharedStr {
@@ -601,7 +600,6 @@ impl Names {
             f_days: interned("days"),
             f_seconds: interned("seconds"),
             f_microseconds: interned("microseconds"),
-            f_fromisoformat: interned("fromisoformat"),
         }
     }
 }
@@ -632,9 +630,10 @@ struct State {
     expect: std::sync::OnceLock<Vec<(u8, &'static str, Object)>>,
     /// Dead instances kept for reuse (see [`Pool`]).
     pool: Pool,
-    /// The native `datetime.fromisoformat` (the function its
-    /// `classmethod` wraps).
-    fromiso: std::sync::OnceLock<Object>,
+    /// The native class methods (`datetime.fromisoformat`, `now`,
+    /// `fromtimestamp`, `date.today`): the class kind, the interned name,
+    /// the function the `classmethod` wraps and its fast half.
+    classmethods: std::sync::OnceLock<Vec<(u8, SharedStr, Object, Fast)>>,
 }
 
 /// The dunders and fields the dispatch-loop shortcuts serve without a
@@ -687,6 +686,10 @@ const SHORTCUT_NAMES: &[(u8, &str)] = &[
     (KIND_DATETIME, "tzinfo"),
     (KIND_DATETIME, "fold"),
     (KIND_DATETIME, "fromisoformat"),
+    (KIND_DATETIME, "fromtimestamp"),
+    (KIND_DATETIME, "now"),
+    (KIND_DATE, "today"),
+    (KIND_DATE, "fromisoformat"),
     // The slots behind the fields, which `leaf_field` reads by name too.
     (KIND_TIMEDELTA, "_days"),
     (KIND_TIMEDELTA, "_seconds"),
@@ -1030,8 +1033,7 @@ fn entry(k: &SharedStr, v: Object) -> (DictKey, Object) {
 }
 
 fn instance(cls: Rc<TypeObject>, entries: Vec<(DictKey, Object)>) -> Object {
-    let mut i = PyInstance::new(cls);
-    i.slots = RefCell::new(SlotStorage::from_entries(entries));
+    let i = PyInstance::with_slots(cls, SlotStorage::from_entries(entries));
     Object::Instance(Rc::new(i))
 }
 
@@ -1041,8 +1043,7 @@ fn instance_fixed(
     layout: &SharedSlice<DictKey>,
     values: Vec<Object>,
 ) -> Object {
-    let mut i = PyInstance::new(cls);
-    i.slots = RefCell::new(SlotStorage::from_layout(layout.clone(), values));
+    let i = PyInstance::with_slots(cls, SlotStorage::from_layout(layout.clone(), values));
     Object::Instance(Rc::new(i))
 }
 
@@ -1375,8 +1376,10 @@ fn new_packed(
         drop(Rc::into_arc(inst));
     }
     let cls = cls.upgrade()?;
-    let mut i = PyInstance::new(cls);
-    *i.slots.get_mut() = SlotStorage::from_packed(PackedSlots::new(kind, word, aux));
+    let i = PyInstance::with_slots(
+        cls,
+        SlotStorage::from_packed(PackedSlots::new(kind, word, aux)),
+    );
     Some(Object::Instance(Rc::new(i)))
 }
 
@@ -2345,6 +2348,410 @@ fn parse_hms(t: &[u8]) -> Option<(i64, i64, i64, i64)> {
     Some((hh, mm, ss, us))
 }
 
+// ---------------------------------------------------------------------
+// Local time: `_pydatetime`'s `_mktime` and `_local_timezone`, through
+// the libc `localtime_r` that `time.localtime` uses.
+
+/// Seconds since the epoch of naive wall-clock fields.
+fn epoch_secs(y: i64, m: i64, d: i64, hh: i64, mm: i64, ss: i64) -> i64 {
+    (ymd2ord(y, m, d) - ymd2ord(1970, 1, 1)) * 86_400 + hh * 3600 + mm * 60 + ss
+}
+
+/// `time.localtime(u)`'s wall-clock fields, `tm_gmtoff` and `tm_zone`;
+/// `None` where it would raise (or a leap second, which `datetime`
+/// rejects).
+#[cfg(unix)]
+fn local_tm(u: i64) -> Option<([i64; 6], i64, Option<Vec<u8>>)> {
+    let t = libc::time_t::try_from(u).ok()?;
+    // SAFETY: plain C structs, filled by `localtime_r`.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&raw const t, &raw mut tm) }.is_null() || tm.tm_sec > 59 {
+        return None;
+    }
+    let zone = (!tm.tm_zone.is_null())
+        // SAFETY: a NUL-terminated name libc keeps for the process.
+        .then(|| unsafe { std::ffi::CStr::from_ptr(tm.tm_zone) }.to_bytes().to_vec());
+    let f = [
+        i64::from(tm.tm_year) + 1900,
+        i64::from(tm.tm_mon) + 1,
+        i64::from(tm.tm_mday),
+        i64::from(tm.tm_hour),
+        i64::from(tm.tm_min),
+        i64::from(tm.tm_sec),
+    ];
+    Some((f, tm.tm_gmtoff as i64, zone))
+}
+
+#[cfg(not(unix))]
+fn local_tm(_u: i64) -> Option<([i64; 6], i64, Option<Vec<u8>>)> {
+    None
+}
+
+/// `_mktime()` of naive fields with `fold`: the POSIX timestamp whose
+/// local time they are (`_pydatetime`'s search, step for step).
+fn mktime(f: &Dt, fold: i64) -> Option<i64> {
+    const MAX_FOLD_SECONDS: i64 = 24 * 3600;
+    let t = epoch_secs(f.y, f.m, f.d, f.hh, f.mm, f.ss);
+    let local = |u: i64| -> Option<i64> {
+        let ([y, m, d, hh, mm, ss], _, _) = local_tm(u)?;
+        Some(epoch_secs(y, m, d, hh, mm, ss))
+    };
+    let a = local(t)? - t;
+    let u1 = t - a;
+    let t1 = local(u1)?;
+    let b = if t1 == t {
+        let u2 = u1
+            + if fold == 0 {
+                -MAX_FOLD_SECONDS
+            } else {
+                MAX_FOLD_SECONDS
+            };
+        let b = local(u2)? - u2;
+        if a == b {
+            return Some(u1);
+        }
+        b
+    } else {
+        t1 - u1
+    };
+    let u2 = t - b;
+    if local(u2)? == t {
+        return Some(u2);
+    }
+    if t1 == t {
+        return Some(u1);
+    }
+    // In a gap: neither offset solves it.
+    Some(if fold == 0 { u1.max(u2) } else { u1.min(u2) })
+}
+
+/// The timestamp `_local_timezone` reads the local zone at, for naive
+/// fields (`None` for an aware value, whose own offset decides).
+fn local_ts(f: &Dt) -> Option<i64> {
+    let ts = mktime(f, f.fold)?;
+    let ts2 = mktime(f, 1 - f.fold)?;
+    // A gap or a fold.
+    Some(if ts2 != ts && (ts2 > ts) == (f.fold == 1) {
+        ts2
+    } else {
+        ts
+    })
+}
+
+/// Microseconds since the epoch of fields at a fixed UTC offset `off`.
+fn epoch_us(f: &Dt, off: i128) -> i128 {
+    dt_us(f) - off - i128::from(ymd2ord(1970, 1, 1)) * US_PER_DAY
+}
+
+/// `datetime.timestamp()` of a naive or fixed-offset value.
+fn dt_timestamp(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [x] = a else { return None };
+    let st = state_of(x)?;
+    let f = dt_fields(inst(x, KIND_DATETIME)?, st)?;
+    if !valid_date(f.y, f.m, f.d) {
+        return None;
+    }
+    let secs = match tz_of(&f.tz, st)? {
+        Tz::Naive => mktime(&f, f.fold)? as f64 + f.us as f64 / 1e6,
+        Tz::Fixed(off) => {
+            // (Exact as a float, so the division rounds as the Python
+            // code's integer true division does.)
+            let n = epoch_us(&f, off);
+            if n.unsigned_abs() >= 1 << 53 {
+                return None;
+            }
+            n as f64 / 1e6
+        }
+    };
+    Some(Ok(Object::Float(secs)))
+}
+
+/// `datetime.replace(...)` of the fields by position (`year` to `tzinfo`;
+/// an absent or `Unbound` one keeps the value's, as does `None` for any
+/// but `tzinfo`, whose own default is `True`), `tzinfo` `None` or an
+/// exact `timezone`. `fold` (keyword-only) is the Python method's.
+fn dt_replace(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let (x, rest) = a.split_first()?;
+    if rest.len() > 8 {
+        return None;
+    }
+    let st = state_of(x)?;
+    let mut f = dt_fields(inst(x, KIND_DATETIME)?, st)?;
+    for (i, v) in rest.iter().enumerate() {
+        if matches!(v, Object::Unbound) || (i < 7 && matches!(v, Object::None)) {
+            continue;
+        }
+        if i == 7 {
+            if !matches!(v, Object::Bool(true)) {
+                tz_of(v, st)?;
+                f.tz = v.clone();
+            }
+            continue;
+        }
+        let v = as_int(v)?;
+        match i {
+            0 => f.y = v,
+            1 => f.m = v,
+            2 => f.d = v,
+            3 => f.hh = v,
+            4 => f.mm = v,
+            5 => f.ss = v,
+            _ => f.us = v,
+        }
+    }
+    let ok = valid_date(f.y, f.m, f.d)
+        && (0..24).contains(&f.hh)
+        && (0..60).contains(&f.mm)
+        && (0..60).contains(&f.ss)
+        && (0..1_000_000).contains(&f.us);
+    if !ok {
+        return None;
+    }
+    Some(Ok(new_dt(st, f)?))
+}
+
+/// `datetime.astimezone(tz)` of a naive or fixed-offset value, to an
+/// exact `timezone` or (no `tz`) the local zone.
+fn dt_astimezone(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let (x, rest) = a.split_first()?;
+    let target = match rest {
+        [] | [Object::None] => None,
+        [t] => Some(t),
+        _ => return None,
+    };
+    let st = state_of(x)?;
+    let f = dt_fields(inst(x, KIND_DATETIME)?, st)?;
+    if !valid_date(f.y, f.m, f.d) {
+        return None;
+    }
+    let mine = tz_of(&f.tz, st)?;
+    let my_off = match mine {
+        Tz::Fixed(off) => off,
+        Tz::Naive => i128::from(local_tm(local_ts(&f)?)?.1) * 1_000_000,
+    };
+    let (tz, tz_off) = match target {
+        Some(t) => match tz_of(t, st)? {
+            Tz::Fixed(off) => (t.clone(), off),
+            Tz::Naive => return None,
+        },
+        None => {
+            let ts = match mine {
+                Tz::Naive => local_ts(&f)?,
+                Tz::Fixed(off) => i64::try_from(epoch_us(&f, off).div_euclid(1_000_000)).ok()?,
+            };
+            let (_, gmtoff, zone) = local_tm(ts)?;
+            let name = Object::from_str(String::from_utf8(zone?).ok()?);
+            let off = i128::from(gmtoff) * 1_000_000;
+            (new_named_timezone(st, off, name)?, off)
+        }
+    };
+    if matches!(mine, Tz::Fixed(_)) && f.tz.is_same(&tz) {
+        return Some(Ok(x.clone()));
+    }
+    // (Two steps, as the Python code takes them, so an intermediate
+    // overflow raises there.)
+    let utc = dt_shift(f, -my_off)?;
+    let mut g = dt_shift(utc, tz_off)?;
+    g.tz = tz;
+    Some(Ok(new_dt(st, g)?))
+}
+
+/// `_fromtimestamp(t, tz is not None, tz)` of whole seconds `t` and
+/// microseconds `us` (rounded and carried as `_fromtimestamp` does) into
+/// an exact `datetime`, for no `tzinfo` (local time, its fold found as
+/// the Python code finds it) or an exact `timezone` (UTC, then
+/// `timezone.fromutc`). `None` for anything the Python method must run.
+fn dt_from_epoch(st: &State, t: i64, us: i64, tz: &Object) -> Option<Object> {
+    match tz_of(tz, st)? {
+        Tz::Naive => {
+            // As of version 2015f max fold in IANA database is 23 hours
+            // (`_fromtimestamp`'s probe a day back).
+            const MAX_FOLD_SECONDS: i64 = 24 * 3600;
+            // (A date out of range is the Python method's to reject.)
+            let local = |u: i64| -> Option<Dt> {
+                let ([y, m, d, hh, mm, ss], _, _) = local_tm(u)?;
+                if !valid_date(y, m, d) {
+                    return None;
+                }
+                Some(Dt {
+                    y,
+                    m,
+                    d,
+                    hh,
+                    mm,
+                    ss,
+                    us,
+                    tz: Object::None,
+                    fold: 0,
+                })
+            };
+            let mut f = local(t)?;
+            if !(cfg!(windows) && t < MAX_FOLD_SECONDS) {
+                let probe1 = local(t.checked_sub(MAX_FOLD_SECONDS)?)?;
+                let trans = dt_us(&f) - dt_us(&probe1) - i128::from(MAX_FOLD_SECONDS) * 1_000_000;
+                if trans < 0 {
+                    let t2 = t.checked_add(i64::try_from(trans.div_euclid(1_000_000)).ok()?)?;
+                    if dt_us(&local(t2)?) == dt_us(&f) {
+                        f.fold = 1;
+                    }
+                }
+            }
+            new_dt(st, f)
+        }
+        Tz::Fixed(off) => {
+            let ord = t.div_euclid(86_400) + ymd2ord(1970, 1, 1);
+            if !(1..=MAX_ORDINAL).contains(&ord) {
+                return None;
+            }
+            let (y, m, d) = ord2ymd(ord);
+            let rest = t.rem_euclid(86_400);
+            let f = Dt {
+                y,
+                m,
+                d,
+                hh: rest / 3600,
+                mm: rest % 3600 / 60,
+                ss: rest % 60,
+                us,
+                tz: Object::None,
+                fold: 0,
+            };
+            let mut g = dt_shift(f, off)?;
+            g.tz = tz.clone();
+            new_dt(st, g)
+        }
+    }
+}
+
+/// A timestamp's whole seconds and microseconds as `_fromtimestamp`
+/// splits a `float` (`modf`, the fraction rounded half to even, carried)
+/// or takes an `int`; `None` for anything else or out of range.
+fn epoch_parts(t: &Object) -> Option<(i64, i64)> {
+    match *t {
+        Object::Int(i) => Some((i, 0)),
+        Object::Bool(b) => Some((i64::from(b), 0)),
+        Object::Float(x) => {
+            if !x.is_finite() || x.abs() >= 1e15 {
+                return None;
+            }
+            let whole = x.trunc();
+            let mut us = ((x - whole) * 1e6).round_ties_even() as i64;
+            let mut secs = whole as i64;
+            if us >= 1_000_000 {
+                secs += 1;
+                us -= 1_000_000;
+            } else if us < 0 {
+                secs -= 1;
+                us += 1_000_000;
+            }
+            Some((secs, us))
+        }
+        _ => None,
+    }
+}
+
+/// The system clock now: whole seconds and microseconds (the nanoseconds
+/// rounded half to even, as `datetime.now()` in CPython rounds them).
+fn clock_now() -> Option<(i64, i64)> {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    let mut secs = i64::try_from(d.as_secs()).ok()?;
+    let nanos = i64::from(d.subsec_nanos());
+    let (q, r) = (nanos / 1000, nanos % 1000);
+    let mut us = q + i64::from(r > 500 || (r == 500 && q % 2 == 1));
+    if us == 1_000_000 {
+        secs += 1;
+        us = 0;
+    }
+    Some((secs, us))
+}
+
+/// `datetime.fromtimestamp(t, tz=None)` of the exact class.
+fn dt_fromtimestamp(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let (cls, t, tz) = match a {
+        [Object::Type(c), t] => (c, t, &Object::None),
+        [Object::Type(c), t, tz] => (c, t, tz),
+        _ => return None,
+    };
+    let st = state_of_cls(cls)?;
+    if !std::ptr::eq(Rc::as_ptr(cls), st.datetime.as_ptr()) {
+        return None;
+    }
+    let (secs, us) = epoch_parts(t)?;
+    Some(Ok(dt_from_epoch(st, secs, us, tz)?))
+}
+
+/// `datetime.now(tz=None)` of the exact class.
+fn dt_now(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let (cls, tz) = match a {
+        [Object::Type(c)] => (c, &Object::None),
+        [Object::Type(c), tz] => (c, tz),
+        _ => return None,
+    };
+    let st = state_of_cls(cls)?;
+    if !std::ptr::eq(Rc::as_ptr(cls), st.datetime.as_ptr()) {
+        return None;
+    }
+    let (secs, us) = clock_now()?;
+    Some(Ok(dt_from_epoch(st, secs, us, tz)?))
+}
+
+/// `date.today()` of the exact class: `time.localtime()`'s date.
+/// `date.fromisoformat` for an ASCII `YYYY-MM-DD` or `YYYYMMDD` naming a
+/// real date, on the exact class. Anything else (week dates, a subclass,
+/// a bad field) declines to the Python method, which raises its errors.
+fn date_fromisoformat(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Type(cls), Object::Str(s)] = a else {
+        return None;
+    };
+    let st = state_of_cls(cls)?;
+    if !std::ptr::eq(Rc::as_ptr(cls), st.date.as_ptr()) {
+        return None;
+    }
+    let b = s.as_bytes();
+    let (y, m, d) = match b.len() {
+        10 if b[4] == b'-' && b[7] == b'-' => {
+            (digits(&b[0..4])?, digits(&b[5..7])?, digits(&b[8..10])?)
+        }
+        8 => (digits(&b[0..4])?, digits(&b[4..6])?, digits(&b[6..8])?),
+        _ => return None,
+    };
+    if !valid_date(y, m, d) {
+        return None;
+    }
+    Some(Ok(new_date(st, y, m, d)?))
+}
+
+fn date_today(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Type(cls)] = a else { return None };
+    let st = state_of_cls(cls)?;
+    if !std::ptr::eq(Rc::as_ptr(cls), st.date.as_ptr()) {
+        return None;
+    }
+    let (secs, _) = clock_now()?;
+    let ([y, m, d, ..], _, _) = local_tm(secs)?;
+    if !valid_date(y, m, d) {
+        return None;
+    }
+    Some(Ok(new_date(st, y, m, d)?))
+}
+
+/// An exact `timezone` with the offset `us` and the name `name`, as
+/// `timezone(offset, name)` builds it (even for a zero offset).
+fn new_named_timezone(st: &State, us: i128, name: Object) -> Option<Object> {
+    if us.unsigned_abs() >= US_PER_DAY as u128 {
+        return None;
+    }
+    let off = new_td(st, 0, 0, us)?.ok()?;
+    let cls = st.timezone.upgrade()?;
+    let n = &st.names;
+    Some(instance(
+        cls,
+        vec![entry(&n.offset, off), entry(&n.name, name)],
+    ))
+}
+
 /// An exact `timezone` with the fixed offset `us` (non-zero, in range)
 /// and no name.
 fn new_timezone(st: &State, us: i128) -> Option<Object> {
@@ -2475,21 +2882,28 @@ pub(crate) fn leaf_compare(
 }
 
 /// The function under the native class method `name` of the exact class
-/// `cls` while the class still has it (`datetime.fromisoformat`), for
-/// the dispatch loop to bind to `cls` without the descriptor protocol.
+/// `cls` while the class still has it (`datetime.fromisoformat`,
+/// `datetime.now`, `date.today`, …), for the dispatch loop to bind to
+/// `cls` without the descriptor protocol.
 pub(crate) fn type_classmethod(cls: &TypeObject, name: &SharedStr) -> Option<Object> {
     let kind = cls.native_kind.get();
-    if kind != KIND_DATETIME {
+    if kind != KIND_DATETIME && kind != KIND_DATE {
         return None;
     }
     let st = state_of_cls(cls)?;
-    if !SharedStr::ptr_eq(name, &st.names.f_fromisoformat)
-        || !std::ptr::eq(cls, st.datetime.as_ptr())
-        || !verified(st, cls, kind)
-    {
+    let exact = if kind == KIND_DATETIME {
+        st.datetime.as_ptr()
+    } else {
+        st.date.as_ptr()
+    };
+    if !std::ptr::eq(cls, exact) || !verified(st, cls, kind) {
         return None;
     }
-    st.fromiso.get().cloned()
+    st.classmethods
+        .get()?
+        .iter()
+        .find(|(k, n, _, _)| *k == kind && SharedStr::ptr_eq(name, n))
+        .map(|(_, _, f, _)| f.clone())
 }
 
 /// The fast half of `function` bound to `receiver` when that is a native
@@ -2499,13 +2913,16 @@ pub(crate) fn bound_fast(function: &Object, receiver: &Object) -> Option<Fast> {
     let (Object::Builtin(f), Object::Type(cls)) = (function, receiver) else {
         return None;
     };
-    if cls.native_kind.get() != KIND_DATETIME {
+    let kind = cls.native_kind.get();
+    if kind != KIND_DATETIME && kind != KIND_DATE {
         return None;
     }
-    match state_of_cls(cls)?.fromiso.get()? {
-        Object::Builtin(g) if Rc::ptr_eq(f, g) => Some(dt_fromisoformat),
-        _ => None,
-    }
+    state_of_cls(cls)?
+        .classmethods
+        .get()?
+        .iter()
+        .find(|(_, _, g, _)| matches!(g, Object::Builtin(g) if Rc::ptr_eq(f, g)))
+        .map(|&(.., fast)| fast)
 }
 
 /// A public field (`dt.hour`, `d.year`, …) of a natively served instance
@@ -2618,6 +3035,18 @@ fn kw_positional(
 ) -> Option<Vec<Object>> {
     let params: &[&str] = match key {
         (KIND_DATE, "replace") => &["year", "month", "day"],
+        (KIND_DATETIME, "replace") => &[
+            "year",
+            "month",
+            "day",
+            "hour",
+            "minute",
+            "second",
+            "microsecond",
+            "tzinfo",
+        ],
+        (KIND_DATETIME, "astimezone" | "now") => &["tz"],
+        (KIND_DATETIME, "fromtimestamp") => &["timestamp", "tz"],
         _ => return None,
     };
     let (recv, pos) = a.split_first()?;
@@ -2635,9 +3064,12 @@ fn kw_positional(
         }
         out[ix] = v.clone();
     }
-    for o in &mut out {
-        if matches!(o, Object::Unbound) {
-            *o = Object::None;
+    // (A datetime's `replace` tells an omitted `tzinfo` from `None`.)
+    if key != (KIND_DATETIME, "replace") {
+        for o in &mut out {
+            if matches!(o, Object::Unbound) {
+                *o = Object::None;
+            }
         }
     }
     Some(out)
@@ -2894,8 +3326,50 @@ const SPECS: &[Spec] = &[
     },
     Spec {
         kind: KIND_DATETIME,
+        name: "replace",
+        fast: dt_replace,
+        classmethod: false,
+    },
+    Spec {
+        kind: KIND_DATETIME,
+        name: "timestamp",
+        fast: dt_timestamp,
+        classmethod: false,
+    },
+    Spec {
+        kind: KIND_DATETIME,
+        name: "astimezone",
+        fast: dt_astimezone,
+        classmethod: false,
+    },
+    Spec {
+        kind: KIND_DATETIME,
         name: "fromisoformat",
         fast: dt_fromisoformat,
+        classmethod: true,
+    },
+    Spec {
+        kind: KIND_DATETIME,
+        name: "fromtimestamp",
+        fast: dt_fromtimestamp,
+        classmethod: true,
+    },
+    Spec {
+        kind: KIND_DATETIME,
+        name: "now",
+        fast: dt_now,
+        classmethod: true,
+    },
+    Spec {
+        kind: KIND_DATE,
+        name: "today",
+        fast: date_today,
+        classmethod: true,
+    },
+    Spec {
+        kind: KIND_DATE,
+        name: "fromisoformat",
+        fast: date_fromisoformat,
         classmethod: true,
     },
 ];
@@ -2968,7 +3442,7 @@ pub(crate) fn install(args: &[Object]) -> Result<Object, RuntimeError> {
         sealed: Default::default(),
         expect: std::sync::OnceLock::new(),
         pool: Pool::default(),
-        fromiso: std::sync::OnceLock::new(),
+        classmethods: std::sync::OnceLock::new(),
     });
     // Each class carries the state (a class in `native_ext` resolves to
     // it from any of its instances).
@@ -2978,6 +3452,7 @@ pub(crate) fn install(args: &[Object]) -> Result<Object, RuntimeError> {
             .set(crate::rc_unsize!(state.clone() => dyn std::any::Any + Send + Sync));
         cls.native_kind.set(*kind);
     }
+    let mut classmethods = Vec::new();
     for spec in SPECS {
         let cls = classes
             .iter()
@@ -3012,9 +3487,12 @@ pub(crate) fn install(args: &[Object]) -> Result<Object, RuntimeError> {
         });
         crate::leaf_builtins::register_fast(&b, fast);
         let value = if spec.classmethod {
-            if spec.name == "fromisoformat" {
-                let _ = state.fromiso.set(Object::Builtin(b.clone()));
-            }
+            classmethods.push((
+                spec.kind,
+                interned(spec.name),
+                Object::Builtin(b.clone()),
+                fast,
+            ));
             Object::ClassMethod(crate::object::MethodWrapper::new(Object::Builtin(b)))
         } else {
             Object::Builtin(b)
@@ -3023,6 +3501,7 @@ pub(crate) fn install(args: &[Object]) -> Result<Object, RuntimeError> {
             .borrow_mut()
             .insert(DictKey(Object::Str(interned(spec.name))), value);
     }
+    let _ = state.classmethods.set(classmethods);
     for (_, cls) in &classes {
         cls.bump_attr_version();
     }

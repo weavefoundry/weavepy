@@ -302,7 +302,7 @@ pub(crate) fn fast_op(op: u8, recv: &Object, arg: Option<&Object>) -> Option<Obj
             let mut h = f.head().min(f.d.len());
             if h == 0 {
                 h = std::cmp::max(8, f.d.len() / 2);
-                f.d.splice(0..0, std::iter::repeat_n(Object::None, h));
+                grow_front(f.d, h);
             }
             h -= 1;
             f.d[h] = x.clone();
@@ -385,6 +385,157 @@ fn popleft_locked(st: &mut DequeState<'_>, d: &mut Vec<Object>) -> Result<Object
     Ok(x)
 }
 
+/// Room for `slack` more items before the deque's backing list: the list
+/// rebuilt with that many empty slots first and its items moved in after
+/// them (a splice at the front wrote and moved each item one at a time).
+fn grow_front(d: &mut Vec<Object>, slack: usize) {
+    let mut grown = Vec::with_capacity(slack + d.len());
+    grown.resize(slack, Object::None);
+    grown.append(d);
+    *d = grown;
+}
+
+/// `_extend_items(d, items, left)`: `d.extend(items)` (or `extendleft`)
+/// for a list or tuple of items, all at once, with the trimming `maxlen`
+/// calls for; `False`, having done nothing, for any other source (the
+/// Python method iterates it).
+fn deque_extend_items(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [_, src, left] = args else {
+        return Err(type_error(
+            "_extend_items() takes a deque, items and a side",
+        ));
+    };
+    let left = left.is_truthy();
+    let items: Vec<Object> = match src {
+        Object::List(l) => crate::object::cloned_vec(&l.borrow()),
+        Object::Tuple(t) => crate::object::cloned_vec(t),
+        _ => return Ok(Object::Bool(false)),
+    };
+    let mut st = receiver(&args[..1], "extend")?;
+    let data = st.data.clone();
+    let mut trimmed = Vec::new();
+    {
+        let mut d = data.borrow_mut();
+        st.bump_state();
+        let mut h = st.head().min(d.len());
+        if left {
+            let need = items.len();
+            if h < need {
+                let slack = need.max((d.len() - h) / 2).max(8) - h;
+                grow_front(&mut d, slack);
+                h += slack;
+            }
+            for item in items {
+                h -= 1;
+                trimmed.push(std::mem::replace(&mut d[h], item));
+            }
+            st.set_head(h);
+            if let Some(m) = st.maxlen() {
+                while d.len() - h > m {
+                    trimmed.extend(d.pop());
+                }
+            }
+        } else {
+            d.extend(items);
+            if let Some(m) = st.maxlen() {
+                while d.len() - st.head() > m {
+                    trimmed.push(popleft_locked(&mut st, &mut d)?);
+                }
+            }
+        }
+    }
+    drop(st);
+    drop(trimmed);
+    Ok(Object::Bool(true))
+}
+
+/// Whether `item == x` is settled without Python code: `Some(eq)` when
+/// both are plain values (`int`, `float`, `bool`, `None`, `str`, `bytes`)
+/// or the same object, `None` when an `__eq__` might run.
+fn plain_eq(item: &Object, x: &Object) -> Option<bool> {
+    fn plain(o: &Object) -> bool {
+        matches!(
+            o,
+            Object::Int(_)
+                | Object::Float(_)
+                | Object::Bool(_)
+                | Object::None
+                | Object::Str(_)
+                | Object::Bytes(_)
+        )
+    }
+    if item.is_same(x) {
+        return Some(true);
+    }
+    (plain(item) && plain(x)).then(|| item.eq_value(x))
+}
+
+/// `_plain_find(items, x, start, stop)`: the first index in
+/// `items[start:stop]` of an item equal to `x`, `-1` for none, when every
+/// comparison is settled natively ([`plain_eq`]); `None` (the Python
+/// loop's to answer) otherwise.
+fn deque_plain_find(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::List(items), x, Object::Int(start), Object::Int(stop)] = args else {
+        return Ok(Object::None);
+    };
+    let items = items.borrow();
+    let stop = usize::try_from(*stop).unwrap_or(0).min(items.len());
+    let start = usize::try_from(*start).unwrap_or(0).min(stop);
+    for (i, item) in items[start..stop].iter().enumerate() {
+        match plain_eq(item, x) {
+            Some(true) => return Ok(Object::Int((start + i) as i64)),
+            Some(false) => {}
+            None => return Ok(Object::None),
+        }
+    }
+    Ok(Object::Int(-1))
+}
+
+/// `_plain_count(items, x)`: how many items equal `x`, when every
+/// comparison is settled natively; `None` otherwise.
+fn deque_plain_count(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::List(items), x] = args else {
+        return Ok(Object::None);
+    };
+    let mut n = 0;
+    for item in items.borrow().iter() {
+        match plain_eq(item, x) {
+            Some(hit) => n += i64::from(hit),
+            None => return Ok(Object::None),
+        }
+    }
+    Ok(Object::Int(n))
+}
+
+/// `_extend_method(fallback, left)`: a deque's `extend` (or
+/// `extendleft`), which takes a list or tuple in at once (see
+/// [`deque_extend_items`]) and calls the Python function `fallback` with
+/// the same arguments for anything else.
+fn deque_extend_method(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [fallback, left] = args else {
+        return Err(type_error("_extend_method() takes a fallback and a side"));
+    };
+    let (fallback, left) = (fallback.clone(), left.is_truthy());
+    let name = if left { "extendleft" } else { "extend" };
+    Ok(Object::Builtin(Rc::new(BuiltinFn {
+        name,
+        binds_instance: true,
+        call: Box::new(move |a: &[Object]| {
+            if let [recv, src @ (Object::List(_) | Object::Tuple(_))] = a {
+                let side = Object::Bool(left);
+                if let Object::Bool(true) = deque_extend_items(&[recv.clone(), src.clone(), side])?
+                {
+                    return Ok(Object::None);
+                }
+            }
+            let interp = crate::builtins::reentrant_interp()?;
+            let globals = interp.builtins_dict();
+            interp.call(&fallback, a, &[], &globals)
+        }),
+        call_kw: None,
+    })))
+}
+
 pub(crate) fn deque_append(args: &[Object]) -> Result<Object, RuntimeError> {
     if let [recv, x] = args {
         if let Some(v) = fast_op(OP_APPEND, recv, Some(x)) {
@@ -446,7 +597,7 @@ fn deque_appendleft(args: &[Object]) -> Result<Object, RuntimeError> {
         let mut h = st.head();
         if h == 0 {
             h = std::cmp::max(8, d.len() / 2);
-            d.splice(0..0, std::iter::repeat_n(Object::None, h));
+            grow_front(&mut d, h);
         }
         h -= 1;
         d[h] = x;
@@ -585,23 +736,28 @@ fn deque_rotate(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     if right <= len / 2 {
         if h < right {
-            let slack = right.max(len / 2).max(8);
-            d.splice(0..0, std::iter::repeat_n(Object::None, slack));
+            // (Room for as many items again as the deque holds, so the
+            // next rotations find it there: a gap the size of one rotation
+            // moved the whole deque on every other call.)
+            let slack = right.max(len).max(8);
+            grow_front(&mut d, slack);
             h += slack;
         }
         let end = d.len();
-        for i in 0..right {
-            d.swap(h - right + i, end - right + i);
-        }
+        // (The last `right` items trade places, as one block, with the
+        // free slots just before the head.)
+        let (front, back) = d.split_at_mut(end - right);
+        front[h - right..h].swap_with_slice(back);
         d.truncate(end - right);
         st.set_head(h - right);
     } else {
         let left = len - right;
-        d.reserve(left);
-        for i in 0..left {
-            let value = std::mem::replace(&mut d[h + i], Object::None);
-            d.push(value);
-        }
+        // (The first `left` items trade places, as one block, with free
+        // slots added at the end.)
+        let end = d.len();
+        d.resize(end + left, Object::None);
+        let (front, back) = d.split_at_mut(end);
+        front[h..h + left].swap_with_slice(back);
         h += left;
         if h >= 32 && h * 2 >= d.len() {
             d.drain(..h);
@@ -1335,7 +1491,80 @@ fn install_defaultdict(args: &[Object]) -> Result<Object, RuntimeError> {
         d.shift_remove(&DictKey(Object::from_static("__slots__")));
     }
     cls.bump_attr_version();
+    // (The exact class's plain calls build in place; a subclass has its
+    // own, empty, constructor hook.)
+    cls.pure_new.set(Some(dd_pure_new));
     Ok(Object::None)
+}
+
+/// `install_deque(deque)`: the class's plain constructions build in place
+/// (see [`deque_pure_new`]).
+fn install_deque(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Type(cls)] = args else {
+        return Err(type_error("install_deque() expects a class"));
+    };
+    cls.pure_new.set(Some(deque_pure_new));
+    Ok(Object::None)
+}
+
+/// `deque()` or `deque(xs)` of a list or tuple, of the exact class while
+/// its `__init__` is `_collections`' own and its slots are laid out as
+/// that `__init__` stores them: the instance over a copy of the items, as
+/// `__init__` (no `maxlen`) leaves it. `None` for any other call.
+fn deque_pure_new(cls: &Rc<crate::types::TypeObject>, args: &[Object]) -> Option<Object> {
+    const SLOTS: [&str; 4] = ["_data", "_head", "_maxlen", "_state"];
+    let items: Vec<Object> = match args {
+        [] => Vec::new(),
+        [Object::List(l)] => l.try_borrow().ok()?.clone(),
+        [Object::Tuple(t)] => t.to_vec(),
+        _ => return None,
+    };
+    match cls.lookup("__init__") {
+        Some(Object::Function(f)) if f.code().qualname == "deque.__init__" => {}
+        _ => return None,
+    }
+    let layout = cls.own_slot_layout()?;
+    if layout.len() != SLOTS.len()
+        || !layout
+            .iter()
+            .zip(SLOTS)
+            .all(|(k, n)| matches!(&k.0, Object::Str(s) if s.as_ref() == n))
+    {
+        return None;
+    }
+    let data = Object::new_list(items);
+    crate::gc_trace::track_built(&data);
+    let values = [data, Object::Int(0), Object::None, Object::Int(0)];
+    let inst = crate::types::PyInstance::with_slots(
+        cls.clone(),
+        crate::types::SlotStorage::from_layout_array(layout.clone(), values),
+    );
+    let obj = Object::Instance(Rc::new(inst));
+    crate::gc_trace::track(&obj);
+    Some(obj)
+}
+
+/// `defaultdict()` or `defaultdict(factory)` of the exact class, with the
+/// factory `None`, a class, a builtin or a function (callable, as
+/// `defdict_init` requires): the instance over an empty dict, its
+/// `default_factory` set, as `__new__` and `__init__` leave it. `None`
+/// for any other call.
+fn dd_pure_new(cls: &Rc<crate::types::TypeObject>, args: &[Object]) -> Option<Object> {
+    let factory = match args {
+        [] => Object::None,
+        [f @ (Object::None | Object::Type(_) | Object::Builtin(_) | Object::Function(_))] => {
+            f.clone()
+        }
+        _ => return None,
+    };
+    let inst = Rc::new(crate::types::PyInstance::with_native(
+        cls.clone(),
+        Object::new_dict(),
+    ));
+    inst.slot_set("default_factory", factory);
+    let obj = Object::Instance(inst);
+    crate::gc_trace::track(&obj);
+    Some(obj)
 }
 
 /// `defaultdict.__init__(self, default_factory=None, /, *args, **kwds)`,
@@ -1424,6 +1653,54 @@ fn dd_missing(args: &[Object]) -> Result<Object, RuntimeError> {
         crate::gc_trace::track(&value);
     }
     crate::builtins::dict_setdefault(&[recv.clone(), key.clone(), value])
+}
+
+/// The native `defaultdict.__missing__` the module installs, by address
+/// (the class's entry is it while the class keeps it).
+static DD_MISSING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `d[key]` of a `defaultdict` (`inst`, over its payload `d`) missing
+/// `key`, where the class keeps the native `__missing__` and the factory
+/// is one whose value builds natively (`list`, `int`, `dict`, ...): the
+/// new value, stored under the key as `__missing__` stores it. `None`,
+/// touching nothing, for anything else (a key only Python code compares,
+/// any other factory).
+pub(crate) fn dd_missing_pure(
+    inst: &crate::types::PyInstance,
+    d: &Rc<RefCell<DictData>>,
+    key: &Object,
+) -> Option<Object> {
+    let ours = DD_MISSING.load(std::sync::atomic::Ordering::Relaxed);
+    match inst.cls_raw().lookup("__missing__") {
+        Some(Object::Builtin(b)) if Rc::as_ptr(&b) as usize == ours && ours != 0 => {}
+        _ => return None,
+    }
+    if crate::capi_watchers::dicts_active() {
+        return None;
+    }
+    let factory = inst
+        .slots
+        .try_borrow()
+        .ok()?
+        .get("default_factory")
+        .cloned()?;
+    let value = builtin_factory_value(&factory)?;
+    let probe = crate::object::LeafProbe::new(key)?;
+    {
+        let mut m = d.try_borrow_mut().ok()?;
+        match m.probe_entry(&probe) {
+            crate::dictmap::ProbeEntry::Vacant(e) if probe.miss_is_exact() => {
+                e.insert(DictKey(key.clone()), value.clone());
+            }
+            _ => return None,
+        }
+    }
+    if matches!(value, Object::List(_) | Object::Dict(_) | Object::Set(_)) {
+        crate::gc_trace::track(&value);
+    }
+    crate::object::dict_watch_bump(d);
+    crate::object::dict_mutation_event(d);
+    Some(value)
 }
 
 // ---------------------------------------------------------------------
@@ -1578,6 +1855,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         reg("__bool__", "__bool__", deque_bool);
         reg("__getitem__", "__getitem__", deque_getitem);
         reg("rotate", "rotate", deque_rotate);
+        reg("_extend_items", "_extend_items", deque_extend_items);
+        reg("_extend_method", "_extend_method", deque_extend_method);
+        reg("_plain_find", "_plain_find", deque_plain_find);
+        reg("_plain_count", "_plain_count", deque_plain_count);
         reg("__iter__", "__iter__", deque_iter);
         reg("__reversed__", "__reversed__", deque_reversed);
         reg("iterator_index", "iterator_index", deque_iterator_index);
@@ -1599,6 +1880,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             install_defaultdict,
         );
         reg("dd_missing", "__missing__", dd_missing);
+        reg("install_deque", "install_deque", install_deque);
         reg("count_elements", "count_elements", count_elements);
         reg(
             "namedtuple_register",
@@ -1633,6 +1915,9 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 call_kw: Some(Box::new(dd_init)),
             })),
         );
+        if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static("dd_missing"))) {
+            DD_MISSING.store(Rc::as_ptr(b) as usize, std::sync::atomic::Ordering::Relaxed);
+        }
         // The `OrderedDict` methods (see `collections_odict`).
         for (export, name, body, kw) in super::collections_odict::exports() {
             d.insert(
@@ -1655,6 +1940,19 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                     }),
                 })),
             );
+        }
+        for (i, name) in [
+            "od_iter",
+            "odv_keys_iter",
+            "odv_values_iter",
+            "odv_items_iter",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static(name))) {
+                super::collections_odict::note_iter_builtin(i, b);
+            }
         }
         for name in super::collections_odict::LEAVES {
             if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static(name))) {

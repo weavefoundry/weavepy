@@ -33,6 +33,10 @@ pub(crate) const ORDER: &str = "<order>";
 /// class itself (subclasses are recognized through their MRO).
 pub(crate) const KIND_ODICT: u8 = 2;
 
+/// [`crate::types::TypeObject::collections_kind`] of the `OrderedDict`
+/// view classes (`odict_keys`, `odict_values`, `odict_items`) themselves.
+pub(crate) const KIND_ODICT_VIEW: u8 = 3;
+
 /// Whether `cls` is `OrderedDict` or a subclass of it.
 fn is_odict_class(cls: &TypeObject) -> bool {
     cls.collections_kind.get() == KIND_ODICT
@@ -208,6 +212,11 @@ pub(crate) fn order_iter(
 
 /// `OrderedDict.__setitem__(self, key, value)`.
 fn od_setitem(args: &[Object]) -> Result<Object, RuntimeError> {
+    // (A store compiled code reaches through the class's `__setitem__`,
+    // tier 2's say, settles as the leaf half does when it can.)
+    if let Some(done) = od_setitem_leaf(args) {
+        return done;
+    }
     let (inst, main) = receiver(args, "__setitem__")?;
     let [_, key, value] = args else {
         return Err(type_error(format!(
@@ -245,8 +254,13 @@ fn od_setitem_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let Some(Object::Dict(main)) = inst.native.get() else {
         return None;
     };
-    let order = peek_order(inst)?;
     let probe = crate::object::LeafProbe::new(key)?;
+    // (A fresh dict's order starts here, as the full store starts it.)
+    let order = match peek_order(inst) {
+        Some(o) => o,
+        None if inst.slots.try_borrow_mut().is_ok() => order_of(inst),
+        None => return None,
+    };
     let mut m = main.try_borrow_mut().ok()?;
     let mut o = order.try_borrow_mut().ok()?;
     // One probe of each finds the entry or the slot a new key takes.
@@ -306,6 +320,100 @@ fn od_delitem(args: &[Object]) -> Result<Object, RuntimeError> {
         }
         None => Err(key_error_object(key.clone())),
     }
+}
+
+/// The native `__iter__`s of `OrderedDict` and of its keys, values and
+/// items views (see [`note_iter_builtin`]), by address: a class's entry is
+/// one while the class keeps it.
+static ITER_BUILTINS: [std::sync::atomic::AtomicUsize; 4] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 4];
+
+/// Remember a native `__iter__` the module installs (0 the dict's, then
+/// the keys, values and items views').
+pub(crate) fn note_iter_builtin(i: usize, b: &Rc<crate::object::BuiltinFn>) {
+    ITER_BUILTINS[i].store(Rc::as_ptr(b) as usize, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether `cls`'s `__iter__` is the native one [`note_iter_builtin`]
+/// recorded at `i`, with no `__length_hint__` to call (a `len` presize of
+/// these is the dict's own, native).
+fn native_iter(cls: &TypeObject, i: usize) -> bool {
+    let ours = ITER_BUILTINS[i].load(std::sync::atomic::Ordering::Relaxed);
+    matches!(cls.lookup("__iter__"), Some(Object::Builtin(b))
+        if Rc::as_ptr(&b) as usize == ours && ours != 0)
+        && cls.lookup("__length_hint__").is_none()
+}
+
+/// `list(view)` of a keys, values or items view of an exact `OrderedDict`
+/// whose classes keep their native `__iter__`s: the entries in order, as
+/// the view's iterator gives them, where every key looks up in the dict
+/// natively. `None` for anything else.
+pub(crate) fn exact_view_entries(view: &PyInstance) -> Option<Vec<Object>> {
+    if view.cls_raw().collections_kind.get() != KIND_ODICT_VIEW {
+        return None;
+    }
+    let mapping = view.slots.try_borrow().ok()?.get("_mapping").cloned();
+    let od = match mapping? {
+        Object::Instance(od) => od,
+        _ => return None,
+    };
+    let ocls = od.cls_raw();
+    if ocls.collections_kind.get() != KIND_ODICT {
+        return None;
+    }
+    let views = ocls.native_ext.get()?.downcast_ref::<ViewTypes>()?;
+    let vcls = view.cls_raw();
+    let kind = views
+        .0
+        .iter()
+        .position(|w| std::ptr::eq(w.as_ptr(), std::ptr::from_ref(vcls)))?;
+    if !native_iter(vcls, kind + 1) {
+        return None;
+    }
+    let keys = exact_keys(&od)?;
+    if kind == 0 {
+        return Some(keys);
+    }
+    let Some(Object::Dict(main)) = od.native.get() else {
+        return None;
+    };
+    let m = main.try_borrow().ok()?;
+    keys.into_iter()
+        .map(|k| {
+            let probe = crate::object::LeafProbe::new(&k)?;
+            let v = m.get(&probe)?.clone();
+            Some(if kind == 1 {
+                v
+            } else {
+                Object::new_tuple_array([k, v])
+            })
+        })
+        .collect()
+}
+
+/// `list(od)` of an exact `OrderedDict` whose class keeps the native
+/// `__iter__` (and the dict's `__len__`, no `__length_hint__`): its keys
+/// in order, as its iterator gives them (cloning them runs no code).
+/// `None` for anything else.
+pub(crate) fn exact_keys(inst: &PyInstance) -> Option<Vec<Object>> {
+    let cls = inst.cls_raw();
+    if cls.collections_kind.get() != KIND_ODICT || inst.native.get().is_none() {
+        return None;
+    }
+    if !native_iter(cls, 0)
+        || !matches!(cls.lookup("__len__"), Some(Object::Builtin(_)))
+        || inst.slots.try_borrow_mut().is_err()
+    {
+        return None;
+    }
+    let order = order_of(inst);
+    let keys = order
+        .try_borrow()
+        .ok()?
+        .keys()
+        .map(|k| k.0.clone())
+        .collect();
+    Some(keys)
 }
 
 /// `OrderedDict.__iter__(self)`.
@@ -390,7 +498,7 @@ fn pop_node(
 ) -> Result<(Object, Object), RuntimeError> {
     let (key, _) = order
         .borrow_mut()
-        .shift_remove_index(index)
+        .lazy_remove_index(index)
         .ok_or_else(|| runtime_error("OrderedDict mutated during iteration"))?;
     crate::object::dict_watch_bump(order);
     let key = key.0;
@@ -624,9 +732,8 @@ fn leaf_unlink(
 ) -> Option<Object> {
     let mut m = main.try_borrow_mut().ok()?;
     let mut o = order.try_borrow_mut().ok()?;
-    let at = m.get_index_of(probe)?;
-    let (k, v) = m.shift_remove_index(at)?;
-    let node = o.shift_remove_index(index);
+    let (k, v) = m.lazy_remove_entry(probe)?;
+    let node = o.lazy_remove_index(index);
     drop((m, o));
     crate::object::dict_watch_bump(main);
     crate::object::dict_mutation_event(main);
@@ -693,6 +800,12 @@ fn install_odict(args: &[Object]) -> Result<Object, RuntimeError> {
         ));
     };
     cls.collections_kind.set(KIND_ODICT);
+    // (`OrderedDict()` of the exact class builds in place: its `__init__`
+    // does nothing without arguments, the order starting on first use.)
+    cls.pure_new.set(Some(od_pure_new));
+    for view in [k, v, i] {
+        view.collections_kind.set(KIND_ODICT_VIEW);
+    }
     let views = Rc::new(ViewTypes([
         Rc::downgrade(k),
         Rc::downgrade(v),
@@ -702,6 +815,23 @@ fn install_odict(args: &[Object]) -> Result<Object, RuntimeError> {
         .native_ext
         .set(crate::rc_unsize!(views => dyn std::any::Any + Send + Sync));
     Ok(Object::None)
+}
+
+/// `OrderedDict()` of the exact class, while its `__init__` is still the
+/// module's own: the instance over an empty dict, as `__new__` and that
+/// `__init__` leave it. `None` for any call with arguments.
+fn od_pure_new(cls: &Rc<TypeObject>, args: &[Object]) -> Option<Object> {
+    if !args.is_empty() {
+        return None;
+    }
+    match cls.lookup("__init__") {
+        Some(Object::Function(f)) if f.code().qualname == "OrderedDict.__init__" => {}
+        _ => return None,
+    }
+    let inst = Rc::new(PyInstance::with_native(cls.clone(), Object::new_dict()));
+    let obj = Object::Instance(inst);
+    crate::gc_trace::track(&obj);
+    Some(obj)
 }
 
 /// A new view of `od` of the given kind (0 keys, 1 values, 2 items): an

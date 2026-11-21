@@ -71,6 +71,13 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         // quoted-printable pair, etc.
         register_kw(&mut d, "b2a_hex", b2a_hex_kw);
         register_kw(&mut d, "hexlify", b2a_hex_kw);
+        // `hexlify(data)`/`b2a_hex(data)` of a `bytes` or `bytearray`: the
+        // full body, which then runs no code.
+        for name in ["hexlify", "b2a_hex"] {
+            if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static(name))) {
+                crate::leaf_builtins::register_fast(b, hex_fast);
+            }
+        }
         register_kw(&mut d, "b2a_base64", b2a_base64_kw);
         register_kw(&mut d, "a2b_base64", a2b_base64_kw);
         register_kw(&mut d, "b2a_uu", b2a_uu_kw);
@@ -192,6 +199,24 @@ fn truthy_kw(kwargs: &[(String, Object)], key: &str) -> Option<bool> {
 
 // ---- hex ----
 
+fn hex_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    match args {
+        [Object::Bytes(_) | Object::ByteArray(_)] => Some(b2a_hex_kw(args, &[])),
+        _ => None,
+    }
+}
+
+/// `data` as lowercase hex digits, two a byte, through a table.
+fn hex_encode(data: &[u8]) -> Vec<u8> {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = vec![0u8; data.len() * 2];
+    for (pair, &b) in out.as_chunks_mut::<2>().0.iter_mut().zip(data) {
+        pair[0] = DIGITS[usize::from(b >> 4)];
+        pair[1] = DIGITS[usize::from(b & 0x0f)];
+    }
+    out
+}
+
 fn b2a_hex_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let data = buffer_bytes(args.first())?;
     // sep / bytes_per_sep, positional or keyword. CPython:
@@ -214,14 +239,7 @@ fn b2a_hex_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
         .and_then(|o| o.as_i64())
         .unwrap_or(1);
 
-    let hex: Vec<u8> = {
-        let mut out = Vec::with_capacity(data.len() * 2);
-        for &b in &data {
-            out.push(hex_digit(b >> 4));
-            out.push(hex_digit(b & 0x0f));
-        }
-        out
-    };
+    let hex = hex_encode(&data);
 
     let sep = match sep_obj {
         None | Some(Object::None) => None,
@@ -277,13 +295,6 @@ fn insert_sep(data: &[u8], hex: &[u8], sep: u8, bytes_per_sep: i64) -> Vec<u8> {
         }
     }
     out
-}
-
-fn hex_digit(nibble: u8) -> u8 {
-    match nibble {
-        0..=9 => b'0' + nibble,
-        _ => b'a' + (nibble - 10),
-    }
 }
 
 fn a2b_hex(args: &[Object]) -> Result<Object, RuntimeError> {
