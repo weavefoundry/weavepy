@@ -2216,6 +2216,16 @@ branch and pull request.
     (`a + b` 1,075 ns to 202, CPython 85; `copy.copy` 673 to 350, CPython
     209). `len()` of an instance with a native `__len__` caches the half
     itself rather than finding it again on every call.
+  - `operator.methodcaller`'s native call had no leaf half, so compiled
+    code left for the core loop on every call, and the native read its
+    fields, the method and a bound method through the general paths
+    (`methodcaller("lower")("ABC")` 535 ns, CPython 78). A leaf half now
+    runs a native value's leaf method (a `str`, `bytes`, `list`, `dict`,
+    `set` or `int` receiver, positional arguments only) in place (106 ns;
+    `dict.get` through one 573 to 108, CPython 59; `sorted(words,
+    key=methodcaller("lower"))` 377 to 129 ns an item, CPython 105). A
+    Python method of an instance still leaves for the core loop, and the
+    declined half costs it 12% (438 ns to 489, CPython 73).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

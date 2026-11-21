@@ -34164,7 +34164,7 @@ impl Interpreter {
 
     /// The leaf method table entry for `name` on a builtin receiver.
     #[inline]
-    fn leaf_builtin_method(
+    pub(crate) fn leaf_builtin_method(
         &self,
         recv: &Object,
         name: &str,
@@ -35200,7 +35200,7 @@ impl Interpreter {
 
     /// Call a leaf builtin if `args` (receiver first for methods) has an
     /// admitted shape; `None` sends the call down the full path.
-    fn leaf_builtin_call(
+    pub(crate) fn leaf_builtin_call(
         &self,
         kind: LeafKind,
         b: &crate::object::BuiltinFn,
@@ -77990,7 +77990,7 @@ enum LeafAttr {
 // tested for), so the function-pointer equality the derive brings is moot.
 #[allow(unpredictable_function_pointer_comparisons)]
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum LeafKind {
+pub(crate) enum LeafKind {
     /// A registered builtin's pure fast half (see
     /// `leaf_builtins::register_fast`).
     Fast(leaf_builtins::Fast),

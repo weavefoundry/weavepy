@@ -181,6 +181,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 // A plain attribute read that runs no code, in place.
                 crate::leaf_builtins::register_fast(&b, attrgetter_fast);
             }
+            if name == ".methodcaller.__call__" {
+                // A native value's leaf method, in place.
+                crate::leaf_builtins::register_fast(&b, methodcaller_fast);
+            }
             d.insert(DictKey(Object::from_static(export)), Object::Builtin(b));
         }
 
@@ -562,6 +566,71 @@ fn itemgetter_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     }
 }
 
+/// A `methodcaller`'s stored name and positional arguments, read from its
+/// slots, when it stores no keywords.
+fn methodcaller_parts(inst: &crate::types::PyInstance) -> Option<(Object, Object)> {
+    // SAFETY: reads that run no code; the values are cloned out before
+    // anything runs.
+    unsafe {
+        inst.slots.peek().and_then(|slots| {
+            let name = slots.get_hinted(0, "_name")?.clone();
+            let stored = slots.get_hinted(1, "_args")?.clone();
+            let plain = match slots.get_hinted(2, "_kwargs")? {
+                Object::Dict(d) => d.peek()?.is_empty(),
+                _ => false,
+            };
+            plain.then_some((name, stored))
+        })
+    }
+}
+
+/// `methodcaller(name, *args)(obj)`'s leaf half: a native value's method
+/// (`str.lower`, `dict.get`) that is itself a leaf builtin, called with
+/// `obj` and the stored arguments as the core loop's leaf call of
+/// `obj.name(*args)` calls it. `None` (nothing run) for anything else: an
+/// instance, stored keywords, a method that isn't a leaf, or arguments
+/// its leaf doesn't take.
+fn methodcaller_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Instance(slf), obj] = args else {
+        return None;
+    };
+    // (Only the receivers `leaf_builtin_method` knows, tested first: a
+    // declined call may try the half again on its way to the full path.)
+    if !matches!(
+        obj,
+        Object::List(_)
+            | Object::Dict(_)
+            | Object::Set(_)
+            | Object::Str(_)
+            | Object::Int(_)
+            | Object::Bytes(_)
+            | Object::ByteArray(_)
+    ) {
+        return None;
+    }
+    let (Object::Str(name), Object::Tuple(stored)) = methodcaller_parts(slf)? else {
+        return None;
+    };
+    let ptr = crate::vm_singletons::current_interpreter_ptr()?;
+    // SAFETY: published by the enclosing VM frame on this thread; only its
+    // method tables are read.
+    let interp = unsafe { &*ptr };
+    let method = interp.leaf_builtin_method(obj, &name)?;
+    let kind = interp.leaf_call_kind(&method)?;
+    let call = |a: &[Object]| interp.leaf_builtin_call(kind, &method, a);
+    match &stored[..] {
+        [] => call(std::slice::from_ref(obj)),
+        [a] => call(&[obj.clone(), a.clone()]),
+        [a, b] => call(&[obj.clone(), a.clone(), b.clone()]),
+        more => {
+            let mut call_args = Vec::with_capacity(more.len() + 1);
+            call_args.push(obj.clone());
+            call_args.extend_from_slice(more);
+            call(&call_args)
+        }
+    }
+}
+
 /// `methodcaller.__call__(self, obj, /)` without a Python frame. Looks up
 /// the stored method name on `obj` and tail-calls it with the stored
 /// args/kwargs through the interpreter.
@@ -571,20 +640,7 @@ fn methodcaller_call(args: &[Object]) -> Result<Object, RuntimeError> {
     // arguments only, and a Python method of a plain instance, called
     // with the instance first (no bound method, no attribute read).
     if let Object::Instance(inst) = slf {
-        // SAFETY: reads that run no code; the values are cloned out
-        // before anything runs.
-        let parts = unsafe {
-            inst.slots.peek().and_then(|slots| {
-                let name = slots.get_hinted(0, "_name")?.clone();
-                let stored = slots.get_hinted(1, "_args")?.clone();
-                let plain = match slots.get_hinted(2, "_kwargs")? {
-                    Object::Dict(d) => d.peek()?.is_empty(),
-                    _ => false,
-                };
-                plain.then_some((name, stored))
-            })
-        };
-        if let Some((Object::Str(name), Object::Tuple(stored))) = parts {
+        if let Some((Object::Str(name), Object::Tuple(stored))) = methodcaller_parts(inst) {
             if let Some(f) = crate::Interpreter::plain_instance_method(obj, &name) {
                 return with_interp(|interp| {
                     if stored.is_empty() {
