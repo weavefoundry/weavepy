@@ -6086,6 +6086,11 @@ fn int_from_bytes_method(
     let data_obj = args
         .get(offset)
         .ok_or_else(|| type_error("from_bytes() missing data"))?;
+    if matches!(data_obj, Object::MemoryView(mv) if mv.released.get()) {
+        return Err(value_error(
+            "operation forbidden on released memoryview object",
+        ));
+    }
     let data = match data_obj.bytes_cow() {
         Some(v) => v,
         // A str is iterable but is *not* an acceptable byte source
@@ -15226,7 +15231,11 @@ pub(crate) fn dict_fromkeys_leaf(args: &[Object]) -> Option<Result<Object, Runti
 pub(crate) fn int_from_bytes_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     // One to seven bytes in either order: the machine int, with no byte
     // order string or copy of the data built.
-    if let [Object::Type(t), Object::Bytes(data), rest @ ..] = args {
+    // (A `bytearray`'s or a live `memoryview`'s bytes are read in place,
+    // as `bytes(view)` would read them.)
+    if let [Object::Type(t), src @ (Object::Bytes(_) | Object::ByteArray(_) | Object::MemoryView(_)), rest @ ..] =
+        args
+    {
         let little = match rest {
             [] => Some(false),
             [Object::Str(order)] => match order.as_bytes() {
@@ -15236,15 +15245,23 @@ pub(crate) fn int_from_bytes_leaf(args: &[Object]) -> Option<Result<Object, Runt
             },
             _ => None,
         };
-        if let (Some(little), 1..=7) = (little, data.len()) {
-            if crate::sync::Rc::ptr_eq(t, &builtin_types().int_) {
-                let v = data.iter().enumerate().fold(0u64, |v, (i, &b)| {
-                    if little {
-                        v | u64::from(b) << (8 * i)
-                    } else {
-                        v << 8 | u64::from(b)
-                    }
-                });
+        let live = !matches!(src, Object::MemoryView(mv) if mv.released.get());
+        if let (Some(little), true) = (
+            little,
+            live && crate::sync::Rc::ptr_eq(t, &builtin_types().int_),
+        ) {
+            let v = src.with_bytes_view(|data| {
+                (1..=7).contains(&data.len()).then(|| {
+                    data.iter().enumerate().fold(0u64, |v, (i, &b)| {
+                        if little {
+                            v | u64::from(b) << (8 * i)
+                        } else {
+                            v << 8 | u64::from(b)
+                        }
+                    })
+                })
+            });
+            if let Some(Some(v)) = v {
                 return Some(Ok(Object::Int(v as i64)));
             }
         }

@@ -82,6 +82,14 @@ del _tc
 _unpack_from = _struct.unpack_from
 _pack_into = _struct.pack_into
 _struct_pack = _struct.pack
+try:
+    from _struct import _all_exact
+except ImportError:
+    def _all_exact(seq, want):
+        for v in seq:
+            if type(v) is not want:
+                return False
+        return True
 _struct_unpack = _struct.unpack
 _struct_error = _struct.error
 
@@ -508,18 +516,14 @@ class array:
         # below, which raises what CPython's setters raise.
         n = len(seq)
         want = int if self._kind == _KIND_INT else float
-        if n and self._kind != _KIND_CHAR:
-            for v in seq:
-                if type(v) is not want:
-                    break
-            else:
-                try:
-                    packed = _struct_pack('%d%s' % (n, self._fmt), *seq)
-                except (OverflowError, _struct_error):
-                    packed = None
-                if packed is not None:
-                    self._buf += packed
-                    return
+        if n and self._kind != _KIND_CHAR and _all_exact(seq, want):
+            try:
+                packed = _struct_pack('%d%s' % (n, self._fmt), *seq)
+            except (OverflowError, _struct_error):
+                packed = None
+            if packed is not None:
+                self._buf += packed
+                return
         # All-or-nothing: pack into a scratch buffer first.
         scratch = bytearray()
         for v in seq:

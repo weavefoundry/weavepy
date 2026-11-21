@@ -943,6 +943,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         );
         register(&mut d, "_array_methods", array_methods);
         register(&mut d, "_unpack_iterator_methods", unpack_iterator_methods);
+        register(&mut d, "_all_exact", all_exact);
     }
     Rc::new(PyModule {
         name: "_struct".to_owned(),
@@ -1174,6 +1175,7 @@ fn array_parts(recv: &Object) -> Option<(u8, Rc<RefCell<Vec<u8>>>)> {
 /// over one of these has its slots at known places.
 static ARRAY_LAYOUT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static ARRAY_ITER_LAYOUT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static UNPACK_ITER_LAYOUT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// `inst`'s slot values when it is laid out over the layout `known` names.
 fn known_slots<'a>(
@@ -1549,23 +1551,30 @@ fn unpack_iter_next_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>
     let [Object::Instance(it)] = args else {
         return None;
     };
+    // (The class's own layout, `_fmt, _buffer, _size, _offset, _len`, is
+    // read at its places; anything else by name.)
     let (fmt, buffer, offset) = {
         let slots = it.slots.try_borrow().ok()?;
-        let (Object::Str(fmt), Object::Int(offset), Object::Int(len)) = (
-            slots.get_hinted(0, "_fmt")?,
-            slots.get_hinted(3, "_offset")?,
-            slots.get_hinted(4, "_len")?,
-        ) else {
+        let laid = known_slots(it, &slots, &UNPACK_ITER_LAYOUT);
+        let (fmt, offset, len) = match laid {
+            Some([f, _, _, o, l]) => (f, o, l),
+            _ => (
+                slots.get_hinted(0, "_fmt")?,
+                slots.get_hinted(3, "_offset")?,
+                slots.get_hinted(4, "_len")?,
+            ),
+        };
+        let (Object::Str(fmt), Object::Int(offset), Object::Int(len)) = (fmt, offset, len) else {
             return None;
         };
         if offset >= len {
             return None;
         }
-        (
-            fmt.clone(),
-            slots.get_hinted(1, "_buffer")?.clone(),
-            *offset,
-        )
+        let buffer = match laid {
+            Some([_, b, ..]) => b,
+            _ => slots.get_hinted(1, "_buffer")?,
+        };
+        (fmt.clone(), buffer.clone(), *offset)
     };
     let cf = compiled_for(&fmt)?;
     let read = |buf: &[u8]| {
@@ -1583,11 +1592,40 @@ fn unpack_iter_next_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>
         }
         _ => return None,
     };
-    *it.slots
-        .try_borrow_mut()
-        .ok()?
-        .get_hinted_mut(3, "_offset")? = Object::Int(offset + cf.size as i64);
+    let next = Object::Int(offset + cf.size as i64);
+    let mut slots = it.slots.try_borrow_mut().ok()?;
+    let laid = it.cls_raw().own_slot_layout().filter(|layout| {
+        crate::shared_value::SharedSlice::word(layout)
+            == UNPACK_ITER_LAYOUT.load(std::sync::atomic::Ordering::Relaxed)
+    });
+    let at = match laid {
+        Some(layout) => slots.values_for_layout_mut(layout)?.get_mut(3)?,
+        None => slots.get_hinted_mut(3, "_offset")?,
+    };
+    *at = next;
+    drop(slots);
     Some(Ok(Object::new_tuple(vals)))
+}
+
+/// `_all_exact(items, cls)`: whether every item of the list is exactly of
+/// the builtin class `cls` (`int` or `float`: `array.fromlist` packs such
+/// a list in one call). `False` for any other class or argument.
+fn all_exact(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::List(items), Object::Type(cls)] = args else {
+        return Ok(Object::Bool(false));
+    };
+    let bt = crate::builtin_types::builtin_types();
+    let items = items.borrow();
+    let all = if Rc::ptr_eq(cls, &bt.int_) {
+        items
+            .iter()
+            .all(|v| matches!(v, Object::Int(_) | Object::Long(_)))
+    } else if Rc::ptr_eq(cls, &bt.float_) {
+        items.iter().all(|v| matches!(v, Object::Float(_)))
+    } else {
+        false
+    };
+    Ok(Object::Bool(all))
 }
 
 /// `_unpack_iterator_methods(unpack_iterator)`: the iterator's native
@@ -1604,6 +1642,12 @@ fn unpack_iterator_methods(args: &[Object]) -> Result<Object, RuntimeError> {
         .get(&crate::object::StrKey("__next__"))
         .cloned()
         .ok_or_else(|| type_error("_unpack_iterator_methods(): no __next__ to replace"))?;
+    if let Some(layout) = cls.own_slot_layout() {
+        UNPACK_ITER_LAYOUT.store(
+            crate::shared_value::SharedSlice::word(layout),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
     Ok(Object::new_list(vec![Object::new_tuple(vec![
         Object::Type(cls.clone()),
         Object::from_static("__next__"),

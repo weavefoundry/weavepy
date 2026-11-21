@@ -97,8 +97,11 @@ def _readable(buffer):
     buffer-protocol object here, and this is the slice of that protocol we
     can reach from the frozen wrapper (test_struct.test_unpack_with_buffer).
     """
-    if isinstance(buffer, (bytes, bytearray, memoryview)):
+    if type(buffer) in (bytes, bytearray, memoryview):
         return buffer
+    # (A subclass instance's bytes through a view, which the core reads.)
+    if isinstance(buffer, (bytes, bytearray, memoryview)):
+        return memoryview(buffer)
     tobytes = getattr(buffer, "tobytes", None)
     if callable(tobytes):
         return tobytes()

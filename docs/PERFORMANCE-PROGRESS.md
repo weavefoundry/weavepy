@@ -2157,6 +2157,15 @@ branch and pull request.
     1.5). Both now handle `BYTEARRAY8`, memoized as CPython's pickler
     memoizes it and framed as it frames one (8.2 and 3.2 µs; the bytes
     written are the Python pickler's exactly).
+  - `int.from_bytes` of a short `bytearray` or `memoryview` took the full
+    method (2,000 four-byte memoryview slices 1.3 ms, CPython 0.46): the
+    leaf half now reads them in place (0.39 ms), and a released view
+    raises `ValueError` as CPython's does. `struct.iter_unpack`'s step
+    reads its iterator's state at the class's slot places instead of by
+    name (50,000 items 6.1 ms to 4.8; CPython 2.0), and a `bytes`
+    subclass reaches the core through a view instead of failing.
+    `array("d", floats)` checked its items' types in a Python loop:
+    a native check now (25,000 floats 967 µs to 299; CPython 429).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
