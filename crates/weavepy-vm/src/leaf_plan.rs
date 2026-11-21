@@ -1016,7 +1016,7 @@ pub(crate) enum LeafRet {
 /// builtin `StopIteration` class, and the evaluation is that step's own.
 /// Its caller then answers as the exception's catcher would, the
 /// exception never built (nothing could observe it: the step is
-/// frameless, and no store is buffered).
+/// frameless), once the stores buffered ahead of the raise have landed.
 pub(super) fn stop_ends_step(
     interp: &Interpreter,
     code: &CodeObject,
@@ -1024,7 +1024,7 @@ pub(super) fn stop_ends_step(
     args: &[*const Object],
     v: V,
 ) -> bool {
-    let (want_code, want_it) = interp.leaf_stop.get();
+    let (want_code, want_it, _) = interp.leaf_stop.get();
     if nest != 0
         || want_code != std::ptr::from_ref(code) as usize
         || args.first().map(|&a| a as usize) != Some(want_it)
@@ -1289,11 +1289,17 @@ impl Interpreter {
                 Op::New { dst, dict } => set!(dst, new_container(&mut owned, dict)?),
                 Op::Decline => return None,
                 Op::StopIter { src } => {
-                    if depth == 0
-                        && !FRESH
-                        && pend.n == 0
-                        && stop_ends_step(self, code, nest, args, get!(src))
-                    {
+                    if depth == 0 && !FRESH && stop_ends_step(self, code, nest, args, get!(src)) {
+                        // The stores made before the raise land first, as
+                        // a return lands them (`self.i += 1` ahead of the
+                        // exhaustion test); one that can't declines with
+                        // nothing done.
+                        if pend.n > 0 {
+                            if !self.leaf_stop.get().2 {
+                                return None;
+                            }
+                            self.plan_finish::<EFFECT>(code, ext, plan, &owned, &mut pend, V::N)?;
+                        }
                         return Some(LeafRet::Owned(Object::Unbound));
                     }
                     return None;

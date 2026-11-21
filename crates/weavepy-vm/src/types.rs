@@ -822,6 +822,8 @@ pub(crate) mod vm_key {
     pub(crate) const TYPE_INSTANCECHECK: u32 = 100;
     /// A class's native `__next__` that runs no Python code.
     pub(crate) const NEXT_NATIVE: u32 = 101;
+    /// Whether nothing on the MRO supplies `__str__`.
+    pub(crate) const STR_ABSENT: u32 = 102;
 }
 
 /// A builtin type's pure constructor (see [`TypeObject::pure_new`]).

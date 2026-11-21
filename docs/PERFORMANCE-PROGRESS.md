@@ -2051,6 +2051,29 @@ branch and pull request.
     natively before the Python loop that any other item needs (`x in d`
     of 200,000 ints 2.5 ms to 1.9; CPython 2.5), and `index`'s error
     reads as CPython's.
+  - A sweep of 75 class-protocol operations against CPython (named
+    tuples, dataclasses, enums, getters, dunders, iterators) put
+    `operator.itemgetter` on a named tuple at 13.7x (479 ns, CPython
+    35): its fast half took only exact tuples, lists and dicts, so a
+    subclass declined through seven call lanes to the full body. It now
+    reads a subclass's payload when the class keeps the base's
+    `__getitem__` (96 ns). `methodcaller` read its three fields by name
+    and built a bound method and keyword list for every call; it now
+    reads them at their slots and calls a plain instance's Python method
+    with the instance first (502 ns to 358; CPython 99). `str(x)` of an
+    instance with only a Python `__repr__` looked `__str__` up along the
+    MRO and built a bound method to probe for `__repr__` (217 ns to 148;
+    CPython 64), and `f'{x!r}'` went through a bound method and a Rust
+    string (241 ns to 125; CPython 58): both call the function directly
+    now, and `str(x)`'s error for a non-string result is CPython's.
+  - A frameless `__next__` could end at a bare `raise StopIteration`
+    only with no attribute store buffered, so the usual shape (`self.i
+    += 1` ahead of the exhaustion test) ran the whole last step as a
+    frame, raised, and caught (`list(It())` of three items 1.87 µs,
+    CPython 0.62): the buffered stores now land as a return lands them,
+    and the step ends as exhausted (0.93 µs). `next(it)` without a
+    default still declines on such a step, since its full call raises
+    the exception with its traceback and would repeat the stores.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

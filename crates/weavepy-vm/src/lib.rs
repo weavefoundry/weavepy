@@ -1088,8 +1088,10 @@ pub struct Interpreter {
     /// The `__next__` code and iterator (by address) of the frameless
     /// step [`Interpreter::leaf_python_step`] is running: that evaluation
     /// alone may end at a bare `raise StopIteration` as exhausted (see
-    /// `leaf_plan::Op::StopIter`).
-    pub(crate) leaf_stop: std::cell::Cell<(usize, usize)>,
+    /// `leaf_plan::Op::StopIter`), and whether the stores it buffered
+    /// ahead of the raise may land (not when the caller then runs the
+    /// full call to raise the exception, which would repeat them).
+    pub(crate) leaf_stop: std::cell::Cell<(usize, usize, bool)>,
     /// The last builtin [`Interpreter::leaf_call_kind`] found a leaf kind
     /// for, the registry generation it looked under, and the kind. The weak
     /// handle keeps the address from being reused while it is remembered.
@@ -1358,7 +1360,7 @@ impl Default for Interpreter {
                 LeafMisses::default(),
             )),
             leaf_miss: std::cell::Cell::new((0, 0)),
-            leaf_stop: std::cell::Cell::new((0, 0)),
+            leaf_stop: std::cell::Cell::new((0, 0, false)),
             leaf_hit: std::cell::RefCell::new(None),
             core_next: ThreadCell::new(None),
             core_truth: ThreadCell::new(None),
@@ -1521,7 +1523,7 @@ impl Interpreter {
                 LeafMisses::default(),
             )),
             leaf_miss: std::cell::Cell::new((0, 0)),
-            leaf_stop: std::cell::Cell::new((0, 0)),
+            leaf_stop: std::cell::Cell::new((0, 0, false)),
             leaf_hit: std::cell::RefCell::new(None),
             core_next: ThreadCell::new(None),
             core_truth: ThreadCell::new(None),
@@ -32911,7 +32913,7 @@ impl Interpreter {
 
     /// Whether `inst`'s `__getitem__` is a built-in base's own over its
     /// native payload (a `defaultdict`'s): the native subscript serves it.
-    fn native_payload_getitem(inst: &PyInstance) -> bool {
+    pub(crate) fn native_payload_getitem(inst: &PyInstance) -> bool {
         inst.native.get().is_some()
             && Self::instance_native_dunder(
                 inst,
@@ -32925,7 +32927,7 @@ impl Interpreter {
     /// Call a class's dunder `f` (see [`Self::instance_dunder_function`])
     /// with `args` (the instance first): a warm pure or effect leaf
     /// evaluates in place, anything else runs as an ordinary call.
-    fn call_dunder_function(
+    pub(crate) fn call_dunder_function(
         &mut self,
         f: Rc<crate::object::PyFunction>,
         args: &[Object],
@@ -34049,6 +34051,18 @@ impl Interpreter {
         it: &Object,
         inst: &PyInstance,
     ) -> Option<Option<Object>> {
+        self.leaf_python_step_with(it, inst, true)
+    }
+
+    /// [`Self::leaf_python_step`]; without `ends_land`, an exhausting
+    /// step with stores buffered ahead of its raise declines instead
+    /// (for a caller that then runs the full call, which makes them).
+    pub(crate) fn leaf_python_step_with(
+        &self,
+        it: &Object,
+        inst: &PyInstance,
+        ends_land: bool,
+    ) -> Option<Option<Object>> {
         use crate::types::{vm_key, AttrKey};
         let f = Self::instance_dunder_function(inst, AttrKey::vm(vm_key::NEXT_FN), "__next__")?;
         let code = f.code();
@@ -34066,9 +34080,13 @@ impl Interpreter {
         // (A tracer or monitor would see the raise: the step then declines
         // at it, and the full call raises.)
         let stop = if crate::trace::any_observers_active() {
-            (0, 0)
+            (0, 0, false)
         } else {
-            (Rc::as_ptr(&code) as usize, std::ptr::from_ref(it) as usize)
+            (
+                Rc::as_ptr(&code) as usize,
+                std::ptr::from_ref(it) as usize,
+                ends_land,
+            )
         };
         let saved = self.leaf_stop.replace(stop);
         let r = self.pure_leaf_call(&code, &f, &[std::ptr::from_ref(it)], !pure, depth);
@@ -34103,7 +34121,7 @@ impl Interpreter {
             Some(r) => return Some(r),
             None => {}
         }
-        match self.leaf_python_step(it, inst)? {
+        match self.leaf_python_step_with(it, inst, default.is_some())? {
             Some(v) => Some(Ok(v)),
             // (Without a default, the full call raises the exception
             // `__next__` raises, traceback and all.)
@@ -34364,6 +34382,38 @@ impl Interpreter {
     /// decide.
     pub(crate) fn leaf_getattr_value(obj: &Object, name: &Object) -> Option<Object> {
         Self::leaf_getattr_parts(obj, name, None, false)
+    }
+
+    /// The Python function `obj.<name>` binds on a plain instance (no
+    /// native payload, the default `__getattribute__`, no instance entry
+    /// shadowing the class's function), for native callers that call the
+    /// method with the instance first (`operator.methodcaller`): `None`
+    /// for anything else, which the full attribute read decides.
+    pub(crate) fn plain_instance_method(
+        obj: &Object,
+        name: &str,
+    ) -> Option<Rc<crate::object::PyFunction>> {
+        let Object::Instance(inst) = obj else {
+            return None;
+        };
+        if crate::object::exotic_str_keys_possible() || name.starts_with("__") {
+            return None;
+        }
+        let cls = inst.cls_raw();
+        if cls.native_kind.get() != 0
+            || inst.native.get().is_some()
+            || inst.c_body.get() != 0
+            || !Self::default_getattribute(cls)
+        {
+            return None;
+        }
+        let Some(Object::Function(f)) = cls.lookup(name) else {
+            return None;
+        };
+        if inst.attr_get_str(name).is_some() {
+            return None;
+        }
+        Some(f)
     }
 
     /// `getattr(obj, name[, default])` on a plain instance whose lookup
@@ -40581,24 +40631,36 @@ impl Interpreter {
                 // `!a` conversion alone; FORMAT_SIMPLE/FORMAT_WITH_SPEC
                 // then formats the (now-string) result.
                 let value = frame.pop()?;
-                let globals = frame.globals.clone();
-                let converted = match ins.arg & 0x03 {
-                    1 => match &value {
-                        Object::WStr(cps) => crate::builtins::bridge_encode_cps(cps),
-                        _ => self.stringify(&value, &globals)?,
-                    },
-                    2 => self.repr_of(&value, &globals)?,
-                    3 => ascii_repr(&value),
-                    other => {
-                        return Err(RuntimeError::Internal(format!(
-                            "unknown CONVERT_VALUE conversion {other}"
-                        )))
+                // `!r` of an instance with a Python `__repr__` returning an
+                // exact `str`: that string, as it stands.
+                let direct = (ins.arg & 0x03 == 2)
+                    .then(|| self.instance_python_repr(&value))
+                    .flatten();
+                if let Some(r) = direct {
+                    match r? {
+                        s @ Object::Str(_) => frame.push(s),
+                        r => frame.push(Object::from_str(Self::require_str_result(r, "__repr__")?)),
                     }
-                };
-                if matches!(value, Object::WStr(_)) {
-                    frame.push(crate::builtins::bridge_to_object(&converted));
                 } else {
-                    frame.push(Object::from_str(converted));
+                    let globals = frame.globals.clone();
+                    let converted = match ins.arg & 0x03 {
+                        1 => match &value {
+                            Object::WStr(cps) => crate::builtins::bridge_encode_cps(cps),
+                            _ => self.stringify(&value, &globals)?,
+                        },
+                        2 => self.repr_of(&value, &globals)?,
+                        3 => ascii_repr(&value),
+                        other => {
+                            return Err(RuntimeError::Internal(format!(
+                                "unknown CONVERT_VALUE conversion {other}"
+                            )))
+                        }
+                    };
+                    if matches!(value, Object::WStr(_)) {
+                        frame.push(crate::builtins::bridge_to_object(&converted));
+                    } else {
+                        frame.push(Object::from_str(converted));
+                    }
                 }
             }
             OpCode::FormatValue => {
@@ -46012,6 +46074,14 @@ impl Interpreter {
                 "__str__",
             ) {
                 Some(f) => Some(Ok(f)),
+                None if Self::class_lacks(
+                    inst.cls_raw(),
+                    crate::types::AttrKey::vm(crate::types::vm_key::STR_ABSENT),
+                    "__str__",
+                ) =>
+                {
+                    None
+                }
                 None => instance_method(v, "__str__").map(Err),
             };
             if let Some(method) = method {
@@ -46045,8 +46115,22 @@ impl Interpreter {
             // subclass overrides `__repr__` and the base has no `tp_str` of
             // its own (an `int`, `float` or container subclass: CPython's
             // `object_str` then calls the override).
+            // (A plain Python `__repr__`, called with the instance.)
+            if inst.native.get().is_none() {
+                if let Some(r) = self.instance_python_repr(v) {
+                    let r = r?;
+                    if str_like_object(&r) {
+                        return Ok(r);
+                    }
+                    // (`object.__str__`'s own check, as CPython words it.)
+                    return Err(type_error(format!(
+                        "__str__ returned non-string (type {})",
+                        r.type_name()
+                    )));
+                }
+            }
             if (inst.native.get().is_none() || native_subclass_own_repr(inst))
-                && instance_method(v, "__repr__").is_some()
+                && inst.cls_raw().lookup("__repr__").is_some()
             {
                 return self.do_repr_call(v, globals);
             }
@@ -51061,6 +51145,11 @@ impl Interpreter {
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<String, RuntimeError> {
         if let Object::Instance(inst) = v {
+            // A plain Python `__repr__`: called with the instance, with no
+            // bound method built for it.
+            if let Some(r) = self.instance_python_repr(v) {
+                return Self::require_str_result(r?, "__repr__");
+            }
             if let Some(method) = instance_method(v, "__repr__") {
                 let r = self.call(&method, &[], &[], globals)?;
                 return Self::require_str_result(r, "__repr__");

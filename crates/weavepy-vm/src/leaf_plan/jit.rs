@@ -379,8 +379,16 @@ fn enter<const EFFECT: bool>(
     };
     if status != 0 {
         // A frameless iterator step's bare `raise StopIteration` (see
-        // `Op::StopIter`): nothing buffered, nothing to finish.
+        // `Op::StopIter`): the stores buffered ahead of it land first, as
+        // a return's do (one that can't declines with nothing done).
         if status == STOPPED {
+            if ctx.pend.n > 0
+                && interp
+                    .plan_finish::<EFFECT>(code, ext, plan, &ctx.owned, &mut ctx.pend, V::N)
+                    .is_none()
+            {
+                return Some(None);
+            }
             return Some(Some(LeafRet::Owned(Object::Unbound)));
         }
         return Some(None);
@@ -411,15 +419,15 @@ fn stamps(ext: &CodeConstObjects) -> crate::Sites<'_, crate::StampSlot> {
 
 /// `Op::StopIter`: `0` when the raise of the value in words `(t, p)`
 /// ends the evaluation as an exhausted iterator step (see
-/// `stop_ends_step`), with no store buffered; `1` to decline.
+/// `stop_ends_step`; the stores buffered ahead of it land in [`run`]);
+/// `1` to decline.
 unsafe extern "C" fn h_stop_iter(ctx: *mut Ctx<'static>, t: u64, p: u64) -> u32 {
     // SAFETY: called by native code with its context.
     let c = unsafe { cx(ctx) };
     // SAFETY: the evaluation's own frame is live.
     let (code, _, _) = unsafe { c.top.parts() };
-    u32::from(
-        !(c.pend.n == 0 && super::stop_ends_step(c.interp, code, c.nest, c.args, value(t, p))),
-    )
+    let lands = c.pend.n == 0 || c.interp.leaf_stop.get().2;
+    u32::from(!(lands && super::stop_ends_step(c.interp, code, c.nest, c.args, value(t, p))))
 }
 
 unsafe extern "C" fn h_global(

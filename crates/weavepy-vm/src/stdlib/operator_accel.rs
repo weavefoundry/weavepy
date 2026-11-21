@@ -511,6 +511,19 @@ fn itemgetter_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let [Object::Instance(inst), obj] = args else {
         return None;
     };
+    // A subclass of one of them (a named tuple) whose `__getitem__` is
+    // still the base's own reads its payload the same way.
+    let obj = match obj {
+        Object::Instance(o) => match o.native.get() {
+            Some(native @ (Object::Tuple(_) | Object::List(_) | Object::Dict(_)))
+                if crate::Interpreter::native_payload_getitem(o) =>
+            {
+                native
+            }
+            _ => return None,
+        },
+        _ => obj,
+    };
     // SAFETY: guard-free reads that run no code (nothing below can change
     // the instance's slots or the operand).
     unsafe {
@@ -554,6 +567,37 @@ fn itemgetter_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
 /// args/kwargs through the interpreter.
 fn methodcaller_call(args: &[Object]) -> Result<Object, RuntimeError> {
     let (slf, obj) = two_args(args, "methodcaller.__call__")?;
+    // The usual shape: the stored fields in their slots, positional
+    // arguments only, and a Python method of a plain instance, called
+    // with the instance first (no bound method, no attribute read).
+    if let Object::Instance(inst) = slf {
+        // SAFETY: reads that run no code; the values are cloned out
+        // before anything runs.
+        let parts = unsafe {
+            inst.slots.peek().and_then(|slots| {
+                let name = slots.get_hinted(0, "_name")?.clone();
+                let stored = slots.get_hinted(1, "_args")?.clone();
+                let plain = match slots.get_hinted(2, "_kwargs")? {
+                    Object::Dict(d) => d.peek()?.is_empty(),
+                    _ => false,
+                };
+                plain.then_some((name, stored))
+            })
+        };
+        if let Some((Object::Str(name), Object::Tuple(stored))) = parts {
+            if let Some(f) = crate::Interpreter::plain_instance_method(obj, &name) {
+                return with_interp(|interp| {
+                    if stored.is_empty() {
+                        return interp.call_dunder_function(f, std::slice::from_ref(obj));
+                    }
+                    let mut call_args = Vec::with_capacity(stored.len() + 1);
+                    call_args.push(obj.clone());
+                    call_args.extend_from_slice(&stored);
+                    interp.call_dunder_function(f, &call_args)
+                });
+            }
+        }
+    }
     with_interp(|interp| {
         let name = field(interp, slf, "_name")?;
         let Object::Str(name) = &name else {
