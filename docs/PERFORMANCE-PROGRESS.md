@@ -2183,6 +2183,11 @@ branch and pull request.
     mid-loop is seen, as CPython's iterator sees it (the snapshot missed
     it). A released view's error reads as CPython's in `iter`, `tobytes`
     and `tolist`.
+  - `bytes.fromhex` now decodes runs of whole pairs, a bad digit found
+    from the table's high bits, before looking at whitespace (400,000
+    digits 520 µs to 347; CPython 263). `b"".join` of `bytearray` parts
+    reads them in place instead of copying each into a part list first
+    (2,000 parts 53 µs to 22.6; CPython 26).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

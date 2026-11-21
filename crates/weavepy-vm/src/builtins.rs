@@ -7055,21 +7055,29 @@ fn hex_pairs_ascii(text: &[u8]) -> Option<Vec<u8>> {
         t
     };
     let mut out = Vec::with_capacity(text.len() / 2);
-    let mut i = 0;
-    while i < text.len() {
-        let c = text[i];
-        if matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
-            i += 1;
-            continue;
+    let mut rest = text;
+    loop {
+        // A run of whole pairs, up to the first pair that isn't two
+        // digits (a bad digit's high bits are set).
+        let pairs = rest.as_chunks::<2>().0;
+        let mut taken = 0;
+        for pair in pairs {
+            let (hi, lo) = (DIGIT[usize::from(pair[0])], DIGIT[usize::from(pair[1])]);
+            if (hi | lo) & 0xF0 != 0 {
+                break;
+            }
+            out.push(hi << 4 | lo);
+            taken += 2;
         }
-        let (hi, lo) = (DIGIT[usize::from(c)], DIGIT[usize::from(*text.get(i + 1)?)]);
-        if hi == BAD || lo == BAD {
-            return None;
+        rest = &rest[taken..];
+        // Then whitespace between pairs, or the end; anything else (a
+        // non-digit, a lone digit) is the slow parse's to report.
+        match rest.first() {
+            None => return Some(out),
+            Some(b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') => rest = &rest[1..],
+            Some(_) => return None,
         }
-        out.push(hi << 4 | lo);
-        i += 2;
     }
-    Some(out)
 }
 
 fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, RuntimeError> {
@@ -17743,24 +17751,30 @@ fn bytes_join(args: &[Object]) -> Result<Object, RuntimeError> {
     // `bytes` joining a list or tuple of `bytes`: one allocation of the
     // exact size, the parts read in place (reading them runs no code).
     if let Some(Object::Bytes(sep)) = args.first() {
+        // (A `bytearray` part is read in place too.)
         let join = |items: &[Object]| -> Option<Object> {
             let mut total = sep.len().checked_mul(items.len().saturating_sub(1))?;
             for v in items {
-                let Object::Bytes(b) = v else {
-                    return None;
+                let len = match v {
+                    Object::Bytes(b) => b.len(),
+                    Object::ByteArray(b) => b.try_borrow().ok()?.len(),
+                    _ => return None,
                 };
-                total = total.checked_add(b.len())?;
+                total = total.checked_add(len)?;
             }
             let mut out = Vec::with_capacity(total);
             for (i, v) in items.iter().enumerate() {
                 if i > 0 {
                     out.extend_from_slice(sep);
                 }
-                if let Object::Bytes(b) = v {
-                    out.extend_from_slice(b);
+                match v {
+                    Object::Bytes(b) => out.extend_from_slice(b),
+                    Object::ByteArray(b) => out.extend_from_slice(&b.try_borrow().ok()?),
+                    _ => return None,
                 }
             }
-            Some(Object::new_bytes(out))
+            // (No part changed size: nothing ran between the passes.)
+            (out.len() == total).then(|| Object::new_bytes(out))
         };
         let joined = match args.get(1) {
             Some(Object::List(l)) => l.try_borrow().ok().and_then(|l| join(&l)),
