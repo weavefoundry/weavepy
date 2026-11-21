@@ -2125,6 +2125,16 @@ branch and pull request.
     five-word command 25.5 µs to 21, CPython 14). A read past the end
     keeps the position a seek left, and a closed `StringIO`'s error
     drops the period, as CPython's does.
+  - Compiled code ran a container method's kernel in line only for a
+    receiver in a local (`x.append(v)`): one an expression left on the
+    stack (`self.items.append(v)`, `d[k].append(v)`) loaded the method
+    through the method-site helper and called it through the call-site
+    helper, about 145 instructions more (`o.l.append(1)` 34 ns, CPython
+    24; `d[k].append(1)` 40, CPython 31). The stack's receiver now has its
+    type checked in line too and the kernel called with the result in the
+    slot above; the receiver is released as the full call releases its
+    operands (a temporary's finalizers run before the next statement) and
+    the result moved into its slot (28.5 and 32.4 ns).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

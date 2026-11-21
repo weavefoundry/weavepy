@@ -2232,6 +2232,39 @@ unsafe extern "C" fn h_clone(dst: *mut Object, src: *const Object) {
 
 /// Release the heap value at `slot` (it leaves the stack): `0` released,
 /// anything else declined with the slot untouched.
+/// Whether releasing the value at `slot` could run code: `0` when it is
+/// droppable (see [`droppable`]), `1` otherwise.
+unsafe extern "C" fn h_droppable(slot: *const Object) -> u32 {
+    // SAFETY: the code passes an initialized stack slot.
+    u32::from(!droppable(unsafe { &*slot }))
+}
+
+/// A stack receiver's kernel ran (see `stack_method_kernel`): the
+/// receiver at `recv` released as the full call releases its operands
+/// (promptly reaped: a temporary it was the last owner of dies here, its
+/// finalizers before the next instruction) and the result at `out` moved
+/// into its slot: `0`, or `LEFT_MARKED` past the `CALL` at `pc` (the
+/// result on the stack, `len` deep) when a finalizer must run first, as
+/// [`call_status`] leaves after a call.
+unsafe extern "C" fn h_kernel_result(
+    st: *mut State,
+    recv: *mut Object,
+    out: *mut Object,
+    pc: u32,
+    len: u32,
+) -> u32 {
+    // SAFETY: the code passes its live state, the receiver's initialized
+    // slot and the kernel's result in the slot above it.
+    unsafe {
+        crate::release_operands(&*(*st).interp, recv, 1);
+        recv.write(out.read());
+        if (*(*st).maybe_dead).get() {
+            return left_marked(st, pc, len as usize);
+        }
+    }
+    0
+}
+
 unsafe extern "C" fn h_pop(slot: *mut Object) -> u32 {
     // SAFETY: the code passes an initialized stack slot.
     unsafe {
@@ -23986,7 +24019,144 @@ impl<'a> Lower<'a> {
         if let Some(r) = self.inline_method(pc) {
             return r;
         }
+        if !self.is_gen() && crate::method_site_in_place(self.ext, pc) {
+            self.stack_method_kernel(pc);
+        }
         self.load_method_site(pc)
+    }
+
+    /// [`Self::method_kernel`] for a receiver on the stack rather than in a
+    /// local (`self.items.append(x)`, `d[k].append(v)`): `x.m(<up to two
+    /// local, constant or small-int arguments>); CALL` at the method load
+    /// `pc` on an exact `list`, `dict`, `set` or `str`, its tag checked in
+    /// line and the kernel called with the result in the slot above it;
+    /// the receiver then released as `POP_TOP` releases one (checked
+    /// droppable first, so nothing declines after the kernel ran) and the
+    /// result moved into its slot, continuing after the `CALL`. Lowering
+    /// continues (at the general method load) where the receiver is
+    /// something else or the kernel declines.
+    fn stack_method_kernel(&mut self, pc: usize) {
+        #[derive(Clone, Copy)]
+        enum Arg {
+            Local(u32),
+            Const(u32),
+            Small(u32),
+        }
+        let code = self.code;
+        let ins = &code.instructions;
+        let n = ins.len();
+        let mut args: Vec<Arg> = Vec::new();
+        let mut k = pc + 1;
+        let call_pc = loop {
+            let Some(i) = ins.get(k) else {
+                return;
+            };
+            match i.op {
+                OpCode::LoadFast | OpCode::LoadFastBorrow if (i.arg as usize) < self.nlocals => {
+                    args.push(Arg::Local(i.arg));
+                }
+                OpCode::LoadConst if (i.arg as usize) < self.ext.objects.len() => {
+                    args.push(Arg::Const(i.arg));
+                }
+                OpCode::LoadSmallInt => args.push(Arg::Small(i.arg)),
+                OpCode::Call if i.arg as usize == args.len() => break k,
+                _ => return,
+            }
+            if args.len() > 2 {
+                return;
+            }
+            k += 1;
+        };
+        if call_pc + 1 >= n || !self.starts.get(call_pc + 1).copied().unwrap_or(false) {
+            return;
+        }
+        let Some((tag, kind, f)) = crate::builtin_method_site(self.ext, pc, call_pc) else {
+            return;
+        };
+        let Some(kernel) = kernel_for(tag, kind, args.len()) else {
+            return;
+        };
+        let want = match tag {
+            1 => self.tags.list,
+            2 => self.tags.dict,
+            3 => self.tags.set,
+            _ => self.tags.str,
+        };
+        self.flush();
+        let slot = self.depth - 1;
+        let declined = self.b.create_block();
+        let recv = self.slot_addr(slot);
+        let t = self.tag_at(recv);
+        let other = self.b.ins().icmp_imm(IntCC::NotEqual, t, i64::from(want));
+        self.branch_out(other, declined);
+        let mut addrs = Vec::with_capacity(2);
+        for (j, arg) in args.iter().enumerate() {
+            let at = match *arg {
+                Arg::Local(i) => {
+                    let at = self.local_addr(i);
+                    if self.maybe_unbound[i as usize] && !self.bound[i as usize] {
+                        let t = self.tag_at(at);
+                        let unbound =
+                            self.b
+                                .ins()
+                                .icmp_imm(IntCC::Equal, t, i64::from(self.tags.unbound));
+                        self.branch_out(unbound, declined);
+                    }
+                    at
+                }
+                Arg::Const(c) => self.const_addr(c),
+                // A scalar in a slot above the result's.
+                Arg::Small(v) => {
+                    let at = self.slot_addr(slot + 2 + j);
+                    self.write_tag(at, self.tags.int);
+                    let v = self.b.ins().iconst(types::I64, i64::from(v));
+                    self.b.ins().store(FLAGS, v, at, 8);
+                    at
+                }
+            };
+            addrs.push(at);
+        }
+        // (The receiver leaves after the kernel runs: one whose release
+        // could run code takes the general path.)
+        let keep = self
+            .call(h_droppable as *const () as usize, &[recv], true)
+            .expect("returns");
+        self.branch_out(keep, declined);
+        let null = self.b.ins().iconst(self.ptr, 0);
+        let a = addrs.first().copied().unwrap_or(null);
+        let b = addrs.get(1).copied().unwrap_or(null);
+        let fp = self.b.ins().iconst(self.ptr, Rc::as_ptr(&f) as i64);
+        self.held.push(f);
+        let out = self.slot_addr(slot + 1);
+        let r = self
+            .call(kernel as *const () as usize, &[out, recv, a, b, fp], true)
+            .expect("returns");
+        let ran = self.b.create_block();
+        self.b.ins().brif(r, declined, &[], ran, &[]);
+        // Ran: the receiver released and the result moved into its slot,
+        // as after the `CALL`.
+        self.b.switch_to_block(ran);
+        let recv = self.slot_addr(slot);
+        let out = self.slot_addr(slot + 1);
+        let pcv = self.b.ins().iconst(types::I32, call_pc as i64);
+        let lenv = self.b.ins().iconst(types::I32, (slot + 1) as i64);
+        let r = self
+            .call(
+                h_kernel_result as *const () as usize,
+                &[self.st, recv, out, pcv, lenv],
+                true,
+            )
+            .expect("returns");
+        self.after_helper(r);
+        let (depth, last) = (self.depth, self.last_pc);
+        self.depth = slot;
+        self.push(Item::Mem(slot));
+        self.set_last(call_pc);
+        self.goto(call_pc + 1);
+        self.depth = depth;
+        self.last_pc = last;
+        self.vs.clear();
+        self.b.switch_to_block(declined);
     }
 
     /// `LOAD_ATTR` with the method flag at `pc` through [`h_method`].
