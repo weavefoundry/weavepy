@@ -221,6 +221,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                             None,
                         );
                     }
+                    register_getter_ctor(cls);
                 }
                 Ok(Object::None)
             }),
@@ -564,6 +565,93 @@ fn itemgetter_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
             many => Object::new_tuple(many.iter().map(get).collect::<Option<Vec<_>>>()?),
         }))
     }
+}
+
+/// Which of the three classes a pure constructor builds, and the class's
+/// attribute version when it was registered (a class changed since, its
+/// `__init__` replaced say, constructs through its Python methods).
+struct GetterCtor {
+    slots: &'static [&'static str],
+    version: u64,
+}
+
+/// The exact `attrgetter`, `itemgetter` and `methodcaller` classes' pure
+/// constructors (see `TypeObject::pure_new`): `itemgetter(1)` builds its
+/// instance in place, as CPython's C constructor does, rather than running
+/// the Python `__init__` with its `*items`.
+fn register_getter_ctor(cls: &Rc<crate::types::TypeObject>) {
+    let (slots, pure): (&'static [&'static str], crate::types::PureNew) = match cls.name.as_str() {
+        "itemgetter" => (&["_items"], itemgetter_new_pure),
+        "attrgetter" => (&["_attrs"], attrgetter_new_pure),
+        "methodcaller" => (&["_name", "_args", "_kwargs"], methodcaller_new_pure),
+        _ => return,
+    };
+    let laid_out = cls.own_slot_layout().is_some_and(|layout| {
+        layout.len() == slots.len()
+            && layout
+                .iter()
+                .zip(slots)
+                .all(|(k, n)| matches!(&k.0, Object::Str(s) if s.as_ref() == *n))
+    });
+    let reg = Rc::new(GetterCtor {
+        slots,
+        version: cls.attr_version.get(),
+    });
+    if laid_out
+        && cls
+            .native_ext
+            .set(crate::rc_unsize!(reg => dyn std::any::Any + Send + Sync))
+            .is_ok()
+    {
+        cls.pure_new.set(Some(pure));
+    }
+}
+
+/// An instance of `cls` with `values` in its slots, laid out at once,
+/// when `cls` is the registered class unchanged since.
+fn getter_instance<const N: usize>(
+    cls: &Rc<crate::types::TypeObject>,
+    values: [Object; N],
+) -> Option<Object> {
+    let reg = cls.native_ext.get()?.downcast_ref::<GetterCtor>()?;
+    if reg.version != cls.attr_version.get() || reg.slots.len() != N {
+        return None;
+    }
+    let layout = cls.own_slot_layout()?;
+    let inst = crate::types::PyInstance::with_slots(
+        cls.clone(),
+        crate::types::SlotStorage::from_layout_array(layout.clone(), values),
+    );
+    let obj = Object::Instance(Rc::new(inst));
+    crate::gc_trace::track(&obj);
+    Some(obj)
+}
+
+/// `itemgetter(item, *items)`.
+fn itemgetter_new_pure(cls: &Rc<crate::types::TypeObject>, args: &[Object]) -> Option<Object> {
+    if args.is_empty() {
+        return None;
+    }
+    getter_instance(cls, [Object::tuple_from_slice(args)])
+}
+
+/// `attrgetter(attr, *attrs)` of `str` names (anything else raises from
+/// the Python `__init__`).
+fn attrgetter_new_pure(cls: &Rc<crate::types::TypeObject>, args: &[Object]) -> Option<Object> {
+    if args.is_empty() || !args.iter().all(|a| matches!(a, Object::Str(_))) {
+        return None;
+    }
+    getter_instance(cls, [Object::tuple_from_slice(args)])
+}
+
+/// `methodcaller(name, *args)` of a `str` name, with no keywords.
+fn methodcaller_new_pure(cls: &Rc<crate::types::TypeObject>, args: &[Object]) -> Option<Object> {
+    let [name @ Object::Str(_), rest @ ..] = args else {
+        return None;
+    };
+    let kwargs = Object::Dict(Rc::new(RefCell::new(DictData::default())));
+    crate::gc_trace::track(&kwargs);
+    getter_instance(cls, [name.clone(), Object::tuple_from_slice(rest), kwargs])
 }
 
 /// A `methodcaller`'s stored name and positional arguments, read from its
