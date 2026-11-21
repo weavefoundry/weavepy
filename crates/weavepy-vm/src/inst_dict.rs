@@ -1262,15 +1262,6 @@ fn note_materialize(at: &'static std::panic::Location<'static>) {
 }
 
 impl crate::types::PyInstance {
-    /// The attribute at position `i` of the class's shared names, while
-    /// this instance's values are still split over its own class's names:
-    /// the name there is fixed for as long as the class lives, so a
-    /// caller that proved it once needs no name check again.
-    ///
-    /// # Safety
-    ///
-    /// As [`crate::sync::GilCell::peek`].
-    #[inline(always)]
     /// The value at position `i` of the instance's published dictionary
     /// (one its `__dict__` made), when the key there is still `name`.
     ///
@@ -1295,6 +1286,15 @@ impl crate::types::PyInstance {
         }
     }
 
+    /// The attribute at position `i` of the class's shared names, while
+    /// this instance's values are still split over its own class's names:
+    /// the name there is fixed for as long as the class lives, so a
+    /// caller that proved it once needs no name check again.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::sync::GilCell::peek`].
+    #[inline(always)]
     pub unsafe fn split_field(&self, i: usize) -> Option<&Object> {
         let keys: *const SharedKeys = self.cls_raw().shared_keys.get()?;
         // SAFETY: forwarded contract.

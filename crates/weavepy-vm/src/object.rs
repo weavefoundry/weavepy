@@ -11780,10 +11780,6 @@ impl PyIterator {
         }
     }
 
-    /// Step past the item [`Self::pure_peek`] returned (as `next` steps a
-    /// sequence iterator, whatever the sequence holds now): `false` for
-    /// any other iterator, untouched.
-    #[inline]
     /// [`Self::pure_peek`] and [`Self::pure_skip`] in one, for the plain
     /// cursors (a list's with no owner, a tuple's, a range's): the next
     /// item, stepped past. `None`, changing nothing, when there is none or
@@ -11822,6 +11818,10 @@ impl PyIterator {
         }
     }
 
+    /// Step past the item [`Self::pure_peek`] returned (as `next` steps a
+    /// sequence iterator, whatever the sequence holds now): `false` for
+    /// any other iterator, untouched.
+    #[inline]
     pub fn pure_skip(&mut self) -> bool {
         match self {
             PyIterator::List {
