@@ -836,6 +836,10 @@ pub(crate) mod vm_key {
     pub(crate) const GETITEM_LEAF: u32 = 114;
     /// Likewise its `__add__` (an `array`'s concatenation).
     pub(crate) const ADD_LEAF: u32 = 115;
+    /// A class's own Python `__setattr__`, for the inline stores.
+    pub(crate) const SETATTR_FN: u32 = 116;
+    /// Its native `__setattr__` (a `threading.local`'s hook).
+    pub(crate) const SETATTR_NATIVE: u32 = 117;
 }
 
 /// A builtin type's pure constructor (see [`TypeObject::pure_new`]).

@@ -10825,10 +10825,11 @@ impl Interpreter {
         let hook = if Self::default_setattr(inst.cls_raw()) {
             None
         } else {
-            let Object::Function(hook) = inst.cls_raw().lookup("__setattr__")? else {
-                return None;
-            };
-            Some(hook)
+            Some(Self::instance_dunder_function(
+                inst,
+                crate::types::AttrKey::vm(crate::types::vm_key::SETATTR_FN),
+                "__setattr__",
+            )?)
         };
         let f = match &hook {
             Some(hook) => hook.clone(),
@@ -10906,9 +10907,12 @@ impl Interpreter {
         if !Self::default_setattr(inst.cls_raw()) {
             // A `threading.local`'s native `__setattr__`, where it runs no
             // Python code: the entry stored in place.
-            let Some(Object::Builtin(b)) = inst.cls_raw().lookup("__setattr__") else {
-                return None;
-            };
+            let b = Self::instance_native_dunder(
+                inst,
+                crate::types::AttrKey::vm(crate::types::vm_key::SETATTR_NATIVE),
+                "__setattr__",
+                false,
+            )?;
             let name = code_name_obj(&frame.code, ins.arg)?;
             if !crate::stdlib::local_native::is_hook(&b, true)
                 || !crate::stdlib::local_native::setattr_fast(

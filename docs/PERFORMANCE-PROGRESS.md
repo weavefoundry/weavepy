@@ -2226,6 +2226,12 @@ branch and pull request.
     key=methodcaller("lower"))` 377 to 129 ns an item, CPython 105). A
     Python method of an instance still leaves for the core loop, and the
     declined half costs it 12% (438 ns to 489, CPython 73).
+  - A store through a class's own `__setattr__` looked the hook up along
+    the MRO on every store, twice when it was Python (`o.x = i` with a
+    one-line Python hook 3,670 instructions, CPython 1,230). The class
+    now caches its Python and native hooks per version (3,385). The rest
+    is the hook's activation in the core loop: compiled code leaves for
+    it on every store.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
