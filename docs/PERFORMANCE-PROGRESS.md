@@ -2142,6 +2142,10 @@ branch and pull request.
     subclasses keep the loop for their own `__setitem__`, and an
     unhashable key still raises from the loop, which words the error as
     CPython's `OrderedDict` does.
+  - Tier 2's `len()` and `next()` of an instance with a native leaf
+    dunder (`len(deque)`) looked the dunder up along the MRO on every
+    call (190 of the 270 instructions a `len(dq)` cost): the class now
+    caches the builtin it resolves per version.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

@@ -33534,16 +33534,26 @@ impl Interpreter {
         if !Self::default_getattribute(cls) || crate::object::exotic_str_keys_possible() {
             return None;
         }
-        match cls.lookup(name)? {
-            Object::Builtin(b)
-                if b.binds_instance
-                    && b.call_kw.is_none()
-                    && self.leaf_call_kind(&b) == Some(LeafKind::Opaque) =>
-            {
-                Some(b)
-            }
+        // (`len()`'s and `next()`'s, the per-call ones, from the class's
+        // cache under its version.)
+        let key = match name {
+            "__len__" => Some(crate::types::vm_key::LEAF_LEN),
+            "__next__" => Some(crate::types::vm_key::LEAF_NEXT),
             _ => None,
-        }
+        };
+        let b = match key {
+            Some(k) => {
+                Self::instance_native_dunder(inst, crate::types::AttrKey::vm(k), name, false)?
+            }
+            None => match cls.lookup(name)? {
+                Object::Builtin(b) => b,
+                _ => return None,
+            },
+        };
+        (b.binds_instance
+            && b.call_kw.is_none()
+            && self.leaf_call_kind(&b) == Some(LeafKind::Opaque))
+        .then_some(b)
     }
 
     /// One `__next__` step of an instance iterator with a registered leaf

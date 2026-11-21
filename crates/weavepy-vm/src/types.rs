@@ -827,6 +827,10 @@ pub(crate) mod vm_key {
     /// Per comparison (eight): whether the class's method for it is
     /// `object`'s own.
     pub(crate) const CMP_OBJECT: u32 = 104;
+    /// The native `__len__` / `__next__` a class resolves (any owner), for
+    /// the leaf calls of an instance's dunder.
+    pub(crate) const LEAF_LEN: u32 = 112;
+    pub(crate) const LEAF_NEXT: u32 = 113;
 }
 
 /// A builtin type's pure constructor (see [`TypeObject::pure_new`]).
