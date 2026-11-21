@@ -16880,6 +16880,26 @@ impl Object {
     /// it must not run Python code or touch the buffer's owner. (A caller
     /// that needs a few bytes of a large buffer shouldn't pay for a copy of
     /// all of it, which is what [`Self::as_bytes_view`] makes.)
+    /// For a `memoryview`, CPython's errors for a buffer taken as one
+    /// contiguous run (`PyBUF_SIMPLE`, as `zlib` and `hashlib` take one):
+    /// a released view's `ValueError`, a strided view's `BufferError`.
+    /// `Ok` for anything else.
+    pub fn check_simple_buffer(&self) -> Result<(), crate::RuntimeError> {
+        if let Object::MemoryView(mv) = self {
+            if mv.released.get() {
+                return Err(crate::error::value_error(
+                    "operation forbidden on released memoryview object",
+                ));
+            }
+            if !mv.is_c_contiguous() {
+                return Err(crate::error::buffer_error(
+                    "memoryview: underlying buffer is not C-contiguous",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn with_bytes_view<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
         match self {
             Object::Bytes(b) => Some(f(b)),

@@ -2166,6 +2166,15 @@ branch and pull request.
     subclass reaches the core through a view instead of failing.
     `array("d", floats)` checked its items' types in a Python loop:
     a native check now (25,000 floats 967 µs to 299; CPython 429).
+  - `zlib.crc32`/`adler32` and `hashlib`'s constructors and `update`
+    copied a `bytearray`'s or `memoryview`'s whole buffer before reading
+    it: they read it in place now (`crc32` of 200 KB 13.2 µs to 7.5,
+    CPython 8.4). `adler32` took a modulo per byte; it reduces once per
+    5,552-byte block, as zlib does (473 µs to 72; CPython 12), and
+    reduces its starting value even for no data, as zlib does. A released
+    view raises `ValueError` and a strided one `BufferError` in all of
+    them, as CPython's do. (SHA-256 itself is the `sha2` crate's portable
+    code, about half OpenSSL's AVX2 speed on this machine.)
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

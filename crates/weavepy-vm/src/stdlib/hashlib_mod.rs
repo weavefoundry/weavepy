@@ -359,8 +359,20 @@ fn hasher_update(args: &[Object]) -> Result<Object, RuntimeError> {
     let data = args
         .get(1)
         .ok_or_else(|| type_error("update: missing data"))?;
-    let bytes = bytes_of(data)?;
     let state = lookup_hasher(id)?;
+    data.check_simple_buffer()?;
+    // (A `bytearray`'s or a live `memoryview`'s bytes hashed where they
+    // are: hashing runs no code while it reads.)
+    if matches!(
+        data,
+        Object::Bytes(_) | Object::ByteArray(_) | Object::MemoryView(_)
+    ) {
+        let mut hasher = state.borrow_mut();
+        if data.with_bytes_view(|d| hasher.update(d)).is_some() {
+            return Ok(Object::None);
+        }
+    }
+    let bytes = bytes_of(data)?;
     state.borrow_mut().update(&bytes);
     Ok(Object::None)
 }
@@ -663,21 +675,6 @@ fn seed_arg_checked(
         .or(kw_string)
         .filter(|o| !matches!(o, Object::None))
         .cloned())
-}
-
-/// The digest seed passed to a constructor: positional index 0, or the
-/// `data=`/`string=` keyword, validated with clinic precedence.
-/// `usedforsecurity=` is accepted and ignored (we never link OpenSSL, so
-/// FIPS mode is moot).
-fn seed_arg(
-    fname: &str,
-    args: &[Object],
-    kwargs: &[(String, Object)],
-) -> Result<Option<Vec<u8>>, RuntimeError> {
-    match seed_arg_checked(fname, 0, args, kwargs, &[])? {
-        None => Ok(None),
-        Some(o) => Ok(Some(bytes_of(&o)?.into_owned())),
-    }
 }
 
 fn algos_set() -> Object {
@@ -1238,19 +1235,38 @@ fn make_sha512(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, R
     seeded(AnyHasher::Sha512(Sha512::new()), args, kwargs)
 }
 
+/// A constructor's hasher, fed its seed: positional index 0, or the
+/// `data=`/`string=` keyword, validated with clinic precedence.
+/// `usedforsecurity=` is accepted and ignored (we never link OpenSSL, so
+/// FIPS mode is moot).
 fn seeded(
     mut hasher: AnyHasher,
     args: &[Object],
     kwargs: &[(String, Object)],
 ) -> Result<Object, RuntimeError> {
-    if let Some(bytes) = seed_arg(hasher.name(), args, kwargs)? {
-        hasher.update(&bytes);
+    match seed_arg_checked(hasher.name(), 0, args, kwargs, &[])? {
+        None => {}
+        // (A `bytes`, `bytearray` or contiguous `memoryview` hashed where
+        // it is.)
+        Some(o)
+            if matches!(
+                o,
+                Object::Bytes(_) | Object::ByteArray(_) | Object::MemoryView(_)
+            ) =>
+        {
+            o.check_simple_buffer()?;
+            if o.with_bytes_view(|d| hasher.update(d)).is_none() {
+                hasher.update(&bytes_of(&o)?);
+            }
+        }
+        Some(o) => hasher.update(&bytes_of(&o)?),
     }
     Ok(make_hasher_instance(hasher))
 }
 
 fn bytes_of(obj: &Object) -> Result<std::borrow::Cow<'_, [u8]>, RuntimeError> {
     use std::borrow::Cow;
+    obj.check_simple_buffer()?;
     // Hashers consume the buffer protocol only: `bytes`, `bytearray`,
     // `memoryview` (and their subclasses). A `str` is rejected with
     // CPython's exact message — `test_hmac` asserts `update("…")` raises.
