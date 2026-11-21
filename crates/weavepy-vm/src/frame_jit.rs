@@ -12446,7 +12446,7 @@ unsafe extern "C" fn h_binop_dunder(
         let inplace = arg & weavepy_compiler::BINARY_OP_INPLACE_FLAG != 0;
         let at = st.stack.add(slot);
         let Some(f) = Interpreter::binop_instance_dunder(&*at, &*at.add(1), op, inplace) else {
-            return CALL_DECLINED;
+            return binop_leaf(st, pc, slot, op, inplace);
         };
         if let Some(ext) = crate::code_vm_ext(&*code) {
             if !crate::dunder_known(ext, pc) {
@@ -12524,10 +12524,103 @@ unsafe extern "C" fn h_subscr_dunder(
             return CALL_DECLINED;
         }
         let (pc, slot) = (pc as usize, slot as usize);
+        // (A class's `__getitem__` is a native method with a leaf half or
+        // a Python function, never both.)
+        if let Some(fast) = getitem_leaf_of(&*st.stack.add(slot)) {
+            return pair_leaf_call(st, pc, slot, fast, false);
+        }
         let Some(f) = Interpreter::getitem_dunder(&*code, pc, &*st.stack.add(slot)) else {
             return CALL_DECLINED;
         };
         dunder_call(st, pc, slot, 2, f, site, None)
+    }
+}
+
+/// [`h_binop_dunder`]'s lane for `a + b` of two instances of one plain
+/// class whose `__add__` is a native method with a leaf half (an
+/// `array`'s): the half's answer at `slot` (see [`pair_leaf_call`]). Only
+/// one class, so no reflected method comes first; a `+=` is its
+/// `__iadd__`'s.
+///
+/// # Safety
+///
+/// As [`pair_leaf_call`]'s.
+unsafe fn binop_leaf(st: &mut State, pc: usize, slot: usize, op: BinOpKind, inplace: bool) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let at = st.stack.add(slot);
+        let (Object::Instance(a), Object::Instance(b), BinOpKind::Add, false) =
+            (&*at, &*at.add(1), op, inplace)
+        else {
+            return CALL_DECLINED;
+        };
+        if !std::ptr::eq(a.cls_raw(), b.cls_raw()) {
+            return CALL_DECLINED;
+        }
+        match Interpreter::instance_add_leaf(a) {
+            Some(fast) => pair_leaf_call(st, pc, slot, fast, true),
+            None => CALL_DECLINED,
+        }
+    }
+}
+
+/// The leaf half of the native `__getitem__` of the instance `v`'s plain
+/// Python class (see [`Interpreter::instance_getitem_leaf`]).
+fn getitem_leaf_of(v: &Object) -> Option<crate::leaf_builtins::Fast> {
+    match v {
+        Object::Instance(inst) => Interpreter::instance_getitem_leaf(inst),
+        _ => None,
+    }
+}
+
+/// [`h_subscr_dunder`]'s, [`h_slice_dunder`]'s and [`binop_leaf`]'s
+/// lane for a class whose special method is a native method with a leaf
+/// half: `fast` called on the two operands at stack slots `slot` and
+/// above it, both released as the full call releases its operands, the
+/// result at `slot`. `0` done (or a finalizer's stop), `RAISED` with the
+/// half's error, or `CALL_DECLINED` untouched (for an operator, also an
+/// answer of `NotImplemented`, whose reflected method the full path
+/// tries).
+///
+/// # Safety
+///
+/// As [`dunder_call`]'s, with `n` two.
+unsafe fn pair_leaf_call(
+    st: &mut State,
+    pc: usize,
+    slot: usize,
+    fast: crate::leaf_builtins::Fast,
+    operator: bool,
+) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let at = st.stack.add(slot);
+        let Some(r) = fast(std::slice::from_raw_parts(at, 2)) else {
+            return CALL_DECLINED;
+        };
+        if operator
+            && r.as_ref()
+                .is_ok_and(|v| v.is_same(&crate::vm_singletons::not_implemented()))
+        {
+            drop(r);
+            return CALL_DECLINED;
+        }
+        crate::release_operands(&*st.interp, at, 2);
+        match r {
+            Ok(v) => {
+                at.write(v);
+                if (*st.maybe_dead).get() {
+                    return left_marked(st, pc as u32, slot + 1);
+                }
+                0
+            }
+            Err(e) => {
+                st.len = slot;
+                st.pc = pc + 1;
+                st.err = Some(e);
+                RAISED
+            }
+        }
     }
 }
 
@@ -12555,8 +12648,17 @@ unsafe extern "C" fn h_slice_dunder(
         }
         let (pc, slot) = (pc as usize, slot as usize);
         let at = st.stack.add(slot);
-        let Some(f) = Interpreter::getitem_dunder(&*code, pc, &*at) else {
-            return CALL_DECLINED;
+        // (A class's `__getitem__` is a native method with a leaf half or
+        // a Python function, never both.)
+        let fast = getitem_leaf_of(&*at);
+        let f = match fast {
+            Some(_) => None,
+            None => {
+                let Some(f) = Interpreter::getitem_dunder(&*code, pc, &*at) else {
+                    return CALL_DECLINED;
+                };
+                Some(f)
+            }
         };
         let (start, stop) = (at.add(1).read(), at.add(2).read());
         at.add(1)
@@ -12565,7 +12667,11 @@ unsafe extern "C" fn h_slice_dunder(
                 stop,
                 step: Object::None,
             })));
-        let r = dunder_call(st, pc, slot, 2, f, site, None);
+        let r = match (fast, f) {
+            (Some(fast), _) => pair_leaf_call(st, pc, slot, fast, false),
+            (None, Some(f)) => dunder_call(st, pc, slot, 2, f, site, None),
+            (None, None) => unreachable!("one of them, checked above"),
+        };
         if r == CALL_DECLINED {
             // The bounds back in their slots.
             let Object::Slice(s) = at.add(1).read() else {

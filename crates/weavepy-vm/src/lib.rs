@@ -32551,24 +32551,22 @@ impl Interpreter {
     ) -> Option<Object> {
         use crate::types::LeafAttrKind as K;
         let key = crate::types::AttrKey::vm(crate::types::vm_key::LEN_FAST);
+        // (The half itself, cached under the class version, as
+        // `instance_setitem_leaf` caches `__setitem__`'s.)
         let fast = match cls.leaf_attrs.get(key, ver) {
-            Some(K::BuiltinMethod(b)) => match self.leaf_call_kind(b)? {
-                LeafKind::Fast(f) => f,
-                _ => return None,
-            },
+            Some(K::LeafFast(f)) => *f,
             Some(_) => return None,
             None => {
-                let kind = match cls.lookup("__len__") {
-                    Some(Object::Builtin(b)) if b.binds_instance => K::BuiltinMethod(b),
-                    _ => K::Other,
+                let fast = match cls.lookup("__len__") {
+                    Some(Object::Builtin(b)) if b.binds_instance => match self.leaf_call_kind(&b) {
+                        Some(LeafKind::Fast(f)) => Some(f),
+                        _ => None,
+                    },
+                    _ => None,
                 };
-                let found = matches!(kind, K::BuiltinMethod(_));
-                cls.leaf_attrs.set(key, ver, kind);
-                return if found {
-                    self.leaf_instance_len_fast(cls, ver, v)
-                } else {
-                    None
-                };
+                cls.leaf_attrs
+                    .set(key, ver, fast.map_or(K::Other, K::LeafFast));
+                fast?
             }
         };
         match fast(std::slice::from_ref(v))?.ok()? {
@@ -33020,21 +33018,56 @@ impl Interpreter {
         match cls.leaf_attrs.get(key, ver) {
             Some(K::LeafFast(f)) => Some(*f),
             Some(_) => None,
-            None => Self::instance_setitem_leaf_slow(cls, key, ver),
+            None => Self::instance_dunder_leaf_slow(cls, key, ver, "__setitem__"),
+        }
+    }
+
+    /// The leaf half of `inst`'s `__getitem__` when its plain Python class
+    /// (no native payload or kind) resolves it to a native method with one
+    /// (the `array` class's), cached on the class as
+    /// [`Self::instance_setitem_leaf`] caches `__setitem__`'s.
+    #[cfg(feature = "jit")]
+    #[inline]
+    pub(crate) fn instance_getitem_leaf(inst: &PyInstance) -> Option<leaf_builtins::Fast> {
+        Self::plain_instance_leaf(inst, crate::types::vm_key::GETITEM_LEAF, "__getitem__")
+    }
+
+    /// Likewise the leaf half of `inst`'s native `__add__` (an `array`'s).
+    #[cfg(feature = "jit")]
+    #[inline]
+    pub(crate) fn instance_add_leaf(inst: &PyInstance) -> Option<leaf_builtins::Fast> {
+        Self::plain_instance_leaf(inst, crate::types::vm_key::ADD_LEAF, "__add__")
+    }
+
+    #[cfg(feature = "jit")]
+    #[inline]
+    fn plain_instance_leaf(inst: &PyInstance, key: u32, name: &str) -> Option<leaf_builtins::Fast> {
+        use crate::types::LeafAttrKind as K;
+        let cls = inst.cls_raw();
+        if inst.native.get().is_some() || cls.native_kind.get() != 0 || cls.c_ext_ptr.get() != 0 {
+            return None;
+        }
+        let ver = cls.attr_version.get();
+        let key = crate::types::AttrKey::vm(key);
+        match cls.leaf_attrs.get(key, ver) {
+            Some(K::LeafFast(f)) => Some(*f),
+            Some(_) => None,
+            None => Self::instance_dunder_leaf_slow(cls, key, ver, name),
         }
     }
 
     #[inline(never)]
-    fn instance_setitem_leaf_slow(
+    fn instance_dunder_leaf_slow(
         cls: &crate::types::TypeObject,
         key: crate::types::AttrKey,
         ver: u64,
+        name: &str,
     ) -> Option<leaf_builtins::Fast> {
         use crate::types::LeafAttrKind as K;
         if crate::object::exotic_str_keys_possible() {
             return None;
         }
-        let fast = match cls.lookup("__setitem__") {
+        let fast = match cls.lookup(name) {
             Some(Object::Builtin(b)) if b.binds_instance => match leaf_builtins::lookup(&b) {
                 Some((_, leaf_builtins::Entry::Fast(f))) => Some(f),
                 _ => None,

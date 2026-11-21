@@ -112,6 +112,23 @@ def _make_array(typecode):
     return self
 
 
+def _like(src, buf):
+    """A new array of `src`'s type code over `buf`: its fields copied, not
+    looked up again (slices, sums, repeats and copies)."""
+    out = _object_new(array)
+    out._typecode = src._typecode
+    out._fmt = src._fmt
+    out._itemsize = src._itemsize
+    out._kind = src._kind
+    out._lo = src._lo
+    out._hi = src._hi
+    out._buf = buf
+    return out
+
+
+_object_new = object.__new__
+
+
 def _values(self):
     """Every stored value in one unpacking: a tuple of numbers (a unicode
     array's are code points)."""
@@ -604,20 +621,16 @@ class array:
                 return value
             raise IndexError('array index out of range')
         if isinstance(key, slice):
-            out = _make_array(self._typecode)
-            start, stop, step = key.indices(len(self))
             size = self._itemsize
             buf = self._buf
+            start, stop, step = key.indices(len(buf) // size)
             if step == 1:
                 # (A run of items is a run of bytes.)
-                if stop > start:
-                    out._buf = buf[start * size:stop * size]
-                return out
+                return _like(self, buf[start * size:stop * size] if stop > start else bytearray())
             chunks = []
             for i in range(start, stop, step):
                 chunks.append(bytes(buf[i * size:(i + 1) * size]))
-            out._buf = bytearray(b''.join(chunks))
-            return out
+            return _like(self, bytearray(b''.join(chunks)))
         return self._unpack(self._normalize_index(key))
 
     def __setitem__(self, key, value):
@@ -700,9 +713,7 @@ class array:
         if not isinstance(other, array) or other._typecode != self._typecode:
             raise TypeError("can only append array (not \"%s\") to array"
                             % type(other).__name__)
-        out = _make_array(self._typecode)
-        out._buf = bytearray(self._buf) + other._buf
-        return out
+        return _like(self, bytearray(self._buf) + other._buf)
 
     def __iadd__(self, other):
         if not isinstance(other, array) or other._typecode != self._typecode:
@@ -804,9 +815,7 @@ class array:
         return (type(self), (self._typecode, initializer), state)
 
     def __copy__(self):
-        out = _make_array(self._typecode)
-        out._buf = bytearray(self._buf)
-        return out
+        return _like(self, bytearray(self._buf))
 
     def __deepcopy__(self, memo):
         return self.__copy__()

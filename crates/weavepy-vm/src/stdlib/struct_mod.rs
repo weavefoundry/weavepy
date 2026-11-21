@@ -1320,63 +1320,112 @@ fn array_byte_run(sl: &crate::object::PySlice, len: usize, size: usize) -> Optio
     Some((lo, (stop as usize * size).max(lo)))
 }
 
-/// `a[i:j]` of an instance of the `array` class itself: a new array over
-/// a copy of the run's bytes, laid out as `_make_array` lays one out (its
-/// slots written at once, in the class's layout).
-fn array_slice_fast(recv: &Object, sl: &crate::object::PySlice) -> Option<Object> {
-    const SLOTS: [&str; 7] = [
-        "_typecode",
-        "_fmt",
-        "_itemsize",
-        "_buf",
-        "_kind",
-        "_lo",
-        "_hi",
-    ];
-    let Object::Instance(inst) = recv else {
-        return None;
-    };
-    let cls = inst.cls_raw();
-    if std::ptr::from_ref(cls) as usize != ARRAY_CLASS.load(std::sync::atomic::Ordering::Relaxed) {
-        return None;
-    }
-    let layout = cls.own_slot_layout()?;
-    if layout.len() != SLOTS.len()
-        || !layout
-            .iter()
-            .zip(SLOTS)
-            .all(|(k, n)| matches!(&k.0, Object::Str(s) if s.as_ref() == n))
+/// The seven slot values of an instance of the `array` class itself
+/// (`_typecode`, `_fmt`, `_itemsize`, `_buf`, `_kind`, `_lo`, `_hi`), read
+/// in place when it is laid out over the class's layout with all of them
+/// set.
+fn array_values<'a>(
+    inst: &crate::types::PyInstance,
+    slots: &'a crate::types::SlotStorage,
+) -> Option<&'a [Object; 7]> {
+    if std::ptr::from_ref(inst.cls_raw()) as usize
+        != ARRAY_CLASS.load(std::sync::atomic::Ordering::Relaxed)
     {
         return None;
     }
-    let slots = inst.slots.try_borrow().ok()?;
-    let slot = |at: usize| slots.get_hinted(at, SLOTS[at]).cloned();
-    let (Object::Str(code), Object::ByteArray(buf)) = (slot(0)?, slot(3)?) else {
+    let values: &[Object; 7] = known_slots(inst, slots, &ARRAY_LAYOUT)?.try_into().ok()?;
+    (!values.iter().any(|v| matches!(v, Object::Unbound))).then_some(values)
+}
+
+/// A new instance of the `array` class with `values`' fields (see
+/// [`array_values`]) over the bytes `run`, laid out as `_make_array` lays
+/// one out (its slots written at once, in the class's layout).
+fn array_over(
+    inst: &crate::types::PyInstance,
+    values: &[Object; 7],
+    run: Object,
+) -> Option<Object> {
+    let layout = inst.cls_raw().own_slot_layout()?;
+    let out = [
+        values[0].clone(),
+        values[1].clone(),
+        values[2].clone(),
+        run,
+        values[4].clone(),
+        values[5].clone(),
+        values[6].clone(),
+    ];
+    Some(Object::Instance(Rc::new(
+        crate::types::PyInstance::with_slots(
+            inst.cls(),
+            crate::types::SlotStorage::from_layout_array(layout.clone(), out),
+        ),
+    )))
+}
+
+/// The numeric typecode and buffer among [`array_values`]' fields.
+fn array_code_buf(values: &[Object; 7]) -> Option<(u8, &Rc<RefCell<Vec<u8>>>)> {
+    match (&values[0], &values[3]) {
+        (Object::Str(code), Object::ByteArray(buf)) => match code.as_bytes() {
+            [typecode] if array_item_size(*typecode).is_some() => Some((*typecode, buf)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `a[i:j]` of an instance of the `array` class itself: a new array over
+/// a copy of the run's bytes.
+fn array_slice_fast(recv: &Object, sl: &crate::object::PySlice) -> Option<Object> {
+    let Object::Instance(inst) = recv else {
         return None;
     };
-    let size = match code.as_bytes() {
-        [typecode] => array_item_size(*typecode)?,
-        _ => return None,
-    };
+    let slots = inst.slots.try_borrow().ok()?;
+    let values = array_values(inst, &slots)?;
+    let (typecode, buf) = array_code_buf(values)?;
+    let size = array_item_size(typecode)?;
     let run = {
         let buf = buf.try_borrow().ok()?;
         let (lo, hi) = array_byte_run(sl, buf.len(), size)?;
         Object::new_bytearray(&buf[lo..hi])
     };
-    let values = [
-        Object::Str(code),
-        slot(1)?,
-        slot(2)?,
-        run,
-        slot(4)?,
-        slot(5)?,
-        slot(6)?,
-    ];
-    let out = crate::types::PyInstance::with_slots(
-        inst.cls(),
-        crate::types::SlotStorage::from_layout_array(layout.clone(), values),
-    );
-    Some(Object::Instance(Rc::new(out)))
+    array_over(inst, values, run)
+}
+
+/// `a.__copy__()` (`copy.copy(a)`) of an instance of the `array` class
+/// itself with a numeric typecode: a new array over a copy of its bytes.
+fn array_copy_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Instance(inst)] = args else {
+        return None;
+    };
+    let slots = inst.slots.try_borrow().ok()?;
+    let values = array_values(inst, &slots)?;
+    let (_, buf) = array_code_buf(values)?;
+    let run = Object::new_bytearray(buf.try_borrow().ok()?.as_slice());
+    array_over(inst, values, run).map(Ok)
+}
+
+/// `a + b` of two instances of the `array` class itself with one numeric
+/// typecode: a new array over both runs of bytes. (Anything else is the
+/// Python method's, which raises for another typecode or type.)
+fn array_add_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Instance(a), Object::Instance(b)] = args else {
+        return None;
+    };
+    let (sa, sb) = (a.slots.try_borrow().ok()?, b.slots.try_borrow().ok()?);
+    let (va, vb) = (array_values(a, &sa)?, array_values(b, &sb)?);
+    let ((ca, ba), (cb, bb)) = (array_code_buf(va)?, array_code_buf(vb)?);
+    if ca != cb {
+        return None;
+    }
+    let run = {
+        let (x, y) = (ba.try_borrow().ok()?, bb.try_borrow().ok()?);
+        let mut joined = Vec::with_capacity(x.len() + y.len());
+        joined.extend_from_slice(&x);
+        joined.extend_from_slice(&y);
+        Object::new_bytearray(joined)
+    };
+    array_over(a, va, run).map(Ok)
 }
 
 /// The items of an instance of the `array` class itself (whose `__iter__`
@@ -1665,8 +1714,10 @@ fn array_methods(args: &[Object]) -> Result<Object, RuntimeError> {
             "_array_methods() expects the array class and its iterator's",
         ));
     };
-    let table: [(&Rc<crate::types::TypeObject>, &'static str, Fast); 5] = [
+    let table: [(&Rc<crate::types::TypeObject>, &'static str, Fast); 7] = [
         (cls, "__getitem__", array_getitem_fast),
+        (cls, "__add__", array_add_fast),
+        (cls, "__copy__", array_copy_fast),
         (cls, "__setitem__", array_setitem_fast),
         (cls, "__len__", array_len_fast),
         (cls, "append", array_append_fast),

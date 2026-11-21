@@ -2202,6 +2202,20 @@ branch and pull request.
     `for` does, leaving a changed dict and the end to the full call, and
     `iter`'s takes views and `mappingproxy` objects (118 ns and 64;
     `next(iter(d.items()))` 291 ns to 180, CPython 141).
+  - Compiled code called an instance's `__getitem__` directly only when
+    it was a Python function, so every subscript or slice of an `array`
+    (whose `__getitem__` is a native method with a leaf half) left for the
+    core loop, and tier 2 took the general subscript path for it. Both
+    tiers now call a plain class's native leaf half in place, released as
+    the full call releases its operands (`a[i:i + 4]` 5,050 instructions
+    to 2,070 and 502 ns to 217, CPython 168; `a[i]` 84 ns to 59, CPython
+    63). The slice reads its source's seven slots by position once the
+    class layout matches, instead of by name. `a + b` and `copy.copy(a)`
+    ran Python methods: they're native now, and compiled `+` of two
+    instances of one class calls a native `__add__`'s half in place
+    (`a + b` 1,075 ns to 202, CPython 85; `copy.copy` 673 to 350, CPython
+    209). `len()` of an instance with a native `__len__` caches the half
+    itself rather than finding it again on every call.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

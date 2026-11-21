@@ -831,6 +831,11 @@ pub(crate) mod vm_key {
     /// the leaf calls of an instance's dunder.
     pub(crate) const LEAF_LEN: u32 = 112;
     pub(crate) const LEAF_NEXT: u32 = 113;
+    /// The leaf half of the native `__getitem__` a plain Python class
+    /// resolves (the `array` class's), for compiled subscripts.
+    pub(crate) const GETITEM_LEAF: u32 = 114;
+    /// Likewise its `__add__` (an `array`'s concatenation).
+    pub(crate) const ADD_LEAF: u32 = 115;
 }
 
 /// A builtin type's pure constructor (see [`TypeObject::pure_new`]).

@@ -13823,6 +13823,14 @@ unsafe fn dyn_leaf_getitem(jf: &JitFrame, ctx: &CallCtx) -> Option<Object> {
         let i = if i < 0 { i + n as i64 } else { i };
         usize::try_from(i).ok().filter(|&i| i < n)
     };
+    // A plain class's native `__getitem__` with a leaf half (an `array`'s
+    // item): the half's answer (an error is the full path's to raise
+    // again).
+    if let Object::Instance(inst) = container {
+        if let Some(fast) = super::Interpreter::instance_getitem_leaf(inst) {
+            return fast(&[container.clone(), key.clone()])?.ok();
+        }
+    }
     match (container, key) {
         (Object::List(l), Object::Int(i)) => {
             // SAFETY: nothing runs code while the items are viewed.
@@ -13830,6 +13838,7 @@ unsafe fn dyn_leaf_getitem(jf: &JitFrame, ctx: &CallCtx) -> Option<Object> {
             xs.get(at(*i, xs.len())?).map(super::clone_hot)
         }
         (Object::Tuple(t), Object::Int(i)) => t.get(at(*i, t.len())?).map(super::clone_hot),
+
         // A `dict` subclass's instance that keeps `dict.__getitem__` (a
         // `defaultdict`, a `Counter`) by a present key, as compiled code's
         // `h_inst_dict_get` reads it (a miss may run `__missing__`).
