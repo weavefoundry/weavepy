@@ -7030,6 +7030,43 @@ pub(crate) fn b_float_from_number_cls(args: &[Object]) -> Result<Object, Runtime
     float_fromhex_wrap(cls, x)
 }
 
+/// The bytes of ASCII hex text (pairs of digits, ASCII whitespace between
+/// pairs), or `None` at the first thing that isn't (whose error the
+/// character-by-character parse reports).
+fn hex_pairs_ascii(text: &[u8]) -> Option<Vec<u8>> {
+    const BAD: u8 = 0xFF;
+    const DIGIT: [u8; 256] = {
+        let mut t = [BAD; 256];
+        let mut c = 0;
+        while c < 256 {
+            t[c] = match c as u8 {
+                b'0'..=b'9' => c as u8 - b'0',
+                b'a'..=b'f' => c as u8 - b'a' + 10,
+                b'A'..=b'F' => c as u8 - b'A' + 10,
+                _ => BAD,
+            };
+            c += 1;
+        }
+        t
+    };
+    let mut out = Vec::with_capacity(text.len() / 2);
+    let mut i = 0;
+    while i < text.len() {
+        let c = text[i];
+        if matches!(c, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') {
+            i += 1;
+            continue;
+        }
+        let (hi, lo) = (DIGIT[usize::from(c)], DIGIT[usize::from(*text.get(i + 1)?)]);
+        if hi == BAD || lo == BAD {
+            return None;
+        }
+        out.push(hi << 4 | lo);
+        i += 2;
+    }
+    Some(out)
+}
+
 fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, RuntimeError> {
     // CPython's `_PyBytes_FromHex`: pairs of hex digits, with *ASCII*
     // whitespace permitted only between pairs. Error positions are
@@ -7039,6 +7076,13 @@ fn parse_hex_bytes(s: &str) -> Result<Vec<u8>, RuntimeError> {
             "non-hexadecimal number found in fromhex() arg at position {pos}"
         ))
     };
+    // (ASCII text, the usual input, is read by its bytes, a table lookup
+    // per digit; anything else, and every error, by characters below.)
+    if s.is_ascii() {
+        if let Some(bytes) = hex_pairs_ascii(s.as_bytes()) {
+            return Ok(bytes);
+        }
+    }
     let chars: Vec<char> = s.chars().collect();
     let mut bytes = Vec::with_capacity(chars.len() / 2);
     let mut i = 0usize;

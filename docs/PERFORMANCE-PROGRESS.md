@@ -2027,6 +2027,20 @@ branch and pull request.
     a plain class's native methods alone. Generator chains, which cost
     more per level the deeper they go (16 levels: 85 ns a level-step,
     CPython 16), are left for now.
+  - `re` over a `bytearray` or a `memoryview` (how h11 and urllib3 parse
+    a socket's buffer) converted the whole subject to code points on
+    every call, so a search near the front of 200 KB cost 28 µs (CPython
+    0.27) and a `findall` over it 24 ms (0.17). The bodies that run no
+    Python code (`search`, `match`, `fullmatch`, `findall`, `split`,
+    `finditer`, and `sub` with a bytes replacement) now read a
+    `bytearray`, or a plain view's window of a `bytes` or `bytearray`,
+    where its bytes are, and return `bytes` pieces as CPython does (0.47
+    µs and 0.24 ms). Results equal the old ones on 524 cases over five
+    buffer kinds.
+    `bytes.fromhex` read its text as a vector of characters: ASCII text
+    is now read by its bytes through a digit table (51,200 bytes: 6.3 ms
+    to 1.4 for five, CPython 1.4 for five; errors still come from the
+    character reader, so their positions are unchanged).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

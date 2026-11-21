@@ -146,6 +146,32 @@ fn fast_subject(o: &Object, cc: &CompiledCode) -> bool {
     }
 }
 
+/// [`fast_subject`], or a `bytearray` for a bytes pattern: read in place
+/// for as long as a body that runs no Python code holds it (see
+/// [`with_pattern`]); its pieces are `bytes`, as CPython's are.
+#[inline]
+fn fast_or_buffer_subject(o: &Object, cc: &CompiledCode) -> bool {
+    fast_subject(o, cc)
+        || (cc.is_str != Some(true)
+            && (matches!(o, Object::ByteArray(_)) || plain_view_window(o).is_some()))
+}
+
+/// A live, plain view of unsigned bytes (h11's and urllib3's subjects):
+/// where its bytes start in its buffer, and how many it spans.
+fn plain_view_window(o: &Object) -> Option<(usize, usize)> {
+    let Object::MemoryView(mv) = o else {
+        return None;
+    };
+    (!mv.released.get()
+        && mv.itemsize.get() == 1
+        && !mv.zero_dim.get()
+        && mv.shape.borrow().is_empty()
+        && mv.strides.borrow().is_empty()
+        && mv.suboffsets.borrow().is_empty()
+        && mv.format.borrow().as_str() == "B")
+        .then(|| (mv.start.get(), mv.len.get()))
+}
+
 /// The subject a slicing body (`findall`, `split`) reads: a str
 /// subclass's instance reads as its payload, its pieces exact strs as
 /// CPython's slices of it are. (A body that builds match objects keeps the
@@ -162,7 +188,9 @@ fn sliced_subject(o: &Object) -> &Object {
 
 fn empty_like(o: &Object) -> Object {
     match o {
-        Object::Bytes(_) => Object::new_bytes(Vec::new()),
+        Object::Bytes(_) | Object::ByteArray(_) | Object::MemoryView(_) => {
+            Object::new_bytes(Vec::new())
+        }
         _ => Object::Str(SharedStr::from_ascii("")),
     }
 }
@@ -215,6 +243,15 @@ fn subject_slice(o: &Object, a: usize, b: usize) -> Option<Object> {
             }
             Some(Object::Bytes(SharedSlice::from(&bs[a..b])))
         }
+        // (A buffer's piece is a `bytes` of what it holds now, as
+        // CPython's `getslice` reads it.)
+        Object::ByteArray(bs) => {
+            let bs = bs.try_borrow().ok()?;
+            if b > bs.len() || a > b {
+                return None;
+            }
+            Some(Object::new_bytes(&bs[a..b]))
+        }
         _ => None,
     }
 }
@@ -225,6 +262,12 @@ fn subject_slice(o: &Object, a: usize, b: usize) -> Option<Object> {
 enum Units<'a> {
     Narrow(&'a [u8]),
     Wide(Rc<Vec<u32>>),
+    /// A `bytearray`'s bytes (or a view's window of them, from `.1` to
+    /// `.2`), borrowed for the subject's life (only bodies that run no
+    /// Python code make one: see [`fast_or_buffer_subject`]).
+    Held(crate::sync::Ref<'a, Vec<u8>>, usize, usize),
+    /// A view's window of a `bytes` object's bytes.
+    Window(&'a [u8]),
 }
 
 /// A subject ready for matching, with cheap slicing for `str`/`bytes`.
@@ -238,6 +281,27 @@ impl<'a> Subject<'a> {
         let units = match obj {
             Object::Str(s) if SharedStr::is_ascii(s) => Units::Narrow(s.as_bytes()),
             Object::Bytes(b) => Units::Narrow(&b[..]),
+            Object::ByteArray(b) => match b.try_borrow() {
+                Ok(held) => {
+                    let n = held.len();
+                    Units::Held(held, 0, n)
+                }
+                Err(_) => Units::Wide(sre_mod::decode_subject_cached(obj)?),
+            },
+            Object::MemoryView(mv) => match (plain_view_window(obj), &mv.buffer) {
+                (Some((start, n)), crate::object::MemoryViewBuffer::Bytes(b))
+                    if start + n <= b.len() =>
+                {
+                    Units::Window(&b[start..start + n])
+                }
+                (Some((start, n)), crate::object::MemoryViewBuffer::ByteArray(b)) => {
+                    match b.try_borrow() {
+                        Ok(held) if start + n <= held.len() => Units::Held(held, start, start + n),
+                        _ => Units::Wide(sre_mod::decode_subject_cached(obj)?),
+                    }
+                }
+                _ => Units::Wide(sre_mod::decode_subject_cached(obj)?),
+            },
             _ => Units::Wide(sre_mod::decode_subject_cached(obj)?),
         };
         Ok(Self { obj, units })
@@ -247,6 +311,8 @@ impl<'a> Subject<'a> {
         match &self.units {
             Units::Narrow(b) => b.len(),
             Units::Wide(w) => w.len(),
+            Units::Held(_, start, end) => end - start,
+            Units::Window(b) => b.len(),
         }
     }
 
@@ -263,12 +329,24 @@ impl<'a> Subject<'a> {
         match &self.units {
             Units::Narrow(b) => sre_mod::exec_found(cc, b, pos, endpos, mode, must_advance, f),
             Units::Wide(w) => sre_mod::exec_found(cc, &w[..], pos, endpos, mode, must_advance, f),
+            Units::Held(b, start, end) => {
+                sre_mod::exec_found(cc, &b[*start..*end], pos, endpos, mode, must_advance, f)
+            }
+            Units::Window(b) => sre_mod::exec_found(cc, b, pos, endpos, mode, must_advance, f),
         }
     }
 
     /// `[a:b]` as a new object (the subject itself for the whole range).
     fn slice(&self, a: usize, b: usize) -> Object {
         let (a, b) = (a.min(self.len()), b.min(self.len()));
+        // (A buffer's piece is a `bytes`, never the buffer itself.)
+        match &self.units {
+            Units::Held(held, start, _) => {
+                return Object::new_bytes(&held[start + a..start + b.max(a)]);
+            }
+            Units::Window(bytes) => return Object::new_bytes(&bytes[a..b.max(a)]),
+            _ => {}
+        }
         if a == 0 && b == self.len() {
             return self.obj.clone();
         }
@@ -321,7 +399,9 @@ enum Sink {
 impl Sink {
     fn new(subject: &Subject<'_>) -> Self {
         match subject.obj {
-            Object::Bytes(_) => Sink::Bytes(Vec::new()),
+            Object::Bytes(_) | Object::ByteArray(_) | Object::MemoryView(_) => {
+                Sink::Bytes(Vec::new())
+            }
             _ => Sink::Str(String::new()),
         }
     }
@@ -334,6 +414,10 @@ impl Sink {
             (Sink::Str(t), Object::Str(s), Units::Narrow(_)) => t.push_str(&s[a..b]),
             (Sink::Str(t), Object::Str(_), Units::Wide(w)) => push_cps(t, &w[a..b]),
             (Sink::Bytes(v), Object::Bytes(bs), _) => v.extend_from_slice(&bs[a..b]),
+            (Sink::Bytes(v), _, Units::Held(bs, start, _)) => {
+                v.extend_from_slice(&bs[start + a..start + b]);
+            }
+            (Sink::Bytes(v), _, Units::Window(bs)) => v.extend_from_slice(&bs[a..b]),
             (Sink::Parts(parts), _, _) => parts.push(subject.slice(a, b)),
             _ => {}
         }
@@ -503,7 +587,7 @@ fn with_pattern<R>(
     };
     with_state(inst, |st| {
         let (cc, handle) = pattern_code(st, inst)?;
-        if !fast_subject(string, cc) {
+        if !fast_or_buffer_subject(string, cc) {
             return None;
         }
         Some(f(st, cc, handle))
