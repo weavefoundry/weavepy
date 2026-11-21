@@ -18512,6 +18512,29 @@ pub(crate) fn bytearray_extend_leaf(args: &[Object]) -> Option<Result<Object, Ru
             let s = s.try_borrow().ok()?;
             b.try_borrow_mut().ok()?.extend_from_slice(&s);
         }
+        // A list or tuple of ints in `range(256)`, checked whole first (any
+        // other item is the full method's to convert or refuse).
+        Object::List(_) | Object::Tuple(_) => {
+            let push = |items: &[Object]| -> Option<()> {
+                if !items
+                    .iter()
+                    .all(|v| matches!(v, Object::Int(i) if (0..256).contains(i)))
+                {
+                    return None;
+                }
+                let mut out = b.try_borrow_mut().ok()?;
+                out.extend(items.iter().map(|v| match v {
+                    Object::Int(i) => *i as u8,
+                    _ => 0,
+                }));
+                Some(())
+            };
+            match data {
+                Object::List(l) => push(&l.try_borrow().ok()?)?,
+                Object::Tuple(t) => push(t)?,
+                _ => return None,
+            }
+        }
         _ => return None,
     }
     Some(Ok(Object::None))
@@ -20232,9 +20255,9 @@ fn memoryview_tobytes(
         _ => false,
     };
     if !fortran {
-        return Ok(Object::Bytes(SharedSlice::from(
-            mv.to_bytes().into_boxed_slice(),
-        )));
+        // (A contiguous view's bytes go straight into the result; a
+        // strided one's are gathered first.)
+        return Ok(Object::Bytes(mv.with_bytes(|b| SharedSlice::from(b))));
     }
     // Fortran gather: first index varies fastest.
     let shape = mv.shape_dims();

@@ -2188,6 +2188,13 @@ branch and pull request.
     digits 520 µs to 347; CPython 263). `b"".join` of `bytearray` parts
     reads them in place instead of copying each into a part list first
     (2,000 parts 53 µs to 22.6; CPython 26).
+  - `memoryview.tobytes()` copied a contiguous view's bytes twice (200 KB
+    17.9 µs, CPython 5.8): once now (6.0 µs). A strided one-dimensional
+    view is gathered in one read of its buffer instead of a buffer read
+    per element (`mv[::2].tobytes()` 3.0 ms to 0.37; CPython 0.64).
+    `bytearray.extend` of a list or tuple of ints took the full method
+    (four ints onto 200 KB 563 ns, CPython about 220): the leaf half takes
+    them, all checked first (171 ns).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

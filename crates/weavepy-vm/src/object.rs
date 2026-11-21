@@ -2482,6 +2482,28 @@ impl PyMemoryView {
             return self.buffer.with_read(|all| all[start..end].to_vec());
         }
         let shape = self.shape_dims();
+        // A one-dimensional strided view: its elements gathered in one
+        // read of the buffer (any element outside it takes the walk below,
+        // which skips such elements).
+        if let ([n], false) = (shape.as_slice(), self.has_suboffsets()) {
+            let (n, start) = (*n, self.start.get() as isize);
+            let stride = self
+                .stride_bytes()
+                .first()
+                .copied()
+                .unwrap_or(itemsize as isize);
+            let gathered = self.buffer.with_read(|all| {
+                let mut out = Vec::with_capacity(n * itemsize);
+                for i in 0..n {
+                    let off = usize::try_from(start + i as isize * stride).ok()?;
+                    out.extend_from_slice(all.get(off..off + itemsize)?);
+                }
+                Some(out)
+            });
+            if let Some(out) = gathered {
+                return out;
+            }
+        }
         let total: usize = shape.iter().product();
         let mut out = Vec::with_capacity(total * itemsize);
         let mut index = vec![0usize; shape.len()];
