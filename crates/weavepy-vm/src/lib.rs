@@ -86309,6 +86309,9 @@ fn builtin_fn_lane_ok_uncached(name: &str) -> bool {
             | "pack" | "unpack" | "calcsize"
             // functools (whose callbacks run through reentrant calls)
             | "reduce"
+            // `operator`'s getters' and `methodcaller`'s calls (a Python
+            // `__getitem__`, getter or method runs through a reentrant call)
+            | ".itemgetter.__call__" | ".attrgetter.__call__" | ".methodcaller.__call__"
             // `str.maketrans`/`bytes.maketrans` (static, pure)
             | "maketrans"
             // warnings (which reads the whole stack, lean activations included)

@@ -15649,9 +15649,25 @@ unsafe extern "C" fn h_call_native(
         let (pcu, lenu) = (pc as usize, len as usize);
         let start = lenu - site.argc - 2;
         let base = s.stack;
+        // An instance whose class's native `__call__` is the builtin and
+        // takes it first (a `methodcaller` whose leaf half declined): the
+        // call rewritten as `h_call` rewrites it, the instance in the self
+        // slot as the body's first argument.
+        let mut rewritten = false;
+        if let (Object::Instance(inst), Object::Unbound) =
+            (&*base.add(start), &*base.add(start + 1))
+        {
+            if !(*site.f).binds_instance && Interpreter::instance_calls_native(inst, site.f) {
+                Interpreter::core_instance_callee(base.add(start));
+                rewritten = true;
+            }
+        }
         let hit = match (&*base.add(start), &*base.add(start + 1)) {
             (Object::Builtin(b), Object::Unbound) => {
                 std::ptr::eq(Rc::as_ptr(b), site.f) && !b.binds_instance
+            }
+            (Object::Builtin(b), Object::Instance(_)) if rewritten => {
+                std::ptr::eq(Rc::as_ptr(b), site.f)
             }
             (Object::Builtin(b), recv) => {
                 std::ptr::eq(Rc::as_ptr(b), site.f) && crate::lane_recv_ok(b, recv, site.via_call)

@@ -2223,9 +2223,12 @@ branch and pull request.
     runs a native value's leaf method (a `str`, `bytes`, `list`, `dict`,
     `set` or `int` receiver, positional arguments only) in place (106 ns;
     `dict.get` through one 573 to 108, CPython 59; `sorted(words,
-    key=methodcaller("lower"))` 377 to 129 ns an item, CPython 105). A
-    Python method of an instance still leaves for the core loop, and the
-    declined half costs it 12% (438 ns to 489, CPython 73).
+    key=methodcaller("lower"))` 377 to 129 ns an item, CPython 105). When
+    the half declines (a Python method of an instance, or an `itemgetter`
+    of a Python `__getitem__`), compiled code runs the native body in
+    place with the instance first, as the core loop's rewrite of the call
+    passes it, instead of leaving for the core loop (`methodcaller("f",
+    1)(obj)` 515 ns to 184, CPython 75).
   - A store through a class's own `__setattr__` looked the hook up along
     the MRO on every store, twice when it was Python (`o.x = i` with a
     one-line Python hook 3,670 instructions, CPython 1,230). The class
