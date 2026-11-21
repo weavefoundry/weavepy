@@ -2011,6 +2011,33 @@ impl Drop for Pep563Guard {
     }
 }
 
+/// A nested `def`'s free names (see [`function_free_names`]) by the
+/// addresses of its parameters and body, kept for one compilation: every
+/// enclosing scope asks for them, and a function nested `d` deep was
+/// walked `d` times at each of `d` levels (a module of 80 nested closures
+/// took 47 ms to compile, CPython 2).
+type FreeNamesMemo = fxhash::HashMap<(usize, usize, usize), HashSet<String>>;
+
+thread_local! {
+    static FREE_NAMES_MEMO: std::cell::RefCell<Option<FreeNamesMemo>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Installs the free-names memo for one compilation of a (folded, so no
+/// longer changing) AST, and puts back what was there when it ends.
+struct FreeNamesMemoGuard(Option<FreeNamesMemo>);
+
+impl FreeNamesMemoGuard {
+    fn install() -> Self {
+        FreeNamesMemoGuard(FREE_NAMES_MEMO.with(|m| m.replace(Some(FreeNamesMemo::default()))))
+    }
+}
+
+impl Drop for FreeNamesMemoGuard {
+    fn drop(&mut self) {
+        FREE_NAMES_MEMO.with(|m| *m.borrow_mut() = self.0.take());
+    }
+}
+
 /// Build the shared per-compilation parameters from caller options +
 /// the module's own `__future__` imports.
 fn make_params(module: &Module, opts: CompileOptions) -> CompileParams {
@@ -2361,6 +2388,7 @@ fn compile_module_cow(
     let _pep563 = Pep563Guard::install(params.future_annotations);
     validate::validate_module(&module, source, params.future_annotations)?;
     ast_opt::fold_module(module.to_mut(), params.future_annotations);
+    let _free_names = FreeNamesMemoGuard::install();
     let line_index = LineIndex::new(source);
     let mut top = Compiler::new(
         "<module>".to_owned(),
@@ -2418,6 +2446,7 @@ fn compile_interactive_cow(
     let _pep563 = Pep563Guard::install(params.future_annotations);
     validate::validate_module(&module, source, params.future_annotations)?;
     ast_opt::fold_module(module.to_mut(), params.future_annotations);
+    let _free_names = FreeNamesMemoGuard::install();
     let line_index = LineIndex::new(source);
     let mut top = Compiler::new(
         "<module>".to_owned(),
@@ -2506,6 +2535,7 @@ fn compile_eval_cow(
     let _pep563 = Pep563Guard::install(params.future_annotations);
     validate::validate_module(&module, source, params.future_annotations)?;
     ast_opt::fold_module(module.to_mut(), params.future_annotations);
+    let _free_names = FreeNamesMemoGuard::install();
     let line_index = LineIndex::new(source);
     let mut top = Compiler::new(
         "<module>".to_owned(),
@@ -16556,6 +16586,25 @@ fn class_nested_scope_reads(body: &[Stmt], out: &mut HashSet<String>) {
 /// reach up even when only written). Decorators, defaults and
 /// annotations are the enclosing scope's business.
 fn function_free_names(args: &AstArguments, body: &[Stmt]) -> HashSet<String> {
+    let key = (
+        std::ptr::from_ref(args) as usize,
+        body.as_ptr() as usize,
+        body.len(),
+    );
+    let hit = FREE_NAMES_MEMO.with(|m| m.borrow().as_ref().and_then(|m| m.get(&key).cloned()));
+    if let Some(names) = hit {
+        return names;
+    }
+    let names = function_free_names_uncached(args, body);
+    FREE_NAMES_MEMO.with(|m| {
+        if let Some(m) = m.borrow_mut().as_mut() {
+            m.insert(key, names.clone());
+        }
+    });
+    names
+}
+
+fn function_free_names_uncached(args: &AstArguments, body: &[Stmt]) -> HashSet<String> {
     let mut nested_reads = HashSet::default();
     for s in body {
         collect_reads_stmt_in(s, &mut nested_reads, true);

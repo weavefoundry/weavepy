@@ -302,7 +302,7 @@ pub(crate) fn fast_op(op: u8, recv: &Object, arg: Option<&Object>) -> Option<Obj
             let mut h = f.head().min(f.d.len());
             if h == 0 {
                 h = std::cmp::max(8, f.d.len() / 2);
-                f.d.splice(0..0, std::iter::repeat_n(Object::None, h));
+                grow_front(f.d, h);
             }
             h -= 1;
             f.d[h] = x.clone();
@@ -385,6 +385,99 @@ fn popleft_locked(st: &mut DequeState<'_>, d: &mut Vec<Object>) -> Result<Object
     Ok(x)
 }
 
+/// Room for `slack` more items before the deque's backing list: the list
+/// rebuilt with that many empty slots first and its items moved in after
+/// them (a splice at the front wrote and moved each item one at a time).
+fn grow_front(d: &mut Vec<Object>, slack: usize) {
+    let mut grown = Vec::with_capacity(slack + d.len());
+    grown.resize(slack, Object::None);
+    grown.append(d);
+    *d = grown;
+}
+
+/// `_extend_items(d, items, left)`: `d.extend(items)` (or `extendleft`)
+/// for a list or tuple of items, all at once, with the trimming `maxlen`
+/// calls for; `False`, having done nothing, for any other source (the
+/// Python method iterates it).
+fn deque_extend_items(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [_, src, left] = args else {
+        return Err(type_error(
+            "_extend_items() takes a deque, items and a side",
+        ));
+    };
+    let left = left.is_truthy();
+    let items: Vec<Object> = match src {
+        Object::List(l) => crate::object::cloned_vec(&l.borrow()),
+        Object::Tuple(t) => crate::object::cloned_vec(t),
+        _ => return Ok(Object::Bool(false)),
+    };
+    let mut st = receiver(&args[..1], "extend")?;
+    let data = st.data.clone();
+    let mut trimmed = Vec::new();
+    {
+        let mut d = data.borrow_mut();
+        st.bump_state();
+        let mut h = st.head().min(d.len());
+        if left {
+            let need = items.len();
+            if h < need {
+                let slack = need.max((d.len() - h) / 2).max(8) - h;
+                grow_front(&mut d, slack);
+                h += slack;
+            }
+            for item in items {
+                h -= 1;
+                trimmed.push(std::mem::replace(&mut d[h], item));
+            }
+            st.set_head(h);
+            if let Some(m) = st.maxlen() {
+                while d.len() - h > m {
+                    trimmed.extend(d.pop());
+                }
+            }
+        } else {
+            d.extend(items);
+            if let Some(m) = st.maxlen() {
+                while d.len() - st.head() > m {
+                    trimmed.push(popleft_locked(&mut st, &mut d)?);
+                }
+            }
+        }
+    }
+    drop(st);
+    drop(trimmed);
+    Ok(Object::Bool(true))
+}
+
+/// `_extend_method(fallback, left)`: a deque's `extend` (or
+/// `extendleft`), which takes a list or tuple in at once (see
+/// [`deque_extend_items`]) and calls the Python function `fallback` with
+/// the same arguments for anything else.
+fn deque_extend_method(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [fallback, left] = args else {
+        return Err(type_error("_extend_method() takes a fallback and a side"));
+    };
+    let (fallback, left) = (fallback.clone(), left.is_truthy());
+    let name = if left { "extendleft" } else { "extend" };
+    Ok(Object::Builtin(Rc::new(BuiltinFn {
+        name,
+        binds_instance: true,
+        call: Box::new(move |a: &[Object]| {
+            if let [recv, src @ (Object::List(_) | Object::Tuple(_))] = a {
+                let side = Object::Bool(left);
+                if let Object::Bool(true) = deque_extend_items(&[recv.clone(), src.clone(), side])?
+                {
+                    return Ok(Object::None);
+                }
+            }
+            let interp = crate::builtins::reentrant_interp()?;
+            let globals = interp.builtins_dict();
+            interp.call(&fallback, a, &[], &globals)
+        }),
+        call_kw: None,
+    })))
+}
+
 pub(crate) fn deque_append(args: &[Object]) -> Result<Object, RuntimeError> {
     if let [recv, x] = args {
         if let Some(v) = fast_op(OP_APPEND, recv, Some(x)) {
@@ -446,7 +539,7 @@ fn deque_appendleft(args: &[Object]) -> Result<Object, RuntimeError> {
         let mut h = st.head();
         if h == 0 {
             h = std::cmp::max(8, d.len() / 2);
-            d.splice(0..0, std::iter::repeat_n(Object::None, h));
+            grow_front(&mut d, h);
         }
         h -= 1;
         d[h] = x;
@@ -585,23 +678,28 @@ fn deque_rotate(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     if right <= len / 2 {
         if h < right {
-            let slack = right.max(len / 2).max(8);
-            d.splice(0..0, std::iter::repeat_n(Object::None, slack));
+            // (Room for as many items again as the deque holds, so the
+            // next rotations find it there: a gap the size of one rotation
+            // moved the whole deque on every other call.)
+            let slack = right.max(len).max(8);
+            grow_front(&mut d, slack);
             h += slack;
         }
         let end = d.len();
-        for i in 0..right {
-            d.swap(h - right + i, end - right + i);
-        }
+        // (The last `right` items trade places, as one block, with the
+        // free slots just before the head.)
+        let (front, back) = d.split_at_mut(end - right);
+        front[h - right..h].swap_with_slice(back);
         d.truncate(end - right);
         st.set_head(h - right);
     } else {
         let left = len - right;
-        d.reserve(left);
-        for i in 0..left {
-            let value = std::mem::replace(&mut d[h + i], Object::None);
-            d.push(value);
-        }
+        // (The first `left` items trade places, as one block, with free
+        // slots added at the end.)
+        let end = d.len();
+        d.resize(end + left, Object::None);
+        let (front, back) = d.split_at_mut(end);
+        front[h..h + left].swap_with_slice(back);
         h += left;
         if h >= 32 && h * 2 >= d.len() {
             d.drain(..h);
@@ -1699,6 +1797,8 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         reg("__bool__", "__bool__", deque_bool);
         reg("__getitem__", "__getitem__", deque_getitem);
         reg("rotate", "rotate", deque_rotate);
+        reg("_extend_items", "_extend_items", deque_extend_items);
+        reg("_extend_method", "_extend_method", deque_extend_method);
         reg("__iter__", "__iter__", deque_iter);
         reg("__reversed__", "__reversed__", deque_reversed);
         reg("iterator_index", "iterator_index", deque_iterator_index);

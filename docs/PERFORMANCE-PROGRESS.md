@@ -2006,6 +2006,27 @@ branch and pull request.
     now a fast half on the stream's buffer, declining a closed stream,
     one with bytes parked ahead, an exported buffer, and a stream read
     into its own buffer.
+  - A fourth sweep, of 55 interpreter-level operations at n and 8n
+    (compiling large and deeply nested code, calls with many arguments,
+    deep inheritance, recursion, tracebacks, formatting, library
+    algorithms), found two more growth cliffs. Compiling functions
+    nested `d` deep cost about `d` cubed: each enclosing scope asked for
+    each nested function's free names, recomputed from the whole subtree
+    every time (80 nested closures, 47 ms to compile, CPython 2.1). The
+    free names are kept for the compilation, by the function's place in
+    the tree: 3.6 ms. And `deque.rotate` made room at the front one
+    rotation's worth at a time, so every few rotations shifted the whole
+    deque item by item (`rotate(n // 3)` on 4,000 items: 17.6 µs, CPython
+    0.6); the room is now as large as the deque, made by moving its
+    items once, and a rotation trades its items with the free slots as
+    one block (4.0 µs). `extend` and `extendleft` of a list or tuple are
+    native (`extendleft` of two items 309 ns to 194, CPython 93); a
+    generator still goes in item by item, so an exception partway leaves
+    the items before it, as CPython does, which needed the dispatch's
+    by-name rule for `extend` (materialize the iterable first) to leave
+    a plain class's native methods alone. Generator chains, which cost
+    more per level the deeper they go (16 levels: 85 ns a level-step,
+    CPython 16), are left for now.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

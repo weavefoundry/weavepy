@@ -62387,6 +62387,13 @@ impl Interpreter {
                     {
                         return (b.call)(args);
                     }
+                    // (A plain instance's method of one of these names, a
+                    // native method of a class written in Python such as
+                    // `deque.extend`, takes its iterable as it comes.)
+                    let plain_receiver = matches!(
+                        args.first(),
+                        Some(Object::Instance(i)) if i.native.get().is_none()
+                    );
                     if matches!(
                         b.name,
                         "join"
@@ -62405,6 +62412,7 @@ impl Interpreter {
                             | "isdisjoint"
                             | "writelines"
                     ) && !(b.name == "update" && !receiver_is_native_set(args.first()))
+                        && !(plain_receiver && b.binds_instance)
                     {
                         // `fromkeys` may take its iterable in slot 0 (unbound
                         // classmethod form); the others iterate args[1..].
@@ -62461,7 +62469,10 @@ impl Interpreter {
                     // `Object::make_iter`, which can't drive generator frames or
                     // a user `__iter__` — materialise those eagerly, like the
                     // free-function consumers above.
-                    if b.name == "extend" && args.get(1).is_some_and(needs_vm_iter) {
+                    if b.name == "extend"
+                        && !(plain_receiver && b.binds_instance)
+                        && args.get(1).is_some_and(needs_vm_iter)
+                    {
                         let collected = self.collect_iterable(&args[1], outer_globals)?;
                         let mut new_args = args.to_vec();
                         new_args[1] = Object::new_list(collected);

@@ -41,6 +41,7 @@ from _collections_abc import (
     ValuesView as _ValuesView,
 )
 from _weave_collections import iterator_index as _deque_iterator_index
+from _weave_collections import _extend_method as _deque_extend_method
 from _weave_collections import (
     install_tuplegetter as _install_tuplegetter,
     tuplegetter_get as _tuplegetter_get,
@@ -301,6 +302,11 @@ class deque:
             iterable = list(self._flat())
         for item in iterable:
             self.appendleft(item)
+
+    # (Native for a list or tuple, which goes in at once; the methods
+    # above for anything else.)
+    extend = _deque_extend_method(extend, False)
+    extendleft = _deque_extend_method(extendleft, True)
 
     def clear(self):
         self._state += 1
