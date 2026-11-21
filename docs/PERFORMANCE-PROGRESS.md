@@ -2116,6 +2116,15 @@ branch and pull request.
     151 ns against 105 for a split instance). Its position in the
     published dictionary is cached too and checked by name as read
     (116 ns).
+  - `shlex.split` reads its input one character at a time
+    (`instream.read(1)` of a `StringIO`), and each read took the text
+    layer's whole path: the characters' bytes copied out, checked as
+    UTF-8, newline-translated and un-bridged into a new string, about
+    650 instructions. A read of ASCII characters with no `\r` now copies
+    them straight out of the buffer as a leaf half (`shlex.split` of a
+    five-word command 25.5 µs to 21, CPython 14). A read past the end
+    keeps the position a seek left, and a closed `StringIO`'s error
+    drops the period, as CPython's does.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

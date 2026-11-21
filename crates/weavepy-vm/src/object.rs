@@ -8257,6 +8257,44 @@ impl PyFile {
         true
     }
 
+    /// `StringIO.read(n)` (all with `None`) when the characters to read
+    /// are ASCII with no `\r` (so no newline translation or surrogate
+    /// bridge touches them): the `str` copied from the buffer, the position
+    /// moved past it. `None`, having changed nothing, otherwise.
+    pub(crate) fn mem_text_read_ascii(&self, n: Option<usize>) -> Option<Object> {
+        if self.io_kind.get() != IoKind::StringIO || self.binary {
+            return None;
+        }
+        // SAFETY: guard-free views, each dropped at once (nothing here
+        // runs code).
+        if unsafe { self.closed.peek() }.is_none_or(|c| *c)
+            || unsafe { self.read_ahead.peek() }.is_none_or(|ra| ra.pending() != 0)
+        {
+            return None;
+        }
+        let mut backend = self.backend.try_borrow_mut().ok()?;
+        let FileBackend::MemText { data, pos } = &mut *backend else {
+            return None;
+        };
+        let bytes = data.as_bytes();
+        // (At or past the end: nothing, the position kept where a seek
+        // left it.)
+        if *pos >= bytes.len() {
+            return Some(Object::from_static(""));
+        }
+        let start = *pos;
+        let end = n.map_or(bytes.len(), |n| start.saturating_add(n).min(bytes.len()));
+        let run = &bytes[start..end];
+        if !run.is_ascii() || run.contains(&b'\r') {
+            return None;
+        }
+        // SAFETY: an ASCII run of valid UTF-8 is valid UTF-8.
+        let text = unsafe { std::str::from_utf8_unchecked(run) };
+        let out = Object::from_str(text);
+        *pos = end;
+        Some(out)
+    }
+
     /// The open `BytesIO`'s bytes at its position, where they are: `f` on
     /// up to `n` of them (all of them with `None`), the position then moved
     /// past the `f`'s count. `None` for any other stream, a closed one, or

@@ -18714,6 +18714,10 @@ pub(crate) fn file_self(args: &[Object]) -> Result<Rc<crate::object::PyFile>, Ru
 /// `ValueError("I/O operation on closed file.")` (`test_io.test_io_after_close`).
 pub(crate) fn file_check_open(f: &Rc<crate::object::PyFile>) -> Result<(), RuntimeError> {
     if *f.closed.borrow() {
+        // (CPython's `StringIO` words it without the period.)
+        if f.io_kind.get() == crate::object::IoKind::StringIO {
+            return Err(value_error("I/O operation on closed file"));
+        }
         return Err(value_error("I/O operation on closed file."));
     }
     Ok(())
@@ -19247,8 +19251,12 @@ fn file_read_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
         [Object::File(f), Object::Int(n)] => (f, usize::try_from(*n).ok()),
         _ => return None,
     };
-    f.mem_bytes_read_with(n, |run| (Object::new_bytes(run), run.len()))
-        .map(Ok)
+    if f.binary {
+        return f
+            .mem_bytes_read_with(n, |run| (Object::new_bytes(run), run.len()))
+            .map(Ok);
+    }
+    f.mem_text_read_ascii(n).map(Ok)
 }
 
 /// `f.readinto(b)` of an open `BytesIO` into a `bytearray` no view
