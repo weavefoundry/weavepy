@@ -2090,6 +2090,16 @@ branch and pull request.
     trailing parameters come straight from the positional defaults
     (`obj.m(*args)` 243 ns to 136, CPython 87; `f(*(1,))` with a
     default 84 to 74, CPython 45).
+  - `a > b` of a class that defines only `__lt__` looked up `__gt__`,
+    found `object`'s, bound and called it to get `NotImplemented`, then
+    went through the general protocol to the reflected `b.__lt__(a)`
+    (341 ns, CPython 130; `max()` over 50 such instances 11.7 µs,
+    CPython 5.6). `object`'s orderings are now recognized per class and
+    skipped, and two instances of one class call the reflected method
+    directly, in compiled code as a frameless leaf (73 ns; `max()` 5.5
+    µs). `weakref.ref` calls have a leaf half that calls the referent's
+    deref closure in place (78 ns to 45, CPython 26), and `r(1)` raises
+    CPython's `TypeError` instead of ignoring the argument.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

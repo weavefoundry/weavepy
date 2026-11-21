@@ -2475,6 +2475,17 @@ unsafe extern "C" fn h_compare_site(st: *mut State, site: *const BinopSite) -> u
                 }
                 return left(st, s.pc, s.last, s.slot as usize + 2);
             }
+            // The reflected method of a class defining only the other
+            // ordering (`a > b` of one with `__lt__`): `f(b, a)` in place,
+            // the operands swapped for it and back on a decline.
+            if let Some(f) = Interpreter::compare_reflected_dunder(&*at, &*at.add(1), kind) {
+                std::ptr::swap(at, at.add(1));
+                let r = compare_leaf(st, at, &f);
+                if r <= 1 {
+                    return answered(r != 0);
+                }
+                std::ptr::swap(at, at.add(1));
+            }
         }
         let r = h_compare_bool(at, s.arg);
         if r <= 1 {

@@ -169,6 +169,12 @@ fn ref_type_call(args: &[Object]) -> Result<Object, RuntimeError> {
     let me = args
         .first()
         .ok_or_else(|| type_error("__call__() missing self"))?;
+    if args.len() > 1 {
+        return Err(type_error(format!(
+            "weakref expected 0 arguments, got {}",
+            args.len() - 1
+        )));
+    }
     if let Object::Instance(inst) = me {
         let getter = reg::wrapper_value(inst, WrapperKey::Get);
         if let Some(Object::Builtin(b)) = getter {
@@ -176,6 +182,18 @@ fn ref_type_call(args: &[Object]) -> Result<Object, RuntimeError> {
         }
     }
     Err(type_error("__call__() requires a weakref instance"))
+}
+
+/// [`ref_type_call`]'s leaf half: a weakref instance's referent, or
+/// `None` once it died; anything else declines to the full call.
+fn ref_call_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [me @ Object::Instance(inst)] = args else {
+        return None;
+    };
+    if let Some(r) = reg::wrapper_deref_in_place(inst) {
+        return r.ok().map(Ok);
+    }
+    ref_type_call(std::slice::from_ref(me)).ok().map(Ok)
 }
 
 /// C-API bridge (`PyWeakref_NewRef`): mint a plain weakref to `target`,
@@ -450,10 +468,13 @@ fn ref_type() -> Rc<TypeObject> {
             return t;
         }
         let mut type_dict = DictData::default();
-        type_dict.insert(
-            DictKey(Object::from_static("__call__")),
-            m("__call__", ref_type_call),
-        );
+        let call = m("__call__", ref_type_call);
+        // `r()` runs no Python code (the referent, or `None` once it
+        // died): a leaf half, so call sites take the leaf lanes.
+        if let Object::Builtin(b) = &call {
+            crate::leaf_builtins::register_fast(b, ref_call_fast);
+        }
+        type_dict.insert(DictKey(Object::from_static("__call__")), call);
         type_dict.insert(
             DictKey(Object::from_static("__eq__")),
             m("__eq__", ref_type_eq),

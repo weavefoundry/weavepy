@@ -160,6 +160,27 @@ pub(crate) fn wrapper_value(inst: &crate::types::PyInstance, key: WrapperKey) ->
         .cloned()
 }
 
+/// The referent of weakref wrapper `inst` (or `None` once it died), by a
+/// call of its deref closure read in place from the wrapper's laid-out
+/// slots (no reference taken): `None` for a wrapper that keeps them some
+/// other way, which [`wrapper_value`] reads.
+#[inline]
+pub(crate) fn wrapper_deref_in_place(
+    inst: &crate::types::PyInstance,
+) -> Option<Result<Object, crate::RuntimeError>> {
+    if inst.inline_values.get() {
+        return None;
+    }
+    let layout = WRAPPER_LAYOUT.get()?;
+    // SAFETY: a read of the wrapper's own slots; the closure called below
+    // touches only its weak slot, never the wrapper.
+    let slots = unsafe { inst.slots.peek() }?;
+    match slots.values_for_layout(layout)?.first()? {
+        Object::Builtin(b) => Some((b.call)(&[])),
+        _ => None,
+    }
+}
+
 /// Weakref kinds as exposed to Python. Numeric so the field
 /// fits in a `u8`.
 pub mod kind {

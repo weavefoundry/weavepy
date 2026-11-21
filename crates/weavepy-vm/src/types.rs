@@ -824,6 +824,9 @@ pub(crate) mod vm_key {
     pub(crate) const NEXT_NATIVE: u32 = 101;
     /// Whether nothing on the MRO supplies `__str__`.
     pub(crate) const STR_ABSENT: u32 = 102;
+    /// Per comparison (eight): whether the class's method for it is
+    /// `object`'s own.
+    pub(crate) const CMP_OBJECT: u32 = 104;
 }
 
 /// A builtin type's pure constructor (see [`TypeObject::pure_new`]).

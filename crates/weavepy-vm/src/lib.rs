@@ -56070,6 +56070,40 @@ impl Interpreter {
     /// Python function, from the class's cache (see
     /// [`Self::instance_dunder_function`]): called with `x` first, it is
     /// what [`Self::cmp_method`] binds.
+    /// Whether `x`'s method for the ordering `op` (`<`, `<=`, `>`, `>=`)
+    /// is `object`'s own, which always answers `NotImplemented`: the
+    /// comparison goes straight on to the other operand's, with no bound
+    /// method built and called. Cached on the class per version.
+    fn cmp_object_default(x: &Object, op: CompareKind) -> bool {
+        use crate::types::LeafAttrKind as K;
+        if matches!(op, CompareKind::Eq | CompareKind::NotEq) {
+            return false;
+        }
+        let Object::Instance(inst) = x else {
+            return false;
+        };
+        let cls = inst.cls_raw();
+        let key = crate::types::AttrKey::vm(crate::types::vm_key::CMP_OBJECT + op as u32);
+        let ver = cls.attr_version.get();
+        match cls.leaf_attrs.get(key, ver) {
+            Some(K::InstanceOnly) => true,
+            Some(_) => false,
+            None => {
+                if crate::object::exotic_str_keys_possible() {
+                    return false;
+                }
+                let default = matches!(
+                    cls.lookup_with_owner(cmp_dunder(op).0),
+                    Some((Object::Builtin(_), owner))
+                        if Rc::ptr_eq(&owner, &builtin_types().object_)
+                );
+                cls.leaf_attrs
+                    .set(key, ver, if default { K::InstanceOnly } else { K::Other });
+                default
+            }
+        }
+    }
+
     fn cmp_function(x: &Object, op: CompareKind) -> Option<Rc<PyFunction>> {
         let Object::Instance(inst) = x else {
             return None;
@@ -56261,7 +56295,42 @@ impl Interpreter {
                 }
             }
         }
+        // `a > b` of a class that defines only `__lt__`: the reflected
+        // method directly (see `compare_reflected_dunder`).
+        if !forward_ran {
+            if let Some(f) = Self::compare_reflected_dunder(a, b, op) {
+                let r = self.call_dunder_function(f, &[b.clone(), a.clone()])?;
+                if !r.is_same(&crate::vm_singletons::not_implemented()) {
+                    return Ok(r);
+                }
+            }
+        }
         self.rich_compare_rest(a, b, op, globals, forward_ran)
+    }
+
+    /// The reflected Python method a comparison of two instances of one
+    /// plain class calls when the class's method for `op` is `object`'s
+    /// own (which answers `NotImplemented`): `a > b` of a class defining
+    /// only `__lt__` is `b.__lt__(a)`, CPython's `do_richcompare` order.
+    pub(crate) fn compare_reflected_dunder(
+        a: &Object,
+        b: &Object,
+        op: CompareKind,
+    ) -> Option<Rc<PyFunction>> {
+        let (Object::Instance(ia), Object::Instance(ib)) = (a, b) else {
+            return None;
+        };
+        let cls = ia.cls_raw();
+        if !std::ptr::eq(cls, ib.cls_raw())
+            || ia.native.get().is_some()
+            || ib.native.get().is_some()
+            || cls.native_kind.get() != 0
+            || cls.c_ext_ptr.get() != 0
+            || !Self::cmp_object_default(a, op)
+        {
+            return None;
+        }
+        Self::cmp_function(b, cmp_swapped(op))
     }
 
     /// [`Self::rich_compare_obj`] past its first steps: the whole protocol,
@@ -56442,6 +56511,9 @@ impl Interpreter {
             if !r.is_same(&not_impl) {
                 return Ok(r);
             }
+        } else if Self::cmp_object_default(a, op) {
+            // (`object`'s ordering answers `NotImplemented`.)
+            a_slot_ran = true;
         } else if let Some(method) = self.cmp_method(a, dunder, globals) {
             a_slot_ran = true;
             let r = self.call(&method, std::slice::from_ref(b), &[], globals)?;
@@ -56475,6 +56547,8 @@ impl Interpreter {
                 if !r.is_same(&not_impl) {
                     return Ok(r);
                 }
+            } else if Self::cmp_object_default(b, cmp_swapped(op)) {
+                b_slot_ran = true;
             } else if let Some(method) = self.cmp_method(b, swapped, globals) {
                 b_slot_ran = true;
                 let r = self.call(&method, std::slice::from_ref(a), &[], globals)?;
