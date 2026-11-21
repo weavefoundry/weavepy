@@ -1550,6 +1550,13 @@ impl<'c> Decoder<'c> {
                     push_entry!(stack, value);
                     self.memoize_next(&mut reader, stack)?;
                 }
+                // BYTEARRAY8: a new bytearray of the bytes.
+                0x96 => {
+                    let size = reader.size64()?;
+                    let value = Object::new_bytearray(reader.read(size)?);
+                    push_entry!(stack, value);
+                    self.memoize_next(&mut reader, stack)?;
+                }
                 b']' => {
                     self.empty_list(stack)?;
                     self.memoize_next(&mut reader, stack)?;

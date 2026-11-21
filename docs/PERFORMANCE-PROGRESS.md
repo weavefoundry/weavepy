@@ -2151,6 +2151,12 @@ branch and pull request.
     (110 KB 47 µs, CPython 19): it now checks eight bytes at a time and
     packs each word's four low bytes straight into the string's
     allocation (22.5 µs).
+  - The native pickler and unpickler knew `bytes` but not `bytearray`,
+    so protocol 5 (the default) sent any data holding one to the Python
+    pickler (64 KB `dumps` 35.8 µs and `loads` 39 µs; CPython 2.2 and
+    1.5). Both now handle `BYTEARRAY8`, memoized as CPython's pickler
+    memoizes it and framed as it frames one (8.2 and 3.2 µs; the bytes
+    written are the Python pickler's exactly).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
