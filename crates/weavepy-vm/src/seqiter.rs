@@ -1517,6 +1517,31 @@ fn cursors_next(iters: &[Object]) -> Option<[Object; CURSORS_MAX]> {
 /// `islice_next` order (the skipped items first, then the stop bound),
 /// the adapter left finished with its source released. `None`, nothing
 /// consumed, for any other `islice` or iterator.
+/// `list(product(...))` and its kin: every row of a combinatoric machine
+/// (`product`, `permutations`, `combinations`, `combinations_with_replacement`,
+/// a bounded `repeat`) stepped straight to its end, as the items one at a
+/// time would leave it (rows are built from the pools it holds, running no
+/// code). `None` for any other iterator.
+pub(crate) fn machine_collect(l: &PyLazyIter) -> Option<Vec<Object>> {
+    // SAFETY: nothing below runs code; the view ends with this call.
+    let st = unsafe { l.state.peek_mut() }?;
+    if !matches!(
+        st,
+        LazyIterKind::Product { .. }
+            | LazyIterKind::Permutations { .. }
+            | LazyIterKind::Combinations { .. }
+            | LazyIterKind::Cwr { .. }
+            | LazyIterKind::Repeat { times: Some(_), .. }
+    ) {
+        return None;
+    }
+    let mut out = Vec::new();
+    while let Some(row) = machine_step(st)? {
+        out.push(row);
+    }
+    Some(out)
+}
+
 pub(crate) fn islice_collect(l: &PyLazyIter) -> Option<Vec<Object>> {
     // SAFETY: nothing below runs code until the source's release, after
     // the views end.

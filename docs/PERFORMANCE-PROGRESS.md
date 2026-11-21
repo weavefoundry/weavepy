@@ -2253,6 +2253,15 @@ branch and pull request.
     (`pairs.sort()`). `xs.sort(reverse=True)` 286 ns to 108, `sorted(xs,
     key=None)` 335 to 186. The per-call lookup of a builtin's keyword
     half took a lock each time: a per-thread cache answers it.
+  - `list(product(...))` and its kin stepped each row through four layers
+    of the lazy-iterator step (`list(product(range(5), repeat=3))` 592
+    instructions a row, CPython about 200). `list()` of a combinatoric
+    iterator (`product`, `permutations`, `combinations`,
+    `combinations_with_replacement`, a bounded `repeat`) now steps the
+    machine to its end directly (478). The rest is the tuple itself: a
+    per-thread free list for small tuples, parked at their last release,
+    made no difference (the allocator's own free and malloc cost what the
+    list's push and pop do).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
