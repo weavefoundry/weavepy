@@ -42,6 +42,8 @@ from _collections_abc import (
 )
 from _weave_collections import iterator_index as _deque_iterator_index
 from _weave_collections import _extend_method as _deque_extend_method
+from _weave_collections import _plain_find as _deque_plain_find
+from _weave_collections import _plain_count as _deque_plain_count
 from _weave_collections import (
     install_tuplegetter as _install_tuplegetter,
     tuplegetter_get as _tuplegetter_get,
@@ -322,6 +324,10 @@ class deque:
         # CPython `deque_count`: per-comparison mutation trip-wire — an
         # `__eq__` that mutates the deque raises RuntimeError.
         data = self._flat()
+        # (Plain items and value: counted natively.)
+        result = _deque_plain_count(data, value)
+        if result is not None:
+            return result
         state = self._state
         n = len(data)
         result = 0
@@ -345,6 +351,13 @@ class deque:
             start = max(0, start + n)
         if stop < 0:
             stop += n
+        # (Plain items and value: found natively.)
+        if type(start) is int and type(stop) is int:
+            found = _deque_plain_find(data, value, start, stop)
+            if found is not None:
+                if found >= 0:
+                    return found
+                raise ValueError("deque.index(x): x not in deque")
         for i in range(start, min(stop, n)):
             item = data[i]
             hit = item is value or item == value
@@ -352,7 +365,7 @@ class deque:
                 raise RuntimeError("deque mutated during iteration")
             if hit:
                 return i
-        raise ValueError(f"{value!r} is not in deque")
+        raise ValueError("deque.index(x): x not in deque")
 
     def insert(self, i, x):
         if self._maxlen is not None and len(self) >= self._maxlen:
@@ -385,6 +398,10 @@ class deque:
     def __contains__(self, x):
         # CPython `deque_contains`: mutation during a comparison raises.
         data = self._flat()
+        # (Plain items and value: searched natively.)
+        found = _deque_plain_find(data, x, 0, len(data))
+        if found is not None:
+            return found >= 0
         state = self._state
         i = 0
         while i < len(data):

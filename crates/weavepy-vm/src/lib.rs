@@ -31194,14 +31194,25 @@ impl Interpreter {
                         break;
                     };
                     let str_keys = |d: &DictData| d.keys().all(|k| matches!(k.0, Object::Str(_)));
-                    if !str_keys(&s)
-                        || !str_keys(&t)
-                        || (ins.arg & 1 != 0 && s.keys().any(|k| t.contains_key(k)))
-                    {
+                    if crate::capi_watchers::dicts_active() {
                         break;
                     }
-                    for (k, v) in s.iter() {
-                        t.insert(k.clone(), v.clone());
+                    if t.is_empty() && (ins.arg & 1 == 0 || str_keys(&s)) {
+                        // (`{**d}`, `f(**kw)` into an empty dict: the source's
+                        // table copied whole, its keys hashed already and
+                        // none repeated, so nothing compares them.)
+                        let map: &mut crate::object::DictMap = &mut t;
+                        map.clone_from(&s);
+                    } else {
+                        if !str_keys(&s)
+                            || !str_keys(&t)
+                            || (ins.arg & 1 != 0 && s.keys().any(|k| t.contains_key(k)))
+                        {
+                            break;
+                        }
+                        for (k, v) in s.iter() {
+                            t.insert(k.clone(), v.clone());
+                        }
                     }
                     drop((t, s));
                     drop(stack.pop().expect("length checked above"));
@@ -39844,6 +39855,22 @@ impl Interpreter {
                     }
                 };
                 match other {
+                    // A display's `**d` merged as `dict.update` merges, in one
+                    // pass while the keys settle natively (the source's table
+                    // copied whole into an empty dict); a call's `**kw` into
+                    // an empty dict when its keys are all strings (nothing
+                    // can repeat). A partial merge leaves the rest to the loop
+                    // below, which stores those keys again harmlessly.
+                    Object::Dict(src)
+                        if !Rc::ptr_eq(&target, &src)
+                            && !crate::capi_watchers::dicts_active()
+                            && (!is_kw_merge
+                                || (target.borrow().is_empty()
+                                    && src
+                                        .borrow()
+                                        .keys()
+                                        .all(|k| matches!(k.0, Object::Str(_)))))
+                            && Self::dict_merge_plain(&target, &src) => {}
                     Object::Dict(src) => {
                         let mut t = target.borrow_mut();
                         for (k, v) in src.borrow().iter() {

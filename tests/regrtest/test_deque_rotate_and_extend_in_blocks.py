@@ -1,4 +1,4 @@
-"""`deque.rotate`, `extend` and `extendleft` over long deques.
+"""`deque.rotate`, `extend`, `extendleft` and the searches over long deques.
 
 A rotation moves its items as one block, with room made at the front
 for the next few rotations at once; `extend` and `extendleft` of a list
@@ -192,6 +192,65 @@ class RandomTests(unittest.TestCase):
                 if maxlen:
                     model = model[-maxlen:]
                 self.assertEqual(list(d), model, step)
+
+
+class SearchTests(unittest.TestCase):
+    def test_plain_values(self):
+        d = collections.deque([1, 2.0, "a", b"b", None, True, 2])
+        self.assertIn(2, d)
+        self.assertIn(1.0, d)
+        self.assertIn("a", d)
+        self.assertNotIn("b", d)
+        self.assertIn(b"b", d)
+        self.assertIn(None, d)
+        self.assertEqual(d.count(2), 2)
+        self.assertEqual(d.count(1), 2)
+        self.assertEqual(d.index(2), 1)
+        self.assertEqual(d.index(2, 2), 6)
+        self.assertEqual(d.index("a", -5, -3), 2)
+        with self.assertRaises(ValueError) as cm:
+            d.index(99)
+        self.assertEqual(str(cm.exception), "deque.index(x): x not in deque")
+        with self.assertRaises(ValueError):
+            d.index(2, 2, 6)
+        nan = float("nan")
+        n = collections.deque([nan])
+        self.assertIn(nan, n)
+        self.assertNotIn(float("nan"), n)
+        self.assertEqual(n.count(nan), 1)
+
+    def test_python_equality_still_runs(self):
+        calls = []
+
+        class Eq:
+            def __eq__(self, other):
+                calls.append(other)
+                return other == 5
+
+        d = collections.deque([1, Eq(), 3])
+        self.assertIn(5, d)
+        self.assertEqual(d.count(5), 1)
+        self.assertEqual(d.index(5), 1)
+        self.assertTrue(calls)
+        self.assertIn(Eq(), collections.deque([5]))
+
+        class Mutating:
+            def __eq__(self, other):
+                d.append(0)
+                return False
+
+        d = collections.deque([Mutating(), 1])
+        with self.assertRaises(RuntimeError):
+            2 in d
+
+    def test_after_rotations_and_pops(self):
+        d = collections.deque(range(1000))
+        d.rotate(300)
+        for _ in range(10):
+            d.popleft()
+        self.assertEqual(d.index(0), 290)
+        self.assertNotIn(700, d)
+        self.assertEqual(d.count(999), 1)
 
 
 class CostTests(unittest.TestCase):

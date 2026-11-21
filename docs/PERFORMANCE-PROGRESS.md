@@ -2041,6 +2041,16 @@ branch and pull request.
     is now read by its bytes through a digit table (51,200 bytes: 6.3 ms
     to 1.4 for five, CPython 1.4 for five; errors still come from the
     character reader, so their positions are unchanged).
+  - `{**d}` and `f(**kw)` into an empty dict inserted the source's keys
+    one at a time, rehashing and growing the table (200,000 int keys
+    13.3 ms, str keys 19.9 ms; CPython 1.9 and 2.8): both the core
+    loop's arm and the full handler now copy the source's table whole
+    when they can, and merge a display's `**d` into a non-empty dict as
+    `dict.update` does (1.9 and 3.4 ms). A deque's `in`, `count` and
+    `index` compare plain items (numbers, strings, bytes, `None`)
+    natively before the Python loop that any other item needs (`x in d`
+    of 200,000 ints 2.5 ms to 1.9; CPython 2.5), and `index`'s error
+    reads as CPython's.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

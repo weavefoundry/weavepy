@@ -348,5 +348,62 @@ class PythonKeyTests(unittest.TestCase):
         self.assertEqual([d[Key(i)] for i in (0, 10, 29)], [0, -10, -29])
 
 
+class SplatTests(unittest.TestCase):
+    def test_displays(self):
+        for label, dst_items, src_items in sources():
+            src = dict(src_items)
+            with self.subTest(label=label):
+                self.assertEqual(list({**src}.items()), list(src.items()))
+                self.assertIsNot({**src}, src)
+                both = {**dict(dst_items), **src}
+                self.assertEqual(list(both.items()), model_merge(dst_items, src_items))
+                self.assertEqual(list({"first": 0, **src}.items())[0], ("first", 0))
+                self.assertEqual({**src, **src}, src)
+        big = {str(i): i for i in range(5000)}
+        copy = {**big}
+        copy["new"] = 1
+        self.assertNotIn("new", big)
+        self.assertEqual(list(copy)[:3], ["0", "1", "2"])
+        self.assertEqual({**{1: "x"}, 1.0: "y"}, {1: "y"})
+
+    def test_keyword_splats(self):
+        def f(**kw):
+            return kw
+
+        kw = {f"k{i}": i for i in range(300)}
+        got = f(**kw)
+        self.assertEqual(got, kw)
+        self.assertIsNot(got, kw)
+        got["extra"] = 1
+        self.assertNotIn("extra", kw)
+        self.assertEqual(f(a=1, **{"b": 2}), {"a": 1, "b": 2})
+        with self.assertRaises(TypeError):
+            f(**{"x": 1}, x=2)
+        with self.assertRaises(TypeError):
+            f(**{"a": 1}, **{"a": 2})
+        with self.assertRaises(TypeError):
+            f(**{1: 2})
+        with self.assertRaises(TypeError):
+            f(**[1, 2])
+
+    def test_mappings_that_are_not_dicts(self):
+        import collections
+        import os
+
+        self.assertEqual({**collections.OrderedDict(a=1)}, {"a": 1})
+        self.assertIs(type({**os.environ}), dict)
+
+        class Mapping:
+            def keys(self):
+                return ["a", "b"]
+
+            def __getitem__(self, k):
+                return k.upper()
+
+        self.assertEqual({**Mapping()}, {"a": "A", "b": "B"})
+        with self.assertRaises(TypeError):
+            {**1}
+
+
 if __name__ == "__main__":
     unittest.main()

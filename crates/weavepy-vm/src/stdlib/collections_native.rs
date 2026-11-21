@@ -449,6 +449,64 @@ fn deque_extend_items(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Bool(true))
 }
 
+/// Whether `item == x` is settled without Python code: `Some(eq)` when
+/// both are plain values (`int`, `float`, `bool`, `None`, `str`, `bytes`)
+/// or the same object, `None` when an `__eq__` might run.
+fn plain_eq(item: &Object, x: &Object) -> Option<bool> {
+    fn plain(o: &Object) -> bool {
+        matches!(
+            o,
+            Object::Int(_)
+                | Object::Float(_)
+                | Object::Bool(_)
+                | Object::None
+                | Object::Str(_)
+                | Object::Bytes(_)
+        )
+    }
+    if item.is_same(x) {
+        return Some(true);
+    }
+    (plain(item) && plain(x)).then(|| item.eq_value(x))
+}
+
+/// `_plain_find(items, x, start, stop)`: the first index in
+/// `items[start:stop]` of an item equal to `x`, `-1` for none, when every
+/// comparison is settled natively ([`plain_eq`]); `None` (the Python
+/// loop's to answer) otherwise.
+fn deque_plain_find(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::List(items), x, Object::Int(start), Object::Int(stop)] = args else {
+        return Ok(Object::None);
+    };
+    let items = items.borrow();
+    let stop = usize::try_from(*stop).unwrap_or(0).min(items.len());
+    let start = usize::try_from(*start).unwrap_or(0).min(stop);
+    for (i, item) in items[start..stop].iter().enumerate() {
+        match plain_eq(item, x) {
+            Some(true) => return Ok(Object::Int((start + i) as i64)),
+            Some(false) => {}
+            None => return Ok(Object::None),
+        }
+    }
+    Ok(Object::Int(-1))
+}
+
+/// `_plain_count(items, x)`: how many items equal `x`, when every
+/// comparison is settled natively; `None` otherwise.
+fn deque_plain_count(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::List(items), x] = args else {
+        return Ok(Object::None);
+    };
+    let mut n = 0;
+    for item in items.borrow().iter() {
+        match plain_eq(item, x) {
+            Some(hit) => n += i64::from(hit),
+            None => return Ok(Object::None),
+        }
+    }
+    Ok(Object::Int(n))
+}
+
 /// `_extend_method(fallback, left)`: a deque's `extend` (or
 /// `extendleft`), which takes a list or tuple in at once (see
 /// [`deque_extend_items`]) and calls the Python function `fallback` with
@@ -1799,6 +1857,8 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         reg("rotate", "rotate", deque_rotate);
         reg("_extend_items", "_extend_items", deque_extend_items);
         reg("_extend_method", "_extend_method", deque_extend_method);
+        reg("_plain_find", "_plain_find", deque_plain_find);
+        reg("_plain_count", "_plain_count", deque_plain_count);
         reg("__iter__", "__iter__", deque_iter);
         reg("__reversed__", "__reversed__", deque_reversed);
         reg("iterator_index", "iterator_index", deque_iterator_index);
