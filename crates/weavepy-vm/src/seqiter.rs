@@ -1409,9 +1409,19 @@ pub(crate) fn next_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>>
         Object::Iter(c) => {
             // SAFETY: a view that runs no code and ends with the step.
             let cursor = unsafe { c.peek_mut() }?;
-            let v = cursor.pure_peek()?;
-            cursor.pure_skip();
-            v
+            match cursor.pure_peek() {
+                Some(v) => {
+                    cursor.pure_skip();
+                    v
+                }
+                // A dict's or dict view's iterator, stepped as `for`
+                // steps it (`next(iter(d))`, the first key): any change of
+                // the dict, and the end, are the full call's to report.
+                None if matches!(cursor, PyIterator::DictKeys { .. }) => {
+                    crate::Interpreter::core_dict_next_item(cursor)?
+                }
+                None => return None,
+            }
         }
         Object::LazyIter(l) => lazy_pure_next(l)??,
         // An `os.scandir` iterator (`os.walk`'s `next(scandir_it)`): its
@@ -2759,6 +2769,8 @@ pub(crate) fn iter_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>>
         | Object::Str(_)
         | Object::Range(_)
         | Object::Dict(_)
+        | Object::DictView(_)
+        | Object::MappingProxy(_)
         | Object::Set(_)
         | Object::FrozenSet(_)
         | Object::Bytes(_) => Object::Iter(Rc::new(RefCell::new(x.make_iter().ok()?))),

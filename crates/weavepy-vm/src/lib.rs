@@ -23916,6 +23916,16 @@ impl Interpreter {
     /// size or key change the checked step reports, an exhaustion that
     /// could release anything (a shared iterator, the dict's last
     /// reference, a subclass keepalive), or a reverse iterator.
+    /// The next key, value or item of a dict or dict-view iterator, for a
+    /// leaf `next()`; `None`, having changed nothing, where
+    /// [`Self::core_dict_next`] declines or the iterator ends.
+    pub(crate) fn core_dict_next_item(it: &mut crate::object::PyIterator) -> Option<Object> {
+        match Self::core_dict_next(it, false, false) {
+            DictStep::Item(v, _) => Some(v),
+            DictStep::Exhausted | DictStep::Decline => None,
+        }
+    }
+
     #[inline(never)]
     fn core_dict_next(it: &mut crate::object::PyIterator, fuse: bool, unique: bool) -> DictStep {
         use crate::object::DictViewKind;

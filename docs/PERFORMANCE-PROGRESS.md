@@ -2195,6 +2195,13 @@ branch and pull request.
     `bytearray.extend` of a list or tuple of ints took the full method
     (four ints onto 200 KB 563 ns, CPython about 220): the leaf half takes
     them, all checked first (171 ns).
+  - `next(iter(d))` (a dict's first key) took `next`'s full call for a
+    dict or dict view's iterator, and `iter()` of a view the general
+    builtin path (`next(iter(d))` 188 ns, CPython 78; `iter(d.values())`
+    106 ns, CPython 61). `next`'s leaf half now steps a dict iterator as
+    `for` does, leaving a changed dict and the end to the full call, and
+    `iter`'s takes views and `mappingproxy` objects (118 ns and 64;
+    `next(iter(d.items()))` 291 ns to 180, CPython 141).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
