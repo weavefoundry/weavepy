@@ -2329,6 +2329,9 @@ branch and pull request.
     CPython 201). Compiled code calls it as the positional call it is, the
     keyword values already in the positional places (131 and 75 ns in the
     container's build, where the positional calls take 122 and 58).
+    `zip(xs, ys, strict=True)` and `map(f, xs, strict=True)` of a plain
+    `bool` flag are built natively the same way (396 ns to 202 in the
+    container; CPython 321).
   - `b.decode(errors=...)` and `b.decode(encoding=...)` of bytes and
     bytearrays take a keyword half too (270 ns to 165 in the container;
     CPython 103), and the full method now rejects an unknown keyword with

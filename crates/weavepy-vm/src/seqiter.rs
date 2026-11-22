@@ -358,6 +358,44 @@ impl Interpreter {
     /// without the interpreter (the core loop's `CALL`): `None` when an
     /// argument needs `iter()` to run code, or the call would raise.
     pub(crate) fn seq_new_pure(ty: SeqType, args: &[Object]) -> Option<Object> {
+        Self::seq_new_pure_strict(ty, args, false)
+    }
+
+    /// `zip(*its, strict=True)` and `map(f, *its, strict=True)` of a plain
+    /// `bool` flag (compiled `CALL_KW`'s operands: the type, the empty self
+    /// slot, the positionals, the flag, the names tuple), built as
+    /// [`Self::seq_new_pure`] builds the positional call. `None` for any
+    /// other shape.
+    #[cfg(feature = "jit")]
+    pub(crate) fn seq_new_strict_kw(ops: &[Object], argc: usize) -> Option<Object> {
+        let bt = builtin_types();
+        let (Object::Type(t), Object::Unbound, Some(Object::Tuple(names))) =
+            (ops.first()?, ops.get(1)?, ops.last())
+        else {
+            return None;
+        };
+        let ty = if Rc::ptr_eq(t, &bt.zip_) {
+            SeqType::Zip
+        } else if Rc::ptr_eq(t, &bt.map_) {
+            SeqType::Map
+        } else {
+            return None;
+        };
+        if ops.len() != argc + 4
+            || !matches!(&names[..], [Object::Str(n)] if n.as_ref() == "strict")
+        {
+            return None;
+        }
+        let Object::Bool(strict) = ops[2 + argc] else {
+            return None;
+        };
+        if !Self::core_all_droppable(ops) {
+            return None;
+        }
+        Self::seq_new_pure_strict(ty, &ops[2..2 + argc], strict)
+    }
+
+    fn seq_new_pure_strict(ty: SeqType, args: &[Object], strict: bool) -> Option<Object> {
         Some(match ty {
             SeqType::Map => {
                 let (func, sources) = args.split_first()?;
@@ -368,7 +406,7 @@ impl Interpreter {
                 lazy(LazyIterKind::Map {
                     func: func.clone(),
                     iters,
-                    strict: false,
+                    strict,
                 })
             }
             SeqType::Filter => {
@@ -384,7 +422,7 @@ impl Interpreter {
                 let iters = args.iter().map(pure_iter).collect::<Option<Vec<_>>>()?;
                 lazy(LazyIterKind::Zip {
                     iters,
-                    strict: false,
+                    strict,
                     result: None,
                     spare: None,
                     held: Vec::new(),

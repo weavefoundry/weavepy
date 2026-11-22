@@ -42,6 +42,21 @@ class BuiltinTypeKeywordTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             str(5, encoding="utf-8")
 
+    def test_strict_zip_and_map(self):
+        xs, ys = [1, 2, 3], "abc"
+        for _ in range(300):
+            self.assertEqual(list(zip(xs, ys, strict=True)), [(1, "a"), (2, "b"), (3, "c")])
+            self.assertEqual(list(zip(xs, ys[:2], strict=False)), [(1, "a"), (2, "b")])
+            self.assertEqual(list(map(lambda a, b: a * 2 + len(b), xs, ys, strict=True)), [3, 5, 7])
+        with self.assertRaises(ValueError) as cm:
+            list(zip(xs, ys[:2], strict=True))
+        self.assertIn("zip() argument 2 is shorter than argument 1", str(cm.exception))
+        with self.assertRaises(ValueError):
+            list(map(pow, [1, 2], [3], strict=True))
+        self.assertEqual(list(zip(xs, ys, strict=1)), [(1, "a"), (2, "b"), (3, "c")])
+        with self.assertRaises(TypeError):
+            zip(xs, nope=True)
+
     def test_subclasses_keep_their_call(self):
         class I(int):
             pass

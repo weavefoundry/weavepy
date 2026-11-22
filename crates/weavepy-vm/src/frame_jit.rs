@@ -16130,6 +16130,13 @@ unsafe extern "C" fn h_call_kw(st: *mut State, code: *const CodeObject, pc: u64,
             Object::Type(ty) if crate::builtin_kw_positional(ty, argc, &ops[len - start - 1]) => {
                 interp.core_builtin_ctor(base, start, len - 1)
             }
+            // `zip(xs, ys, strict=True)`, `map(f, xs, strict=True)`.
+            Object::Type(ty)
+                if Rc::ptr_eq(ty, &crate::builtin_types::builtin_types().zip_)
+                    || Rc::ptr_eq(ty, &crate::builtin_types::builtin_types().map_) =>
+            {
+                Interpreter::seq_new_strict_kw(ops, argc)
+            }
             _ if st.depth_cell.is_null() => None,
             _ => interp.core_pure_kw_call(code, pc, ops, argc, st.depth_cell),
         };
