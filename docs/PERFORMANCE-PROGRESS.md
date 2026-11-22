@@ -2322,6 +2322,13 @@ branch and pull request.
   - A call binding a `*args` tuple moved the surplus arguments into it one
     at a time through an iterator, each by way of the stack: they move in
     one copy now (`f(*t)` of three items 1,166 instructions to 1,120).
+  - A builtin type called with keywords naming its next positional
+    parameters in order (`int(text, base=16)`, `enumerate(xs, start=1)`,
+    `str(b, encoding=...)`, `bytes(s, encoding=...)`) took the general
+    keyword call (341 ns for that `enumerate`, CPython 145; `int` 300,
+    CPython 201). Compiled code calls it as the positional call it is, the
+    keyword values already in the positional places (131 and 75 ns in the
+    container's build, where the positional calls take 122 and 58).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

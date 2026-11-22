@@ -16124,6 +16124,12 @@ unsafe extern "C" fn h_call_kw(st: *mut State, code: *const CodeObject, pc: u64,
             {
                 Interpreter::core_dict_kw(ops)
             }
+            // `int(text, base=16)`, `enumerate(xs, start=1)`: keywords that
+            // name the next positional parameters in order, so the operands
+            // below the names are the positional call's.
+            Object::Type(ty) if crate::builtin_kw_positional(ty, argc, &ops[len - start - 1]) => {
+                interp.core_builtin_ctor(base, start, len - 1)
+            }
             _ if st.depth_cell.is_null() => None,
             _ => interp.core_pure_kw_call(code, pc, ops, argc, st.depth_cell),
         };

@@ -87567,6 +87567,37 @@ pub(crate) fn inst_method_unshadowed_by(
         && unsafe { inst.attr_peek_has(name, hash) } == Some(false)
 }
 
+/// Whether a keyword call of the exact builtin type `ty` with `argc`
+/// positional arguments and the keyword `names` (the call's names tuple)
+/// is its positional call: the names are, in order, the parameters after
+/// the positional ones, each of which may come by keyword (`int(x,
+/// base=16)`, `enumerate(xs, start=1)`, `str(b, encoding="utf-8")`).
+#[cfg(feature = "jit")]
+pub(crate) fn builtin_kw_positional(ty: &Rc<TypeObject>, argc: usize, names: &Object) -> bool {
+    let bt = builtin_types();
+    // (A `/` marks a positional-only parameter.)
+    let params: &[&str] = if Rc::ptr_eq(ty, &bt.int_) {
+        &["/x", "base"]
+    } else if Rc::ptr_eq(ty, &bt.enumerate_) {
+        &["iterable", "start"]
+    } else if Rc::ptr_eq(ty, &bt.str_) {
+        &["object", "encoding", "errors"]
+    } else if Rc::ptr_eq(ty, &bt.bytes_) || Rc::ptr_eq(ty, &bt.bytearray_) {
+        &["source", "encoding", "errors"]
+    } else {
+        return false;
+    };
+    let Object::Tuple(names) = names else {
+        return false;
+    };
+    !names.is_empty()
+        && argc + names.len() <= params.len()
+        && names.iter().enumerate().all(|(j, n)| {
+            let p = params[argc + j];
+            !p.starts_with('/') && matches!(n, Object::Str(s) if s.as_ref() == p)
+        })
+}
+
 /// The leaf builtin's kind the `CALL` at `pc` last settled on.
 #[cfg(feature = "jit")]
 pub(crate) fn call_site_leaf(ext: &CodeConstObjects, pc: usize) -> Option<LeafKind> {
