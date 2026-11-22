@@ -2528,6 +2528,15 @@ branch and pull request.
     output once too (251,000 to 205,000, CPython 32,000). CPython keeps
     such text as one or two bytes a character, so its codecs copy units
     where these decode UTF-8.
+  - `f.readinto(b)` of a buffered binary file gave the read-ahead back to
+    the descriptor (a seek), read `len(b)` bytes into a fresh vector with
+    its own system call, and copied them over: 7,800 instructions a call
+    for a 4,096-byte `bytearray` (CPython 2,300), where `read(4096)` is
+    served from the read-ahead (2,500). A read of less than half the
+    buffer goes through the read-ahead now, one `read(2)` refilling it a
+    buffer at a time with the target borrowed only to copy each run, and
+    a leaf half copies from the read-ahead when it holds the whole target
+    (3,000; 2,200 into a `memoryview`, which cost 8,000).
   - `BytesIO.getvalue()` of an unchanged buffer returned its cached value
     after taking a guarded borrow of the stream's state, its buffer, and
     the cache each (730 instructions a call, CPython 350). The leaf half

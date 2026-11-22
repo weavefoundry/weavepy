@@ -19177,9 +19177,29 @@ pub(crate) fn file_readinto(args: &[Object]) -> Result<Object, RuntimeError> {
             ));
         }
         let capacity = mv.len.get();
+        let start = mv.start.get();
+        // A buffered file's read of less than half its buffer, through the
+        // read-ahead (the view's storage borrowed only to copy each run).
+        #[cfg(unix)]
+        {
+            let mut at = 0;
+            let served = f.readinto_buffered(capacity, |run| {
+                let took = mv.buffer.with_write(|d| {
+                    let n = run.len().min(capacity - at);
+                    d.get_mut(start + at..start + at + n)?
+                        .copy_from_slice(&run[..n]);
+                    Some(n)
+                });
+                let n = took.flatten().unwrap_or(0);
+                at += n;
+                n
+            });
+            if let Some(n) = served {
+                return Ok(Object::Int(n? as i64));
+            }
+        }
         let bytes = f.read_bytes(Some(capacity))?;
         let n = bytes.len();
-        let start = mv.start.get();
         let wrote = mv
             .buffer
             .with_write(|d| d[start..start + n].copy_from_slice(&bytes));
@@ -19238,6 +19258,24 @@ pub(crate) fn file_readinto(args: &[Object]) -> Result<Object, RuntimeError> {
         }
     };
     let capacity = target.borrow().len();
+    // A buffered file's read of less than half its buffer, through the
+    // read-ahead (the target borrowed only to copy each run).
+    #[cfg(unix)]
+    {
+        let mut at = 0;
+        let served = f.readinto_buffered(capacity, |run| {
+            let Ok(mut dst) = target.try_borrow_mut() else {
+                return 0;
+            };
+            let n = run.len().min(dst.len().saturating_sub(at));
+            dst[at..at + n].copy_from_slice(&run[..n]);
+            at += n;
+            n
+        });
+        if let Some(n) = served {
+            return Ok(Object::Int(n? as i64));
+        }
+    }
     let bytes = f.read_bytes(Some(capacity))?;
     let n = bytes.len();
     target.borrow_mut()[..n].copy_from_slice(&bytes);
@@ -19498,27 +19536,27 @@ fn file_readinto_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let [Object::File(f), target] = args else {
         return None;
     };
+    // (A `BytesIO`'s bytes where they are; a buffered file's from its
+    // read-ahead when that holds the whole target.)
+    let fill = |dst: &mut [u8]| {
+        let room = dst.len();
+        f.mem_bytes_read_with(Some(room), |run| {
+            dst[..run.len()].copy_from_slice(run);
+            (run.len(), run.len())
+        })
+        .or_else(|| {
+            f.read_ahead_into(room, |run| dst.copy_from_slice(run))
+                .map(|()| room)
+        })
+    };
     let copied = match target {
-        Object::ByteArray(b) => {
-            let mut dst = b.try_borrow_mut().ok()?;
-            let room = dst.len();
-            f.mem_bytes_read_with(Some(room), |run| {
-                dst[..run.len()].copy_from_slice(run);
-                (run.len(), run.len())
-            })?
-        }
+        Object::ByteArray(b) => fill(&mut b.try_borrow_mut().ok()?)?,
         Object::MemoryView(mv)
             if !mv.released.get() && !mv.readonly.get() && mv.is_c_contiguous() =>
         {
             let (start, room) = (mv.start.get(), mv.len.get());
             mv.buffer
-                .with_write(|all| {
-                    let dst = all.get_mut(start..start + room)?;
-                    f.mem_bytes_read_with(Some(room), |run| {
-                        dst[..run.len()].copy_from_slice(run);
-                        (run.len(), run.len())
-                    })
-                })
+                .with_write(|all| fill(all.get_mut(start..start + room)?))
                 .flatten()?
         }
         _ => return None,

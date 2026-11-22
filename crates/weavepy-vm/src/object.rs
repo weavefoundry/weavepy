@@ -9637,6 +9637,98 @@ impl PyFile {
         Some(Object::Bytes(out))
     }
 
+    /// `readinto` of `want` bytes into `copy`, when the read-ahead of an
+    /// open, readable, buffered binary disk stream with nothing written to
+    /// flush and no text sibling holds them all: `copy` is handed them and
+    /// they are consumed, with no system call and no code run (a leaf
+    /// half's read). `None`, nothing touched, for anything else.
+    pub(crate) fn read_ahead_into(&self, want: usize, copy: impl FnOnce(&[u8])) -> Option<()> {
+        if want == 0 || !self.binary || self.io_kind.get() == IoKind::Raw {
+            return None;
+        }
+        // SAFETY: guard-free views, each dropped at once (nothing here runs
+        // code).
+        unsafe {
+            if self.closed.peek().is_none_or(|c| *c)
+                || self.write_buf.peek().is_none_or(|w| !w.is_empty())
+                || self.binary_buffer_cache.peek().is_none_or(Option::is_some)
+                || !matches!(self.backend.peek()?, FileBackend::Disk(_))
+            {
+                return None;
+            }
+        }
+        if !self.mode.bytes().any(|b| b == b'r' || b == b'+') {
+            return None;
+        }
+        let mut ra = self.read_ahead.try_borrow_mut().ok()?;
+        if ra.pending() < want {
+            return None;
+        }
+        copy(&ra.rest()[..want]);
+        ra.consume(want);
+        Some(())
+    }
+
+    /// `readinto` of up to `want` bytes from a buffered binary disk file
+    /// through its read-ahead, as CPython's `BufferedReader` serves a read
+    /// of less than half its buffer: `copy` is handed each run taken from
+    /// the read-ahead (which one `read(2)` of a buffer's worth refills, with
+    /// the GIL released and nothing of the caller's borrowed) and returns
+    /// how much of it it took, until `want` bytes are taken or the file
+    /// ends. The count taken, or `None` when another path must serve it
+    /// (another backend or kind of stream, a larger read, a non-blocking
+    /// descriptor with nothing taken yet).
+    #[cfg(unix)]
+    pub fn readinto_buffered(
+        &self,
+        want: usize,
+        mut copy: impl FnMut(&[u8]) -> usize,
+    ) -> Option<Result<usize, RuntimeError>> {
+        use std::os::unix::io::AsRawFd;
+        if want == 0 || !self.binary {
+            return None;
+        }
+        let fd = match &*self.backend.borrow() {
+            FileBackend::Disk(f) if self.io_kind.get() != IoKind::Raw => f.as_raw_fd(),
+            _ => return None,
+        };
+        let room = self.buf_size.get().clamp(8192, 8192 * 1024);
+        if want * 2 > room {
+            return None;
+        }
+        if let Err(e) = self.check_open().and_then(|()| self.flush_write_buf()) {
+            return Some(Err(e));
+        }
+        let lock = &self.fd_syscall_lock;
+        let mut done = 0;
+        while done < want {
+            if self.read_ahead.borrow().pending() == 0 {
+                if fd_is_nonblocking(fd) {
+                    return (done != 0).then_some(Ok(done));
+                }
+                // (The storage leaves the cell for the read, as in
+                // `fill_read_ahead`.)
+                let mut buf = self.read_ahead.borrow_mut().begin_fill(room);
+                let got = read_fd_into(fd, &mut buf, room, lock);
+                self.read_ahead.borrow_mut().put_back(buf);
+                match got {
+                    Err(e) => return Some(Err(e)),
+                    Ok(0) => break,
+                    Ok(_) => {}
+                }
+            }
+            let mut ra = self.read_ahead.borrow_mut();
+            let k = (want - done).min(ra.pending());
+            let took = copy(&ra.rest()[..k]).min(k);
+            ra.consume(took);
+            done += took;
+            if took < k {
+                break;
+            }
+        }
+        Some(Ok(done))
+    }
+
     /// A sized binary read of a disk file with nothing parked, read straight
     /// into the `bytes` object's own storage: `Ok(Ok(bytes))` when one
     /// `read(2)` filled all `want` bytes, `Ok(Err(partial))` with what it
