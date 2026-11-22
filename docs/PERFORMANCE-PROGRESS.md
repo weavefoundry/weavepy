@@ -2413,6 +2413,10 @@ branch and pull request.
     bools and `None`s is read at once now (writing those runs no code, so
     a live iteration would see the same items), and numbers and bools are
     joined as text (5,000 rows 3.49 ms to 2.49, CPython 2.92).
+  - A compiled `for v in d.values()` stepped the view through the general
+    dict iterator (251 instructions a value, CPython 139), where keys had
+    a step of their own: values take the same direct step now, the dict
+    unchanged since the first step and its length checked (189).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

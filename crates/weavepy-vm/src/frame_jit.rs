@@ -2949,6 +2949,31 @@ unsafe extern "C" fn h_for_iter_view(
                             return 1;
                         }
                     }
+                    // Its next value likewise, for a values view.
+                    PyIterator::DictKeys {
+                        kind: crate::object::DictViewKind::Values,
+                        index,
+                        dict: Some(d),
+                        len,
+                        watch: Some(w),
+                        reverse: false,
+                        odict: None,
+                        ..
+                    } if !w.changed() => {
+                        if let Some((_, v)) = d
+                            .peek()
+                            .filter(|data| data.len() == *len)
+                            .and_then(|data| data.get_index(*index))
+                        {
+                            *index += 1;
+                            if let Object::Int(i) = *v {
+                                (*st).out = i as u64;
+                                return 0;
+                            }
+                            out.write(crate::clone_hot(v));
+                            return 1;
+                        }
+                    }
                     view @ PyIterator::DictKeys { .. } => {
                         match Interpreter::core_dict_next(view, false, false) {
                             crate::DictStep::Item(Object::Int(i), _) => {
