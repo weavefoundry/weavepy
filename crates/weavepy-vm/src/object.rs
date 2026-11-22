@@ -8112,6 +8112,18 @@ impl PyFile {
     /// translation, or this stream hasn't been through the general path yet.
     /// Runs no code, so a loop can take it without publishing its frame.
     pub(crate) fn next_line_pure(&self, limit: Option<usize>) -> Option<Object> {
+        self.next_line_pure_with(limit, Some)
+    }
+
+    /// [`PyFile::next_line_pure`] handed to `take`, the line consumed only
+    /// when `take` accepts it (the stream is as it was when it declines).
+    /// `take` runs with the stream's buffer borrowed, so it must not touch
+    /// the stream.
+    pub(crate) fn next_line_pure_with<R>(
+        &self,
+        limit: Option<usize>,
+        take: impl FnOnce(Object) -> Option<R>,
+    ) -> Option<R> {
         // (A zero limit reads nothing, which isn't a line to hand out.)
         if limit == Some(0) {
             return None;
@@ -8172,7 +8184,7 @@ impl PyFile {
                 // Bytes wait here only on an open stream that has been read.
                 let mut ra = self.read_ahead.try_borrow_mut().ok()?;
                 let n = line_take(ra.rest(), end, cut(ra.rest()))?;
-                let line = make(&ra.rest()[..n])?;
+                let line = take(make(&ra.rest()[..n])?)?;
                 ra.consume(n);
                 Some(line)
             }
@@ -8183,7 +8195,7 @@ impl PyFile {
                 let d = data.try_borrow().ok()?;
                 let rest = d.get(*pos..).filter(|r| !r.is_empty())?;
                 let n = line_take(rest, end, cut(rest)).unwrap_or(rest.len());
-                let line = make(&rest[..n])?;
+                let line = take(make(&rest[..n])?)?;
                 *pos += n;
                 Some(line)
             }
@@ -8193,7 +8205,7 @@ impl PyFile {
                 }
                 let rest = data.as_bytes().get(*pos..).filter(|r| !r.is_empty())?;
                 let n = line_take(rest, end, utf8_limit(rest, limit)).unwrap_or(rest.len());
-                let line = make(&rest[..n])?;
+                let line = take(make(&rest[..n])?)?;
                 *pos += n;
                 Some(line)
             }

@@ -2481,6 +2481,18 @@ branch and pull request.
     reads a stream's cached method first (`BytesIO.write(b)` 968
     instructions to 889, `read(64)` 881 to 763, `tell()` 574 to 490;
     CPython 627, 545 and 340).
+  - A `for` loop over a csv reader reached its native `__next__` through
+    the interpreter on every row, since the reader may call Python (its
+    input iterator, or `float` for the numeric quoting styles): 8,460
+    instructions a row for a five-field line from a list, CPython 4,250.
+    The reader has a leaf half now. It takes a line from a list or tuple
+    iterator, or from a text stream that holds it in its buffer, when the
+    line is one whole record. A line with only delimiters to interpret is
+    split on them, and any other runs through the parser in place, the
+    stream's line consumed only once the parse has finished the record.
+    Rows cost 3,340 from a list, 6,400 for quoted fields (9,020 before,
+    CPython 4,570), 3,860 from a `StringIO` (9,020, CPython 4,950), and
+    4,010 from a file (9,230, CPython 4,950).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

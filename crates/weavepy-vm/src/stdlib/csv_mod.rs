@@ -706,6 +706,32 @@ enum St {
     AfterEscapedCrnl,
 }
 
+/// How [`Parser::save_field`] converts an unquoted field to a `float` for
+/// the numeric quoting styles: through `float` itself, or (for the leaf
+/// half, which never reads with those styles) not at all.
+trait FloatConv {
+    fn to_float(&mut self, val: Object) -> Result<Object, RuntimeError>;
+}
+
+impl FloatConv for Interpreter {
+    fn to_float(&mut self, val: Object) -> Result<Object, RuntimeError> {
+        self.call_object(
+            Object::Type(builtin_types().float_.clone()),
+            std::slice::from_ref(&val),
+            &[],
+        )
+    }
+}
+
+/// The leaf half's [`FloatConv`]: it declines the styles that convert.
+struct NoFloats;
+
+impl FloatConv for NoFloats {
+    fn to_float(&mut self, _val: Object) -> Result<Object, RuntimeError> {
+        Err(type_error("this reader converts no fields"))
+    }
+}
+
 struct Parser {
     cfg: DialectCfg,
     state: St,
@@ -739,7 +765,7 @@ impl Parser {
         Ok(())
     }
 
-    fn save_field(&mut self, interp: &mut Interpreter) -> Result<(), RuntimeError> {
+    fn save_field(&mut self, interp: &mut impl FloatConv) -> Result<(), RuntimeError> {
         let q = self.cfg.quoting;
         if self.unquoted && self.field_len == 0 && (q == QUOTE_NOTNULL || q == QUOTE_STRINGS) {
             self.fields.push(Object::None);
@@ -747,11 +773,7 @@ impl Parser {
             let mut val = crate::builtins::bridge_to_object(&self.field);
             if self.unquoted && self.field_len != 0 && (q == QUOTE_NONNUMERIC || q == QUOTE_STRINGS)
             {
-                val = interp.call_object(
-                    Object::Type(builtin_types().float_.clone()),
-                    std::slice::from_ref(&val),
-                    &[],
-                )?;
+                val = interp.to_float(val)?;
             }
             self.fields.push(val);
         }
@@ -823,6 +845,24 @@ impl Parser {
         true
     }
 
+    /// Run one line through the machine, then its end-of-line marker.
+    /// Runs of a field's ordinary characters go in whole; the characters
+    /// that mean something go through [`Parser::process`].
+    fn feed_line(&mut self, interp: &mut impl FloatConv, line: &str) -> Result<(), RuntimeError> {
+        let mut at = 0;
+        while at < line.len() {
+            let run = self.plain_run(&line.as_bytes()[at..]);
+            if run > 0 && self.add_run(&line[at..at + run]) {
+                at += run;
+                continue;
+            }
+            let ch = line[at..].chars().next().expect("at a character");
+            self.process(interp, Some(ch))?;
+            at += ch.len_utf8();
+        }
+        self.process(interp, None)
+    }
+
     fn is_quote(&self, c: Option<char>) -> bool {
         self.cfg.quotechar.is_some_and(|q| c == Some(q))
     }
@@ -831,7 +871,11 @@ impl Parser {
         self.cfg.escapechar.is_some_and(|e| c == Some(e))
     }
 
-    fn process(&mut self, interp: &mut Interpreter, c: Option<char>) -> Result<(), RuntimeError> {
+    fn process(
+        &mut self,
+        interp: &mut impl FloatConv,
+        c: Option<char>,
+    ) -> Result<(), RuntimeError> {
         match self.state {
             St::StartRecord => {
                 if c.is_none() {
@@ -925,7 +969,7 @@ impl Parser {
 
     fn process_start_field(
         &mut self,
-        interp: &mut Interpreter,
+        interp: &mut impl FloatConv,
         c: Option<char>,
     ) -> Result<(), RuntimeError> {
         self.unquoted = true;
@@ -954,7 +998,7 @@ impl Parser {
 
     fn process_in_field(
         &mut self,
-        interp: &mut Interpreter,
+        interp: &mut impl FloatConv,
         c: Option<char>,
     ) -> Result<(), RuntimeError> {
         if matches!(c, None | Some('\n') | Some('\r')) {
@@ -1096,20 +1140,7 @@ fn reader_iternext(args: &[Object]) -> Result<Object, RuntimeError> {
                             }
                         }
                     }
-                    // Runs of a field's ordinary characters go in whole; the
-                    // characters that mean something go through the machine.
-                    let mut at = 0;
-                    while at < line.len() {
-                        let run = p.plain_run(&line.as_bytes()[at..]);
-                        if run > 0 && p.add_run(&line[at..at + run]) {
-                            at += run;
-                            continue;
-                        }
-                        let ch = line[at..].chars().next().expect("at a character");
-                        p.process(interp, Some(ch))?;
-                        at += ch.len_utf8();
-                    }
-                    p.process(interp, None)?;
+                    p.feed_line(interp, &line)?;
                 }
             }
             if p.state == St::StartRecord {
@@ -1119,6 +1150,145 @@ fn reader_iternext(args: &[Object]) -> Result<Object, RuntimeError> {
         set_reader_value(&inst, &keys.fields_live, Object::Bool(false));
         Ok(Object::new_list(std::mem::take(&mut p.fields)))
     })
+}
+
+/// The reader's `__next__` leaf half: a line that is one whole record,
+/// read without the dispatch loop's full call, from a list or tuple
+/// iterator or from a text stream that has the line in its buffer (see
+/// `PyFile::next_line_pure`). A line with nothing to interpret but
+/// delimiters is split on them; any other runs through the machine. A
+/// record that goes on past its line, a line the machine raises on, a line
+/// that isn't a plain `str`, a quoting style that converts fields to
+/// `float`, a reader in the middle of a call or before its first row, and
+/// any other input decline to the full parser, which then reads the same
+/// line.
+fn reader_next_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Instance(inst)] = args else {
+        return None;
+    };
+    let keys = reader_keys();
+    let mut d = inst.dict_cell().try_borrow_mut().ok()?;
+    let src = match d.get(&keys.input_iter) {
+        Some(o @ Object::Iter(_)) => o.clone(),
+        Some(o @ Object::File(f)) if !f.binary => o.clone(),
+        _ => return None,
+    };
+    if !matches!(d.get(&keys.fields_live), Some(Object::Bool(false)))
+        || !matches!(d.get(&keys.line_num), Some(Object::Int(_)))
+    {
+        return None;
+    }
+    let cfg = d.get(&keys.cfg).and_then(unpack_reader_cfg)?;
+    if matches!(cfg.quoting, QUOTE_NONNUMERIC | QUOTE_STRINGS) {
+        return None;
+    }
+    let fields = match &src {
+        Object::Iter(it) => {
+            let mut it = it.try_borrow_mut().ok()?;
+            let (line, index) = match &mut *it {
+                crate::object::PyIterator::List { items, index, .. } => {
+                    let items = items.try_borrow().ok()?;
+                    match items.get(*index) {
+                        Some(Object::Str(s)) => (s.clone(), index),
+                        _ => return None,
+                    }
+                }
+                crate::object::PyIterator::Tuple { items, index } => match items.get(*index) {
+                    Some(Object::Str(s)) => (s.clone(), index),
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            let fields = record_fields(cfg, &line)?;
+            *index += 1;
+            fields
+        }
+        Object::File(f) => {
+            let fields = f.next_line_pure_with(None, |line| match &line {
+                Object::Str(s) => record_fields(cfg, s),
+                _ => None,
+            })?;
+            // (As a text stream's own `__next__` leaves it.)
+            f.telling.set(false);
+            fields
+        }
+        _ => return None,
+    };
+    if let Some(Object::Int(n)) = d.get_mut(&keys.line_num) {
+        *n += 1;
+    }
+    Some(Ok(Object::new_list(fields)))
+}
+
+/// The fields of `line` when it is one whole record the machine reads
+/// without raising (and without converting fields, which `cfg` doesn't).
+fn record_fields(cfg: DialectCfg, line: &str) -> Option<Vec<Object>> {
+    if let Some(fields) = split_plain(&cfg, line) {
+        return Some(fields);
+    }
+    let mut p = Parser::new(cfg);
+    // (Sized once: no field is longer than its line, and a record has at
+    // most one field more than the line has delimiters.)
+    p.field.reserve(line.len());
+    if p.cfg.delimiter.is_ascii() {
+        let d = p.cfg.delimiter as u8;
+        p.fields
+            .reserve(memchr::memchr_iter(d, line.as_bytes()).count() + 1);
+    }
+    p.feed_line(&mut NoFloats, line).ok()?;
+    (p.state == St::StartRecord).then_some(p.fields)
+}
+
+/// `line`'s fields when it has nothing to interpret but delimiters, which
+/// is what the machine makes of it: no quote, escape, carriage return or
+/// newline before the line's own terminator (`\n`, `\r` or `\r\n` at its
+/// end), a quoting style that leaves unquoted fields as they are, no
+/// `skipinitialspace`, ASCII dialect characters, and a line no longer than
+/// the field limit. `None` for any other line (and for an empty one).
+fn split_plain(cfg: &DialectCfg, line: &str) -> Option<Vec<Object>> {
+    if !matches!(cfg.quoting, QUOTE_MINIMAL | QUOTE_ALL | QUOTE_NONE) || cfg.skipinitialspace {
+        return None;
+    }
+    let ascii = |c: char| c.is_ascii().then_some(c as u8);
+    let delimiter = ascii(cfg.delimiter).filter(|&b| b != b'\r' && b != b'\n')?;
+    let quote = match cfg.quotechar {
+        None => None,
+        Some(q) => Some(ascii(q)?),
+    };
+    let escape = match cfg.escapechar {
+        None => None,
+        Some(e) => Some(ascii(e)?),
+    };
+    let bytes = line.as_bytes();
+    let special = match (quote, escape) {
+        (None, None) => memchr::memchr2(b'\n', b'\r', bytes),
+        (Some(a), None) | (None, Some(a)) => memchr::memchr3(a, b'\n', b'\r', bytes),
+        (Some(a), Some(b)) => bytes
+            .iter()
+            .position(|&c| c == a || c == b || c == b'\n' || c == b'\r'),
+    };
+    let body = match special {
+        None => bytes.len(),
+        Some(at) => match &bytes[at..] {
+            b"\n" | b"\r" | b"\r\n" => at,
+            _ => return None,
+        },
+    };
+    if body == 0 || body as i64 > FIELD_LIMIT.load(Ordering::Relaxed) {
+        return None;
+    }
+    let body = &line[..body];
+    let plain = body.is_ascii();
+    let count = memchr::memchr_iter(delimiter, body.as_bytes()).count() + 1;
+    let mut fields = Vec::with_capacity(count);
+    fields.extend(body.split(delimiter as char).map(|f| {
+        if plain {
+            Object::from_str(f)
+        } else {
+            crate::builtins::bridge_to_object(f)
+        }
+    }));
+    Some(fields)
 }
 
 /// `inst.<key> = value` on a reader's state: replaced in place when it is
@@ -1143,7 +1313,11 @@ fn reader_type() -> Rc<TypeObject> {
         let bt = builtin_types();
         let mut dict = DictData::default();
         dict.insert(key("__iter__"), method("__iter__", reader_iter_self));
-        dict.insert(key("__next__"), method("__next__", reader_iternext));
+        let next = method("__next__", reader_iternext);
+        if let Object::Builtin(b) = &next {
+            crate::leaf_builtins::register_fast(b, reader_next_fast);
+        }
+        dict.insert(key("__next__"), next);
         dict.insert(
             key("__new__"),
             Object::Builtin(Rc::new(BuiltinFn {
