@@ -2440,6 +2440,12 @@ branch and pull request.
     leaves it only when every total is native (359). And `zip` of three to
     eight list or tuple cursors checks and steps them in one pass, not two
     (`for x, y, z in zip(a, a, a)` 1,064 instructions a step to 1,025).
+  - A compiled call of a `functools.partial` read the partial's stored
+    function, arguments and keywords up to three times (for a pure leaf,
+    then a builtin, then a bound call), each through a thread-local and a
+    slot-layout check: they're read once now and the path chosen from the
+    function's kind (`partial(f, 1, c=3)()` 3,021 instructions to 2,766,
+    CPython 2,191).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

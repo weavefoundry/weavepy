@@ -17625,35 +17625,10 @@ impl Interpreter {
     /// call's, and the stored keywords bind by name (see
     /// [`Self::lean_bind_keywords`]), and the function runs as a frameless
     /// leaf, its result in place, or as an inline activation switched to
-    /// here. `false` touches nothing (the native `__call__` takes the call,
-    /// its errors included).
-    /// [`Self::core_partial_call`] of a partial over a builtin with a leaf
-    /// half and no stored keywords: the result, for `ops` the partial
-    /// instance and the call's positionals, of the builtin's leaf half
-    /// over the stored positionals and those (four at most). `None` for
-    /// anything else, a decline or an error.
-    fn core_partial_builtin(&self, ops: &[Object]) -> Option<Object> {
-        let [Object::Instance(inst), args @ ..] = ops else {
-            return None;
-        };
-        let mut buf: [Object; 4] = std::array::from_fn(|_| Object::None);
-        let (b, n) = crate::stdlib::functools_mod::with_partial_call(inst, |func, stored, kw| {
-            let Object::Builtin(b) = func else {
-                return None;
-            };
-            let n = stored.len() + args.len();
-            if !kw.is_empty() || b.binds_instance || n > buf.len() {
-                return None;
-            }
-            for (slot, v) in buf.iter_mut().zip(stored.iter().chain(args)) {
-                *slot = v.clone();
-            }
-            Some((b.clone(), n))
-        })?;
-        let kind = self.leaf_call_kind(&b)?;
-        self.leaf_builtin_call(kind, &b, &buf[..n])?.ok()
-    }
-
+    /// here. A partial over a builtin with a leaf half and no stored
+    /// keywords runs that half over the stored positionals and the call's
+    /// (four at most). `false` touches nothing (the native `__call__` takes
+    /// the call, its errors included).
     #[inline(never)]
     fn core_partial_call(&mut self, sw: &mut CoreSwitch, pc: usize) -> bool {
         // SAFETY: see `CoreSwitch`: the running activation is synced and
@@ -17673,87 +17648,98 @@ impl Interpreter {
         if !crate::stdlib::functools_mod::is_partial_call(b) {
             return false;
         }
-        // A warm pure leaf evaluates in place, its arguments borrowed.
+        // The partial's fields, read once: a warm pure leaf evaluates in
+        // place, its arguments borrowed; a builtin with a leaf half runs
+        // over the merged arguments (`partial(operator.add, 1)`); any other
+        // function's arguments bind for the lean call below.
+        enum Step {
+            Done(Object),
+            Builtin(Rc<crate::object::BuiltinFn>, usize),
+            Bound(Rc<crate::object::PyFunction>),
+        }
         let depth = crate::recursion::current_depth();
         let args = &frame.stack[callee_slot + 2..];
-        let r = crate::stdlib::functools_mod::with_partial_call(inst, |func, stored, kw| {
-            let Object::Function(f) = func else {
-                return None;
-            };
-            // SAFETY: GIL-serialized raw read of the function's code cell;
-            // the partial holds the function.
-            let code = unsafe { &*f.code.as_ptr() };
-            if !code_is_pure_leaf(code)
-                || !pure_leaf_warm(code)
-                || depth >= crate::recursion::recursion_limit()
-            {
-                return None;
-            }
-            let mut ptrs = [std::ptr::null::<Object>(); 8];
-            let kw = kw.iter().map(|(k, v)| (&k.0, v));
-            let arity = Self::leaf_bind_keywords(f, code, stored, args, kw, &mut ptrs)?;
-            self.pure_leaf_call(code, f, &ptrs[..arity], false, depth)
-        });
-        if let Some(r) = r {
-            // The operands leave the stack, the result in their place.
-            self.release_call_operands(&mut frame.stack, callee_slot);
-            frame.stack.push(r);
-            frame.pc = pc as u32 + 1;
-            // SAFETY: the running activation's last-pc slot.
-            unsafe { *sw.last = pc };
-            // SAFETY: the running thread's own flag (see `quiet_run`).
-            if unsafe { (*sw.maybe_dead).get() } {
-                sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
-            }
-            return true;
-        }
-        // A builtin with a leaf half over the merged arguments
-        // (`partial(operator.add, 1)`): its result in place. A decline or
-        // an error leaves the call to the native `__call__`, which repeats
-        // it (a leaf runs no code, so nothing is observed twice).
-        if let Some(r) = self.core_partial_builtin(&frame.stack[callee_slot + 1..]) {
-            self.release_call_operands(&mut frame.stack, callee_slot);
-            frame.stack.push(r);
-            frame.pc = pc as u32 + 1;
-            // SAFETY: the running activation's last-pc slot.
-            unsafe { *sw.last = pc };
-            // SAFETY: the running thread's own flag (see `quiet_run`).
-            if unsafe { (*sw.maybe_dead).get() } {
-                sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
-            }
-            return true;
-        }
+        let mut buf: [Object; 4] = std::array::from_fn(|_| Object::None);
         let mut bound: Vec<Object> = self.pooled_scratch();
-        let f = {
-            let stack = &frame.stack;
-            let Object::Instance(inst) = &stack[callee_slot + 1] else {
-                return false;
-            };
-            let args = &stack[callee_slot + 2..];
-            crate::stdlib::functools_mod::with_partial_call(inst, |func, stored, kw| {
-                let Object::Function(f) = func else {
-                    return None;
-                };
-                // SAFETY: GIL-serialized raw read of the function's code
-                // cell; the partial holds the function.
-                let code = unsafe { &*f.code.as_ptr() };
-                if code.is_generator
-                    || code.is_coroutine
-                    || code.is_async_generator
-                    || (f.defaults_maybe_overridden()
-                        && (f.slot("__defaults__").is_some() || f.slot("__kwdefaults__").is_some()))
-                {
-                    return None;
+        let step = crate::stdlib::functools_mod::with_partial_call(inst, |func, stored, kw| {
+            match func {
+                Object::Function(f) => {
+                    // SAFETY: GIL-serialized raw read of the function's
+                    // code cell; the partial holds the function.
+                    let code = unsafe { &*f.code.as_ptr() };
+                    if code_is_pure_leaf(code)
+                        && pure_leaf_warm(code)
+                        && depth < crate::recursion::recursion_limit()
+                    {
+                        let mut ptrs = [std::ptr::null::<Object>(); 8];
+                        let kws = kw.iter().map(|(k, v)| (&k.0, v));
+                        if let Some(arity) =
+                            Self::leaf_bind_keywords(f, code, stored, args, kws, &mut ptrs)
+                        {
+                            if let Some(r) =
+                                self.pure_leaf_call(code, f, &ptrs[..arity], false, depth)
+                            {
+                                return Some(Step::Done(r));
+                            }
+                        }
+                    }
+                    if code.is_generator
+                        || code.is_coroutine
+                        || code.is_async_generator
+                        || (f.defaults_maybe_overridden()
+                            && (f.slot("__defaults__").is_some()
+                                || f.slot("__kwdefaults__").is_some()))
+                    {
+                        return None;
+                    }
+                    let kws = kw.iter().map(|(k, v)| (&k.0, v));
+                    Self::lean_bind_keywords(f, code, stored, args, kws, &mut bound)?;
+                    Some(Step::Bound(f.clone()))
                 }
-                let kw = kw.iter().map(|(k, v)| (&k.0, v));
-                Self::lean_bind_keywords(f, code, stored, args, kw, &mut bound)?;
-                Some(f.clone())
-            })
-        };
-        let Some(f) = f else {
-            bound.clear();
-            self.recycle_scratch(bound);
-            return false;
+                Object::Builtin(b) => {
+                    let n = stored.len() + args.len();
+                    if !kw.is_empty() || b.binds_instance || n > buf.len() {
+                        return None;
+                    }
+                    for (slot, v) in buf.iter_mut().zip(stored.iter().chain(args)) {
+                        *slot = v.clone();
+                    }
+                    Some(Step::Builtin(b.clone(), n))
+                }
+                _ => None,
+            }
+        });
+        let f = match step {
+            Some(Step::Bound(f)) => f,
+            other => {
+                let r = match other {
+                    Some(Step::Done(r)) => Some(r),
+                    // (A decline or an error leaves the call to the native
+                    // `__call__`, which repeats it: a leaf runs no code, so
+                    // nothing is observed twice.)
+                    Some(Step::Builtin(b, n)) => self
+                        .leaf_call_kind(&b)
+                        .and_then(|kind| self.leaf_builtin_call(kind, &b, &buf[..n]))
+                        .and_then(Result::ok),
+                    _ => None,
+                };
+                bound.clear();
+                self.recycle_scratch(bound);
+                let Some(r) = r else {
+                    return false;
+                };
+                // The operands leave the stack, the result in their place.
+                self.release_call_operands(&mut frame.stack, callee_slot);
+                frame.stack.push(r);
+                frame.pc = pc as u32 + 1;
+                // SAFETY: the running activation's last-pc slot.
+                unsafe { *sw.last = pc };
+                // SAFETY: the running thread's own flag (see `quiet_run`).
+                if unsafe { (*sw.maybe_dead).get() } {
+                    sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
+                }
+                return true;
+            }
         };
         let code = f.code();
         // A frameless leaf evaluates in place.
