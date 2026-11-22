@@ -1886,6 +1886,93 @@ fn most_common_plain(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(list)
 }
 
+/// The original `Logger.isEnabledFor` the native log methods require of a
+/// logger's class (see [`log_methods`]).
+static LOG_IS_ENABLED_FOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `_log_methods(Logger)`: native `debug`, `info`, `warning`, `error` and
+/// `critical` for `logging.Logger`, as `(name, method)` pairs for the
+/// module to assign. A call on a logger that is disabled for the level, as
+/// its class's own `isEnabledFor` would find it (`disabled`, or `False`
+/// cached for the level), with no keywords and no trace or profile hook
+/// set, returns `None` at once; anything else calls the Python method.
+fn log_methods(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Type(cls)] = args else {
+        return Err(type_error("_log_methods() expects the Logger class"));
+    };
+    let dict = cls.dict.borrow();
+    let Some(Object::Function(enabled)) = dict.get(&crate::object::StrKey("isEnabledFor")) else {
+        return Err(type_error("_log_methods(): no isEnabledFor"));
+    };
+    LOG_IS_ENABLED_FOR.store(
+        Rc::as_ptr(enabled) as usize,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let table: [(&'static str, crate::stdlib::struct_mod::Fast); 5] = [
+        ("debug", |a| log_disabled(a, 10)),
+        ("info", |a| log_disabled(a, 20)),
+        ("warning", |a| log_disabled(a, 30)),
+        ("error", |a| log_disabled(a, 40)),
+        ("critical", |a| log_disabled(a, 50)),
+    ];
+    let mut out = Vec::with_capacity(table.len());
+    for (name, fast) in table {
+        let orig = dict
+            .get(&crate::object::StrKey(name))
+            .cloned()
+            .ok_or_else(|| type_error(format!("_log_methods(): no {name} to replace")))?;
+        out.push(Object::new_tuple(vec![
+            Object::from_static(name),
+            crate::stdlib::struct_mod::fast_method(cls, name, fast, orig, true),
+        ]));
+    }
+    Ok(Object::new_list(out))
+}
+
+/// A log method's leaf half: `None` for a call at `level` on a logger the
+/// level is disabled for (see [`log_methods`]); `None`, the call left to
+/// the Python method, for anything else.
+fn log_disabled(args: &[Object], level: i64) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Instance(inst), _msg, ..] = args else {
+        return None;
+    };
+    if crate::trace::any_observers_active() {
+        return None;
+    }
+    let enabled = crate::Interpreter::instance_dunder_function(
+        inst,
+        crate::types::AttrKey::vm(crate::types::vm_key::LOG_ENABLED_FOR),
+        "isEnabledFor",
+    )?;
+    if Rc::as_ptr(&enabled) as usize
+        != LOG_IS_ENABLED_FOR.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return None;
+    }
+    // (The two names' hashes, once per process.)
+    static HASHES: std::sync::OnceLock<(i64, i64)> = std::sync::OnceLock::new();
+    let &(disabled, cache) = HASHES.get_or_init(|| {
+        (
+            crate::object::py_str_hash("disabled"),
+            crate::object::py_str_hash("_cache"),
+        )
+    });
+    match inst.attr_get_hashed("disabled", disabled)? {
+        Object::Bool(true) => return Some(Ok(Object::None)),
+        Object::Bool(false) => {}
+        _ => return None,
+    }
+    let Object::Dict(cache) = inst.attr_get_hashed("_cache", cache)? else {
+        return None;
+    };
+    let cached = cache
+        .try_borrow()
+        .ok()?
+        .get(&crate::object::LeafProbe::new(&Object::Int(level))?)
+        .cloned();
+    matches!(cached, Some(Object::Bool(false))).then_some(Ok(Object::None))
+}
+
 /// How deep [`deep_plain`] nests before leaving the copy to Python.
 const DEEPCOPY_DEPTH: u32 = 200;
 
@@ -1999,6 +2086,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 deepcopy_plain as fn(&[Object]) -> Result<Object, RuntimeError>,
             ),
             ("_most_common_plain", most_common_plain),
+            ("_log_methods", log_methods),
         ] {
             d.insert(
                 DictKey(Object::from_static(name)),

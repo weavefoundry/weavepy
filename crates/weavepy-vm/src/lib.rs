@@ -32851,7 +32851,7 @@ impl Interpreter {
         found
     }
 
-    fn instance_dunder_function(
+    pub(crate) fn instance_dunder_function(
         inst: &PyInstance,
         key: crate::types::AttrKey,
         name: &str,
@@ -87547,18 +87547,20 @@ pub(crate) fn inst_builtin_method_site(
 }
 
 /// Whether a method `cls` (an instance's class at the version its site
-/// cached) resolved stays the one an attribute read finds: the class reads
-/// attributes the default way, and `inst` holds none of its own.
+/// cached) resolved as `name` (Python hash `hash`) stays the one an
+/// attribute read finds: the class reads attributes the default way, and
+/// `inst` holds no attribute of that name.
 #[cfg(feature = "jit")]
 #[inline]
-pub(crate) fn inst_method_unshadowed(
+pub(crate) fn inst_method_unshadowed_by(
     cls: &crate::types::TypeObject,
     inst: &crate::types::PyInstance,
+    name: &str,
+    hash: i64,
 ) -> bool {
-    inst.dict.published().is_none()
+    Interpreter::default_getattribute(cls)
         // SAFETY: a read between two instructions (see `GilCell::peek`).
-        && unsafe { inst.dict.split_cell().peek() }.is_some_and(|s| s.is_empty())
-        && Interpreter::default_getattribute(cls)
+        && unsafe { inst.attr_peek_has(name, hash) } == Some(false)
 }
 
 /// The leaf builtin's kind the `CALL` at `pc` last settled on.

@@ -843,6 +843,8 @@ pub(crate) mod vm_key {
     /// The leaf half of a class's native `__call__` (an `itemgetter`'s),
     /// for callbacks that call its instances (`map`, a sort's key).
     pub(crate) const CALL_LEAF: u32 = 118;
+    /// A logger class's `isEnabledFor`, for the native log methods.
+    pub(crate) const LOG_ENABLED_FOR: u32 = 119;
 }
 
 /// A builtin type's pure constructor (see [`TypeObject::pure_new`]).

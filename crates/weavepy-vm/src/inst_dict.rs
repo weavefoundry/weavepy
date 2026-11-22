@@ -1563,6 +1563,24 @@ impl crate::types::PyInstance {
         }
     }
 
+    /// [`Self::attr_get_str`] of a name whose Python hash is `hash`: the
+    /// split layout finds it by the hash first, a name no instance of the
+    /// class set answering without a comparison.
+    pub fn attr_get_hashed(&self, name: &str, hash: i64) -> Option<Object> {
+        match self.dict.published() {
+            Some(d) => d
+                .try_borrow()
+                .ok()?
+                .get(&crate::object::StrKey(name))
+                .cloned(),
+            None => {
+                let s = self.dict.split_cell().try_borrow().ok()?;
+                let i = s.position_hashed(name, hash)?;
+                s.get_index(i).map(|(_, v)| v.clone())
+            }
+        }
+    }
+
     /// Attribute `name`'s value (either layout), without materializing
     /// a split layout and without running code.
     pub fn attr_get_str(&self, name: &str) -> Option<Object> {

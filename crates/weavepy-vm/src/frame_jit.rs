@@ -7453,6 +7453,10 @@ pub(crate) struct InstMethodSite {
     ver: u64,
     nargs: u32,
     call_pc: u32,
+    /// The method's name and its Python hash: an instance whose own
+    /// attributes hold the name shadows the method.
+    name: Box<str>,
+    hash: i64,
 }
 
 /// `x.m(a, b)` (the site's `nargs` of them, at `a` and `b`) on the instance
@@ -7461,8 +7465,8 @@ pub(crate) struct InstMethodSite {
 /// at `out`; `RAISED` the method raised (the error in the state, the stack
 /// `len` deep and its last instruction the call); anything else declined
 /// untouched, when the receiver's class isn't at the site's version, reads
-/// attributes its own way, or the instance holds attributes (which could
-/// shadow the method).
+/// attributes its own way, or the instance holds an attribute of the
+/// method's name (which shadows it).
 unsafe extern "C" fn h_inst_native(
     st: *mut State,
     out: *mut Object,
@@ -7480,7 +7484,9 @@ unsafe extern "C" fn h_inst_native(
             return 1;
         };
         let cls = inst.cls_raw();
-        if cls.attr_version.get() != site.ver || !crate::inst_method_unshadowed(cls, inst) {
+        if cls.attr_version.get() != site.ver
+            || !crate::inst_method_unshadowed_by(cls, inst, &site.name, site.hash)
+        {
             return 1;
         }
         // Bitwise views, never dropped: the method reads them (and clones
@@ -21422,12 +21428,20 @@ impl<'a> Lower<'a> {
             };
             addrs.push(at);
         }
+        let name: Box<str> = self
+            .code
+            .names
+            .get(self.code.instructions[pc + 1].arg as usize)
+            .map_or_else(|| Box::from(""), |n| Box::from(n.as_str()));
+        let hash = crate::object::py_str_hash(&name);
         let site = Box::new(InstMethodSite {
             f,
             fast,
             ver,
             nargs: args.len() as u32,
             call_pc: call_pc as u32,
+            name,
+            hash,
         });
         let sp = self
             .b

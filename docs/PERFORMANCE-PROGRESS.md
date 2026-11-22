@@ -2309,6 +2309,16 @@ branch and pull request.
     CPython 1.8). An exact `Counter` whose counts are all ints now sorts
     them natively, largest first and equal counts in insertion order, as
     `nlargest` orders them.
+  - A disabled level's `logger.debug(...)` ran two Python calls, `debug`
+    with its `*args` and `**kwargs`, then `isEnabledFor` (214 ns, CPython
+    141). `Logger`'s five level methods are native now: on a logger whose
+    class keeps `logging`'s own `isEnabledFor`, with the logger disabled or
+    `False` cached for the level, no keywords and no trace hook, they
+    return at once; everything else is the Python method (119 ns; `info`
+    186 to 107, CPython 106). And compiled calls of a native method on an
+    instance ran it in place only when the instance had no attributes at
+    all: now when it has none of the method's name (a `Logger`, the
+    `random` module's `Random`).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
