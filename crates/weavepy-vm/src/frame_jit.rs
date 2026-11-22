@@ -7438,6 +7438,19 @@ unsafe extern "C" fn h_local_method(
         let st = &mut *st;
         let (code, ext, pc) = (&*code, &*ext, pc as usize);
         let local = &*st.locals.add(code.instructions[pc].arg as usize);
+        // (The receivers `core_local_method` serves; any other, a stream
+        // say, declines here before its set-up.)
+        if !matches!(
+            local,
+            Object::Instance(_)
+                | Object::Module(_)
+                | Object::List(_)
+                | Object::Dict(_)
+                | Object::Set(_)
+                | Object::Str(_)
+        ) {
+            return 1;
+        }
         let Some((r, call_pc)) = (*st.interp).core_local_method::<false>(
             code,
             Some(ext),
@@ -8450,6 +8463,17 @@ unsafe extern "C" fn h_method(st: *mut State, site: *mut MethodSite) -> u32 {
             top.write(f);
             (*st).stack.add(s.len as usize).write(recv);
             return 0;
+        }
+        // A native stream's method of the kind the site loaded it for (as
+        // `method_slow` finds it, without its other lanes' checks).
+        if let (Object::File(_), Some((want, f))) = (&*top, &s.stream) {
+            if crate::builtins::method_memo_tag(&*top) == Some(*want) {
+                let f = crate::clone_hot(f);
+                let recv = top.read();
+                top.write(f);
+                (*st).stack.add(s.len as usize).write(recv);
+                return 0;
+            }
         }
         method_slow(st, site)
     }

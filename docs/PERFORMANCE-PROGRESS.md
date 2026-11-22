@@ -2474,6 +2474,13 @@ branch and pull request.
     1,119 instructions a call, CPython 340 and 459): an open `BytesIO`
     with nothing read ahead or written to flush is served by leaf halves
     now, `seek` for an absolute position not below zero (574 and 608).
+    And every compiled `f.method(...)` of a native stream first tried the
+    fused local-method call, which serves instances and containers only,
+    and then found the stream's method past the slow loader's other lanes:
+    other receivers decline the fused call at once now, and the loader
+    reads a stream's cached method first (`BytesIO.write(b)` 968
+    instructions to 889, `read(64)` 881 to 763, `tell()` 574 to 490;
+    CPython 627, 545 and 340).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

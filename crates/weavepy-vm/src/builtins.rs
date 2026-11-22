@@ -19434,13 +19434,11 @@ fn file_read_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
         _ => return None,
     };
     if f.binary {
-        // (A buffered disk file's read the read-ahead holds whole.)
-        if let Some(v) = n.and_then(|n| f.read_ahead_pure(n)) {
+        if let Some(v) = f.mem_bytes_read_with(n, |run| (Object::new_bytes(run), run.len())) {
             return Some(Ok(v));
         }
-        return f
-            .mem_bytes_read_with(n, |run| (Object::new_bytes(run), run.len()))
-            .map(Ok);
+        // (A buffered disk file's read the read-ahead holds whole.)
+        return n.and_then(|n| f.read_ahead_pure(n)).map(Ok);
     }
     f.mem_text_read_ascii(n).map(Ok)
 }
