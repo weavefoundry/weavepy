@@ -10009,10 +10009,14 @@ impl Interpreter {
                 // The interned empty tuple.
                 Object::new_tuple(Vec::new())
             } else {
-                Object::Tuple(crate::tuple_storage::TupleStorage::from_exact_iter(
-                    // SAFETY: the caller's contract.
-                    (direct..nargs).map(|k| unsafe { src.add(k).read() }),
-                ))
+                // SAFETY: the caller's contract: the surplus arguments move
+                // into the tuple.
+                Object::Tuple(unsafe {
+                    crate::tuple_storage::TupleStorage::from_moved_raw(
+                        src.add(direct),
+                        nargs - direct,
+                    )
+                })
             }
         });
         if missing > 0 {

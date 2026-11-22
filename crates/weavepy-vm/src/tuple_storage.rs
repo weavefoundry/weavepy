@@ -64,6 +64,23 @@ impl TupleStorage {
         }
     }
 
+    /// A tuple of the `len` objects at `src`, moved in whole (a `*args`
+    /// run out of a call's operands).
+    ///
+    /// # Safety
+    ///
+    /// `src` holds `len` initialized objects whose ownership passes to the
+    /// tuple: the caller forgets them.
+    pub unsafe fn from_moved_raw(src: *const Object, len: usize) -> SharedTuple {
+        // SAFETY: per the caller, the `len` objects move bitwise into the
+        // tuple's slots (which neither runs code nor unwinds).
+        unsafe {
+            Self::filled(len, |destination| {
+                std::ptr::copy_nonoverlapping(src, destination, len);
+            })
+        }
+    }
+
     /// A tuple of clones of `items`: the elements copied whole in one
     /// pass, then their counts taken in a second (an element moved
     /// through an iterator goes by way of the stack in two unaligned

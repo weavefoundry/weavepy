@@ -2319,6 +2319,9 @@ branch and pull request.
     instance ran it in place only when the instance had no attributes at
     all: now when it has none of the method's name (a `Logger`, the
     `random` module's `Random`).
+  - A call binding a `*args` tuple moved the surplus arguments into it one
+    at a time through an iterator, each by way of the stack: they move in
+    one copy now (`f(*t)` of three items 1,166 instructions to 1,120).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
