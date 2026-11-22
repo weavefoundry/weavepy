@@ -1,4 +1,5 @@
-"""`random.Random`'s `randint`, `randrange` and `choice` run natively.
+"""`random.Random`'s `randint`, `randrange`, `choice` and `shuffle` run
+natively.
 
 For the `Random` class itself, with plain int arguments, each draws exactly
 as `_randbelow_with_getrandbits` does (the same numbers from the same
@@ -37,6 +38,40 @@ class RandomIntMethodsTests(unittest.TestCase):
                 self.assertEqual(a.choice((7, 8)), (7, 8)[randbelow(b, 2)])
                 self.assertEqual(a.random(), b.random())
             self.assertEqual(a.getstate(), b.getstate())
+
+    def test_shuffle_matches_the_algorithm(self):
+        for seed in (0, 7, 99):
+            a, b = random.Random(seed), random.Random(seed)
+            for n in (0, 1, 2, 10, 100):
+                xs = list(range(n))
+                ys = list(range(n))
+                a.shuffle(xs)
+                for i in reversed(range(1, n)):
+                    j = randbelow(b, i + 1)
+                    ys[i], ys[j] = ys[j], ys[i]
+                self.assertEqual(xs, ys)
+            self.assertEqual(a.getstate(), b.getstate())
+        words = ["a", "b", "c"]
+        random.shuffle(words)
+        self.assertEqual(sorted(words), ["a", "b", "c"])
+        t = random.Random(1)
+        arr = bytearray(b"abc")
+        t.shuffle(arr)
+        self.assertEqual(sorted(arr), [97, 98, 99])
+        with self.assertRaises(TypeError):
+            t.shuffle((1, 2))
+
+    def test_uniform_matches(self):
+        for seed in (0, 3):
+            a, b = random.Random(seed), random.Random(seed)
+            for _ in range(300):
+                self.assertEqual(a.uniform(1.5, 9.25), 1.5 + (9.25 - 1.5) * b.random())
+                self.assertEqual(a.uniform(-3, 40), -3 + (40 - -3) * b.random())
+                self.assertEqual(a.uniform(10, 2), 10 + (2 - 10) * b.random())
+        g = random.Random(1)
+        g.random = [0.5].pop
+        self.assertEqual(g.uniform(0, 10), 5.0)
+        self.assertEqual(random.Random(2).uniform(2**80, 2**80), float(2**80))
 
     def test_other_shapes(self):
         r = random.Random(3)
@@ -90,10 +125,12 @@ class TracedTests(unittest.TestCase):
         try:
             r.randint(1, 4)
             r.choice([1, 2])
+            r.shuffle([1, 2, 3])
         finally:
             sys.settrace(None)
         self.assertIn("randint", seen)
         self.assertIn("choice", seen)
+        self.assertIn("shuffle", seen)
 
 
 if __name__ == "__main__":

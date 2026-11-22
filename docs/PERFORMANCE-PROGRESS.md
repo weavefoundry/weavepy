@@ -2289,9 +2289,12 @@ branch and pull request.
     int arguments (a list, tuple or ASCII string for `choice`), they're
     native now, drawing as `_randbelow_with_getrandbits` draws, so a seeded
     stream is the same as CPython's (108, 94 and 109 ns; CPython 171, 157
-    and 167). Anything else calls the Python method, as does every call
-    while a trace or profile hook is set (a debugger steps into
-    `randint`: `test_pdb` does).
+    and 167). `shuffle` of a list is native the same way (100 items 13.5
+    µs to 3.0; CPython 13.7). Anything else calls the Python method, as
+    does every call while a trace or profile hook is set (a debugger steps
+    into `randint`: `test_pdb` does). (A native `uniform` was slower than
+    the compiled Python one, whose `self.random()` compiled code already
+    calls natively: its guards cost more than the call.)
   - `copy.deepcopy` walked every container through `copy.py`'s Python
     dispatch (a small nested dict 6.3 µs, CPython 3.8; fifty rows of dicts,
     lists and tuples 228 µs, CPython 153). A tree of exact dicts, lists and

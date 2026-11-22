@@ -480,7 +480,8 @@ fn random_getrandbits(args: &[Object]) -> Result<Object, RuntimeError> {
 static PY_RANDOM_CLASS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static PY_RANDOM_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// `_int_methods(Random)`: native `randint`, `randrange` and `choice` for
+/// `_int_methods(Random)`: native `randint`, `randrange`, `choice` and
+/// `shuffle` for
 /// `random.py`'s `Random` class, as `(name, method)` pairs for the module
 /// to assign. Each serves an instance of the class itself, unchanged since,
 /// whose `_randbelow` and `getrandbits` are the class's, with plain int
@@ -496,6 +497,7 @@ fn int_methods(args: &[Object]) -> Result<Object, RuntimeError> {
         ("randint", randint_fast as crate::stdlib::struct_mod::Fast),
         ("randrange", randrange_fast),
         ("choice", choice_fast),
+        ("shuffle", shuffle_fast),
     ] {
         let orig = cls
             .dict
@@ -629,6 +631,22 @@ fn choice_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
         Object::Str(s) => Object::from_str(&s[i..=i]),
         _ => return None,
     }))
+}
+
+/// `shuffle(x)` of a list, of a plain `Random` (see [`int_methods`]):
+/// `random.py`'s Fisher-Yates walk from the end, each swap partner drawn as
+/// `_randbelow(i + 1)` draws it. (Swapping items runs no code.)
+fn shuffle_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [recv, Object::List(l)] = args else {
+        return None;
+    };
+    let inst = plain_random(recv)?;
+    let mut xs = l.try_borrow_mut().ok()?;
+    for i in (1..xs.len()).rev() {
+        let j = randbelow(inst, i as u64 + 1) as usize;
+        xs.swap(i, j);
+    }
+    Some(Ok(Object::None))
 }
 
 /// `getrandbits`'s leaf half: an exact `int` or `bool` count never runs
