@@ -2501,6 +2501,24 @@ branch and pull request.
     by address now and copy each into the tuple whole (85), so
     `list(combinations(range(8), 3))` costs 24,950 instructions on x86
     (27,250 before).
+  - A `for` loop over `struct.iter_unpack("<I", b)` cost 1,100
+    instructions a record (CPython 560). The iterator's leaf half read its
+    slots under one borrow, cloned the format and buffer out, and then
+    borrowed the slots again to move the offset; it reads and moves them
+    under a single borrow now. And a dropped tuple was cleared slot by
+    slot for the tuple free list before the list was found full, which a
+    loop that only drops tuples keeps it: a full bucket takes nothing now,
+    and a tuple of scalars is freed as it is (one holding objects still
+    releases them last first, as CPython's tuple does). Records cost 900
+    (756 on x86, 971 before).
+  - `bytes.startswith` and `endswith` (and `bytearray`'s) went through
+    the full method's arity and window checks on every call (922
+    instructions for `ba.startswith(b"\x00\x01")`, CPython 600). One
+    `bytes` or `bytearray` affix with no window runs as a leaf half now.
+  - `BytesIO.getvalue()` of an unchanged buffer returned its cached value
+    after taking a guarded borrow of the stream's state, its buffer, and
+    the cache each (730 instructions a call, CPython 350). The leaf half
+    reads them through guard-free views first now (575).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

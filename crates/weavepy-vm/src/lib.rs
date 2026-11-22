@@ -2775,13 +2775,37 @@ impl Interpreter {
 
     fn maybe_donate_tuple(&self, dropped: Object) {
         const PER_LEN_CAP: usize = 8;
+        let scalar = |s: &Object| {
+            matches!(
+                s,
+                Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
+            )
+        };
+        let n = match &dropped {
+            Object::Tuple(t) => {
+                let n = t.len();
+                if n == 0 || n > 16 {
+                    return;
+                }
+                // A full bucket (a loop that only drops tuples fills it for
+                // good) takes nothing: a tuple of scalars goes as any other,
+                // without its slots cleared first. (Other items are released
+                // last first below, as CPython's tuple releases them.)
+                if t.iter().all(scalar)
+                    && !self
+                        .tuple_pool
+                        .try_borrow()
+                        .is_ok_and(|pool| pool[n - 1].len() < PER_LEN_CAP)
+                {
+                    return;
+                }
+                n
+            }
+            _ => return,
+        };
         let Object::Tuple(mut t) = dropped else {
             return;
         };
-        let n = t.len();
-        if n == 0 || n > 16 {
-            return;
-        }
         let Some(slots) = ThinArc::get_mut(&mut t) else {
             return;
         };

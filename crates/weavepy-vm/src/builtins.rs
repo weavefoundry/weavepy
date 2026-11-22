@@ -549,6 +549,14 @@ fn lookup_method_memo(obj: &Object, name: &str, tag: u8) -> Option<Object> {
             _ => {}
         }
     }
+    // `startswith`/`endswith` of one `bytes` or `bytearray` affix.
+    if let (Object::Bytes(_) | Object::ByteArray(_), Some(Object::Builtin(b))) = (obj, &found) {
+        match name {
+            "startswith" => crate::leaf_builtins::register_fast(b, bytes_startswith_fast),
+            "endswith" => crate::leaf_builtins::register_fast(b, bytes_endswith_fast),
+            _ => {}
+        }
+    }
     // A dict's `update` from another plain dict whose keys run no code.
     if let (Object::Dict(_), Some(Object::Builtin(b))) = (obj, &found) {
         match name {
@@ -17140,6 +17148,43 @@ fn bytes_fromhex(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
+/// `b.startswith(affix)` (`endswith` with `prefix` false) of a `bytes` or
+/// `bytearray` receiver and affix, with no window. A leaf half, like
+/// [`file_write_fast`].
+fn bytes_affix_fast(args: &[Object], prefix: bool) -> Option<Result<Object, RuntimeError>> {
+    let [recv, affix] = args else {
+        return None;
+    };
+    let test = |data: &[u8]| {
+        let with = |needle: &[u8]| {
+            if prefix {
+                data.starts_with(needle)
+            } else {
+                data.ends_with(needle)
+            }
+        };
+        match affix {
+            Object::Bytes(n) => Some(with(n)),
+            Object::ByteArray(n) => Some(with(&n.try_borrow().ok()?)),
+            _ => None,
+        }
+    };
+    let hit = match recv {
+        Object::Bytes(b) => test(b)?,
+        Object::ByteArray(b) => test(&b.try_borrow().ok()?)?,
+        _ => return None,
+    };
+    Some(Ok(Object::Bool(hit)))
+}
+
+fn bytes_startswith_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    bytes_affix_fast(args, true)
+}
+
+fn bytes_endswith_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    bytes_affix_fast(args, false)
+}
+
 fn bytes_startswith(args: &[Object]) -> Result<Object, RuntimeError> {
     bytes_search_arity("startswith", args)?;
     let target = args
@@ -19419,6 +19464,9 @@ fn file_getvalue_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let [Object::File(f)] = args else {
         return None;
     };
+    if let Some(v) = f.mem_value_cached() {
+        return Some(Ok(v));
+    }
     if f.is_closed() {
         return None;
     }

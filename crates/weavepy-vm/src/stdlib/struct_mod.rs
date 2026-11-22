@@ -1629,6 +1629,48 @@ fn unpack_iter_next_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>
     let [Object::Instance(it)] = args else {
         return None;
     };
+    // The class's own layout, `_fmt, _buffer, _size, _offset, _len`: the
+    // slots read and the offset moved in place, under one borrow (nothing
+    // below runs code).
+    let laid = it.cls_raw().own_slot_layout().filter(|layout| {
+        crate::shared_value::SharedSlice::word(layout)
+            == UNPACK_ITER_LAYOUT.load(std::sync::atomic::Ordering::Relaxed)
+    });
+    let Some(layout) = laid else {
+        return unpack_iter_next_named(it);
+    };
+    let mut slots = it.slots.try_borrow_mut().ok()?;
+    let [Object::Str(fmt), buffer, _, Object::Int(offset), Object::Int(len)] =
+        slots.values_for_layout_mut(layout)?
+    else {
+        return None;
+    };
+    if *offset >= *len {
+        return None;
+    }
+    let cf = compiled_for(fmt)?;
+    let off = usize::try_from(*offset).ok()?;
+    let read = |buf: &[u8]| {
+        if off.checked_add(cf.size)? > buf.len() {
+            return None;
+        }
+        cf.unpack_tuple_at(buf, off).ok()
+    };
+    let vals = match &*buffer {
+        Object::Bytes(b) => read(b)?,
+        Object::ByteArray(b) => read(&b.try_borrow().ok()?)?,
+        Object::MemoryView(mv) if !mv.released.get() && mv.is_c_contiguous() => {
+            mv.with_bytes(read)?
+        }
+        _ => return None,
+    };
+    *offset += cf.size as i64;
+    Some(Ok(vals))
+}
+
+/// [`unpack_iter_next_fast`] for an iterator whose class isn't laid out as
+/// the module's own: its slots by name.
+fn unpack_iter_next_named(it: &crate::types::PyInstance) -> Option<Result<Object, RuntimeError>> {
     // (The class's own layout, `_fmt, _buffer, _size, _offset, _len`, is
     // read at its places; anything else by name.)
     let (fmt, buffer, offset) = {

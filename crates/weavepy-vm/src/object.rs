@@ -10839,6 +10839,28 @@ impl PyFile {
 
     /// Extract the entire buffer of an in-memory StringIO/BytesIO.
     /// Used by `StringIO.getvalue()` / `BytesIO.getvalue()`.
+    /// `getvalue()` of an open `BytesIO` when the value cached at the last
+    /// call is still the buffer's: shared again, read through guard-free
+    /// views. `None` otherwise (nothing cached, a buffer changed since or
+    /// with a live `getbuffer()` view, a closed or other stream).
+    pub(crate) fn mem_value_cached(&self) -> Option<Object> {
+        // SAFETY: guard-free views, each dropped at once (nothing here runs
+        // code).
+        unsafe {
+            if self.closed.peek().is_none_or(|c| *c) {
+                return None;
+            }
+            let FileBackend::MemBytes { data, .. } = self.backend.peek()? else {
+                return None;
+            };
+            let v = self.mem_value.peek()?.as_ref()?;
+            if v.len() != data.peek()?.len() || bytearray_is_exported(data) {
+                return None;
+            }
+            Some(Object::Bytes(v.clone()))
+        }
+    }
+
     pub fn getvalue(&self) -> Option<Object> {
         match &*self.backend.borrow() {
             FileBackend::MemBytes { data, .. } => {
