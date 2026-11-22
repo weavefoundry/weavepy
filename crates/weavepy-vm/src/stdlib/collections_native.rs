@@ -1845,6 +1845,47 @@ fn deepcopy_plain(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(deep_plain(x, &mut memo, 0).unwrap_or(Object::None))
 }
 
+/// `_most_common_plain(counter, n)`: `Counter.most_common(n)` of an exact
+/// `Counter` (the caller checks) whose counts are all plain ints: the `n`
+/// largest `(key, count)` pairs, ties in insertion order, as
+/// `heapq.nlargest(n, self.items(), key=itemgetter(1))` gives them. `None`
+/// for anything else, or while a trace or profile hook watches.
+fn most_common_plain(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Instance(inst), Object::Int(n)] = args else {
+        return Ok(Object::None);
+    };
+    if crate::trace::any_observers_active() {
+        return Ok(Object::None);
+    }
+    let Some(Object::Dict(d)) = inst.native.get() else {
+        return Ok(Object::None);
+    };
+    let Ok(d) = d.try_borrow() else {
+        return Ok(Object::None);
+    };
+    let mut items = Vec::with_capacity(d.len());
+    for (k, v) in d.iter() {
+        let count = match *v {
+            Object::Int(i) => i,
+            Object::Bool(b) => i64::from(b),
+            _ => return Ok(Object::None),
+        };
+        items.push((count, k, v));
+    }
+    // (A stable sort: equal counts keep insertion order, as `nlargest`'s
+    // decreasing tie-break index keeps it.)
+    items.sort_by_key(|item| std::cmp::Reverse(item.0));
+    let take = usize::try_from(*n).unwrap_or(0).min(items.len());
+    let out: Vec<Object> = items[..take]
+        .iter()
+        .map(|(_, k, v)| Object::new_tuple_array([k.0.clone(), (*v).clone()]))
+        .collect();
+    drop(d);
+    let list = Object::new_list(out);
+    crate::gc_trace::track(&list);
+    Ok(list)
+}
+
 /// How deep [`deep_plain`] nests before leaving the copy to Python.
 const DEEPCOPY_DEPTH: u32 = 200;
 
@@ -1952,15 +1993,23 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("__name__")),
             Object::from_static("_weave_collections"),
         );
-        d.insert(
-            DictKey(Object::from_static("_deepcopy_plain")),
-            Object::Builtin(Rc::new(BuiltinFn {
-                name: "_deepcopy_plain",
-                binds_instance: false,
-                call: Box::new(deepcopy_plain),
-                call_kw: None,
-            })),
-        );
+        for (name, f) in [
+            (
+                "_deepcopy_plain",
+                deepcopy_plain as fn(&[Object]) -> Result<Object, RuntimeError>,
+            ),
+            ("_most_common_plain", most_common_plain),
+        ] {
+            d.insert(
+                DictKey(Object::from_static(name)),
+                Object::Builtin(Rc::new(BuiltinFn {
+                    name,
+                    binds_instance: false,
+                    call: Box::new(f),
+                    call_kw: None,
+                })),
+            );
+        }
         let mut reg = |export: &'static str,
                        name: &'static str,
                        f: fn(&[Object]) -> Result<Object, RuntimeError>| {

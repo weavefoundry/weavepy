@@ -2304,6 +2304,11 @@ branch and pull request.
     themselves is returned itself (1.4 µs and 22 µs). Anything else in the
     tree, a memo, a tree over 200 deep, or a trace hook takes the Python
     function.
+  - `Counter.most_common(n)` ran `heapq.nlargest` in Python over the
+    items, with an `itemgetter` key (ten counts, `most_common(3)` 4.4 µs,
+    CPython 1.8). An exact `Counter` whose counts are all ints now sorts
+    them natively, largest first and equal counts in insertion order, as
+    `nlargest` orders them.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
