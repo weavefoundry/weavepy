@@ -5555,6 +5555,7 @@ fn attr_set(obj: &Object, name: &str, value: Object) -> Result<(), RuntimeError>
                 }
                 f.kwonly_memo.set(0);
                 crate::frame_jit::retire_code(f.code.replace(c));
+                crate::rare_events::note_func_edit();
                 f.names_kept.set(0);
             } else if crate::object::is_function_slot(name) {
                 f.set_slot(name, value);
@@ -20122,6 +20123,7 @@ pub(crate) fn file_setstate_mem(args: &[Object]) -> Result<Object, RuntimeError>
         };
         let pos = pos_from_state(&items[1], "second")?;
         if let FileBackend::MemBytes { data, pos: bpos } = &mut *f.backend.borrow_mut() {
+            f.mem_changed();
             *data.borrow_mut() = buf;
             *bpos = pos;
         }

@@ -3230,14 +3230,16 @@ fn sort_plain(v: &mut [Object], reverse: bool) -> Option<Result<(), RuntimeError
     Some(sorted)
 }
 
-/// Which plain kind every item of `v` is, for [`sort_by_kind`]: strings only,
-/// ints only, plain numbers only, or tuples of ints and strings; `None`
-/// for anything else.
+/// Which plain kind every item of `v` is, for [`sort_by_kind`]: strings only
+/// (0), ints only (1), floats only (4), plain numbers only (2), or tuples
+/// of ints and strings (3); `None` for anything else.
 fn plain_kind(v: &[Object]) -> Option<u8> {
     Some(if v.iter().all(|x| matches!(x, Object::Str(_))) {
         0
     } else if v.iter().all(|x| matches!(x, Object::Int(_))) {
         1
+    } else if v.iter().all(|x| matches!(x, Object::Float(_))) {
+        4
     } else if v
         .iter()
         .all(|x| matches!(x, Object::Int(_) | Object::Float(_) | Object::Bool(_)))
@@ -3278,6 +3280,14 @@ fn sort_by_kind<T>(
             })
         }),
         2 => crate::timsort::sort(v, |a, b| crate::compare_op(value(a), value(b), C::Lt)),
+        // (`<` of two floats, a NaN on either side false, as the
+        // interpreter's comparison gives it.)
+        4 => crate::timsort::sort(v, |a, b| {
+            Ok(match (value(a), value(b)) {
+                (Object::Float(a), Object::Float(b)) => a < b,
+                _ => false,
+            })
+        }),
         _ => crate::timsort::sort(v, |a, b| {
             let (Object::Tuple(a), Object::Tuple(b)) = (value(a), value(b)) else {
                 return Ok(false);

@@ -5929,6 +5929,7 @@ impl PyFunction {
             self.defaults_override
                 .0
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+            crate::rare_events::note_func_edit();
         }
         self.slots()
             .borrow_mut()
@@ -7289,6 +7290,11 @@ pub struct PyFile {
     /// `.buffer` access; `None` until then and for streams that are their own
     /// buffer.
     pub binary_buffer_cache: RefCell<Option<Object>>,
+    /// The last `BytesIO.getvalue()` result, handed out again while the
+    /// buffer is unchanged (CPython shares its bytes object the same way).
+    /// Every write, truncate, re-init, `__setstate__` and `getbuffer()`
+    /// clears it; see [`Self::mem_changed`].
+    pub mem_value: RefCell<Option<SharedSlice<u8>>>,
     /// Observed line endings, as CPython's `IncrementalNewlineDecoder` tracks
     /// them for the text-mode `.newlines` attribute. Bit flags: `1`=`\r`,
     /// `2`=`\n`, `4`=`\r\n`. Updated on every text-mode read (regardless of the
@@ -7400,6 +7406,7 @@ impl PyFile {
             closefd: crate::sync::Cell::new(true),
             extra_attrs: RefCell::new(Vec::new()),
             binary_buffer_cache: RefCell::new(None),
+            mem_value: RefCell::new(None),
             seennl: crate::sync::Cell::new(0),
             write_buf: RefCell::new(Vec::new()),
             line_buffering: crate::sync::Cell::new(LINE_BUFFER_UNDECIDED),
@@ -8265,6 +8272,7 @@ impl PyFile {
         let Ok(mut b) = buf.try_borrow_mut() else {
             return false;
         };
+        self.mem_changed();
         // (At the end: appended. Inside the buffer, after a seek: written
         // over what is there, the buffer growing if the data runs past its
         // end. Past the end is the full method's, which fills the gap.)
@@ -9509,6 +9517,7 @@ impl PyFile {
     /// the rare read↔write re-init, which CPython itself rejects mid-stream).
     pub fn reinit_fileio(&self, new_backend: FileBackend, closefd: bool) {
         self.close();
+        self.mem_changed();
         *self.backend.borrow_mut() = new_backend;
         self.closefd.set(closefd);
         *self.closed.borrow_mut() = false;
@@ -10339,6 +10348,7 @@ impl PyFile {
                 if data.is_empty() {
                     return Ok(0);
                 }
+                self.mem_changed();
                 let mut b = buf.borrow_mut();
                 if *pos > b.len() {
                     // Seeked past EOF: writing zero-fills the gap (CPython
@@ -10668,6 +10678,7 @@ impl PyFile {
                 // live (CPython `bytesio.c` `check_exports`).
                 bytearray_check_resizable(data)?;
                 let n = size.unwrap_or(*pos as u64) as usize;
+                self.mem_changed();
                 let mut d = data.borrow_mut();
                 // `bytesio.c` only ever *shrinks*: a size beyond the end
                 // leaves the buffer untouched, and the requested size is
@@ -10702,12 +10713,44 @@ impl PyFile {
         }
     }
 
+    /// Drop the cached `getvalue()` result: the in-memory buffer changed
+    /// (or may change through a `getbuffer()` view).
+    #[inline]
+    pub(crate) fn mem_changed(&self) {
+        // SAFETY: a guard-free view, dropped at once.
+        if unsafe { self.mem_value.peek() }.is_some_and(|v| v.is_some()) {
+            *self.mem_value.borrow_mut() = None;
+        }
+    }
+
+    /// Seed the cached `getvalue()` result with the initial bytes object,
+    /// so `BytesIO(b).getvalue()` returns `b` itself, as in CPython.
+    pub(crate) fn mem_seed(&self, v: SharedSlice<u8>) {
+        *self.mem_value.borrow_mut() = Some(v);
+    }
+
     /// Extract the entire buffer of an in-memory StringIO/BytesIO.
     /// Used by `StringIO.getvalue()` / `BytesIO.getvalue()`.
     pub fn getvalue(&self) -> Option<Object> {
         match &*self.backend.borrow() {
             FileBackend::MemBytes { data, .. } => {
-                Some(Object::Bytes(SharedSlice::from(data.borrow().as_slice())))
+                let d = data.borrow();
+                // A cached value is good while nothing has changed the
+                // buffer: the mutators clear it, and a live `getbuffer()`
+                // view (which can write in place) bypasses it.
+                let exported = bytearray_is_exported(data);
+                if !exported {
+                    if let Some(v) = self.mem_value.borrow().as_ref() {
+                        if v.len() == d.len() {
+                            return Some(Object::Bytes(v.clone()));
+                        }
+                    }
+                }
+                let v = SharedSlice::from(d.as_slice());
+                if !exported {
+                    *self.mem_value.borrow_mut() = Some(v.clone());
+                }
+                Some(Object::Bytes(v))
             }
             // The buffer stores lone surrogates as bridged PUA code points
             // (so a Rust `String` can hold them); map them back to a `str`/
@@ -10729,6 +10772,7 @@ impl PyFile {
     /// stream, and the export keeps the buffer pinned (a subsequent
     /// `write`/`truncate` raises `BufferError`) until the view is released.
     pub fn getbuffer(&self) -> Result<Object, RuntimeError> {
+        self.mem_changed();
         match &*self.backend.borrow() {
             FileBackend::MemBytes { data, .. } => Ok(Object::MemoryView(Rc::new(
                 PyMemoryView::from_bytearray(data.clone()),

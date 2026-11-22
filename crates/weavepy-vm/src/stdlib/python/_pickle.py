@@ -453,6 +453,11 @@ def dumps(obj, protocol=None, *, fix_imports=True, buffer_callback=None):
         encoded = _native_dumps(obj, Pickler, protocol, fix_imports, buffer_callback)
         if encoded is not None:
             return encoded
+    return _dumps_python(obj, protocol, fix_imports=fix_imports,
+                         buffer_callback=buffer_callback)
+
+
+def _dumps_python(obj, protocol=None, *, fix_imports=True, buffer_callback=None):
     f = _io.BytesIO()
     Pickler(f, protocol, fix_imports=fix_imports,
             buffer_callback=buffer_callback).dump(obj)
@@ -477,6 +482,14 @@ def loads(s, /, *, fix_imports=True, encoding="ASCII", errors="strict",
         decoded = _native_loads(s, Unpickler, fix_imports, encoding, errors, buffers)
         if decoded is not None:
             return decoded[0]
+    return _loads_python(s, fix_imports=fix_imports, encoding=encoding,
+                         errors=errors, buffers=buffers)
+
+
+def _loads_python(s, /, *, fix_imports=True, encoding="ASCII", errors="strict",
+                  buffers=None):
+    if isinstance(s, str):
+        raise TypeError("Can't load pickle from unicode string")
     file = _io.BytesIO(s)
     return Unpickler(file, fix_imports=fix_imports, buffers=buffers,
                      encoding=encoding, errors=errors).load()
@@ -500,6 +513,25 @@ else:
     _native_dumps = _make_native_dumps(
         Pickler, _sys, _builtins, _pickle_py, _copyreg)
     del _builtins, _copyreg, _pickle_py
+    # Built-in `dumps` and `loads`, as CPython's are: the native engine's
+    # calls run no Python frame, and the rest take the functions above.
+    try:
+        from _weave_pickle import make_front as _make_front
+    except ImportError:
+        pass
+    else:
+        if _native_dumps is not None:
+            _front = _make_front("dumps", _native_dumps, Pickler, dumps._func,
+                                 _dumps_python)
+            if _front is not None:
+                _dumps_py, dumps = dumps, _front
+        if _native_loads is not None:
+            _front = _make_front("loads", _native_loads, Unpickler, loads._func,
+                                 _loads_python)
+            if _front is not None:
+                _loads_py, loads = loads, _front
+        _front = None
+        del _make_front, _front
 
 # Importing _pickle first initializes pickle while this module is incomplete.
 # Its final accelerator import then falls back. Publish the completed entry

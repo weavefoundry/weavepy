@@ -2339,6 +2339,29 @@ branch and pull request.
     `min(...)` likewise (no key: the positional half, or the default for an
     empty list or tuple; 298 ns to 133 in the container) and `round(x,
     ndigits=2)` (its positional half, 394 to 223).
+  - `BytesIO.getvalue()` copied the whole buffer on every call (34 µs for
+    a 1 MB stream, CPython 23 ns, which hands out its bytes object until
+    the next write). The stream keeps its last result now and returns it
+    again until a write, a truncate, a re-`__init__`, a `__setstate__` or
+    a `getbuffer()` (whose view can write in place) changes the buffer,
+    and a stream made from a bytes object starts with that object (70 to
+    90 ns a call at any size).
+  - `l.sort()` of a list of floats compared them through the general
+    comparison (6,963 µs for 20,000 floats; `sorted()` of the same list
+    1,645, CPython 2,118 for both): it compares two floats directly now
+    (1,628 µs), as `sorted()` did.
+  - `pickle.dumps(1)` took 1,768 ns (CPython 674) and `pickle.loads` of a
+    small stream 1,751 (CPython 344). Each call ran two Python frames
+    (the stand-in built-in object's `__call__` with its `*args` and
+    `**kwargs`, then the Python `dumps`) before the native encoder, and
+    the encoder's guard then checked the code and defaults of 52 Python
+    functions (30% of the call's instructions). `dumps` and `loads` are
+    built-in functions now, as CPython's are, running the native engine
+    with no Python frame and anything it declines in the Python pickler
+    directly. And the guards check each function once per change to any
+    function's code or defaults (a count kept for this, never reset),
+    and otherwise only which functions the classes and tables hold (789
+    ns and 1,049).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

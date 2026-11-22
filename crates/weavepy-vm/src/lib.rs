@@ -59700,6 +59700,7 @@ impl Interpreter {
                         self.settle_lazy();
                         f.kwonly_memo.set(0);
                         crate::frame_jit::retire_code(f.code.replace(c));
+                        crate::rare_events::note_func_edit();
                         f.names_kept.set(0);
                         crate::rare_events::bump(crate::rare_events::FUNC_MODIFICATION);
                         if crate::capi_watchers::funcs_active() {

@@ -420,6 +420,10 @@ fn bytesio_file(args: &[Object], kwargs: &[(String, Object)]) -> Result<Rc<PyFil
         .get(1)
         .cloned()
         .or_else(|| kw_get(kwargs, "initial_bytes"));
+    let seed = match &initial {
+        Some(Object::Bytes(b)) => Some(b.clone()),
+        _ => None,
+    };
     let data = match initial {
         Some(Object::Bytes(b)) => b.to_vec(),
         Some(Object::ByteArray(b)) => b.borrow().clone(),
@@ -447,6 +451,9 @@ fn bytesio_file(args: &[Object], kwargs: &[(String, Object)]) -> Result<Rc<PyFil
         },
     );
     f.no_name.set(true);
+    if let Some(b) = seed {
+        f.mem_seed(b);
+    }
     Ok(Rc::new(f))
 }
 
@@ -952,6 +959,7 @@ fn bytesio_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
     if let Ok(f) = crate::builtins::file_self(args) {
         if let FileBackend::MemBytes { data, pos } = &mut *f.backend.borrow_mut() {
             crate::object::bytearray_check_resizable(data)?;
+            f.mem_changed();
             data.borrow_mut().clear();
             *pos = 0;
         }

@@ -56,6 +56,24 @@ static COUNTERS: [AtomicU64; 5] = [
 /// mutation targets with one relaxed load.
 static BUILTINS_DICT_ADDR: AtomicUsize = AtomicUsize::new(0);
 
+/// Every assignment to a function's `__code__`, `__defaults__` or
+/// `__kwdefaults__`, counted like `func_modification` but never reset (the
+/// test probe's [`reset`] clears the counters above), so a cache can prove
+/// that no function changed since it last checked its functions.
+static FUNC_EDITS: AtomicU64 = AtomicU64::new(0);
+
+/// Count a function's code or defaults changing (see [`FUNC_EDITS`]).
+#[inline]
+pub fn note_func_edit() {
+    FUNC_EDITS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// How many times any function's code or defaults changed.
+#[inline]
+pub fn func_edits() -> u64 {
+    FUNC_EDITS.load(Ordering::Relaxed)
+}
+
 #[inline]
 pub fn bump(event: usize) {
     COUNTERS[event].fetch_add(1, Ordering::Relaxed);
