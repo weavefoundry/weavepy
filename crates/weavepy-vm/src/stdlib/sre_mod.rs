@@ -778,8 +778,20 @@ fn category(chcode: u32, ch: u32) -> bool {
 
 /// A subject code unit: a byte (`bytes`, or an ASCII `str` matched over
 /// its UTF-8 bytes in place) or a code point.
-pub(crate) trait SreChar: Copy + Into<u32> {}
-impl SreChar for u8 {}
+pub(crate) trait SreChar: Copy + Into<u32> {
+    /// Where the first unit equal to `c` is in `hay`.
+    #[inline]
+    fn find(hay: &[Self], c: u32) -> Option<usize> {
+        hay.iter().position(|&u| u.into() == c)
+    }
+}
+impl SreChar for u8 {
+    /// (Bytes: `memchr`'s word-at-a-time scan.)
+    #[inline]
+    fn find(hay: &[Self], c: u32) -> Option<usize> {
+        memchr::memchr(u8::try_from(c).ok()?, hay)
+    }
+}
 impl SreChar for u32 {}
 
 #[inline(always)]
@@ -2390,11 +2402,9 @@ impl<'a, C: SreChar> Matcher<'a, C> {
             let end = self.end;
             self.must_advance = false;
             while ptr < end {
-                while cu(self.s[ptr]) != c {
-                    ptr += 1;
-                    if ptr >= end {
-                        return Ok(None);
-                    }
+                match C::find(&self.s[ptr..end], c) {
+                    Some(k) => ptr += k,
+                    None => return Ok(None),
                 }
                 self.start = ptr;
                 self.ptr = ptr + prefix_skip;
@@ -2420,16 +2430,10 @@ impl<'a, C: SreChar> Matcher<'a, C> {
                 return Ok(None);
             }
             while ptr < end {
-                let c = prefix[0];
-                loop {
-                    let ch = cu(self.s[ptr]);
-                    ptr += 1;
-                    if ch == c {
-                        break;
-                    }
-                    if ptr >= end {
-                        return Ok(None);
-                    }
+                // (Past the next unit equal to the prefix's first.)
+                match C::find(&self.s[ptr..end], prefix[0]) {
+                    Some(k) => ptr += k + 1,
+                    None => return Ok(None),
                 }
                 if ptr >= end {
                     return Ok(None);

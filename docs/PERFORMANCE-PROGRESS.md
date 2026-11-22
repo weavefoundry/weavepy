@@ -2456,6 +2456,12 @@ branch and pull request.
     borrowed" in the builtin-method memo, a cache shared by the whole
     process. Its lookups now go without it when it is borrowed, and a
     store that finds it borrowed is skipped, so no lookup can panic there.
+  - A `re` search whose pattern starts with a literal stepped the subject
+    one unit at a time to the prefix's first character, with a bounds and
+    an end check at each (about ten instructions a byte; `search` of a
+    four-byte literal 254 bytes into a bytearray 4,434 instructions,
+    CPython 3,074). Over bytes, and text matched as its ASCII bytes, that
+    scan is `memchr` now (1,963).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
