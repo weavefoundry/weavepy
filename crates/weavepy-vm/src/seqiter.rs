@@ -254,6 +254,9 @@ impl Interpreter {
             }
         };
         if filter {
+            if filter_seq_bulk(&func, &source, out) {
+                return Ok(true);
+            }
             loop {
                 match self.filter_next(&func, &source, globals) {
                     Ok(Some(v)) => out.push(v),
@@ -3774,6 +3777,60 @@ pub(crate) fn enumerate_pure_pair(it: &Object) -> Option<(Object, Object)> {
 
 /// The truth of a value whose truth is plain data (`None` for anything
 /// whose `__bool__`/`__len__` could run code).
+/// `filter(None, xs)` or `filter(bool, xs)` drained over a plain list or
+/// tuple cursor whose items left all have a truth that runs no code (see
+/// [`scalar_truth`]): the items kept appended to `out` at once, and the
+/// cursor stepped to its end and then past it, as stepping it item by item
+/// leaves it. `false`, nothing consumed, for anything else.
+fn filter_seq_bulk(func: &Object, source: &Object, out: &mut Vec<Object>) -> bool {
+    let plain = match func {
+        Object::None => true,
+        Object::Type(t) => Rc::ptr_eq(t, &builtin_types().bool_),
+        _ => false,
+    };
+    let Object::Iter(c) = source else {
+        return false;
+    };
+    if !plain {
+        return false;
+    }
+    {
+        // SAFETY: a view that runs no code (cloning a scalar or a string
+        // runs none) and ends in this block.
+        let Some((xs, idx)) = (unsafe { c.peek_mut() }).and_then(seq_cursor) else {
+            return false;
+        };
+        let Some(rest) = xs.get(*idx..) else {
+            return false;
+        };
+        if rest.is_empty() {
+            return false;
+        }
+        let mut kept = 0;
+        for x in rest {
+            match scalar_truth(x) {
+                Some(keep) => kept += usize::from(keep),
+                None => return false,
+            }
+        }
+        out.reserve(kept);
+        for x in rest {
+            if scalar_truth(x) == Some(true) {
+                out.push(x.clone());
+            }
+        }
+        *idx = xs.len();
+    }
+    // (The step that finds the end, so the cursor records its exhaustion;
+    // what that releases holds only scalars and strings.)
+    if let Ok(mut cursor) = c.try_borrow_mut() {
+        let end = cursor.next_value();
+        drop(cursor);
+        drop(end);
+    }
+    true
+}
+
 fn scalar_truth(v: &Object) -> Option<bool> {
     Some(match v {
         Object::Bool(b) => *b,

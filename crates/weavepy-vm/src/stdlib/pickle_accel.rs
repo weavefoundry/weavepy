@@ -281,6 +281,8 @@ struct UnpicklerGuard {
     entries: Vec<(u8, FunctionGuard)>,
     /// The function-edit count at which every guarded function last held.
     proven: std::sync::atomic::AtomicU64,
+    /// The dispatch table's mutation stamp when its entries last matched.
+    dispatch_stamp: std::sync::atomic::AtomicU64,
 }
 
 impl UnpicklerGuard {
@@ -311,6 +313,7 @@ impl UnpicklerGuard {
             dispatch: Rc::downgrade(&dispatch),
             entries,
             proven: std::sync::atomic::AtomicU64::new(u64::MAX),
+            dispatch_stamp: std::sync::atomic::AtomicU64::new(u64::MAX),
         })
     }
 
@@ -330,8 +333,10 @@ impl UnpicklerGuard {
             return false;
         }
         let (proven, edits) = proven_edits(&self.proven);
-        if proven {
-            return self.same_dispatch(|guard, value| guard.is_same(value));
+        // (A table whose entries changed may still hold every function
+        // this stream runs.)
+        if proven && self.same_dispatch(true, |guard, value| guard.is_same(value)) {
+            return true;
         }
         // Every function checked at once proves them all until the next
         // function edit; otherwise only the ones this stream runs count.
@@ -341,7 +346,7 @@ impl UnpicklerGuard {
                 .find_class
                 .as_ref()
                 .is_none_or(FunctionGuard::holds_live)
-            && self.same_dispatch(FunctionGuard::holds)
+            && self.same_dispatch(false, FunctionGuard::holds)
         {
             self.proven
                 .store(edits, std::sync::atomic::Ordering::Relaxed);
@@ -351,20 +356,36 @@ impl UnpicklerGuard {
     }
 
     /// The dispatch table still maps the guarded opcodes, in order, to
-    /// functions `same` accepts.
-    fn same_dispatch(&self, same: impl Fn(&FunctionGuard, &Object) -> bool) -> bool {
+    /// functions `same` accepts. With `proven`, an unchanged table (its
+    /// mutation stamp the one it had when its entries last matched) is
+    /// taken as it is.
+    fn same_dispatch(&self, proven: bool, same: impl Fn(&FunctionGuard, &Object) -> bool) -> bool {
         let Some(dispatch) = self.dispatch.upgrade() else {
             return false;
         };
         let dispatch = dispatch.borrow();
-        dispatch.len() == self.entries.len()
+        let stamp = dispatch.mutation_stamp();
+        if proven
+            && stamp
+                == self
+                    .dispatch_stamp
+                    .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return true;
+        }
+        let holds = dispatch.len() == self.entries.len()
             && dispatch
                 .iter()
                 .zip(&self.entries)
                 .all(|((key, value), (opcode, guard))| {
                     matches!(key.0, Object::Int(current) if current == i64::from(*opcode))
                         && same(guard, value)
-                })
+                });
+        if holds {
+            self.dispatch_stamp
+                .store(stamp, std::sync::atomic::Ordering::Relaxed);
+        }
+        holds
     }
 
     /// [`Self::holds`] checked for only the functions a stream of
@@ -461,6 +482,8 @@ fn make_front(args: &[Object]) -> Result<Object, RuntimeError> {
     };
     let front = Rc::new(Front {
         loads,
+        ascii: Object::from_static("ASCII"),
+        strict: Object::from_static("strict"),
         native: native.clone(),
         cls: Rc::downgrade(cls),
         full: Rc::downgrade(full),
@@ -481,6 +504,9 @@ fn make_front(args: &[Object]) -> Result<Object, RuntimeError> {
 
 struct Front {
     loads: bool,
+    /// `loads`'s default `encoding` and `errors`, made once.
+    ascii: Object,
+    strict: Object,
     native: Rc<BuiltinFn>,
     cls: Weak<TypeObject>,
     full: Weak<PyFunction>,
@@ -493,7 +519,8 @@ impl Front {
             return self.fall_back(&self.full, args, kwargs);
         };
         let result = if self.loads {
-            Self::loads_args(args, kwargs, cls).map(|a| (self.native.call)(&a))
+            self.loads_args(args, kwargs, cls)
+                .map(|a| (self.native.call)(&a))
         } else {
             Self::dumps_args(args, kwargs, cls).map(|a| (self.native.call)(&a))
         };
@@ -542,6 +569,7 @@ impl Front {
     /// `try_loads`'s arguments for `loads(data, /, *, fix_imports=True,
     /// encoding="ASCII", errors="strict", buffers=None)`.
     fn loads_args(
+        &self,
         args: &[Object],
         kwargs: &[(String, Object)],
         cls: Rc<TypeObject>,
@@ -550,8 +578,8 @@ impl Front {
             return None;
         };
         let mut fix_imports = Object::Bool(true);
-        let mut encoding = Object::from_static("ASCII");
-        let mut errors = Object::from_static("strict");
+        let mut encoding = self.ascii.clone();
+        let mut errors = self.strict.clone();
         for (name, value) in kwargs {
             match (name.as_str(), value) {
                 ("fix_imports", Object::Bool(_)) => fix_imports = value.clone(),
@@ -709,6 +737,8 @@ struct PicklerGuard {
     entries: Vec<(Weak<TypeObject>, FunctionGuard)>,
     /// The function-edit count at which every guarded function last held.
     proven: std::sync::atomic::AtomicU64,
+    /// The dispatch table's mutation stamp when its entries last matched.
+    dispatch_stamp: std::sync::atomic::AtomicU64,
 }
 
 impl PicklerGuard {
@@ -739,6 +769,7 @@ impl PicklerGuard {
             dispatch: Rc::downgrade(&dispatch),
             entries,
             proven: std::sync::atomic::AtomicU64::new(u64::MAX),
+            dispatch_stamp: std::sync::atomic::AtomicU64::new(u64::MAX),
         })
     }
 
@@ -746,16 +777,32 @@ impl PicklerGuard {
         let (proven, edits) = proven_edits(&self.proven);
         if Rc::as_ptr(class) != self.class.as_ptr()
             || !self.hierarchy.iter().all(|guard| guard.holds_with(proven))
-            || !class
-                .lookup("dump")
-                .is_some_and(|value| self.dump.holds(&value, proven))
         {
+            return false;
+        }
+        // (With the whole hierarchy unchanged, `dump` resolves to the
+        // guarded descriptor; its `_func` can still be reassigned.)
+        let dump = if proven {
+            self.dump.instance.upgrade().map(Object::Instance)
+        } else {
+            class.lookup("dump")
+        };
+        if !dump.is_some_and(|value| self.dump.holds(&value, proven)) {
             return false;
         }
         let Some(dispatch) = self.dispatch.upgrade() else {
             return false;
         };
         let dispatch = dispatch.borrow();
+        let stamp = dispatch.mutation_stamp();
+        if proven
+            && stamp
+                == self
+                    .dispatch_stamp
+                    .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return true;
+        }
         let holds = dispatch.len() == self.entries.len()
             && dispatch
                 .iter()
@@ -768,9 +815,13 @@ impl PicklerGuard {
                             function.holds(value)
                         }
                 });
-        if holds && !proven {
-            self.proven
-                .store(edits, std::sync::atomic::Ordering::Relaxed);
+        if holds {
+            self.dispatch_stamp
+                .store(stamp, std::sync::atomic::Ordering::Relaxed);
+            if !proven {
+                self.proven
+                    .store(edits, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         holds
     }

@@ -407,8 +407,17 @@ impl<T> SharedSlice<T> {
             ptr::addr_of_mut!((*raw).len).write(len);
             ptr::addr_of_mut!((*raw).hash).write(AtomicI64::new(-1));
             let dst = ptr::addr_of_mut!((*raw).items).cast::<T>();
-            for (i, value) in items.into_iter().enumerate() {
-                dst.add(i).write(value);
+            if std::mem::needs_drop::<T>() {
+                for (i, value) in items.into_iter().enumerate() {
+                    dst.add(i).write(value);
+                }
+            } else {
+                // (Elements with no drop glue move as one bulk copy: the
+                // `Vec` then frees only its buffer.)
+                let mut items = std::mem::ManuallyDrop::new(items);
+                ptr::copy_nonoverlapping(items.as_ptr(), dst, len);
+                items.set_len(0);
+                std::mem::ManuallyDrop::drop(&mut items);
             }
             Self::from_arc(Arc::from_raw(raw))
         }

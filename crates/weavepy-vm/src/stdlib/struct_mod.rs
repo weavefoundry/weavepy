@@ -79,6 +79,8 @@ struct CompiledFormat {
     endian: Endian,
     fields: Vec<Field>,
     size: usize,
+    /// How many values an unpack yields (padding none, a string one).
+    values: usize,
 }
 
 impl CompiledFormat {
@@ -172,10 +174,19 @@ impl CompiledFormat {
                 .filter(|s| *s <= MAX_STRUCT_SIZE)
                 .ok_or_else(|| struct_error("total struct size too long"))?;
         }
+        let values = fields
+            .iter()
+            .map(|f| match f.code {
+                'x' => 0,
+                's' | 'p' => 1,
+                _ => f.count,
+            })
+            .sum();
         Ok(Self {
             endian,
             fields,
             size,
+            values,
         })
     }
 
@@ -278,6 +289,17 @@ impl CompiledFormat {
         self.unpack_from_offset(buf, 0).map(|(v, _)| v)
     }
 
+    /// [`Self::unpack`] as a tuple (see [`Self::unpack_tuple_at`]).
+    fn unpack_tuple(&self, buf: &[u8]) -> Result<Object, RuntimeError> {
+        if buf.len() != self.size {
+            return Err(struct_error(format!(
+                "unpack requires a buffer of {} bytes",
+                self.size
+            )));
+        }
+        self.unpack_tuple_at(buf, 0)
+    }
+
     fn iter_unpack(&self, buf: &[u8]) -> Result<Vec<Vec<Object>>, RuntimeError> {
         if !buf.len().is_multiple_of(self.size) {
             return Err(struct_error(format!(
@@ -300,16 +322,7 @@ impl CompiledFormat {
         buf: &[u8],
         start: usize,
     ) -> Result<(Vec<Object>, usize), RuntimeError> {
-        let values = self
-            .fields
-            .iter()
-            .map(|f| match f.code {
-                'x' => 0,
-                's' | 'p' => 1,
-                _ => f.count,
-            })
-            .sum();
-        let mut out = Vec::with_capacity(values);
+        let mut out = Vec::with_capacity(self.values);
         let mut pos = start;
         for f in &self.fields {
             match f.code {
@@ -342,6 +355,23 @@ impl CompiledFormat {
             }
         }
         Ok((out, pos - start))
+    }
+
+    /// [`Self::unpack_from_offset`]'s values as a tuple: one or two
+    /// numbers of a single field built in place, with no list between.
+    fn unpack_tuple_at(&self, buf: &[u8], start: usize) -> Result<Object, RuntimeError> {
+        if let [f] = self.fields.as_slice() {
+            if !matches!(f.code, 'x' | 's' | 'p') && matches!(f.count, 1 | 2) {
+                let (a, n) = decode_one(f.code, self.endian, &buf[start..])?;
+                if f.count == 1 {
+                    return Ok(Object::new_tuple_array([a]));
+                }
+                let (b, _) = decode_one(f.code, self.endian, &buf[start + n..])?;
+                return Ok(Object::new_tuple_array([a, b]));
+            }
+        }
+        self.unpack_from_offset(buf, start)
+            .map(|(vals, _)| Object::new_tuple(vals))
     }
 }
 
@@ -1088,8 +1118,7 @@ fn struct_unpack_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
         return None;
     };
     let cf = struct_format(recv)?;
-    let vals = cf.unpack(buf).ok()?;
-    Some(Ok(Object::new_tuple(vals)))
+    Some(Ok(cf.unpack_tuple(buf).ok()?))
 }
 
 pub(crate) type Fast = fn(&[Object]) -> Option<Result<Object, RuntimeError>>;
@@ -1631,7 +1660,7 @@ fn unpack_iter_next_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>
         if off.checked_add(cf.size)? > buf.len() {
             return None;
         }
-        cf.unpack_from_offset(buf, off).ok().map(|(vals, _)| vals)
+        cf.unpack_tuple_at(buf, off).ok()
     };
     let vals = match &buffer {
         Object::Bytes(b) => read(b)?,
@@ -1653,7 +1682,7 @@ fn unpack_iter_next_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>
     };
     *at = next;
     drop(slots);
-    Some(Ok(Object::new_tuple(vals)))
+    Some(Ok(vals))
 }
 
 /// `_all_exact(items, cls)`: whether every item of the list is exactly of
@@ -1937,11 +1966,13 @@ fn unpack_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
         return None;
     };
     let vals = match buffer {
-        Object::Bytes(b) => compiled_for(fmt)?.unpack(b).ok()?,
-        Object::ByteArray(b) => compiled_for(fmt)?.unpack(&b.try_borrow().ok()?).ok()?,
+        Object::Bytes(b) => compiled_for(fmt)?.unpack_tuple(b).ok()?,
+        Object::ByteArray(b) => compiled_for(fmt)?
+            .unpack_tuple(&b.try_borrow().ok()?)
+            .ok()?,
         _ => return None,
     };
-    Some(Ok(Object::new_tuple(vals)))
+    Some(Ok(vals))
 }
 
 /// `_native_unpack(python_unpack)`: the public `struct.unpack`, which
@@ -2114,7 +2145,7 @@ fn unpack_from_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let read = |buf: &[u8]| {
         let cf = compiled_for(fmt)?;
         let off = resolve_buffer_offset(offset, buf.len(), cf.size, "unpack_from", false).ok()?;
-        cf.unpack_from_offset(buf, off).ok().map(|(vals, _)| vals)
+        cf.unpack_tuple_at(buf, off).ok()
     };
     let vals = match buffer {
         Object::Bytes(b) => read(b)?,
@@ -2124,7 +2155,7 @@ fn unpack_from_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
         }
         _ => return None,
     };
-    Some(Ok(Object::new_tuple(vals)))
+    Some(Ok(vals))
 }
 
 /// `struct.pack_into(format, buffer, offset, *v)`'s fast half: a `str`

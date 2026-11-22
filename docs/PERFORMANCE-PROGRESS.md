@@ -2361,7 +2361,23 @@ branch and pull request.
     directly. And the guards check each function once per change to any
     function's code or defaults (a count kept for this, never reset),
     and otherwise only which functions the classes and tables hold (789
-    ns and 1,049).
+    ns and 1,049). The tables themselves aren't walked either while their
+    dicts' mutation stamps hold (the unpickler's has 70 entries, a third
+    of the call's instructions), and `loads`'s default `encoding` and
+    `errors` are made once: 760 ns and 756.
+  - `list(filter(None, xs))` and `filter(bool, xs)` over a list or tuple
+    stepped the filter once an item (153 instructions each; 5,564 µs for
+    200,000 ints, CPython 2,552). When every item left has a truth that
+    runs no code, the items kept are counted, then copied at once, and the
+    source is stepped past its end as stepping it leaves it (4,164 µs to
+    1,848, or 5.3 ns an item for 1,000 items, CPython 13.4).
+  - `struct` unpacks of one or two numbers built a list and then the tuple
+    from it, and counted the format's values on every call: the tuple is
+    built directly now, the count kept with the compiled format
+    (`iter_unpack` 1,249 instructions an item to 1,061).
+  - A `Vec` of plain data became a `bytes` (or another shared slice) one
+    element at a time: it's one copy now (`pickle.dumps` of 200 KB of
+    bytes 21.4 µs to 18.5).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
