@@ -29091,8 +29091,15 @@ impl Interpreter {
             let Object::Str(name) = name else {
                 return None;
             };
+            let name: &str = name;
             let i = params.iter().position(|p| {
-                !p.starts_with('/') && p.trim_start_matches(['*', '?']) == name.as_ref()
+                // (One marker byte at most; lengths first.)
+                let bare = match p.as_bytes().first() {
+                    Some(b'/') => return false,
+                    Some(b'*' | b'?') => &p[1..],
+                    _ => p,
+                };
+                bare.len() == name.len() && bare == name
             })?;
             if i >= 4 || bound[i].is_some() {
                 return None;
