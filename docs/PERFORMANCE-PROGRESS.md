@@ -2262,6 +2262,12 @@ branch and pull request.
     per-thread free list for small tuples, parked at their last release,
     made no difference (the allocator's own free and malloc cost what the
     list's push and pop do).
+  - More keyword calls in place: compiled code builds `dict(a=1, ...)` from
+    the keywords as the core loop's arm does (400 ns to 126 in the
+    container, CPython 107), and `s.encode(encoding=...)` and
+    `s.split(sep=..., maxsplit=...)` take keyword halves (263 to 117, and
+    361 to 214). Keyword halves can mark a parameter `?name`, optional but
+    positional too, so `s.split(maxsplit=1)` binds without its `sep`.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

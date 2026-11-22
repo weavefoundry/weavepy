@@ -29072,8 +29072,10 @@ impl Interpreter {
         let (params, fast) = leaf_builtins::fast_kw(b)?;
         // (A parameter named `*name` is keyword-only: no positional binds
         // it, and the half takes `Unbound` where the call leaves it out. One
-        // named `/name` is positional-only: no keyword binds it.)
+        // named `?name` is optional the same way but may come positionally,
+        // and one named `/name` is positional-only: no keyword binds it.)
         let keyword_only = |p: &str| p.starts_with('*');
+        let optional = |p: &str| p.starts_with('*') || p.starts_with('?');
         if params.len() > 4 || params.iter().take(argc).any(|p| keyword_only(p)) {
             return None;
         }
@@ -29085,19 +29087,19 @@ impl Interpreter {
             let Object::Str(name) = name else {
                 return None;
             };
-            let i = params
-                .iter()
-                .position(|p| !p.starts_with('/') && p.trim_start_matches('*') == name.as_ref())?;
+            let i = params.iter().position(|p| {
+                !p.starts_with('/') && p.trim_start_matches(['*', '?']) == name.as_ref()
+            })?;
             if i >= 4 || bound[i].is_some() {
                 return None;
             }
             bound[i] = Some(value);
         }
         let unbound = Object::Unbound;
-        let n = if params.iter().any(|p| keyword_only(p)) {
+        let n = if params.iter().any(|p| optional(p)) {
             for (i, p) in params.iter().enumerate() {
                 if bound[i].is_none() {
-                    if !keyword_only(p) {
+                    if !optional(p) {
                         return None;
                     }
                     bound[i] = Some(&unbound);
@@ -33940,6 +33942,22 @@ impl Interpreter {
                         &b,
                         &["table", "delete"],
                         crate::builtins::bytes_translate_fast,
+                    );
+                }
+                // `s.encode(encoding="utf-8")`, `s.split(maxsplit=1)`.
+                let probe = Object::from_static("");
+                if let Some(Object::Builtin(b)) = crate::builtins::lookup_method(&probe, "encode") {
+                    leaf_builtins::register_fast_kw(
+                        &b,
+                        &["encoding", "errors"],
+                        crate::builtins::str_encode_leaf,
+                    );
+                }
+                if let Some(Object::Builtin(b)) = crate::builtins::lookup_method(&probe, "split") {
+                    leaf_builtins::register_fast_kw(
+                        &b,
+                        &["?sep", "?maxsplit"],
+                        crate::builtins::str_split_kw_fast,
                     );
                 }
                 // `xs.sort(reverse=True)`, `xs.sort(key=None)`: keyword-only.

@@ -12027,6 +12027,28 @@ fn split_keywords(name: &str, kwargs: &[(String, Object)]) -> Result<(), Runtime
     }
 }
 
+/// `s.split(sep=None, maxsplit=-1)`'s keyword half (see
+/// `leaf_builtins::register_fast_kw`): the receiver, then `sep` and
+/// `maxsplit`, each `Unbound` when the call left it out. A `str` or `None`
+/// separator and an `int` count split as the full method does, running no
+/// code.
+pub(crate) fn str_split_kw_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [recv @ Object::Str(_), sep, maxsplit] = args else {
+        return None;
+    };
+    let sep = match sep {
+        Object::Unbound => Object::None,
+        Object::None | Object::Str(_) => sep.clone(),
+        _ => return None,
+    };
+    let maxsplit = match maxsplit {
+        Object::Unbound => Object::Int(-1),
+        Object::Int(_) => maxsplit.clone(),
+        _ => return None,
+    };
+    Some(str_split(&[recv.clone(), sep, maxsplit], &[]))
+}
+
 fn str_split(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     str_arity("split", args, 0, 2)?;
     split_keywords("split", kwargs)?;

@@ -16111,6 +16111,13 @@ unsafe extern "C" fn h_call_kw(st: *mut State, code: *const CodeObject, pc: u64,
             Object::BoundMethod(_) | Object::Builtin(_) => {
                 Interpreter::core_native_kw_call(ops, argc)
             }
+            // `dict(k=v, ...)`: the keywords' own names are the keys, as the
+            // core loop's arm builds it.
+            Object::Type(ty)
+                if argc == 0 && Rc::ptr_eq(ty, &crate::builtin_types::builtin_types().dict_) =>
+            {
+                Interpreter::core_dict_kw(ops)
+            }
             _ if st.depth_cell.is_null() => None,
             _ => interp.core_pure_kw_call(code, pc, ops, argc, st.depth_cell),
         };
