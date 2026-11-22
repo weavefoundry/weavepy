@@ -225,6 +225,10 @@ impl Interpreter {
         if chain_drain(l, out) {
             return Ok(true);
         }
+        if let Some(items) = accumulate_collect(l) {
+            out.extend(items);
+            return Ok(true);
+        }
         if zip_seq_bulk(l, out) {
             return Ok(true);
         }
@@ -1324,16 +1328,18 @@ pub(crate) fn lazy_pure_next(l: &PyLazyIter) -> Option<Option<Object>> {
     // Up to eight plain sequence cursors (`zip(xs, ys, zs)`): their items,
     // into the previous result when this adapter holds it alone.
     if (3..=CURSORS_MAX).contains(&n) {
-        // (Tuple and list cursors, straight into the result's slots.)
-        if seq_cursors_ready(iters) {
-            if let Some(slots) = reusable_result(result, spare, n) {
-                seq_cursors_take(iters, slots);
+        // (Tuple and list cursors, straight into the result's slots, in
+        // one pass over them.)
+        if let Some(slots) = reusable_result(result, spare, n) {
+            if seq_cursors_fill(iters, slots) {
                 return Some(Some(Object::Tuple(result.clone()?)));
             }
+        } else {
             let mut items = vec![Object::None; n];
-            seq_cursors_take(iters, &mut items);
-            let t = crate::object::TupleStorage::from_vec(items);
-            return Some(Some(fresh_result(result, spare, t)));
+            if seq_cursors_fill(iters, &mut items) {
+                let t = crate::object::TupleStorage::from_vec(items);
+                return Some(Some(fresh_result(result, spare, t)));
+            }
         }
         if let Some(mut items) = cursors_next(iters) {
             if let Some(slots) = reusable_result(result, spare, n) {
@@ -1484,10 +1490,17 @@ pub(crate) fn next_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>>
 /// The most sources [`cursors_next`] steps at once.
 const CURSORS_MAX: usize = 8;
 
-/// Whether every one of `iters` is a distinct tuple or list cursor with an
-/// item left (see [`seq_cursors_take`]).
-fn seq_cursors_ready(iters: &[Object]) -> bool {
-    iters.iter().enumerate().all(|(k, it)| {
+/// The next items of distinct tuple and list cursors, in one pass: when
+/// every one of the distinct plain sequence cursors `iters` has an item left,
+/// each steps, its item written over the matching slot of `out` (the old
+/// one released), and `true`; otherwise `false`, nothing touched.
+fn seq_cursors_fill(iters: &[Object], out: &mut [Object]) -> bool {
+    let n = iters.len();
+    if n > CURSORS_MAX || out.len() < n {
+        return false;
+    }
+    // (Distinct cells first, so the views below never alias.)
+    for (k, it) in iters.iter().enumerate() {
         let Object::Iter(c) = it else {
             return false;
         };
@@ -1497,29 +1510,33 @@ fn seq_cursors_ready(iters: &[Object]) -> bool {
         {
             return false;
         }
-        // SAFETY: a view that runs no code and ends here.
-        unsafe { c.peek_mut() }
-            .and_then(seq_cursor)
-            .is_some_and(|(xs, i)| *i < xs.len())
-    })
-}
-
-/// Each of the cursors [`seq_cursors_ready`] admitted steps, its item
-/// written over the matching slot of `out` (the old one released).
-fn seq_cursors_take(iters: &[Object], out: &mut [Object]) {
-    for (slot, it) in out.iter_mut().zip(iters) {
+    }
+    let mut runs: [(*const Object, usize, *mut usize); CURSORS_MAX] =
+        [(std::ptr::null(), 0, std::ptr::null_mut()); CURSORS_MAX];
+    for (run, it) in runs.iter_mut().zip(iters) {
         let Object::Iter(c) = it else {
-            continue;
+            return false;
         };
-        // SAFETY: distinct cells, one viewed at a time; an item's release
-        // only queues work for the next safe point.
-        if let Some((xs, i)) = unsafe { c.peek_mut() }.and_then(seq_cursor) {
-            if let Some(x) = xs.get(*i) {
-                *slot = x.clone();
-                *i += 1;
-            }
+        // SAFETY: distinct cells, each viewed once; nothing runs code until
+        // the views end with this call.
+        let Some((xs, i)) = (unsafe { c.peek_mut() }).and_then(seq_cursor) else {
+            return false;
+        };
+        if *i >= xs.len() {
+            return false;
+        }
+        *run = (xs.as_ptr(), *i, std::ptr::from_mut(i));
+    }
+    for (slot, &(xs, i, at)) in out.iter_mut().zip(&runs[..n]) {
+        // SAFETY: `i` is below its sequence's length (checked above), and
+        // the sequences live while their cursors do; an item's release only
+        // queues work for the next safe point.
+        unsafe {
+            *slot = (*xs.add(i)).clone();
+            *at = i + 1;
         }
     }
+    true
 }
 
 /// [`cursor_pair`] for up to [`CURSORS_MAX`] distinct plain sequence
@@ -1580,6 +1597,52 @@ pub(crate) fn machine_collect(l: &PyLazyIter) -> Option<Vec<Object>> {
     while let Some(row) = machine_step(st)? {
         out.push(row);
     }
+    Some(out)
+}
+
+/// `accumulate(xs)` with no function over a plain list or tuple cursor:
+/// every remaining running total (the initial value first, when one is
+/// still to come), the adapter left as its last step leaves it: its total
+/// the last, its cursor at the end (the end itself changes nothing).
+/// Totals of machine ints (none overflowing) or floats, the first item
+/// any object; `None`, nothing consumed, for anything else.
+pub(crate) fn accumulate_collect(l: &PyLazyIter) -> Option<Vec<Object>> {
+    // SAFETY: nothing below runs code (clones and native sums); the views
+    // end with this call.
+    let st = unsafe { l.state.peek_mut() }?;
+    let LazyIterKind::Accumulate {
+        source: Object::Iter(c),
+        func: None,
+        total,
+        initial,
+    } = st
+    else {
+        return None;
+    };
+    // SAFETY: the source's own cell, viewed alone.
+    let (xs, idx) = unsafe { c.peek_mut() }.and_then(seq_cursor)?;
+    let rest = xs.get(*idx..)?;
+    let mut out = Vec::with_capacity(rest.len() + 1);
+    let mut t = total.clone();
+    if let Some(init) = initial.as_ref() {
+        out.push(init.clone());
+        t = Some(init.clone());
+    }
+    for item in rest {
+        let next = match (&t, item) {
+            (None, _) => item.clone(),
+            (Some(Object::Int(a)), Object::Int(b)) => Object::Int(a.checked_add(*b)?),
+            (Some(Object::Float(a)), Object::Float(b)) => Object::Float(a + b),
+            _ => return None,
+        };
+        out.push(next.clone());
+        t = Some(next);
+    }
+    // (Committed: the general steps would have left exactly this.)
+    *initial = None;
+    *idx = xs.len();
+    let old = std::mem::replace(total, t);
+    drop(old);
     Some(out)
 }
 

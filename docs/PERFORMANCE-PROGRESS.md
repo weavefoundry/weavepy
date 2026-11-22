@@ -2433,6 +2433,13 @@ branch and pull request.
     already valid (243,000 instructions). The copy sets them as they are
     now and builds its own flag and trap mappings (56,000; `copy()` 43 µs
     to under 10, `localcontext()` to 16).
+  - `list(accumulate(xs))` with no function over a list or tuple stepped
+    the adapter once an item through four layers (741 instructions an item
+    of a ten-item list, CPython 424). Its running totals of machine ints or
+    floats are computed at once now, the adapter committed as its last step
+    leaves it only when every total is native (359). And `zip` of three to
+    eight list or tuple cursors checks and steps them in one pass, not two
+    (`for x, y, z in zip(a, a, a)` 1,064 instructions a step to 1,025).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

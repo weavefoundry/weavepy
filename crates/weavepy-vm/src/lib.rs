@@ -48673,6 +48673,9 @@ impl Interpreter {
             if let Some(items) = crate::seqiter::islice_collect(l) {
                 return Ok(items);
             }
+            if let Some(items) = crate::seqiter::accumulate_collect(l) {
+                return Ok(items);
+            }
             if let Some(items) = crate::seqiter::machine_collect(l) {
                 return Ok(items);
             }
