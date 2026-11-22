@@ -2515,6 +2515,19 @@ branch and pull request.
     the full method's arity and window checks on every call (922
     instructions for `ba.startswith(b"\x00\x01")`, CPython 600). One
     `bytes` or `bytearray` affix with no window runs as a leaf half now.
+  - UTF-16 encoding of text that isn't all ASCII pushed each unit of
+    `encode_utf16()` onto a growing vector, and decoding pushed each
+    character of `char::decode_utf16` onto a `String`: 316,000
+    instructions to encode `"héllo wörld " * 1000` (CPython 30,000),
+    326,000 for 8,000 CJK characters (84,000), and 448,000 to decode the
+    first (57,000). The encoder sizes its output exactly now (characters
+    counted a lane of bytes at a time), spreads eight ASCII bytes into
+    their units at once, and writes the rest from the UTF-8 directly; the
+    decoder takes four ASCII units at once and writes each character's
+    UTF-8 itself (176,000, 260,000 and 184,000). UTF-32 encoding sizes its
+    output once too (251,000 to 205,000, CPython 32,000). CPython keeps
+    such text as one or two bytes a character, so its codecs copy units
+    where these decode UTF-8.
   - `BytesIO.getvalue()` of an unchanged buffer returned its cached value
     after taking a guarded borrow of the stream's state, its buffer, and
     the cache each (730 instructions a call, CPython 350). The leaf half

@@ -762,6 +762,88 @@ fn utf8_decode_named(
 // UTF-16 / UTF-32 decoders
 // ---------------------------------------------------------------------------
 
+/// The text of whole UTF-16 units whose surrogates all pair up, its UTF-8
+/// written straight into a buffer sized for the worst case (three bytes a
+/// unit; a pair's four bytes are its two units'). `None` at a lone
+/// surrogate, for the handler's path.
+fn utf16_well_formed(pairs: &[[u8; 2]], big: bool) -> Option<String> {
+    let unit = |pair: [u8; 2]| {
+        u32::from(if big {
+            u16::from_be_bytes(pair)
+        } else {
+            u16::from_le_bytes(pair)
+        })
+    };
+    let mut out: Vec<u8> = Vec::with_capacity(pairs.len() * 3);
+    // (A unit is ASCII when its high byte is zero and its low byte is.)
+    let (mask, at) = if big {
+        (0x80FF_80FF_80FF_80FF_u64, 1)
+    } else {
+        (0xFF80_FF80_FF80_FF80_u64, 0)
+    };
+    let dst = out.as_mut_ptr();
+    let (mut k, mut o) = (0, 0);
+    // SAFETY: no unit writes more than three bytes (a pair's four are its
+    // two units'), so every write lands inside the reserved capacity; the
+    // length then covers exactly what was written.
+    unsafe {
+        let put = |o: &mut usize, bytes: &[u8]| {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst.add(*o), bytes.len());
+            *o += bytes.len();
+        };
+        while k < pairs.len() {
+            // Four ASCII units at a time.
+            if let Some(block) = pairs.get(k..k + 4) {
+                let b: &[u8; 8] = block.as_flattened().try_into().expect("eight bytes");
+                if u64::from_le_bytes(*b) & mask == 0 {
+                    put(&mut o, &[b[at], b[at + 2], b[at + 4], b[at + 6]]);
+                    k += 4;
+                    continue;
+                }
+            }
+            let u = unit(pairs[k]);
+            k += 1;
+            if u < 0x80 {
+                *dst.add(o) = u as u8;
+                o += 1;
+            } else if u < 0x800 {
+                put(&mut o, &[0xC0 | (u >> 6) as u8, 0x80 | (u & 0x3F) as u8]);
+            } else if (0xD800..0xDC00).contains(&u) {
+                let low = unit(*pairs.get(k)?);
+                if !(0xDC00..0xE000).contains(&low) {
+                    return None;
+                }
+                k += 1;
+                let cp = 0x1_0000 + ((u - 0xD800) << 10) + (low - 0xDC00);
+                put(
+                    &mut o,
+                    &[
+                        0xF0 | (cp >> 18) as u8,
+                        0x80 | ((cp >> 12) & 0x3F) as u8,
+                        0x80 | ((cp >> 6) & 0x3F) as u8,
+                        0x80 | (cp & 0x3F) as u8,
+                    ],
+                );
+            } else if (0xDC00..0xE000).contains(&u) {
+                return None;
+            } else {
+                put(
+                    &mut o,
+                    &[
+                        0xE0 | (u >> 12) as u8,
+                        0x80 | ((u >> 6) & 0x3F) as u8,
+                        0x80 | (u & 0x3F) as u8,
+                    ],
+                );
+            }
+        }
+        out.set_len(o);
+        // (Every sequence written is a whole, valid UTF-8 encoding of a
+        // scalar value, surrogates excluded.)
+        Some(String::from_utf8_unchecked(out))
+    }
+}
+
 /// CPython's `PyUnicode_DecodeUTF16Stateful`: `byteorder` < 0 is LE, > 0 is
 /// BE, 0 sniffs a BOM (defaulting to native/LE). Returns the decoded text,
 /// bytes consumed, and the (possibly BOM-updated) byte order.
@@ -793,16 +875,7 @@ pub fn utf16_decode(
         if let Some(text) = utf16_ascii(body, big) {
             return Ok((text, data.len(), byteorder));
         }
-        let pairs = body.as_chunks::<2>().0;
-        let units = pairs.iter().map(|pair| {
-            if big {
-                u16::from_be_bytes(*pair)
-            } else {
-                u16::from_le_bytes(*pair)
-            }
-        });
-        let mut text = String::with_capacity((data.len() - start) / 2);
-        if char::decode_utf16(units).all(|unit| unit.map(|c| text.push(c)).is_ok()) {
+        if let Some(text) = utf16_well_formed(body.as_chunks::<2>().0, big) {
             return Ok((Object::from_str(text), data.len(), byteorder));
         }
     }
@@ -1600,6 +1673,15 @@ pub fn utf16_encode(cps: &[u32], errors: &str, byteorder: i32) -> Result<Vec<u8>
     Ok(body)
 }
 
+/// How many of `bytes` satisfy `test`, counted in lanes of bytes (a run
+/// of up to 255 at a time), which the compiler vectorizes.
+fn count_bytes(bytes: &[u8], test: impl Fn(u8) -> bool) -> usize {
+    bytes
+        .chunks(255)
+        .map(|run| usize::from(run.iter().fold(0u8, |c, &b| c + u8::from(test(b)))))
+        .sum()
+}
+
 /// [`utf16_encode`] of text with no lone surrogate (a `str`'s own): its
 /// units written straight from the text, an ASCII character as its byte
 /// and a zero.
@@ -1622,17 +1704,85 @@ pub fn utf16_encode_str(text: &str, byteorder: i32) -> Vec<u8> {
         }
         return out;
     }
-    let mut out = Vec::with_capacity(bom + text.len() * 2);
+    // The output sized exactly (a character is a unit, and one of four
+    // UTF-8 bytes a second), and zeroed: an ASCII character then writes
+    // one byte.
+    let bytes = text.as_bytes();
+    let units = count_bytes(bytes, |b| (b as i8) >= -0x40) + count_bytes(bytes, |b| b >= 0xF0);
+    let mut out = vec![0u8; bom + units * 2];
     if bom != 0 {
-        out.extend_from_slice(&[0xFF, 0xFE]);
+        out[..2].copy_from_slice(&[0xFF, 0xFE]); // native (LE) BOM
     }
-    for unit in text.encode_utf16() {
-        out.extend_from_slice(&if big {
-            unit.to_be_bytes()
-        } else {
-            unit.to_le_bytes()
-        });
+    let (lo, hi) = if big { (1, 0) } else { (0, 1) };
+    // Four bytes spread into the low bytes of four 16-bit lanes.
+    let spread = |v: u32| {
+        let v = u64::from(v);
+        let v = (v | (v << 16)) & 0x0000_FFFF_0000_FFFF;
+        (v | (v << 8)) & 0x00FF_00FF_00FF_00FF
+    };
+    let n = bytes.len();
+    let (src, dst) = (bytes.as_ptr(), out.as_mut_ptr());
+    let (mut i, mut o) = (0, bom);
+    // SAFETY: `out` holds exactly the units the text's characters make, so
+    // every write lands inside it; every read is inside the text, whose
+    // lead bytes all have their continuation bytes (it is valid UTF-8).
+    unsafe {
+        while i < n {
+            let b = *src.add(i);
+            if b < 0x80 {
+                // Eight bytes at a time while they are ASCII; the ASCII
+                // bytes before the first that isn't go one at a time.
+                if i + 8 <= n {
+                    let x = u64::from_le_bytes(src.add(i).cast::<[u8; 8]>().read_unaligned());
+                    let high = x & 0x8080_8080_8080_8080;
+                    if high == 0 {
+                        let shift = if big { 8 } else { 0 };
+                        let at = dst.add(o).cast::<[u8; 8]>();
+                        at.write_unaligned((spread(x as u32) << shift).to_le_bytes());
+                        at.add(1)
+                            .write_unaligned((spread((x >> 32) as u32) << shift).to_le_bytes());
+                        i += 8;
+                        o += 16;
+                        continue;
+                    }
+                    for _ in 0..high.trailing_zeros() / 8 {
+                        *dst.add(o + lo) = *src.add(i);
+                        o += 2;
+                        i += 1;
+                    }
+                    continue;
+                }
+                *dst.add(o + lo) = b;
+                o += 2;
+                i += 1;
+                continue;
+            }
+            let tail = |k: usize| u32::from(*src.add(i + k) & 0x3F);
+            let (cp, width) = if b < 0xE0 {
+                ((u32::from(b & 0x1F) << 6) | tail(1), 2)
+            } else if b < 0xF0 {
+                ((u32::from(b & 0x0F) << 12) | (tail(1) << 6) | tail(2), 3)
+            } else {
+                let cp = (u32::from(b & 0x07) << 18) | (tail(1) << 12) | (tail(2) << 6) | tail(3);
+                (cp, 4)
+            };
+            i += width;
+            if cp < 0x1_0000 {
+                *dst.add(o + lo) = cp as u8;
+                *dst.add(o + hi) = (cp >> 8) as u8;
+                o += 2;
+            } else {
+                let v = cp - 0x1_0000;
+                let (h, l) = (0xD800 + (v >> 10), 0xDC00 + (v & 0x3FF));
+                *dst.add(o + lo) = h as u8;
+                *dst.add(o + hi) = (h >> 8) as u8;
+                *dst.add(o + 2 + lo) = l as u8;
+                *dst.add(o + 2 + hi) = (l >> 8) as u8;
+                o += 4;
+            }
+        }
     }
+    debug_assert_eq!(o, out.len());
     out
 }
 
@@ -1657,17 +1807,23 @@ pub fn utf32_encode_str(text: &str, byteorder: i32) -> Vec<u8> {
         }
         return out;
     }
-    let mut out = Vec::with_capacity(4 + text.len() * 4);
-    if byteorder == 0 {
-        out.extend_from_slice(&[0xFF, 0xFE, 0x00, 0x00]); // native (LE) BOM
+    // (Sized once: a unit per character, each written whole.)
+    let bom = if byteorder == 0 { 4 } else { 0 };
+    let mut out = vec![0u8; bom + text.chars().count() * 4];
+    if bom != 0 {
+        out[..4].copy_from_slice(&[0xFF, 0xFE, 0x00, 0x00]); // native (LE) BOM
     }
-    for c in text.chars() {
-        let v = c as u32;
-        out.extend_from_slice(&if big {
-            v.to_be_bytes()
+    for (unit, c) in out[bom..]
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(text.chars())
+    {
+        *unit = if big {
+            (c as u32).to_be_bytes()
         } else {
-            v.to_le_bytes()
-        });
+            (c as u32).to_le_bytes()
+        };
     }
     out
 }
