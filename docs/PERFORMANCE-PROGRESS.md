@@ -2446,6 +2446,16 @@ branch and pull request.
     slot-layout check: they're read once now and the path chosen from the
     function's kind (`partial(f, 1, c=3)()` 3,021 instructions to 2,766,
     CPython 2,191).
+  - `f.read(4096)` of a buffered binary file took the full native method
+    (its argument parsing, checks and dispatch layers, 1,700 instructions
+    beside the copy) even when the bytes were in the read-ahead already.
+    The method's leaf half now serves such a read from the read-ahead, an
+    open, readable file with nothing written to flush (2,635 instructions
+    a read on average to 1,932, half the reads refilling the buffer).
+  - The macOS `torch` probe in CI twice panicked with "cell is already
+    borrowed" in the builtin-method memo, a cache shared by the whole
+    process. Its lookups now go without it when it is borrowed, and a
+    store that finds it borrowed is skipped, so no lookup can panic there.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

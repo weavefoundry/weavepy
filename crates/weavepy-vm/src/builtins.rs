@@ -514,12 +514,15 @@ std::thread_local! {
 /// [`lookup_method`] through the per-kind memo.
 fn lookup_method_memo(obj: &Object, name: &str, tag: u8) -> Option<Object> {
     let memo = METHOD_MEMO.get_or_init(|| RefCell::new(Vec::new()));
-    if let Some(hit) = memo
-        .borrow()
-        .get(usize::from(tag))
-        .and_then(|names| names.get(name))
-    {
-        return hit.clone();
+    // (The memo is one cache for the process: a lookup that finds it in
+    // use, by another thread's lookup between GIL switches, goes without
+    // it rather than panicking.)
+    if let Some(hit) = memo.try_borrow().ok().and_then(|memo| {
+        memo.get(usize::from(tag))
+            .and_then(|names| names.get(name))
+            .cloned()
+    }) {
+        return hit;
     }
     // (Built without the memo borrowed: nothing here reaches it, but a
     // builder is free to.)
@@ -552,13 +555,17 @@ fn lookup_method_memo(obj: &Object, name: &str, tag: u8) -> Option<Object> {
             _ => {}
         }
     }
-    let mut memo = memo.borrow_mut();
+    let Ok(mut memo) = memo.try_borrow_mut() else {
+        return found;
+    };
     if memo.len() <= usize::from(tag) {
         memo.resize_with(usize::from(tag) + 1, Default::default);
     }
     let names = &mut memo[usize::from(tag)];
     // Arbitrary names (`getattr(s, text)`) mustn't grow it without bound.
-    if names.len() < METHOD_MEMO_CAP {
+    // (An entry another lookup stored meanwhile stays: nothing is dropped
+    // while the memo is borrowed.)
+    if names.len() < METHOD_MEMO_CAP && !names.contains_key(name) {
         names.insert(name.into(), found.clone());
     }
     found
@@ -19378,6 +19385,10 @@ fn file_read_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
         _ => return None,
     };
     if f.binary {
+        // (A buffered disk file's read the read-ahead holds whole.)
+        if let Some(v) = n.and_then(|n| f.read_ahead_pure(n)) {
+            return Some(Ok(v));
+        }
         return f
             .mem_bytes_read_with(n, |run| (Object::new_bytes(run), run.len()))
             .map(Ok);

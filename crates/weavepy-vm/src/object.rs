@@ -9564,6 +9564,38 @@ impl PyFile {
     /// backend, read-ahead waiting, a would-block). The first read of the
     /// stream sets `PyFile`'s pre-read state as `read_bytes_opt` does.
     #[cfg(unix)]
+    /// `read(want)` of an open, readable, buffered binary disk stream with
+    /// nothing written to flush and no text sibling, when its read-ahead
+    /// holds all `want` bytes: those bytes, consumed, with no system call
+    /// and no code run (a leaf half's read). `None`, nothing touched, for
+    /// anything else.
+    pub(crate) fn read_ahead_pure(&self, want: usize) -> Option<Object> {
+        if want == 0 || !self.binary || self.io_kind.get() == IoKind::Raw {
+            return None;
+        }
+        // SAFETY: guard-free views, each dropped at once (nothing here runs
+        // code).
+        unsafe {
+            if self.closed.peek().is_none_or(|c| *c)
+                || self.write_buf.peek().is_none_or(|w| !w.is_empty())
+                || self.binary_buffer_cache.peek().is_none_or(Option::is_some)
+                || !matches!(self.backend.peek()?, FileBackend::Disk(_))
+            {
+                return None;
+            }
+        }
+        if !self.mode.bytes().any(|b| b == b'r' || b == b'+') {
+            return None;
+        }
+        let mut ra = self.read_ahead.try_borrow_mut().ok()?;
+        if ra.pending() < want {
+            return None;
+        }
+        let out = SharedSlice::from(&ra.rest()[..want]);
+        ra.consume(want);
+        Some(Object::Bytes(out))
+    }
+
     pub fn read_sized_shared(
         &self,
         want: usize,
