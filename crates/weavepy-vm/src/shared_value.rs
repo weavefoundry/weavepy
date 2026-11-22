@@ -691,6 +691,11 @@ pub struct SharedStr(ThinArc<StrStorage>);
 #[derive(Debug)]
 pub struct WeakStr(ThinWeak<StrStorage>);
 impl SharedStr {
+    /// The text, as a `&str`.
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        self
+    }
     /// The allocation's address: equal for every strong and weak owner of
     /// the same string, and never reused while one exists.
     pub fn addr(this: &Self) -> usize {

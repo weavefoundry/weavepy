@@ -638,7 +638,7 @@ fn b_configure_view(args: &[Object]) -> Result<Object, RuntimeError> {
     };
     let fmt = arg_str(args, 1)?;
     let itemsize = arg_usize(args, 2)?;
-    *mv.format.borrow_mut() = fmt;
+    *mv.format.borrow_mut() = crate::shared_value::SharedStr::from(fmt);
     mv.itemsize.set(itemsize);
     mv.strides.borrow_mut().clear();
     match arg(args, 3)? {

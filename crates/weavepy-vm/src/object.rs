@@ -1856,11 +1856,11 @@ impl Drop for PyTraceback {
 static BYTEARRAY_EXPORT_TOTAL: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-type ExportMap = std::collections::HashMap<usize, (crate::sync::Weak<RefCell<Vec<u8>>>, usize)>;
+type ExportMap = crate::fasthash::FxHashMap<usize, (crate::sync::Weak<RefCell<Vec<u8>>>, usize)>;
 
 fn bytearray_export_map() -> &'static std::sync::Mutex<ExportMap> {
     static MAP: std::sync::OnceLock<std::sync::Mutex<ExportMap>> = std::sync::OnceLock::new();
-    MAP.get_or_init(|| std::sync::Mutex::new(ExportMap::new()))
+    MAP.get_or_init(|| std::sync::Mutex::new(ExportMap::default()))
 }
 
 /// Register a live export of `buf`. Pair with
@@ -2043,6 +2043,14 @@ impl MemoryViewBuffer {
 /// views are RFC 0023 future work; the surface is enough for
 /// `pickle.PickleBuffer`, `socket.recv_into`, and the standard
 /// `memoryview(b'hello').tobytes()` patterns.
+/// The unsigned-byte format `"B"`, one shared string for every view.
+fn unsigned_byte_format() -> SharedStr {
+    match Object::from_static("B") {
+        Object::Str(s) => s,
+        _ => SharedStr::from("B"),
+    }
+}
+
 #[derive(Debug)]
 pub struct PyMemoryView {
     pub buffer: MemoryViewBuffer,
@@ -2055,7 +2063,7 @@ pub struct PyMemoryView {
     pub len: Cell<usize>,
     pub readonly: Cell<bool>,
     pub released: Cell<bool>,
-    pub format: RefCell<String>,
+    pub format: RefCell<SharedStr>,
     pub itemsize: Cell<usize>,
     /// Logical dimensions, in *elements*. Empty means "derive a 1-D
     /// `[len / itemsize]` shape", which keeps every simple constructor a
@@ -2114,7 +2122,7 @@ impl PyMemoryView {
             len: Cell::new(len),
             readonly: Cell::new(true),
             released: Cell::new(false),
-            format: RefCell::new("B".to_owned()),
+            format: RefCell::new(unsigned_byte_format()),
             itemsize: Cell::new(1),
             shape: RefCell::new(Vec::new()),
             strides: RefCell::new(Vec::new()),
@@ -2139,7 +2147,7 @@ impl PyMemoryView {
             len: Cell::new(len),
             readonly: Cell::new(readonly),
             released: Cell::new(false),
-            format: RefCell::new("B".to_owned()),
+            format: RefCell::new(unsigned_byte_format()),
             itemsize: Cell::new(1),
             shape: RefCell::new(Vec::new()),
             strides: RefCell::new(Vec::new()),
@@ -2165,7 +2173,7 @@ impl PyMemoryView {
             len: Cell::new(len),
             readonly: Cell::new(false),
             released: Cell::new(false),
-            format: RefCell::new("B".to_owned()),
+            format: RefCell::new(unsigned_byte_format()),
             itemsize: Cell::new(1),
             shape: RefCell::new(Vec::new()),
             strides: RefCell::new(Vec::new()),
@@ -2197,7 +2205,7 @@ impl PyMemoryView {
             len: Cell::new(len),
             readonly: Cell::new(readonly),
             released: Cell::new(false),
-            format: RefCell::new(format),
+            format: RefCell::new(SharedStr::from(format)),
             itemsize: Cell::new(itemsize),
             shape: RefCell::new(Vec::new()),
             strides: RefCell::new(Vec::new()),
@@ -2530,7 +2538,8 @@ impl PyMemoryView {
     /// are also `"B"`.
     fn norm_format(&self) -> String {
         let f = self.format.borrow();
-        f.strip_prefix('@').unwrap_or(&f).to_owned()
+        let f: &str = &f;
+        f.strip_prefix('@').unwrap_or(f).to_owned()
     }
 
     /// `memoryview == memoryview` per CPython's `memory_richcompare`:

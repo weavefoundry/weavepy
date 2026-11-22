@@ -2378,6 +2378,20 @@ branch and pull request.
   - A `Vec` of plain data became a `bytes` (or another shared slice) one
     element at a time: it's one copy now (`pickle.dumps` of 200 KB of
     bytes 21.4 µs to 18.5).
+  - A stepped slice (`b[::2]` of 200 KB) took its items through a
+    stepping iterator, a capacity check and a bounds check each: it writes
+    them from an exact-length range now, indexed unchecked within the run
+    the count proves (54.5 µs to 26.2, CPython 26.9; bytes 29.5, CPython
+    33.8). `bytearray * n` copied the operand before repeating it (17.2
+    µs to 11.3, CPython 13.0), and `bytearray.translate` copied the
+    receiver and looked bytes up in a table checked at every byte (155 µs
+    to 72, CPython 88): both read the bytearray in place now, translate
+    after it has its table and deletion set, as CPython reads them.
+  - `BytesIO.getbuffer()` and every other `bytearray` export registered
+    itself in a map hashed with SipHash (three hashes a view, about a
+    tenth of `getbuffer()[0]`), now the interpreter's fast hasher; and a
+    memoryview's format is a shared string, so a slice of a view no longer
+    allocates a copy of it.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

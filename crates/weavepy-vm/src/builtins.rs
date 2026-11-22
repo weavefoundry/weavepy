@@ -1170,7 +1170,7 @@ fn lookup_method_uncached(obj: &Object, name: &str) -> Option<Object> {
                     ));
                 }
                 let out = mv.shallow_clone();
-                *out.format.borrow_mut() = fmt.to_string();
+                *out.format.borrow_mut() = fmt.clone();
                 out.itemsize.set(itemsize);
                 let dims = vec![nbytes / itemsize];
                 *out.strides.borrow_mut() = crate::object::c_contiguous_strides(&dims, itemsize);
@@ -17977,7 +17977,11 @@ fn bytes_translate_kw(
     args: &[Object],
     kwargs: &[(String, Object)],
 ) -> Result<Object, RuntimeError> {
-    let data = bytes_data(args)?;
+    // (Only a receiver check here: the table and deletion set are read,
+    // which can run code, before the receiver's bytes are.)
+    if !matches!(args.first(), Some(Object::Bytes(_) | Object::ByteArray(_))) {
+        return Err(type_error("expected bytes-like receiver"));
+    }
     let mut delete_obj = args.get(2).cloned();
     for (k, v) in kwargs {
         match k.as_str() {
@@ -18008,28 +18012,35 @@ fn bytes_translate_kw(
         None => Vec::new(),
         Some(o) => bytes_argview(&o)?,
     };
-    let out: Vec<u8> = match (&table, delete.is_empty()) {
-        // (Nothing deleted: every byte maps to one byte, in one pass.)
-        (Some(t), true) => data.iter().map(|&b| t[b as usize]).collect(),
-        (None, true) => data.to_vec(),
-        _ => {
-            // (The bytes to delete, as a table of their own.)
-            let mut gone = [false; 256];
-            for &b in &delete {
-                gone[b as usize] = true;
-            }
-            let mut out = Vec::with_capacity(data.len());
-            for &b in data.iter() {
-                if !gone[b as usize] {
-                    out.push(match &table {
-                        Some(t) => t[b as usize],
-                        None => b,
-                    });
+    let table: Option<[u8; 256]> = table.map(|t| {
+        let mut a = [0u8; 256];
+        a.copy_from_slice(&t);
+        a
+    });
+    let out: Vec<u8> = with_bytes_data(args, |data| {
+        Ok(match (&table, delete.is_empty()) {
+            // (Nothing deleted: every byte maps to one byte, in one pass.)
+            (Some(t), true) => data.iter().map(|&b| t[b as usize]).collect(),
+            (None, true) => data.to_vec(),
+            _ => {
+                // (The bytes to delete, as a table of their own.)
+                let mut gone = [false; 256];
+                for &b in &delete {
+                    gone[b as usize] = true;
                 }
+                let mut out = Vec::with_capacity(data.len());
+                for &b in data.iter() {
+                    if !gone[b as usize] {
+                        out.push(match &table {
+                            Some(t) => t[b as usize],
+                            None => b,
+                        });
+                    }
+                }
+                out
             }
-            out
-        }
-    };
+        })
+    })?;
     if matches!(args.first(), Some(Object::ByteArray(_))) {
         Ok(Object::new_bytearray(out))
     } else {
@@ -20713,7 +20724,7 @@ fn memoryview_cast(args: &[Object], kwargs: &[(String, Object)]) -> Result<Objec
     // `mv` is left untouched, matching CPython's non-mutating `cast`.
     let cast = mv.shallow_clone();
     let zero_dim = dims.is_empty();
-    *cast.format.borrow_mut() = fmt.to_string();
+    *cast.format.borrow_mut() = fmt.clone();
     cast.itemsize.set(itemsize);
     *cast.strides.borrow_mut() = crate::object::c_contiguous_strides(&dims, itemsize);
     *cast.shape.borrow_mut() = dims;

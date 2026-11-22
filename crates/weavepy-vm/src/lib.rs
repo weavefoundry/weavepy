@@ -77687,13 +77687,14 @@ pub(crate) fn slice_seq<T: Clone + 'static>(
     // (A forward stride inside the sequence: one bounds check for the run,
     // not one per item.)
     if step > 0 && 0 <= start && start < stop && stop <= len {
-        if let Ok(stride) = usize::try_from(step) {
-            out.extend(
-                seq[start as usize..stop as usize]
-                    .iter()
-                    .step_by(stride)
-                    .cloned(),
-            );
+        if let (Ok(stride), Ok(n)) = (usize::try_from(step), usize::try_from(count)) {
+            // (An exact-length range, so the items are written in place
+            // with no per-item capacity check.)
+            let run = &seq[start as usize..stop as usize];
+            debug_assert!(n == 0 || (n - 1) * stride < run.len());
+            // SAFETY: the last item taken, `(n - 1) * stride`, is below
+            // `stop - start` by the count's construction.
+            out.extend((0..n).map(|k| unsafe { run.get_unchecked(k * stride) }.clone()));
             return Ok(out);
         }
     }
@@ -92407,10 +92408,13 @@ fn binary_op(a: &Object, b: &Object, op: BinOpKind) -> Result<Object, RuntimeErr
             Ok(Object::new_bytes(out))
         }
         (O::ByteArray(x), O::Int(n), B::Mult) | (O::Int(n), O::ByteArray(x), B::Mult) => {
-            let body = x.borrow().clone();
+            // (Repeating reads the operand in place: nothing here runs
+            // code that could resize it.)
+            let body = x.borrow();
             let times = checked_repeat_count(body.len(), *n, "bytearray")?;
             let mut out = try_alloc_vec(body.len() * times)?;
             repeat_into(&mut out, &body, times);
+            drop(body);
             Ok(Object::new_bytearray(out))
         }
         // Set operators accept any mix of `set`/`frozenset` operands; the

@@ -336,7 +336,7 @@ pub unsafe extern "C" fn PyMemoryView_FromObjectAndFlags(
                 len: Cell::new(view_len),
                 readonly: Cell::new(readonly),
                 released: Cell::new(false),
-                format: RefCell::new(format),
+                format: RefCell::new(format.into()),
                 itemsize: Cell::new(view_itemsize),
                 shape: RefCell::new(shape),
                 strides: RefCell::new(strides),
@@ -497,7 +497,7 @@ pub unsafe extern "C" fn PyMemoryView_FromBuffer(view: *const Py_buffer) -> *mut
         len: Cell::new(len),
         readonly: Cell::new(readonly),
         released: Cell::new(false),
-        format: RefCell::new(format),
+        format: RefCell::new(format.into()),
         itemsize: Cell::new(itemsize),
         shape: RefCell::new(shape),
         strides: RefCell::new(strides),
@@ -590,7 +590,7 @@ pub unsafe extern "C" fn PyMemoryView_GetContiguous(
         MemoryViewBuffer::Bytes(out.into()),
         total * itemsize,
         true,
-        mv.format.borrow().clone(),
+        mv.format.borrow().to_string(),
         itemsize,
     );
     if ndim >= 1 {
@@ -648,7 +648,7 @@ pub unsafe extern "C" fn PyMemoryView_GET_BUFFER(mv: *mut PyObject) -> *mut Py_b
             (p, Some(buf_box))
         }
     };
-    let format = view.format.borrow().clone() + "\0";
+    let format = view.format.borrow().to_string() + "\0";
     let format_storage: Box<[u8]> = format.into_bytes().into_boxed_slice();
     let itemsize = view.itemsize.get().max(1);
 
