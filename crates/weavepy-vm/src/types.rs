@@ -840,6 +840,9 @@ pub(crate) mod vm_key {
     pub(crate) const SETATTR_FN: u32 = 116;
     /// Its native `__setattr__` (a `threading.local`'s hook).
     pub(crate) const SETATTR_NATIVE: u32 = 117;
+    /// The leaf half of a class's native `__call__` (an `itemgetter`'s),
+    /// for callbacks that call its instances (`map`, a sort's key).
+    pub(crate) const CALL_LEAF: u32 = 118;
 }
 
 /// A builtin type's pure constructor (see [`TypeObject::pure_new`]).

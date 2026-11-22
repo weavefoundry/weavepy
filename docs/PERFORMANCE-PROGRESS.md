@@ -2276,6 +2276,12 @@ branch and pull request.
     (`sorted(items, key=itemgetter(1))` of ten pairs 6,530 instructions to
     4,300, 995 ns to 600; CPython 392). `sorted` takes a dict or a dict's
     view too (`sorted(d.items(), key=itemgetter(1), reverse=True)`).
+  - A callback that calls an instance with a native `__call__` (`map(itemgetter(1),
+    xs)`, a `key=attrgetter("n")`) looked `__call__` up along the class's
+    MRO and found its leaf half again for every item, and cloned both
+    operands (893 instructions an item for `map(itemgetter(1), pairs)`).
+    The class now caches the half per version, and the call passes views
+    of the operands (608).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

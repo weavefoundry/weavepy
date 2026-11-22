@@ -3839,18 +3839,19 @@ impl Interpreter {
             },
             // An instance whose class's `__call__` is a registered leaf
             // half (`key=attrgetter("x")`, `map(itemgetter(0), ...)`).
-            Object::Instance(i) if !crate::gil::free_threading_enabled() => {
-                let Object::Builtin(b) = i.cls_raw().lookup("__call__")? else {
+            // (Its half found once per class version; a half counts as an
+            // effect, as `admit` counts one.)
+            Object::Instance(_) if effects => {
+                let f = self.instance_call_fast(func)?;
+                let [a] = args else {
                     return None;
                 };
-                let LeafKind::Fast(f) = admit(self.leaf_call_kind(&b)?)? else {
-                    return None;
-                };
-                let call = match args {
-                    [a] => [func.clone(), a.clone()],
-                    _ => return None,
-                };
-                f(&call)?.ok()
+                // SAFETY: bitwise views of the live callable and argument,
+                // never dropped (the half clones what it keeps).
+                let views = std::mem::ManuallyDrop::new(unsafe {
+                    [std::ptr::read(func), std::ptr::read(a)]
+                });
+                f(&views[..])?.ok()
             }
             _ => None,
         }
@@ -3860,19 +3861,36 @@ impl Interpreter {
     /// (`attrgetter("x")`, `itemgetter(0)`), for a caller that calls it per
     /// item (a sort's key) to resolve once; it takes the instance first.
     pub(crate) fn instance_call_fast(&self, func: &Object) -> Option<crate::leaf_builtins::Fast> {
+        use crate::types::LeafAttrKind as K;
         let Object::Instance(i) = func else {
             return None;
         };
         if crate::gil::free_threading_enabled() {
             return None;
         }
-        let Object::Builtin(b) = i.cls_raw().lookup("__call__")? else {
-            return None;
-        };
-        match self.leaf_call_kind(&b)? {
-            LeafKind::Fast(f) => Some(f),
-            _ => None,
+        // (Found once per class version: a callback calls one key function
+        // for every item.)
+        let cls = i.cls_raw();
+        let ver = cls.attr_version.get();
+        let key = crate::types::AttrKey::vm(crate::types::vm_key::CALL_LEAF);
+        match cls.leaf_attrs.get(key, ver) {
+            Some(K::LeafFast(f)) => return Some(*f),
+            Some(_) => return None,
+            None => {}
         }
+        if crate::object::exotic_str_keys_possible() {
+            return None;
+        }
+        let fast = match cls.lookup("__call__") {
+            Some(Object::Builtin(b)) => match self.leaf_call_kind(&b) {
+                Some(LeafKind::Fast(f)) => Some(f),
+                _ => None,
+            },
+            _ => None,
+        };
+        cls.leaf_attrs
+            .set(key, ver, fast.map_or(K::Other, K::LeafFast));
+        fast
     }
 
     /// `groupby_step` when taking the next value and computing its key
