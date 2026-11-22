@@ -9556,14 +9556,6 @@ impl PyFile {
         *self.binary_buffer_cache.borrow_mut() = None;
     }
 
-    /// A sized binary read of a disk file with nothing parked, read straight
-    /// into the `bytes` object's own storage: `Ok(Ok(bytes))` when one
-    /// `read(2)` filled all `want` bytes, `Ok(Err(partial))` with what it
-    /// read otherwise (end of file or a short read, for the caller to carry
-    /// on with). `None` when another path must serve the read (another
-    /// backend, read-ahead waiting, a would-block). The first read of the
-    /// stream sets `PyFile`'s pre-read state as `read_bytes_opt` does.
-    #[cfg(unix)]
     /// `read(want)` of an open, readable, buffered binary disk stream with
     /// nothing written to flush and no text sibling, when its read-ahead
     /// holds all `want` bytes: those bytes, consumed, with no system call
@@ -9596,6 +9588,14 @@ impl PyFile {
         Some(Object::Bytes(out))
     }
 
+    /// A sized binary read of a disk file with nothing parked, read straight
+    /// into the `bytes` object's own storage: `Ok(Ok(bytes))` when one
+    /// `read(2)` filled all `want` bytes, `Ok(Err(partial))` with what it
+    /// read otherwise (end of file or a short read, for the caller to carry
+    /// on with). `None` when another path must serve the read (another
+    /// backend, read-ahead waiting, a would-block). The first read of the
+    /// stream sets `PyFile`'s pre-read state as `read_bytes_opt` does.
+    #[cfg(unix)]
     pub fn read_sized_shared(
         &self,
         want: usize,

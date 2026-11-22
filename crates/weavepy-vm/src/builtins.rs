@@ -12781,28 +12781,46 @@ fn short_bytes_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// [`substr_find`] from the right.
 pub(crate) fn substr_rfind(hay: &str, needle: &str) -> Option<usize> {
+    // The rightmost start, at a byte offset (for a match of whole UTF-8
+    // text, a character's).
     let (h, n) = (hay.as_bytes(), needle.as_bytes());
-    if n.is_empty() {
-        return Some(h.len());
+    match n {
+        [] => Some(h.len()),
+        // (One byte: an ASCII byte, never inside a multibyte character.)
+        [b] => memchr::memrchr(*b, h),
+        // A short haystack costs less to scan than a searcher to build.
+        _ if h.len() <= 64 => hay.rfind(needle),
+        _ => bytes_rfind_windows(h, n),
     }
-    if n.len() > 16 || h.len() < n.len() {
-        return hay.rfind(needle);
-    }
-    let first = n[0];
-    let mut end = h.len() - n.len();
-    let mut budget = h.len() / n.len() + 32;
+}
+
+/// The rightmost start of `n` (two bytes or more) in `h`, by the forward
+/// searcher (its vector prefilter is far faster than the reverse one's
+/// scan) over windows taken from the end, each four times the last (a
+/// frequent needle is found in the first, a rare one costs a forward scan
+/// of the rest). Windows overlap by `n.len() - 1` bytes, so a match across
+/// a boundary is in the earlier one, and matches are found overlapping.
+fn bytes_rfind_windows(h: &[u8], n: &[u8]) -> Option<usize> {
+    let finder = memchr::memmem::Finder::new(n);
+    let mut hi = h.len();
+    let mut size = 256usize;
     loop {
-        let at = h[..=end].iter().rposition(|&b| b == first)?;
-        if at + n.len() <= h.len() && h[at..at + n.len()] == *n {
-            return Some(at);
+        let lo = hi.saturating_sub(size + n.len() - 1);
+        let window = &h[lo..hi];
+        let mut last = None;
+        let mut i = 0;
+        while let Some(k) = finder.find(&window[i..]) {
+            last = Some(i + k);
+            i += k + 1;
         }
-        budget -= 1;
-        if budget == 0 || at == 0 {
-            // Everything right of `at` has been ruled out, so the
-            // rightmost match overall is the rightmost below it.
-            return hay.rfind(needle);
+        if let Some(at) = last {
+            return Some(lo + at);
         }
-        end = at - 1;
+        if lo == 0 {
+            return None;
+        }
+        hi = lo + n.len() - 1;
+        size = (size * 4).min(1 << 16);
     }
 }
 
@@ -17319,8 +17337,13 @@ fn bytes_rfind(args: &[Object]) -> Result<Object, RuntimeError> {
         if sub.is_empty() {
             return Ok(Object::Int(end as i64));
         }
-        let last =
-            memchr::memmem::rfind(&data[start..end], &sub).map_or(-1, |i| (start + i) as i64);
+        let hay = &data[start..end];
+        let last = match sub.as_slice() {
+            [b] => memchr::memrchr(*b, hay),
+            _ if hay.len() <= 64 => memchr::memmem::rfind(hay, &sub),
+            _ => bytes_rfind_windows(hay, &sub),
+        }
+        .map_or(-1, |i| (start + i) as i64);
         Ok(Object::Int(last))
     })
 }

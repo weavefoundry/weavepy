@@ -2462,6 +2462,14 @@ branch and pull request.
     four-byte literal 254 bytes into a bytearray 4,434 instructions,
     CPython 3,074). Over bytes, and text matched as its ASCII bytes, that
     scan is `memchr` now (1,963).
+  - `str.rfind` stepped back one candidate first byte at a time (2.48
+    million instructions for `text.rfind("line 5 ")` over 200 KB whose
+    match is near the start, CPython 0.83 million), and `bytes.rfind` used
+    the reverse substring searcher, which has no vector prefilter. Both run
+    the forward searcher over windows taken from the end now, 256 bytes and
+    then four times larger each time, overlapping by the needle's length
+    less one (134,000); one-byte needles use `memrchr`, and short
+    haystacks a plain scan.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
