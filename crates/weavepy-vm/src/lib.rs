@@ -2494,6 +2494,16 @@ impl Interpreter {
     /// state — critical now that worker threads have their own
     /// forked interpreter with independent frame / exception stacks.
     pub(crate) fn activate_thread_handles(&self) -> crate::vm_singletons::ThreadHandlesGuard {
+        // (Re-entered with its own handles on top, the common nested
+        // call: nothing to push.)
+        if crate::vm_singletons::thread_handles_top_is(
+            &self.frame_stack,
+            &self.exc_info_stack,
+            &self.excepthook,
+            &self.unraisable_hook,
+        ) {
+            return crate::vm_singletons::ThreadHandlesGuard::unpushed();
+        }
         crate::vm_singletons::activate_thread_handles(crate::vm_singletons::ThreadHandles {
             frame_stack: self.frame_stack.clone(),
             exc_info_stack: self.exc_info_stack.clone(),
@@ -77152,10 +77162,11 @@ fn mv_slice_subview(
     // A one-dimensional view in its derived layout (no stored shape or
     // strides), sliced with step 1: the sub-view's layout is derived too,
     // from its own start and length, with no vectors built.
+    // SAFETY: guard-free reads, each ending at once.
     if itemsize > 0
         && !mv.zero_dim.get()
-        && mv.shape.borrow().is_empty()
-        && mv.strides.borrow().is_empty()
+        && unsafe { mv.shape.peek() }.is_some_and(Vec::is_empty)
+        && unsafe { mv.strides.peek() }.is_some_and(Vec::is_empty)
     {
         let n = (mv.len.get() / itemsize) as i64;
         let (start_i, _stop, step, slicelen) = adjust_slice(n, slc)?;
@@ -77200,13 +77211,17 @@ fn mv_slice_subview(
 /// buffer, and how many it spans. (Whether the view is live is the
 /// caller's to check.)
 pub(crate) fn mv_plain_bytes(mv: &crate::object::PyMemoryView) -> Option<(usize, usize)> {
-    (mv.itemsize.get() == 1
-        && !mv.zero_dim.get()
-        && mv.shape.borrow().is_empty()
-        && mv.strides.borrow().is_empty()
-        && mv.suboffsets.borrow().is_empty()
-        && mv.format.borrow().as_str() == "B")
-        .then(|| (mv.start.get(), mv.len.get()))
+    // SAFETY: guard-free reads, each ending at once (nothing here runs
+    // code); a cell borrowed mutably reads as not plain.
+    let plain = unsafe {
+        mv.itemsize.get() == 1
+            && !mv.zero_dim.get()
+            && mv.shape.peek()?.is_empty()
+            && mv.strides.peek()?.is_empty()
+            && mv.suboffsets.peek()?.is_empty()
+            && mv.format.peek()?.as_str() == "B"
+    };
+    plain.then(|| (mv.start.get(), mv.len.get()))
 }
 
 /// `view[i]` of such a view ([`mv_plain_bytes`]): the byte, for an index

@@ -1377,59 +1377,85 @@ fn writer_writerow_inner(
     cfg: &DialectCfg,
     seq: Object,
 ) -> Result<Object, RuntimeError> {
-    let iter = match interp.iter_object(seq.clone()) {
-        Ok(it) => it,
-        Err(RuntimeError::PyException(e)) if e.type_name() == "TypeError" => {
-            return Err(csv_error(format!(
-                "iterable expected, not {}",
-                seq.type_name()
-            )))
-        }
-        Err(e) => return Err(e),
-    };
-
     let mut rec = String::new();
     let mut num_fields: i64 = 0;
     let mut last_null = false;
-    loop {
-        let field = match interp.iter_next_object(iter.clone())? {
-            Some(f) => f,
-            None => break,
-        };
+    let mut emit = |interp: &mut Interpreter, field: &Object| -> Result<(), RuntimeError> {
         let quoted = match cfg.quoting {
-            QUOTE_NONNUMERIC => !is_number(&field),
+            QUOTE_NONNUMERIC => !is_number(field),
             QUOTE_ALL => true,
             QUOTE_STRINGS => matches!(field, Object::Str(_) | Object::WStr(_)),
             QUOTE_NOTNULL => !matches!(field, Object::None),
             _ => false,
         };
         last_null = matches!(field, Object::None);
-        if let Some(s) = str_chars(&field) {
+        if let Some(s) = str_chars(field) {
             join_append(&mut rec, cfg, num_fields, Some(&s), quoted)?;
-            num_fields += 1;
         } else if last_null {
             join_append(&mut rec, cfg, num_fields, None, quoted)?;
-            num_fields += 1;
         } else {
-            // (`str()` of a plain number is its own text.)
-            let text = match &field {
+            // (`str()` of a plain number or bool is its own text.)
+            let text = match field {
                 Object::Int(n) => Some(itoa::Buffer::new().format(*n).to_owned()),
                 Object::Float(x) => Some(crate::object::float_repr(*x)),
+                Object::Bool(b) => Some(if *b { "True" } else { "False" }.to_owned()),
                 _ => None,
             };
-            let s = match text {
-                Some(t) => Object::from_str(t),
-                None => interp.call_object(
-                    Object::Type(builtin_types().str_.clone()),
-                    std::slice::from_ref(&field),
-                    &[],
-                )?,
-            };
-            let s = str_chars(&s).unwrap_or_default();
-            join_append(&mut rec, cfg, num_fields, Some(&s), quoted)?;
-            num_fields += 1;
+            match text {
+                Some(t) => join_append(&mut rec, cfg, num_fields, Some(&t), quoted)?,
+                None => {
+                    let s = interp.call_object(
+                        Object::Type(builtin_types().str_.clone()),
+                        std::slice::from_ref(field),
+                        &[],
+                    )?;
+                    let s = str_chars(&s).unwrap_or_default();
+                    join_append(&mut rec, cfg, num_fields, Some(&s), quoted)?;
+                }
+            }
+        }
+        num_fields += 1;
+        Ok(())
+    };
+
+    // A list or tuple of plain strings, numbers, bools and `None`s: its
+    // items in order, read at once (writing them runs no code, so
+    // iterating the sequence live would see the same items).
+    let plain = |x: &Object| {
+        matches!(
+            x,
+            Object::Str(_) | Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
+        )
+    };
+    let items = match &seq {
+        Object::List(l) => l
+            .try_borrow()
+            .ok()
+            .filter(|v| v.iter().all(plain))
+            .map(|v| v.clone()),
+        Object::Tuple(t) => t.iter().all(plain).then(|| t.to_vec()),
+        _ => None,
+    };
+    if let Some(items) = items {
+        for field in &items {
+            emit(interp, field)?;
+        }
+    } else {
+        let iter = match interp.iter_object(seq.clone()) {
+            Ok(it) => it,
+            Err(RuntimeError::PyException(e)) if e.type_name() == "TypeError" => {
+                return Err(csv_error(format!(
+                    "iterable expected, not {}",
+                    seq.type_name()
+                )))
+            }
+            Err(e) => return Err(e),
+        };
+        while let Some(field) = interp.iter_next_object(iter.clone())? {
+            emit(interp, &field)?;
         }
     }
+    drop(emit);
 
     if num_fields > 0 && rec.is_empty() {
         if cfg.quoting == QUOTE_NONE

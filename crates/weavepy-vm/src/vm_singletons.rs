@@ -691,7 +691,30 @@ pub fn activate_thread_handles(handles: ThreadHandles) -> ThreadHandlesGuard {
         }
     });
     CURRENT_THREAD_HANDLES.with(|cell| cell.borrow_mut().push(handles));
-    ThreadHandlesGuard { _private: () }
+    ThreadHandlesGuard { pushed: true }
+}
+
+/// Whether the handles on top of this thread's stack are exactly these
+/// (every one the same shared cell): activating them again would push a
+/// copy of the top, so [`ThreadHandlesGuard::unpushed`] stands in.
+pub(crate) fn thread_handles_top_is(
+    frame_stack: &crate::object::FrameStack,
+    exc_info_stack: &Rc<RefCell<Vec<Object>>>,
+    excepthook: &Rc<RefCell<Object>>,
+    unraisable_hook: &Rc<RefCell<Object>>,
+) -> bool {
+    CURRENT_THREAD_HANDLES
+        .try_with(|cell| {
+            cell.try_borrow().is_ok_and(|v| {
+                v.last().is_some_and(|h| {
+                    Rc::ptr_eq(&h.frame_stack, frame_stack)
+                        && Rc::ptr_eq(&h.exc_info_stack, exc_info_stack)
+                        && Rc::ptr_eq(&h.excepthook, excepthook)
+                        && Rc::ptr_eq(&h.unraisable_hook, unraisable_hook)
+                })
+            })
+        })
+        .unwrap_or(false)
 }
 
 /// Whether the handles on top of this thread's stack are the ones whose
@@ -738,11 +761,23 @@ pub fn swap_thread_handles_stack(new: Vec<ThreadHandles>) -> Vec<ThreadHandles> 
 /// most-recently-pushed handles on drop.
 #[derive(Debug)]
 pub struct ThreadHandlesGuard {
-    _private: (),
+    /// Whether this guard pushed (see [`thread_handles_top_is`]).
+    pushed: bool,
+}
+
+impl ThreadHandlesGuard {
+    /// A guard for handles already on top: it pushed nothing, so it pops
+    /// nothing.
+    pub(crate) fn unpushed() -> Self {
+        Self { pushed: false }
+    }
 }
 
 impl Drop for ThreadHandlesGuard {
     fn drop(&mut self) {
+        if !self.pushed {
+            return;
+        }
         CURRENT_THREAD_HANDLES.with(|cell| {
             let _ = cell.borrow_mut().pop();
         });
@@ -785,11 +820,17 @@ impl Drop for InterpStack {
 /// might run user code which re-enters the C-API.
 #[derive(Debug)]
 pub struct InterpreterGuard {
-    _private: (),
+    /// Whether this guard pushed: publishing the interpreter already on
+    /// top pushes nothing (lookups read the top, which stays the same), so
+    /// its guard pops nothing either.
+    pushed: bool,
 }
 
 impl Drop for InterpreterGuard {
     fn drop(&mut self) {
+        if !self.pushed {
+            return;
+        }
         // `try_with`: guards can unwind during thread teardown after the
         // TLS slot is gone; the stack died with it, so popping is moot.
         let top = CURRENT_INTERPRETER_PTR
@@ -1466,9 +1507,14 @@ pub fn warn_default_encoding() -> bool {
 /// the returned guard. Re-entrant calls produce a stack so the
 /// most recent guard wins on `current_interpreter_ptr` lookups.
 pub fn publish_interpreter_ptr(interp: *mut crate::Interpreter) -> InterpreterGuard {
+    // (Re-entering the interpreter already on top, the common nested
+    // call, leaves the stack as it is.)
+    if !interp.is_null() && CURRENT_INTERPRETER_TOP.with(std::cell::Cell::get) == interp {
+        return InterpreterGuard { pushed: false };
+    }
     CURRENT_INTERPRETER_PTR.with(|cell| cell.borrow_mut().0.push(interp));
     CURRENT_INTERPRETER_TOP.with(|t| t.set(interp));
-    InterpreterGuard { _private: () }
+    InterpreterGuard { pushed: true }
 }
 
 /// Read the most recently published interpreter pointer, or

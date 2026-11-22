@@ -19342,6 +19342,16 @@ fn file_write_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
             f.mem_bytes_append(&b)
                 .then(|| Ok(Object::Int(b.len() as i64)))
         }
+        // (A live one-dimensional view of unsigned bytes, likewise; a view
+        // of the stream's own buffer is an export the append refuses.)
+        [Object::File(f), Object::MemoryView(mv)] if !mv.released.get() => {
+            let (start, len) = crate::mv_plain_bytes(mv)?;
+            mv.buffer.with_read(|all| {
+                let data = all.get(start..start.checked_add(len)?)?;
+                f.mem_bytes_append(data)
+                    .then(|| Ok(Object::Int(len as i64)))
+            })
+        }
         _ => None,
     }
 }
@@ -19497,6 +19507,9 @@ pub(crate) fn file_write(args: &[Object]) -> Result<Object, RuntimeError> {
             if !f.binary {
                 return Err(type_error("string argument expected, got 'memoryview'"));
             }
+            // (A released view's `ValueError`, a strided one's
+            // `BufferError`, as CPython's `PyBUF_SIMPLE` request raises.)
+            data.check_simple_buffer()?;
             f.write_bytes(&mv.to_bytes())?
         }
         // A `str`/`bytes` subclass instance writes its wrapped native

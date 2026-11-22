@@ -2392,6 +2392,27 @@ branch and pull request.
     tenth of `getbuffer()[0]`), now the interpreter's fast hasher; and a
     memoryview's format is a shared string, so a slice of a view no longer
     allocates a copy of it.
+  - `BytesIO.write(view[i:i + 64])` took the full method, which copied
+    the view's bytes out first, and slicing the view took five checked
+    cell borrows to copy its layout (2,828 instructions a write and
+    slice). A one-dimensional view of unsigned bytes now writes from where
+    its bytes are, and the view's layout is read guard-free (545 µs for
+    2,000 writes to 367, CPython 265). The full method now raises
+    CPython's `BufferError` for a strided view and `ValueError` for a
+    released one, where it wrote the first and accepted the second.
+  - Every native entry into the interpreter (an iterator step from
+    `csv`, a callback from a C extension) pushed the interpreter's pointer
+    and its four thread handles onto thread-local stacks and popped them
+    after, about 230 instructions an entry and six entries a `csv` row.
+    When the interpreter and its handles are already on top, as for a
+    nested entry, nothing is pushed or popped (a 5,000-row `csv` round
+    trip 7.27 ms to 6.98).
+  - `csv.writer.writerow` stepped every row through the interpreter's
+    iterator protocol, one entry a field, and made each number's text a
+    Python string before joining it. A list or tuple of strings, numbers,
+    bools and `None`s is read at once now (writing those runs no code, so
+    a live iteration would see the same items), and numbers and bools are
+    joined as text (5,000 rows 3.49 ms to 2.49, CPython 2.92).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

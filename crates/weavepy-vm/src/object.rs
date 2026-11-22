@@ -2232,18 +2232,28 @@ impl PyMemoryView {
             }
             MemoryViewBuffer::Shared(s) => MemoryViewBuffer::Shared(s.clone()),
         };
+        // (Guard-free reads where no borrow is live: cloning these runs no
+        // code. A cell borrowed mutably takes the checked borrow, which
+        // reports it.)
+        fn read<T: Clone>(cell: &RefCell<T>) -> T {
+            // SAFETY: the view ends with the clone, which runs no code.
+            match unsafe { cell.peek() } {
+                Some(v) => v.clone(),
+                None => cell.borrow().clone(),
+            }
+        }
         Self {
             buffer,
             start: Cell::new(self.start.get()),
             len: Cell::new(self.len.get()),
             readonly: Cell::new(self.readonly.get()),
             released: Cell::new(self.released.get()),
-            format: RefCell::new(self.format.borrow().clone()),
+            format: RefCell::new(read(&self.format)),
             itemsize: Cell::new(self.itemsize.get()),
-            shape: RefCell::new(self.shape.borrow().clone()),
-            strides: RefCell::new(self.strides.borrow().clone()),
-            suboffsets: RefCell::new(self.suboffsets.borrow().clone()),
-            exporter: RefCell::new(self.exporter.borrow().clone()),
+            shape: RefCell::new(read(&self.shape)),
+            strides: RefCell::new(read(&self.strides)),
+            suboffsets: RefCell::new(read(&self.suboffsets)),
+            exporter: RefCell::new(read(&self.exporter)),
             zero_dim: Cell::new(self.zero_dim.get()),
             // A fresh object: the hash cache and re-entrancy guard are
             // per-view state, not shared with the source.
@@ -2330,6 +2340,14 @@ impl PyMemoryView {
     /// negative or gapped stride (e.g. `mv[::-1]`, `mv[::2]`) or with
     /// suboffsets is not.
     pub fn is_c_contiguous(&self) -> bool {
+        // (The derived layout, no suboffsets or stored strides, read
+        // guard-free: the common one-dimensional view.)
+        // SAFETY: views that end at once; nothing here runs code.
+        if unsafe { self.suboffsets.peek() }.is_some_and(Vec::is_empty)
+            && unsafe { self.strides.peek() }.is_some_and(Vec::is_empty)
+        {
+            return true;
+        }
         if self.has_suboffsets() {
             return false;
         }
