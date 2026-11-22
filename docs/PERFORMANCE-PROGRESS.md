@@ -2470,6 +2470,10 @@ branch and pull request.
     then four times larger each time, overlapping by the needle's length
     less one (134,000); one-byte needles use `memrchr`, and short
     haystacks a plain scan.
+  - `BytesIO.tell()` and `seek(n)` took the full native methods (925 and
+    1,119 instructions a call, CPython 340 and 459): an open `BytesIO`
+    with nothing read ahead or written to flush is served by leaf halves
+    now, `seek` for an absolute position not below zero (574 and 608).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

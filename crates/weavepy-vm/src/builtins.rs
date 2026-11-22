@@ -536,6 +536,8 @@ fn lookup_method_memo(obj: &Object, name: &str, tag: u8) -> Option<Object> {
             "getvalue" => crate::leaf_builtins::register_fast(b, file_getvalue_fast),
             "read" => crate::leaf_builtins::register_fast(b, file_read_fast),
             "readinto" => crate::leaf_builtins::register_fast(b, file_readinto_fast),
+            "tell" => crate::leaf_builtins::register_fast(b, file_tell_fast),
+            "seek" => crate::leaf_builtins::register_fast(b, file_seek_fast),
             _ => {}
         }
     }
@@ -19384,6 +19386,30 @@ fn file_write_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
         }
         _ => None,
     }
+}
+
+/// `f.tell()` of an open `BytesIO`: its position. A leaf half, like
+/// [`file_write_fast`].
+fn file_tell_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::File(f)] = args else {
+        return None;
+    };
+    let p = f.mem_bytes_tell()?;
+    Some(Ok(Object::Int(i64::try_from(p).ok()?)))
+}
+
+/// `f.seek(n)` or `f.seek(n, 0)` of an open `BytesIO`, `n` not negative:
+/// the new position. A leaf half, like [`file_write_fast`].
+fn file_seek_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let (f, at) = match args {
+        [Object::File(f), Object::Int(n)] | [Object::File(f), Object::Int(n), Object::Int(0)] => {
+            (f, *n)
+        }
+        _ => return None,
+    };
+    let at_usize = usize::try_from(at).ok()?;
+    f.mem_bytes_seek(at_usize)?;
+    Some(Ok(Object::Int(at)))
 }
 
 /// `BytesIO.getvalue()` or `StringIO.getvalue()` of an open stream: the

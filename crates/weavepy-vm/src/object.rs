@@ -9556,6 +9556,43 @@ impl PyFile {
         *self.binary_buffer_cache.borrow_mut() = None;
     }
 
+    /// The position of an open `BytesIO` with nothing read ahead or written
+    /// to flush (its `tell()`), read guard-free; `None` for anything else.
+    pub(crate) fn mem_bytes_tell(&self) -> Option<usize> {
+        if self.io_kind.get() != IoKind::BytesIO {
+            return None;
+        }
+        // SAFETY: guard-free views, each dropped at once (nothing here runs
+        // code).
+        unsafe {
+            if self.closed.peek().is_none_or(|c| *c)
+                || self.read_ahead.peek().is_none_or(|r| r.pending() != 0)
+                || self.write_buf.peek().is_none_or(|w| !w.is_empty())
+            {
+                return None;
+            }
+            match self.backend.peek()? {
+                FileBackend::MemBytes { pos, .. } => Some(*pos),
+                _ => None,
+            }
+        }
+    }
+
+    /// `seek(at)` (from the start, `at` not negative) of such a stream: the
+    /// position set as the full method sets it (past the end too), and
+    /// `tell()` enabled. `None`, nothing touched, for anything else.
+    pub(crate) fn mem_bytes_seek(&self, at: usize) -> Option<()> {
+        self.mem_bytes_tell()?;
+        let mut backend = self.backend.try_borrow_mut().ok()?;
+        let FileBackend::MemBytes { pos, .. } = &mut *backend else {
+            return None;
+        };
+        *pos = at;
+        drop(backend);
+        self.telling.set(true);
+        Some(())
+    }
+
     /// `read(want)` of an open, readable, buffered binary disk stream with
     /// nothing written to flush and no text sibling, when its read-ahead
     /// holds all `want` bytes: those bytes, consumed, with no system call
