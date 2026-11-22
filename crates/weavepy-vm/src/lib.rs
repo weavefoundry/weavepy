@@ -33990,15 +33990,33 @@ impl Interpreter {
                     );
                 }
             });
-            // `sorted(xs, reverse=True)`, this interpreter's `sorted`.
-            if let Some(Object::Builtin(b)) =
-                self.builtins.borrow().get(&crate::object::StrKey("sorted"))
+            // `sorted(xs, reverse=True)`, `max(xs, default=0)` and
+            // `round(x, ndigits=2)`, this interpreter's builtins.
             {
-                leaf_builtins::register_fast_kw(
-                    b,
-                    &["/iterable", "*key", "*reverse"],
-                    crate::seqiter::sorted_kw_fast,
-                );
+                let builtins = self.builtins.borrow();
+                let kw_halves: [(&str, leaf_builtins::KwNames, leaf_builtins::Fast); 4] = [
+                    (
+                        "sorted",
+                        &["/iterable", "*key", "*reverse"],
+                        crate::seqiter::sorted_kw_fast,
+                    ),
+                    (
+                        "max",
+                        &["/iterable", "*key", "*default"],
+                        crate::seqiter::max_kw_fast,
+                    ),
+                    (
+                        "min",
+                        &["/iterable", "*key", "*default"],
+                        crate::seqiter::min_kw_fast,
+                    ),
+                    ("round", &["number", "ndigits"], crate::seqiter::round_fast),
+                ];
+                for (name, params, fast) in kw_halves {
+                    if let Some(Object::Builtin(b)) = builtins.get(&crate::object::StrKey(name)) {
+                        leaf_builtins::register_fast_kw(b, params, fast);
+                    }
+                }
             }
             for (recv, probe, names) in table {
                 // The type's own entry for each name, a receiver-checking

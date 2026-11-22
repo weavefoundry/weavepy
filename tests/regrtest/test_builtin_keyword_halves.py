@@ -1,6 +1,7 @@
 """Keyword calls of builtins served in place.
 
-`dict(a=1)`, `s.encode(encoding=...)` and `s.split(sep=..., maxsplit=...)`
+`dict(a=1)`, `s.encode(encoding=...)`, `s.split(sep=..., maxsplit=...)`,
+`b.decode(errors=...)`, `max(xs, default=...)` and `round(x, ndigits=...)`
 take their keywords without the general keyword call when nothing they do
 runs code. Every other shape, and every error, is the full call's, with
 CPython's results and messages.
@@ -55,6 +56,29 @@ class BuiltinKeywordTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             raw.decode(nope=1)
         self.assertEqual(b"\xff".decode(errors="replace"), "\ufffd")
+
+    def test_min_max_round_keywords(self):
+        for _ in range(300):
+            self.assertEqual(max([3, 1, 2], default=0), 3)
+            self.assertEqual(min((3, 1, 2), default=0), 1)
+            self.assertEqual(max([], default=5), 5)
+            self.assertIsNone(min((), default=None))
+            self.assertEqual(max([], key=None, default=1), 1)
+            self.assertEqual(max(["b", "a"], default=""), "b")
+            self.assertEqual(round(2.567, ndigits=2), 2.57)
+            self.assertEqual(round(number=2.5), 2)
+            self.assertEqual(round(7, ndigits=-1), 10)
+            self.assertEqual(round(2.5, ndigits=None), 2)
+        self.assertEqual(max(iter([4, 9]), default=0), 9)
+        self.assertEqual(max(["aa", "b"], key=len, default=""), "aa")
+        with self.assertRaises(ValueError):
+            max([])
+        with self.assertRaises(TypeError):
+            max([1, "a"], default=0)
+        with self.assertRaises(TypeError):
+            round(1.5, ndigits="x")
+        with self.assertRaises(TypeError):
+            max(1, 2, default=0)
 
     def test_split_keywords(self):
         for _ in range(300):

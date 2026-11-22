@@ -2332,7 +2332,10 @@ branch and pull request.
   - `b.decode(errors=...)` and `b.decode(encoding=...)` of bytes and
     bytearrays take a keyword half too (270 ns to 165 in the container;
     CPython 103), and the full method now rejects an unknown keyword with
-    CPython's `TypeError`, where it ignored it.
+    CPython's `TypeError`, where it ignored it. `max(xs, default=0)`,
+    `min(...)` likewise (no key: the positional half, or the default for an
+    empty list or tuple; 298 ns to 133 in the container) and `round(x,
+    ndigits=2)` (its positional half, 394 to 223).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

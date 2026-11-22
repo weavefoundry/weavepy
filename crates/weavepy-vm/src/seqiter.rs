@@ -3536,6 +3536,40 @@ pub(crate) fn max_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> 
     min_max_fast(args, true)
 }
 
+/// `min(iterable, *, key=None, default=...)`'s keyword half (see
+/// `leaf_builtins::register_fast_kw`): the iterable, then `key` and
+/// `default`, each `Unbound` when the call left it out. No key: the
+/// positional half's answer, or the default for an empty list or tuple.
+pub(crate) fn min_kw_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    min_max_kw_fast(args, false)
+}
+
+/// [`min_kw_fast`] for `max`.
+pub(crate) fn max_kw_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    min_max_kw_fast(args, true)
+}
+
+fn min_max_kw_fast(args: &[Object], want_max: bool) -> Option<Result<Object, RuntimeError>> {
+    let [iterable, key, default] = args else {
+        return None;
+    };
+    if !matches!(key, Object::Unbound | Object::None) {
+        return None;
+    }
+    let empty = match iterable {
+        Object::List(l) => l.try_borrow().ok()?.is_empty(),
+        Object::Tuple(t) => t.is_empty(),
+        _ => false,
+    };
+    if empty {
+        return match default {
+            Object::Unbound => None,
+            d => Some(Ok(d.clone())),
+        };
+    }
+    min_max_fast(std::slice::from_ref(iterable), want_max)
+}
+
 /// `sum(xs)` of plain ints that stays a machine int.
 pub(crate) fn sum_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let mut total: i64 = 0;
