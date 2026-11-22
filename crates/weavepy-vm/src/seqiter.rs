@@ -3043,6 +3043,20 @@ pub(crate) fn sorted_kw_fast(args: &[Object]) -> Option<Result<Object, RuntimeEr
     let mut v = match iterable {
         Object::List(l) => l.try_borrow().ok()?.clone(),
         Object::Tuple(t) => crate::object::cloned_vec(t),
+        // A dict's keys, or a view's keys, values or `(key, value)` items,
+        // in the dict's order (cloning them runs no code).
+        Object::Dict(d) => d.try_borrow().ok()?.keys().map(|k| k.0.clone()).collect(),
+        Object::DictView(view) => {
+            let d = view.dict.try_borrow().ok()?;
+            match view.kind {
+                crate::object::DictViewKind::Keys => d.keys().map(|k| k.0.clone()).collect(),
+                crate::object::DictViewKind::Values => d.values().cloned().collect(),
+                crate::object::DictViewKind::Items => d
+                    .iter()
+                    .map(|(k, v)| Object::new_tuple_array([k.0.clone(), v.clone()]))
+                    .collect(),
+            }
+        }
         _ => return None,
     };
     Some(sort_maybe_keyed(&mut v, key, reverse)?.map(|()| {

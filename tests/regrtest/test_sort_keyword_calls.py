@@ -125,6 +125,24 @@ class SortKeywordTests(unittest.TestCase):
             sorted([(1,), ()], key=operator.itemgetter(0))
         self.assertEqual(sorted([[1, 2], [1], []], key=len), [[], [1], [1, 2]])
 
+    def test_dicts_and_views(self):
+        import collections
+        import operator
+
+        d = {"b": 2, "a": 3, "c": 1}
+        for _ in range(200):
+            self.assertEqual(sorted(d.items(), key=operator.itemgetter(1)), [("c", 1), ("b", 2), ("a", 3)])
+            self.assertEqual(sorted(d.items(), key=operator.itemgetter(1), reverse=True), [("a", 3), ("b", 2), ("c", 1)])
+            self.assertEqual(sorted(d, reverse=True), ["c", "b", "a"])
+            self.assertEqual(sorted(d.keys(), key=None), ["a", "b", "c"])
+            self.assertEqual(sorted(d.values(), reverse=True), [3, 2, 1])
+            self.assertEqual(sorted(d.items(), reverse=True), [("c", 1), ("b", 2), ("a", 3)])
+        c = collections.Counter("aabbbc")
+        self.assertEqual(sorted(c.items(), key=operator.itemgetter(1), reverse=True), [("b", 3), ("a", 2), ("c", 1)])
+        self.assertEqual(sorted({}.items(), reverse=True), [])
+        with self.assertRaises(TypeError):
+            sorted({1: "a", "x": "b"}, reverse=True)
+
     def test_sorted_returns_new_list(self):
         src = [3, 1, 2]
         out = sorted(src, reverse=True)

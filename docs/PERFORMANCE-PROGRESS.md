@@ -2274,8 +2274,8 @@ branch and pull request.
     instance whose native `__call__` has a leaf half (`attrgetter`). The
     keys sort as CPython decorates them, stable in both directions
     (`sorted(items, key=itemgetter(1))` of ten pairs 6,530 instructions to
-    4,300, the shape `Counter.most_common` and `sorted(d.items(), ...)`
-    take).
+    4,300, 995 ns to 600; CPython 392). `sorted` takes a dict or a dict's
+    view too (`sorted(d.items(), key=itemgetter(1), reverse=True)`).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
