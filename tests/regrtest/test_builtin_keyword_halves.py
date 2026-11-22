@@ -39,6 +39,23 @@ class BuiltinKeywordTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             s.encode(nope=1)
 
+    def test_decode_keywords(self):
+        raw = "héllo".encode()
+        for _ in range(300):
+            self.assertEqual(raw.decode(encoding="utf-8"), "héllo")
+            self.assertEqual(raw.decode(errors="strict"), "héllo")
+            self.assertEqual(b"abc".decode(encoding="ascii"), "abc")
+            self.assertEqual(raw.decode("ascii", errors="ignore"), "hllo")
+            self.assertEqual(raw.decode(encoding="latin-1", errors="strict"), "hÃ©llo")
+            self.assertEqual(bytearray(b"xy").decode(errors="strict"), "xy")
+        with self.assertRaises(UnicodeDecodeError):
+            raw.decode(encoding="ascii")
+        with self.assertRaises(LookupError):
+            raw.decode(encoding="no-such-codec")
+        with self.assertRaises(TypeError):
+            raw.decode(nope=1)
+        self.assertEqual(b"\xff".decode(errors="replace"), "\ufffd")
+
     def test_split_keywords(self):
         for _ in range(300):
             self.assertEqual("a b  c".split(maxsplit=1), ["a", "b  c"])

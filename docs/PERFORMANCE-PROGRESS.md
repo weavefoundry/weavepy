@@ -2329,6 +2329,10 @@ branch and pull request.
     CPython 201). Compiled code calls it as the positional call it is, the
     keyword values already in the positional places (131 and 75 ns in the
     container's build, where the positional calls take 122 and 58).
+  - `b.decode(errors=...)` and `b.decode(encoding=...)` of bytes and
+    bytearrays take a keyword half too (270 ns to 165 in the container;
+    CPython 103), and the full method now rejects an unknown keyword with
+    CPython's `TypeError`, where it ignored it.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

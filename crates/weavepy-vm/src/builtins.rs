@@ -15126,6 +15126,26 @@ fn bytes_from_slice(data: &[u8]) -> Object {
 
 /// `b.decode([encoding])` with a plain codec, when the bytes decode (an
 /// undecodable one raises on the full path).
+/// `b.decode(encoding="utf-8", errors="strict")`'s keyword half (see
+/// `leaf_builtins::register_fast_kw`): the receiver, then the two, each
+/// `Unbound` when the call left it out, decoded as [`bytes_decode_leaf`]
+/// decodes them positionally.
+pub(crate) fn bytes_decode_kw_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [recv, encoding, errors] = args else {
+        return None;
+    };
+    let encoding = match encoding {
+        Object::Unbound => Object::from_static("utf-8"),
+        Object::Str(_) => encoding.clone(),
+        _ => return None,
+    };
+    match errors {
+        Object::Unbound => bytes_decode_leaf(&[recv.clone(), encoding]),
+        Object::Str(_) => bytes_decode_leaf(&[recv.clone(), encoding, errors.clone()]),
+        _ => None,
+    }
+}
+
 pub(crate) fn bytes_decode_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let (recv, rest) = args.split_first()?;
     if rest.len() > 1 && !(rest.len() == 2 && is_builtin_error_handler(&rest[1])) {
@@ -16847,6 +16867,14 @@ fn byte_is_pyspace(c: u8) -> bool {
 }
 
 fn bytes_decode_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    if let Some((name, _)) = kwargs
+        .iter()
+        .find(|(k, _)| k != "encoding" && k != "errors")
+    {
+        return Err(type_error(format!(
+            "decode() got an unexpected keyword argument '{name}'"
+        )));
+    }
     let data = bytes_data(args)?;
     let encoding = match arg_or_kw(args, 1, kwargs, "encoding") {
         Some(Object::Str(e)) => e.to_string(),

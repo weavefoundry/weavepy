@@ -33964,6 +33964,21 @@ impl Interpreter {
                         crate::builtins::str_split_kw_fast,
                     );
                 }
+                // `b.decode(errors="replace")` of bytes and bytearrays.
+                for probe in [
+                    Object::new_bytes(Vec::<u8>::new()),
+                    Object::new_bytearray(Vec::new()),
+                ] {
+                    if let Some(Object::Builtin(b)) =
+                        crate::builtins::lookup_method(&probe, "decode")
+                    {
+                        leaf_builtins::register_fast_kw(
+                            &b,
+                            &["?encoding", "?errors"],
+                            crate::builtins::bytes_decode_kw_fast,
+                        );
+                    }
+                }
                 // `xs.sort(reverse=True)`, `xs.sort(key=None)`: keyword-only.
                 if let Some(Object::Builtin(b)) =
                     crate::builtins::lookup_method(&Object::new_list(Vec::new()), "sort")
