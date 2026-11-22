@@ -508,6 +508,27 @@ fn attrgetter_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     crate::Interpreter::leaf_getattr_value(obj, name).map(Ok)
 }
 
+/// The one int index an `itemgetter(i)` holds, when `f` is an instance
+/// whose class's `__call__` is the native getter's (a sort's key, read once
+/// for every item).
+pub(crate) fn itemgetter_single_index(f: &Object) -> Option<i64> {
+    let Object::Instance(inst) = f else {
+        return None;
+    };
+    match inst.cls_raw().lookup("__call__")? {
+        Object::Builtin(b) if b.name == ".itemgetter.__call__" => {}
+        _ => return None,
+    }
+    // SAFETY: a read that runs no code.
+    let Object::Tuple(items) = unsafe { inst.slots.peek() }?.get_hinted(0, "_items")? else {
+        return None;
+    };
+    match &items[..] {
+        [Object::Int(i)] => Some(*i),
+        _ => None,
+    }
+}
+
 /// [`itemgetter_call`]'s pure fast half (the dispatch loop's leaf call):
 /// a list or tuple indexed by an int in range, or a dict holding a `str`
 /// or `int` key. Anything else, including every miss, declines to the full

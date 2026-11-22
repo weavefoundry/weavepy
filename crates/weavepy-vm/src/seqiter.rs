@@ -3028,9 +3028,9 @@ pub(crate) fn list_sort_kw_fast(args: &[Object]) -> Option<Result<Object, Runtim
     let [Object::List(l), key, reverse] = args else {
         return None;
     };
-    let reverse = plain_sort_flags(key, reverse)?;
+    let reverse = plain_sort_flag(reverse)?;
     let mut v = l.try_borrow_mut().ok()?;
-    Some(sort_plain(&mut v, reverse)?.map(|()| Object::None))
+    Some(sort_maybe_keyed(&mut v, key, reverse)?.map(|()| Object::None))
 }
 
 /// `sorted(iterable, /, *, key=None, reverse=...)`'s keyword half, as
@@ -3039,31 +3039,125 @@ pub(crate) fn sorted_kw_fast(args: &[Object]) -> Option<Result<Object, RuntimeEr
     let [iterable, key, reverse] = args else {
         return None;
     };
-    let reverse = plain_sort_flags(key, reverse)?;
+    let reverse = plain_sort_flag(reverse)?;
     let mut v = match iterable {
         Object::List(l) => l.try_borrow().ok()?.clone(),
         Object::Tuple(t) => crate::object::cloned_vec(t),
         _ => return None,
     };
-    Some(sort_plain(&mut v, reverse)?.map(|()| {
+    Some(sort_maybe_keyed(&mut v, key, reverse)?.map(|()| {
         let obj = Object::new_list(v);
         crate::gc_trace::track(&obj);
         obj
     }))
 }
 
-/// The direction a keyword sort with no key function runs in (`None` for
-/// a key, or a flag whose truth could run code).
-fn plain_sort_flags(key: &Object, reverse: &Object) -> Option<bool> {
-    if !matches!(key, Object::Unbound | Object::None) {
-        return None;
-    }
+/// The direction a keyword sort runs in (`None` for a flag whose truth
+/// could run code).
+fn plain_sort_flag(reverse: &Object) -> Option<bool> {
     match *reverse {
         Object::Unbound => Some(false),
         Object::Bool(b) => Some(b),
         Object::Int(i) => Some(i != 0),
         _ => None,
     }
+}
+
+/// [`sort_plain`] of `v`, or with `key` (not `None`) a key function whose
+/// keys compute without running code (see [`native_sort_keys`]), the items
+/// sorted by those keys as CPython's `list.sort` decorates them. `None`, `v`
+/// untouched, for anything else.
+fn sort_maybe_keyed(
+    v: &mut [Object],
+    key: &Object,
+    reverse: bool,
+) -> Option<Result<(), RuntimeError>> {
+    if matches!(key, Object::Unbound | Object::None) {
+        return sort_plain(v, reverse);
+    }
+    let keys = native_sort_keys(v, key)?;
+    let kind = plain_kind(&keys)?;
+    // Each item moves beside its key (its slot left `None`) and back after.
+    let mut pairs: Vec<(Object, Object)> = Vec::with_capacity(v.len());
+    for (k, item) in keys.into_iter().zip(v.iter_mut()) {
+        pairs.push((k, std::mem::replace(item, Object::None)));
+    }
+    if reverse {
+        pairs.reverse();
+    }
+    let sorted = sort_by_kind(&mut pairs, kind, |p| &p.0);
+    if reverse {
+        pairs.reverse();
+    }
+    // (The keys are plain values, and the slots hold `None`: what drops here
+    // runs no code.)
+    for (slot, (_, item)) in v.iter_mut().zip(pairs) {
+        *slot = item;
+    }
+    Some(sorted)
+}
+
+/// Each item's key under `key` when computing it runs no code: `len` of a
+/// string or built-in container, or an instance whose native `__call__`
+/// has a leaf half (`itemgetter(1)`, `attrgetter("x")`). `None` for any
+/// other key function, or an item it declines.
+fn native_sort_keys(items: &[Object], key: &Object) -> Option<Vec<Object>> {
+    let ptr = crate::vm_singletons::current_interpreter_ptr()?;
+    // SAFETY: published by the enclosing VM frame on this thread; only its
+    // tables are read.
+    let interp = unsafe { &*ptr };
+    // `itemgetter(i)` of tuples or lists: each item's `i`th element.
+    if let Some(i) = crate::stdlib::operator_accel::itemgetter_single_index(key) {
+        let at = |len: usize| {
+            let k = if i < 0 { i + len as i64 } else { i };
+            usize::try_from(k).ok().filter(|&k| k < len)
+        };
+        let mut keys = Vec::with_capacity(items.len());
+        for item in items {
+            keys.push(match item {
+                Object::Tuple(t) => t.get(at(t.len())?)?.clone(),
+                // SAFETY: a read that runs no code.
+                Object::List(l) => {
+                    let xs = unsafe { l.peek() }?;
+                    xs.get(at(xs.len())?)?.clone()
+                }
+                _ => return None,
+            });
+        }
+        return Some(keys);
+    }
+    let is_len =
+        matches!(key, Object::Builtin(b) if Rc::as_ptr(b) as usize == interp.leaf_fns().len_ptr);
+    let call_fast = if is_len {
+        None
+    } else {
+        Some(interp.instance_call_fast(key)?)
+    };
+    let mut keys = Vec::with_capacity(items.len());
+    for item in items {
+        let k = match call_fast {
+            None => match item {
+                Object::Str(_)
+                | Object::List(_)
+                | Object::Tuple(_)
+                | Object::Dict(_)
+                | Object::Set(_)
+                | Object::FrozenSet(_)
+                | Object::Bytes(_) => Object::Int(i64::try_from(item.len().ok()?).ok()?),
+                _ => return None,
+            },
+            Some(fast) => {
+                // SAFETY: bitwise views of the live key function and item,
+                // never dropped (the half clones what it keeps).
+                let views = std::mem::ManuallyDrop::new(unsafe {
+                    [std::ptr::read(key), std::ptr::read(item)]
+                });
+                fast(&views[..])?.ok()?
+            }
+        };
+        keys.push(k);
+    }
+    Some(keys)
 }
 
 /// Sort `v` in place, as the interpreter's sort does, when its items are
@@ -3073,9 +3167,22 @@ fn plain_sort_flags(key: &Object, reverse: &Object) -> Option<bool> {
 /// sorts and reverses again, as CPython's does, so equal items keep their
 /// order.
 fn sort_plain(v: &mut [Object], reverse: bool) -> Option<Result<(), RuntimeError>> {
-    // (The comparisons the interpreter's own sort makes for these kinds:
-    // code-point order for strings, which their UTF-8 bytes sort in.)
-    let kind = if v.iter().all(|x| matches!(x, Object::Str(_))) {
+    let kind = plain_kind(v)?;
+    if reverse {
+        v.reverse();
+    }
+    let sorted = sort_by_kind(v, kind, |o| o);
+    if reverse {
+        v.reverse();
+    }
+    Some(sorted)
+}
+
+/// Which plain kind every item of `v` is, for [`sort_by_kind`]: strings only,
+/// ints only, plain numbers only, or tuples of ints and strings; `None`
+/// for anything else.
+fn plain_kind(v: &[Object]) -> Option<u8> {
+    Some(if v.iter().all(|x| matches!(x, Object::Str(_))) {
         0
     } else if v.iter().all(|x| matches!(x, Object::Int(_))) {
         1
@@ -3087,49 +3194,50 @@ fn sort_plain(v: &mut [Object], reverse: bool) -> Option<Result<(), RuntimeError
     } else if v.iter().all(|x| {
         matches!(x, Object::Tuple(t) if t.iter().all(|e| matches!(e, Object::Int(_) | Object::Bool(_) | Object::Str(_))))
     }) {
-        // Tuples of ints and strings (`pairs.sort()`): CPython's tuple
-        // order, the first unequal place deciding, by comparisons that run
-        // no code (and raise as the interpreter's do for an int against a
-        // string).
         3
     } else {
         return None;
-    };
-    if reverse {
-        v.reverse();
-    }
-    let sorted = match kind {
+    })
+}
+
+/// Sort `v` stably by the values `value` gives, all of [`plain_kind`]
+/// `kind`, as the interpreter's sort compares them, running no code:
+/// code-point order for strings (which their UTF-8 bytes sort in), and
+/// CPython's tuple order, the first unequal place deciding (an int against
+/// a string raises as the interpreter's comparison does). Each kind's
+/// comparison is its own closure.
+fn sort_by_kind<T>(
+    v: &mut [T],
+    kind: u8,
+    value: impl Fn(&T) -> &Object,
+) -> Result<(), RuntimeError> {
+    use weavepy_compiler::CompareKind as C;
+    match kind {
         0 => crate::timsort::sort(v, |a, b| {
-            Ok(match (a, b) {
+            Ok(match (value(a), value(b)) {
                 (Object::Str(a), Object::Str(b)) => a.as_bytes() < b.as_bytes(),
                 _ => false,
             })
         }),
         1 => crate::timsort::sort(v, |a, b| {
-            Ok(match (a, b) {
+            Ok(match (value(a), value(b)) {
                 (Object::Int(a), Object::Int(b)) => a < b,
                 _ => false,
             })
         }),
-        2 => crate::timsort::sort(v, |a, b| {
-            crate::compare_op(a, b, weavepy_compiler::CompareKind::Lt)
-        }),
+        2 => crate::timsort::sort(v, |a, b| crate::compare_op(value(a), value(b), C::Lt)),
         _ => crate::timsort::sort(v, |a, b| {
-            let (Object::Tuple(a), Object::Tuple(b)) = (a, b) else {
+            let (Object::Tuple(a), Object::Tuple(b)) = (value(a), value(b)) else {
                 return Ok(false);
             };
             for (x, y) in a.iter().zip(b.iter()) {
                 if !x.eq_value(y) {
-                    return crate::compare_op(x, y, weavepy_compiler::CompareKind::Lt);
+                    return crate::compare_op(x, y, C::Lt);
                 }
             }
             Ok(a.len() < b.len())
         }),
-    };
-    if reverse {
-        v.reverse();
     }
-    Some(sorted)
 }
 
 /// `abs(x)` of a plain number (an int's magnitude must fit).

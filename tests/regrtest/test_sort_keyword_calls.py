@@ -93,6 +93,38 @@ class SortKeywordTests(unittest.TestCase):
         nested.sort()
         self.assertEqual(nested, [(1, (1,)), (1, (2,))])
 
+    def test_native_keys(self):
+        import collections
+        import operator
+
+        words = ["ccc", "a", "bb", "dd", "e"]
+        items = [("x", 3), ("y", 1), ("z", 2), ("w", 1)]
+
+        class P:
+            def __init__(self, n):
+                self.n = n
+
+        ps = [P(3), P(1), P(2)]
+        for _ in range(200):
+            self.assertEqual(sorted(words, key=len), ["a", "e", "bb", "dd", "ccc"])
+            self.assertEqual(sorted(words, key=len, reverse=True), ["ccc", "bb", "dd", "a", "e"])
+            self.assertEqual(sorted(items, key=operator.itemgetter(1)), [("y", 1), ("w", 1), ("z", 2), ("x", 3)])
+            self.assertEqual(sorted(items, key=operator.itemgetter(1), reverse=True), [("x", 3), ("z", 2), ("y", 1), ("w", 1)])
+            self.assertEqual([p.n for p in sorted(ps, key=operator.attrgetter("n"))], [1, 2, 3])
+            ws = list(words)
+            ws.sort(key=len)
+            self.assertEqual(ws, ["a", "e", "bb", "dd", "ccc"])
+            self.assertEqual(sorted(items, key=operator.itemgetter(1, 0)), [("w", 1), ("y", 1), ("z", 2), ("x", 3)])
+        c = collections.Counter("abracadabra")
+        self.assertEqual(c.most_common(3), [("a", 5), ("b", 2), ("r", 2)])
+        with self.assertRaises(TypeError):
+            sorted([1, 2], key=len)
+        with self.assertRaises(TypeError):
+            sorted([("a", 1), ("b", "x")], key=operator.itemgetter(1))
+        with self.assertRaises(IndexError):
+            sorted([(1,), ()], key=operator.itemgetter(0))
+        self.assertEqual(sorted([[1, 2], [1], []], key=len), [[], [1], [1, 2]])
+
     def test_sorted_returns_new_list(self):
         src = [3, 1, 2]
         out = sorted(src, reverse=True)

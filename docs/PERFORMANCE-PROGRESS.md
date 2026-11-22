@@ -2268,6 +2268,14 @@ branch and pull request.
     `s.split(sep=..., maxsplit=...)` take keyword halves (263 to 117, and
     361 to 214). Keyword halves can mark a parameter `?name`, optional but
     positional too, so `s.split(maxsplit=1)` binds without its `sep`.
+  - The keyword sorts also take a key whose keys compute without running
+    code: `len` of strings and built-in containers, an `itemgetter(i)` of
+    tuples or lists (its index read once for the whole sort), or an
+    instance whose native `__call__` has a leaf half (`attrgetter`). The
+    keys sort as CPython decorates them, stable in both directions
+    (`sorted(items, key=itemgetter(1))` of ten pairs 6,530 instructions to
+    4,300, the shape `Counter.most_common` and `sorted(d.items(), ...)`
+    take).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
