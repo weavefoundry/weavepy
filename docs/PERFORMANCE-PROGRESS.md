@@ -2487,12 +2487,13 @@ branch and pull request.
     instructions a row for a five-field line from a list, CPython 4,250.
     The reader has a leaf half now. It takes a line from a list or tuple
     iterator, or from a text stream that holds it in its buffer, when the
-    line is one whole record. A line with only delimiters to interpret is
-    split on them, and any other runs through the parser in place, the
-    stream's line consumed only once the parse has finished the record.
-    Rows cost 3,340 from a list, 6,400 for quoted fields (9,020 before,
-    CPython 4,570), 3,860 from a `StringIO` (9,020, CPython 4,950), and
-    4,010 from a file (9,230, CPython 4,950).
+    line is one whole record. A line of plain and quoted fields is cut
+    into its fields directly, with `memchr` finding each delimiter and
+    closing quote, and any other line runs through the parser in place;
+    the stream's line is consumed only once the record is read. Rows cost
+    3,150 from a list, 3,810 for quoted fields (9,020 before, CPython
+    4,590), 3,670 from a `StringIO` (9,020, CPython 5,000), and 3,890
+    from a file (9,230, CPython 5,040).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

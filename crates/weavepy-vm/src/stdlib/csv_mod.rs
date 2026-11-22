@@ -1155,8 +1155,8 @@ fn reader_iternext(args: &[Object]) -> Result<Object, RuntimeError> {
 /// The reader's `__next__` leaf half: a line that is one whole record,
 /// read without the dispatch loop's full call, from a list or tuple
 /// iterator or from a text stream that has the line in its buffer (see
-/// `PyFile::next_line_pure`). A line with nothing to interpret but
-/// delimiters is split on them; any other runs through the machine. A
+/// `PyFile::next_line_pure`). A line of plain and quoted fields is split
+/// directly (see [`split_direct`]); any other runs through the machine. A
 /// record that goes on past its line, a line the machine raises on, a line
 /// that isn't a plain `str`, a quoting style that converts fields to
 /// `float`, a reader in the middle of a call or before its first row, and
@@ -1223,7 +1223,7 @@ fn reader_next_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
 /// The fields of `line` when it is one whole record the machine reads
 /// without raising (and without converting fields, which `cfg` doesn't).
 fn record_fields(cfg: DialectCfg, line: &str) -> Option<Vec<Object>> {
-    if let Some(fields) = split_plain(&cfg, line) {
+    if let Some(fields) = split_direct(&cfg, line) {
         return Some(fields);
     }
     let mut p = Parser::new(cfg);
@@ -1239,56 +1239,102 @@ fn record_fields(cfg: DialectCfg, line: &str) -> Option<Vec<Object>> {
     (p.state == St::StartRecord).then_some(p.fields)
 }
 
-/// `line`'s fields when it has nothing to interpret but delimiters, which
-/// is what the machine makes of it: no quote, escape, carriage return or
-/// newline before the line's own terminator (`\n`, `\r` or `\r\n` at its
-/// end), a quoting style that leaves unquoted fields as they are, no
-/// `skipinitialspace`, ASCII dialect characters, and a line no longer than
-/// the field limit. `None` for any other line (and for an empty one).
-fn split_plain(cfg: &DialectCfg, line: &str) -> Option<Vec<Object>> {
+/// `line`'s fields read straight off it, which is what the machine makes
+/// of it: for a dialect with ASCII characters, no escape in the line, no
+/// `skipinitialspace`, and a quoting style that leaves unquoted fields as
+/// they are, a line that is one whole record of unquoted fields (in which a
+/// quote is an ordinary character) and quoted ones (doubled quotes inside
+/// them read as one, when the dialect doubles), each quoted field closed
+/// before the next delimiter, and no carriage return or newline outside a
+/// quoted field before the line's own terminator. `None` for any other line
+/// (a record that goes on past its line, a line the machine raises on or
+/// reads characters after a closing quote into, an empty line, one longer
+/// than the field limit), which the machine then reads.
+fn split_direct(cfg: &DialectCfg, line: &str) -> Option<Vec<Object>> {
     if !matches!(cfg.quoting, QUOTE_MINIMAL | QUOTE_ALL | QUOTE_NONE) || cfg.skipinitialspace {
         return None;
     }
     let ascii = |c: char| c.is_ascii().then_some(c as u8);
     let delimiter = ascii(cfg.delimiter).filter(|&b| b != b'\r' && b != b'\n')?;
     let quote = match cfg.quotechar {
-        None => None,
-        Some(q) => Some(ascii(q)?),
-    };
-    let escape = match cfg.escapechar {
-        None => None,
-        Some(e) => Some(ascii(e)?),
+        Some(q) if cfg.quoting != QUOTE_NONE => {
+            Some(ascii(q).filter(|&q| q != delimiter && q != b'\r' && q != b'\n')?)
+        }
+        _ => None,
     };
     let bytes = line.as_bytes();
-    let special = match (quote, escape) {
-        (None, None) => memchr::memchr2(b'\n', b'\r', bytes),
-        (Some(a), None) | (None, Some(a)) => memchr::memchr3(a, b'\n', b'\r', bytes),
-        (Some(a), Some(b)) => bytes
-            .iter()
-            .position(|&c| c == a || c == b || c == b'\n' || c == b'\r'),
-    };
-    let body = match special {
-        None => bytes.len(),
-        Some(at) => match &bytes[at..] {
-            b"\n" | b"\r" | b"\r\n" => at,
-            _ => return None,
-        },
+    let body = match bytes {
+        [.., b'\r', b'\n'] => bytes.len() - 2,
+        [.., b'\n' | b'\r'] => bytes.len() - 1,
+        _ => bytes.len(),
     };
     if body == 0 || body as i64 > FIELD_LIMIT.load(Ordering::Relaxed) {
         return None;
     }
-    let body = &line[..body];
-    let plain = body.is_ascii();
-    let count = memchr::memchr_iter(delimiter, body.as_bytes()).count() + 1;
-    let mut fields = Vec::with_capacity(count);
-    fields.extend(body.split(delimiter as char).map(|f| {
-        if plain {
-            Object::from_str(f)
-        } else {
-            crate::builtins::bridge_to_object(f)
+    let b = &bytes[..body];
+    if let Some(e) = cfg.escapechar {
+        if memchr::memchr(ascii(e)?, b).is_some() {
+            return None;
         }
-    }));
-    Some(fields)
+    }
+    // (Every cut is at an ASCII byte, so every piece is whole text.)
+    let plain = b.is_ascii();
+    let text = |s: &str| {
+        if plain {
+            Object::from_str(s)
+        } else {
+            crate::builtins::bridge_to_object(s)
+        }
+    };
+    let mut fields = Vec::with_capacity(memchr::memchr_iter(delimiter, b).count() + 1);
+    let mut at = 0;
+    loop {
+        if let Some(q) = quote.filter(|&q| b.get(at) == Some(&q)) {
+            let mut from = at + 1;
+            let mut doubled = String::new();
+            let close = loop {
+                // (No closing quote: the record goes on past the line.)
+                let next = from + memchr::memchr(q, &b[from..])?;
+                if b.get(next + 1) != Some(&q) {
+                    break next;
+                }
+                if !cfg.doublequote {
+                    return None;
+                }
+                doubled.push_str(&line[from..=next]);
+                from = next + 2;
+            };
+            if doubled.is_empty() {
+                fields.push(text(&line[from..close]));
+            } else {
+                doubled.push_str(&line[from..close]);
+                fields.push(text(&doubled));
+            }
+            at = close + 1;
+            match b.get(at) {
+                None => return Some(fields),
+                Some(&c) if c == delimiter => at += 1,
+                Some(_) => return None,
+            }
+        } else {
+            match memchr::memchr3(delimiter, b'\r', b'\n', &b[at..]) {
+                None => {
+                    fields.push(text(&line[at..body]));
+                    return Some(fields);
+                }
+                Some(n) if b[at + n] == delimiter => {
+                    fields.push(text(&line[at..at + n]));
+                    at += n + 1;
+                }
+                Some(_) => return None,
+            }
+        }
+        // (A delimiter that ends the line leaves an empty last field.)
+        if at == body {
+            fields.push(text(""));
+            return Some(fields);
+        }
+    }
 }
 
 /// `inst.<key> = value` on a reader's state: replaced in place when it is

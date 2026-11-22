@@ -1,8 +1,8 @@
 """The csv reader over a list or tuple of lines, a `StringIO` or a text file
 yields what it yields over a generator of the same lines.
 
-Lines with nothing but delimiters to interpret are split directly and
-other one-line records run through the parser in place; records that span
+Lines of plain and quoted fields are split directly and other one-line
+records run through the parser in place; records that span
 lines, lines the parser raises on, non-string items, and the quoting styles
 that convert fields take the full path, as do records that run past a
 stream's buffered block. Rows, errors, `line_num` and the stream's `tell()`
@@ -34,6 +34,17 @@ LINES = [
     "a,b\n\n",
     " a, b ,c \n",
     "1,2.5,,x\n",
+    '"",""""\n',
+    '"a""b","c""",d\r\n',
+    '"a"b,c\n',
+    '"a\rb",c\n',
+    'x,"y"\n',
+    '"x",\n',
+    '"x","y"',
+    'a"b",c\n',
+    '"é,""ü""",日\n',
+    '"q"\r\r\n',
+    '"abc""\n',
 ]
 
 DIALECTS = [
@@ -51,6 +62,9 @@ DIALECTS = [
     {"quoting": csv.QUOTE_STRINGS},
     {"quoting": csv.QUOTE_NOTNULL},
     {"delimiter": "é"},
+    {"doublequote": False},
+    {"doublequote": False, "escapechar": "\\"},
+    {"quotechar": "é"},
 ]
 
 
