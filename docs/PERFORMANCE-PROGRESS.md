@@ -2292,6 +2292,15 @@ branch and pull request.
     and 167). Anything else calls the Python method, as does every call
     while a trace or profile hook is set (a debugger steps into
     `randint`: `test_pdb` does).
+  - `copy.deepcopy` walked every container through `copy.py`'s Python
+    dispatch (a small nested dict 6.3 µs, CPython 3.8; fifty rows of dicts,
+    lists and tuples 228 µs, CPython 153). A tree of exact dicts, lists and
+    tuples over `None`, bools, ints, floats, strings and bytes, with no memo
+    given, is now copied natively as `copy`'s own table copies it: shared
+    parts stay shared, cycles are kept, and a tuple whose items all copy to
+    themselves is returned itself (1.4 µs and 22 µs). Anything else in the
+    tree, a memo, a tree over 200 deep, or a trace hook takes the Python
+    function.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

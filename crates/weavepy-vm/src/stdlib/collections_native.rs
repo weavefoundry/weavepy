@@ -1826,6 +1826,124 @@ fn count_elements(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Bool(true))
 }
 
+/// `_deepcopy_plain(x)`: `copy.deepcopy(x)` (no memo given) for a tree of
+/// exact dicts, lists and tuples over `None`, bools, ints, floats, strings
+/// and bytes, which `copy`'s own table copies the same way: what the
+/// original shares, the copy shares (by identity, cycles included), and a
+/// tuple whose items all copy to themselves is itself. `None` for anything
+/// else, a tree deeper than the native walk goes, or any call a trace or
+/// profile hook watches, which the Python function then copies.
+fn deepcopy_plain(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [x] = args else {
+        return Err(type_error("_deepcopy_plain() takes one argument"));
+    };
+    // (A trace or profile hook sees `copy`'s Python frames, as CPython's.)
+    if crate::trace::any_observers_active() {
+        return Ok(Object::None);
+    }
+    let mut memo = crate::fasthash::FxHashMap::default();
+    Ok(deep_plain(x, &mut memo, 0).unwrap_or(Object::None))
+}
+
+/// How deep [`deep_plain`] nests before leaving the copy to Python.
+const DEEPCOPY_DEPTH: u32 = 200;
+
+fn deep_plain(
+    x: &Object,
+    memo: &mut crate::fasthash::FxHashMap<usize, Object>,
+    depth: u32,
+) -> Option<Object> {
+    let id = |o: &Object| o.strong_word().map(|w| w as usize);
+    match x {
+        Object::None
+        | Object::Bool(_)
+        | Object::Int(_)
+        | Object::Long(_)
+        | Object::Float(_)
+        | Object::Str(_)
+        | Object::Bytes(_) => Some(x.clone()),
+        Object::List(l) => {
+            let key = id(x)?;
+            if let Some(y) = memo.get(&key) {
+                return Some(y.clone());
+            }
+            if depth >= DEEPCOPY_DEPTH {
+                return None;
+            }
+            // (A snapshot: copying the items runs no code.)
+            let items = l.try_borrow().ok()?.clone();
+            let y = Object::new_list(Vec::with_capacity(items.len()));
+            crate::gc_trace::track(&y);
+            memo.insert(key, y.clone());
+            let Object::List(out) = &y else {
+                unreachable!("made a list")
+            };
+            for item in &items {
+                let c = deep_plain(item, memo, depth + 1)?;
+                out.try_borrow_mut().ok()?.push(c);
+            }
+            Some(y)
+        }
+        Object::Dict(d) => {
+            let key = id(x)?;
+            if let Some(y) = memo.get(&key) {
+                return Some(y.clone());
+            }
+            if depth >= DEEPCOPY_DEPTH {
+                return None;
+            }
+            let entries: Vec<(Object, Object)> = d
+                .try_borrow()
+                .ok()?
+                .iter()
+                .map(|(k, v)| (k.0.clone(), v.clone()))
+                .collect();
+            let out = Rc::new(RefCell::new(DictData::with_capacity_and_hasher(
+                entries.len(),
+                crate::fasthash::FxBuildHasher,
+            )));
+            let y = Object::Dict(out.clone());
+            crate::gc_trace::track(&y);
+            memo.insert(key, y.clone());
+            for (k, v) in &entries {
+                let (k, v) = (
+                    deep_plain(k, memo, depth + 1)?,
+                    deep_plain(v, memo, depth + 1)?,
+                );
+                // (Keys of these kinds hash natively.)
+                out.try_borrow_mut().ok()?.insert(DictKey(k), v);
+            }
+            Some(y)
+        }
+        Object::Tuple(t) => {
+            let key = id(x)?;
+            if let Some(y) = memo.get(&key) {
+                return Some(y.clone());
+            }
+            if depth >= DEEPCOPY_DEPTH {
+                return None;
+            }
+            let mut ys = Vec::with_capacity(t.len());
+            for item in t.iter() {
+                ys.push(deep_plain(item, memo, depth + 1)?);
+            }
+            // (A tuple reached again through its own items is the copy
+            // made there, as `_deepcopy_tuple` finds it.)
+            if let Some(y) = memo.get(&key) {
+                return Some(y.clone());
+            }
+            let y = if ys.iter().zip(t.iter()).all(|(a, b)| a.is_same(b)) {
+                x.clone()
+            } else {
+                Object::new_tuple(ys)
+            };
+            memo.insert(key, y.clone());
+            Some(y)
+        }
+        _ => None,
+    }
+}
+
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     let dict = Rc::new(RefCell::new(DictData::default()));
     {
@@ -1833,6 +1951,15 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         d.insert(
             DictKey(Object::from_static("__name__")),
             Object::from_static("_weave_collections"),
+        );
+        d.insert(
+            DictKey(Object::from_static("_deepcopy_plain")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "_deepcopy_plain",
+                binds_instance: false,
+                call: Box::new(deepcopy_plain),
+                call_kw: None,
+            })),
         );
         let mut reg = |export: &'static str,
                        name: &'static str,
