@@ -2282,6 +2282,16 @@ branch and pull request.
     operands (893 instructions an item for `map(itemgetter(1), pairs)`).
     The class now caches the half per version, and the call passes views
     of the operands (608).
+  - `random.randint`, `randrange` and `choice` ran `random.py`'s Python
+    methods over the native `getrandbits` (`randint(1, 100)` 340 ns, CPython
+    171). For the `Random` class itself, unchanged since import, with an
+    instance that doesn't override `_randbelow` or `getrandbits` and plain
+    int arguments (a list, tuple or ASCII string for `choice`), they're
+    native now, drawing as `_randbelow_with_getrandbits` draws, so a seeded
+    stream is the same as CPython's (108, 94 and 109 ns; CPython 171, 157
+    and 167). Anything else calls the Python method, as does every call
+    while a trace or profile hook is set (a debugger steps into
+    `randint`: `test_pdb` does).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

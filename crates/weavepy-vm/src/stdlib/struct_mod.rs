@@ -1092,14 +1092,14 @@ fn struct_unpack_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     Some(Ok(Object::new_tuple(vals)))
 }
 
-type Fast = fn(&[Object]) -> Option<Result<Object, RuntimeError>>;
+pub(crate) type Fast = fn(&[Object]) -> Option<Result<Object, RuntimeError>>;
 
 /// A native method `name` for `cls`: it serves what `fast` takes and
 /// calls the Python method `orig` (the one it replaces) for everything
 /// else. With `keywords` it takes keyword arguments (for `orig`); without,
 /// it is positional only, as a special method's slot is (the subscript
 /// lanes take only such methods).
-fn fast_method(
+pub(crate) fn fast_method(
     cls: &Rc<crate::types::TypeObject>,
     name: &'static str,
     fast: Fast,

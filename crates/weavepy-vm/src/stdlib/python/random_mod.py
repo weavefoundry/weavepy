@@ -938,6 +938,15 @@ class SystemRandom(Random):
 # for most programs and is easier for the casual user than making them
 # instantiate their own Random() instance.
 
+# Native integer methods for this class itself (see `_random._int_methods`).
+try:
+    for _name, _method in _random._int_methods(Random):
+        setattr(Random, _name, _method)
+    _random._seal_int_methods(Random)
+    del _name, _method
+except AttributeError:
+    pass
+
 _inst = Random()
 seed = _inst.seed
 random = _inst.random
