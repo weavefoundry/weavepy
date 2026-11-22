@@ -2417,6 +2417,22 @@ branch and pull request.
     dict iterator (251 instructions a value, CPython 139), where keys had
     a step of their own: values take the same direct step now, the dict
     unchanged since the first step and its length checked (189).
+  - `format(x, "g")`, `"e"` and `%g` rounded every float through Rust's
+    exact formatting, which for most values falls back to big-number
+    arithmetic (two thirds of `format(1.5, "g")`'s 3,938 instructions,
+    CPython 2,291). For a zero or normal float at no more than 15
+    significant digits whose shortest round-trip digits fit, those digits
+    padded with zeros are the correctly rounded ones (the shortest form is
+    within half an ulp, under half a unit of the 15th digit), so they're
+    used as they are (3,237). A test checks every precision from 0 to 20
+    across the exponent range against `decimal`'s rounding of the exact
+    binary value.
+  - `decimal.localcontext()` took 54 µs (CPython 0.7): nearly all of it
+    `Context.copy()`, which ran `Context.__init__`'s nine validating
+    attribute setters and signal-dict checks over a context's values,
+    already valid (243,000 instructions). The copy sets them as they are
+    now and builds its own flag and trap mappings (56,000; `copy()` 43 µs
+    to under 10, `localcontext()` to 16).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

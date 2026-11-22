@@ -85632,7 +85632,7 @@ fn format_float_scientific(f: f64, prec: usize, upper: bool, p: &ParsedSpec) -> 
         return finish_special(f < 0.0, if upper { "INF" } else { "inf" }, p);
     }
     // Rust gives e.g. "1.230000e2"; CPython wants "1.230000e+02".
-    let core = normalize_exponent(&format!("{:.*e}", prec, f.abs()), upper);
+    let core = normalize_exponent(&exp_exact(f.abs(), prec), upper);
     let core = if p.alt {
         ensure_decimal_point(&core)
     } else {
@@ -85690,9 +85690,41 @@ fn format_float_general(f: f64, prec: usize, upper: bool, p: &ParsedSpec) -> Str
 /// CPython, which keys off the rounded exponent rather than `log10`).
 /// `exp_hi` is the exclusive exponent at which scientific notation kicks in
 /// (`precision` for `g`, `precision - 1` for the type-omitted format).
+/// `format!("{:.*e}", after, mag)`: `mag` (not negative) in scientific
+/// form with `after` digits past the point, correctly rounded. For a zero
+/// or normal `mag` at no more than 15 significant digits whose shortest
+/// round-trip digits fit, those digits padded with zeros are that result
+/// (the shortest form is within half an ulp of the value, and an ulp of a
+/// normal double is under a unit of its 16th digit, so the padded digits
+/// are the nearest), with no exact, big-number formatting.
+fn exp_exact(mag: f64, after: usize) -> String {
+    if after < 15 && (mag == 0.0 || mag.is_normal()) {
+        let short = format!("{mag:e}");
+        if let Some(k) = short.find('e') {
+            let (mant, exp) = (&short[..k], &short[k..]);
+            let mut digits = mant.bytes().filter(u8::is_ascii_digit);
+            let count = mant.bytes().filter(u8::is_ascii_digit).count();
+            if let Some(first) = digits.next() {
+                if count <= after + 1 {
+                    let mut out = String::with_capacity(after + 2 + exp.len());
+                    out.push(char::from(first));
+                    if after > 0 {
+                        out.push('.');
+                        out.extend(digits.map(char::from));
+                        out.extend(std::iter::repeat_n('0', after + 1 - count));
+                    }
+                    out.push_str(exp);
+                    return out;
+                }
+            }
+        }
+    }
+    format!("{:.*e}", after, mag)
+}
+
 fn general_core(mag: f64, prec: usize, upper: bool, exp_hi: i32) -> String {
     let prec = prec.max(1);
-    let sci = format!("{:.*e}", prec - 1, mag);
+    let sci = exp_exact(mag, prec - 1);
     let Some(k) = sci.rfind('e') else {
         return sci;
     };
