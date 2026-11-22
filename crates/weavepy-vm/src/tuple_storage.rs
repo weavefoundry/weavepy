@@ -64,6 +64,22 @@ impl TupleStorage {
         }
     }
 
+    /// A tuple of clones of the objects `items` yields, which must be
+    /// exactly its length (see `object::clone_refs_into`).
+    pub fn from_cloned_refs<'a, I>(items: I) -> SharedTuple
+    where
+        I: ExactSizeIterator<Item = &'a Object>,
+    {
+        let len = items.len();
+        // SAFETY: the iterator yields exactly `len` objects, each cloned
+        // into its slot.
+        unsafe {
+            Self::filled(len, |destination| {
+                crate::object::clone_refs_into(items, destination);
+            })
+        }
+    }
+
     /// A tuple of the `len` objects at `src`, moved in whole (a `*args`
     /// run out of a call's operands).
     ///

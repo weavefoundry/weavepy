@@ -2494,6 +2494,13 @@ branch and pull request.
     3,150 from a list, 3,810 for quoted fields (9,020 before, CPython
     4,590), 3,670 from a `StringIO` (9,020, CPython 5,000), and 3,890
     from a file (9,230, CPython 5,040).
+  - The rows of `product`, `permutations`, `combinations` and
+    `combinations_with_replacement` were built by cloning each item out of
+    its pool through an iterator, which moves every object by way of the
+    stack (126 instructions for a three-item row). Rows gather their items
+    by address now and copy each into the tuple whole (85), so
+    `list(combinations(range(8), 3))` costs 24,950 instructions on x86
+    (27,250 before).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

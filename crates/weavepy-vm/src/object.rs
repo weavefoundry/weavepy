@@ -12761,6 +12761,34 @@ pub(crate) unsafe fn clone_objects_into(src: &[Object], dst: *mut Object) {
     }
 }
 
+/// Clones of the objects `items` yields, written to `dst` one after
+/// another: each copied whole and its count taken, as
+/// [`clone_objects_into`] does for a slice (a gather by index moves no
+/// object through the iterator, only its address).
+///
+/// # Safety
+///
+/// As [`clone_objects_into`]: `dst` has room for every item `items` yields.
+pub(crate) unsafe fn clone_refs_into<'a>(
+    items: impl Iterator<Item = &'a Object>,
+    dst: *mut Object,
+) {
+    // SAFETY: per the caller; as `clone_objects_into`'s.
+    unsafe {
+        let biased = crate::rc::refcounts_biased();
+        for (at, item) in items.enumerate() {
+            std::ptr::copy_nonoverlapping(item, dst.add(at), 1);
+            if let Some(word) = item.strong_word() {
+                if biased {
+                    crate::rc::plain_increment(word);
+                } else {
+                    crate::rc::increment_word(word);
+                }
+            }
+        }
+    }
+}
+
 /// Clones of `src`'s elements appended to `dst` (see
 /// [`clone_objects_into`]).
 #[inline]
@@ -16880,6 +16908,16 @@ impl Object {
             return Self::new_tuple(Vec::new());
         }
         Object::Tuple(TupleStorage::from_exact_iter(items))
+    }
+
+    /// A tuple of clones of the objects `items` yields (a gather from a
+    /// pool by index), each copied into its storage whole (the empty
+    /// tuple is the interned one). `items` yields exactly its length.
+    pub fn tuple_from_refs<'a>(items: impl ExactSizeIterator<Item = &'a Object>) -> Self {
+        if items.len() == 0 {
+            return Self::new_tuple(Vec::new());
+        }
+        Object::Tuple(TupleStorage::from_cloned_refs(items))
     }
 
     /// A tuple of clones of `items`, copied into its storage in one pass
