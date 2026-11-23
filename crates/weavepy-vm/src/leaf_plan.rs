@@ -264,6 +264,21 @@ enum Op {
         pc: u16,
         name: u16,
     },
+    /// `regs[a].__class__ is regs[b].__class__` (`is not` with `invert`),
+    /// the two reads (at `pa` and `pb`, of name `name`) fused with the
+    /// test: two instances whose classes keep `object`'s `__class__`
+    /// compare their classes, building no class objects (a dataclass's
+    /// `__eq__`); anything else reads both and tests them as the three ops
+    /// would.
+    SameClass {
+        dst: u8,
+        a: u8,
+        b: u8,
+        invert: bool,
+        pa: u16,
+        pb: u16,
+        name: u16,
+    },
     /// `hash((regs[a], regs[b], regs[c]))` of the first `n` (see
     /// [`hash_items`]) with `regs[at]` the builtin `hash`, its result in
     /// `regs[at]`, building no tuple: a `Call` of a global named `hash` on
@@ -295,7 +310,8 @@ impl Op {
             | Op::Subscr { dst, .. }
             | Op::Tuple { dst, .. }
             | Op::Slice { dst, .. }
-            | Op::New { dst, .. } => [Some(dst), None],
+            | Op::New { dst, .. }
+            | Op::SameClass { dst, .. } => [Some(dst), None],
             Op::Method { dst, .. } => [Some(dst), dst.checked_add(1)],
             Op::Swap { a, b } => [Some(a), Some(b)],
             Op::Call { at, .. } | Op::HashItems { at, .. } => [Some(at), None],
@@ -520,6 +536,43 @@ impl Builder<'_> {
         Some(())
     }
 
+    /// At an `IS_OP`: the two ops just emitted, when they read `__class__`
+    /// of two locals into the two operands (`other.__class__ is
+    /// self.__class__`), as `(a, b, pa, pb, name)` for a `SameClass`.
+    fn class_reads(&self) -> Option<(u8, u8, u16, u16, u16)> {
+        let n = self.ops.len();
+        let depth = self.stack.len();
+        if n < 2 || depth < 2 {
+            return None;
+        }
+        let (
+            Op::Attr {
+                dst: d1,
+                src: s1,
+                pc: p1,
+                name: n1,
+            },
+            Op::Attr {
+                dst: d2,
+                src: s2,
+                pc: p2,
+                name: n2,
+            },
+        ) = (self.ops[n - 2], self.ops[n - 1])
+        else {
+            return None;
+        };
+        let locals = usize::from(s1) < self.nl && usize::from(s2) < self.nl;
+        let operands = self.stack[depth - 2] == d1 && self.stack[depth - 1] == d2;
+        let class = n1 == n2
+            && self
+                .code
+                .names
+                .get(usize::from(n1))
+                .is_some_and(|n| n.as_str() == "__class__");
+        (locals && operands && class).then_some((s1, s2, p1, p2, n1))
+    }
+
     /// At a one-argument `CALL` (bytecode `pc`): the `Tuple` op just
     /// emitted, when it built the argument and the callee is the global
     /// `hash` loaded (with its empty self slot) in straight-line code since
@@ -673,6 +726,22 @@ impl Builder<'_> {
                 });
             }
             OpCode::IsOp => {
+                if let Some((a, b, pa, pb, name)) = self.class_reads() {
+                    self.ops.truncate(self.ops.len() - 2);
+                    self.pop()?;
+                    self.pop()?;
+                    let dst = self.push_new()?;
+                    self.ops.push(Op::SameClass {
+                        dst,
+                        a,
+                        b,
+                        invert: arg == 1,
+                        pa,
+                        pb,
+                        name,
+                    });
+                    return Some(true);
+                }
                 let b = self.pop()?;
                 let a = self.pop()?;
                 let dst = self.push_new()?;
@@ -1405,6 +1474,36 @@ impl Interpreter {
                 Op::Is { dst, a, b, invert } => {
                     set!(dst, V::B(is_same(get!(a), get!(b)) != invert))
                 }
+                Op::SameClass {
+                    dst,
+                    a,
+                    b,
+                    invert,
+                    pa,
+                    pb,
+                    name,
+                } => {
+                    let (x, y) = (get!(a), get!(b));
+                    let fast = if EFFECT && pend.n > 0 {
+                        None
+                    } else {
+                        same_plain_class(x, y)
+                    };
+                    let same = match fast {
+                        Some(same) => same,
+                        None => {
+                            let nest = nest + depth as u8;
+                            let cx = self.plan_attr::<GETTER, EFFECT>(
+                                code, ext, stamps, &mut owned, &pend, x, pa, name, nest,
+                            )?;
+                            let cy = self.plan_attr::<GETTER, EFFECT>(
+                                code, ext, stamps, &mut owned, &pend, y, pb, name, nest,
+                            )?;
+                            is_same(cx, cy)
+                        }
+                    };
+                    set!(dst, V::B(same != invert));
+                }
                 Op::Truth { dst, src } => set!(dst, V::B(truth(get!(src))?)),
                 Op::Unary { dst, src, kind } => set!(dst, unary(get!(src), kind)?),
                 Op::Binary { dst, a, b, kind } => set!(dst, binary(get!(a), get!(b), kind)?),
@@ -1681,6 +1780,28 @@ impl Interpreter {
             }
         }
     }
+}
+
+/// `a.__class__ is b.__class__` for two instances whose classes keep
+/// `object`'s `__class__` and `__getattribute__` (so each read is just the
+/// class): whether the classes are one. `None` for anything else.
+#[inline]
+pub(super) fn same_plain_class(a: V, b: V) -> Option<bool> {
+    let (V::R(p), V::R(q)) = (a, b) else {
+        return None;
+    };
+    if crate::gil::free_threading_enabled() {
+        return None;
+    }
+    // SAFETY: as `norm`.
+    let (Object::Instance(x), Object::Instance(y)) = (unsafe { &*p }, unsafe { &*q }) else {
+        return None;
+    };
+    let (cx, cy) = (x.cls_raw(), y.cls_raw());
+    if std::ptr::eq(cx, cy) {
+        return cx.class_attr_is_plain().then_some(true);
+    }
+    (cx.class_attr_is_plain() && cy.class_attr_is_plain()).then_some(false)
 }
 
 /// `a is b` on two leaf values.

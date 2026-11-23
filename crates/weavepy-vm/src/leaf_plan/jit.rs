@@ -19,7 +19,7 @@
 
 use super::{
     binary, compare, hash_items, is_same, new_container, new_slice, new_tuple, norm, plan_store,
-    subscr, truth, unary, LeafPlan, LeafRet, Op, Owned, Pending, NEST, V,
+    same_plain_class, subscr, truth, unary, LeafPlan, LeafRet, Op, Owned, Pending, NEST, V,
 };
 use crate::object::{Object, PyFunction};
 use crate::sync::Rc;
@@ -537,6 +537,52 @@ unsafe extern "C" fn h_class<const EFFECT: bool>(
     }
     // SAFETY: forwarded.
     unsafe { h_attr::<EFFECT>(ctx, fr, t, p, pc_name) }
+}
+
+/// `Op::SameClass`: `a.__class__ is b.__class__` (`!=` with `invert`) put
+/// as a bool. Two instances whose classes keep `object`'s `__class__`
+/// compare their classes; anything else reads both through [`h_class`],
+/// as the unfused ops would. `pcs` holds the two reads' sites, `name_inv`
+/// the name with the inversion in its top bit.
+unsafe extern "C" fn h_same_class<const EFFECT: bool>(
+    ctx: *mut Ctx<'static>,
+    fr: *const Frame,
+    ta: u64,
+    pa: u64,
+    tb: u64,
+    pb: u64,
+    pcs: u32,
+    name_inv: u32,
+) -> u32 {
+    // SAFETY: called by native code with its context.
+    let c = unsafe { cx(ctx) };
+    let invert = name_inv >> 31 != 0;
+    let name = name_inv & 0xffff;
+    let fast = if EFFECT && c.pend.n > 0 {
+        None
+    } else {
+        same_plain_class(value(ta, pa), value(tb, pb))
+    };
+    let same = match fast {
+        Some(same) => same,
+        None => {
+            // SAFETY: forwarded; each read's result is taken before the next.
+            if unsafe { h_class::<EFFECT>(ctx, fr, ta, pa, (pcs & 0xffff) | name << 16) } != 0 {
+                return 1;
+            }
+            let c = unsafe { cx(ctx) };
+            let x = value(c.out[0], c.out[1]);
+            // SAFETY: as above.
+            if unsafe { h_class::<EFFECT>(ctx, fr, tb, pb, (pcs >> 16) | name << 16) } != 0 {
+                return 1;
+            }
+            let c = unsafe { cx(ctx) };
+            is_same(x, value(c.out[0], c.out[1]))
+        }
+    };
+    let c = unsafe { cx(ctx) };
+    c.put(V::B(same != invert));
+    0
 }
 
 /// [`h_attr`] through the site's [`FieldCache`]: a split field of a plain
@@ -2234,6 +2280,28 @@ impl Lower<'_> {
                 };
                 let bit = self.b.ins().ireduce(types::I8, r);
                 self.set_bool(fl, dst, bit);
+            }
+            Op::SameClass {
+                dst,
+                a,
+                b,
+                invert,
+                pa,
+                pb,
+                name,
+            } => {
+                let (ta, va) = self.get(fl, a);
+                let (tb, vb) = self.get(fl, b);
+                let pcs = self.u32c(u32::from(pa) | u32::from(pb) << 16);
+                let ni = self.u32c(u32::from(name) | u32::from(invert) << 31);
+                let addr = if effect {
+                    h_same_class::<true> as *const () as usize
+                } else {
+                    h_same_class::<false> as *const () as usize
+                };
+                let st = self.call(addr, &[self.ctx, fl.fr, ta, va, tb, vb, pcs, ni]);
+                self.check(st);
+                self.set_out(fl, dst, 0);
             }
             Op::Truth { dst, src } => {
                 let bit = self.truth(fl, src);

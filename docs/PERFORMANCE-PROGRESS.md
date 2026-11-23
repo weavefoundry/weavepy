@@ -2626,6 +2626,16 @@ branch and pull request.
     `hash((s.x, s.y))` costs 1,326 (1,380, CPython 1,792); a dict read with
     an equal key, which runs `__eq__`'s four reads, 2,764 (2,976, 2,453);
     and the loop testing 64 keys against a set 1,428 a key (1,541, 1,407).
+  - A dataclass's `__eq__` tests `other.__class__ is self.__class__`. A
+    compiled leaf plan read each `__class__` through a helper that put a
+    new reference to the class in the evaluation's scratch, then tested
+    the two with another helper (about 290 instructions with the
+    scratch's release). The translator fuses the two reads of locals and
+    the test into one operation that compares the classes of two
+    instances whose classes keep `object`'s `__class__`, and reads them as
+    before otherwise. A dict read with an equal dataclass key costs 3,150
+    (3,393, CPython 2,664), and `a == b` of two dataclasses 1,243 (CPython
+    1,435).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
