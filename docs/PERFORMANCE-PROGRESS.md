@@ -2618,6 +2618,14 @@ branch and pull request.
     with equal keys 3,397 (4,102, 2,669). A loop testing 64 such keys
     against a set costs 1,541 a key (3,007, CPython 1,449), the rest from
     leaving that loop to the frame JIT (see the loops over objects above).
+  - A compiled leaf plan's read of a `__slots__` member ran every check of
+    the split-dictionary read first, failed them, and then loaded the
+    instance, its class and the site's entry again for the slot read. The
+    entry's slot bit picks the slot read first now, on the values already
+    loaded: about 38 instructions a read. A slotted class's `hash(k)` with
+    `hash((s.x, s.y))` costs 1,326 (1,380, CPython 1,792); a dict read with
+    an equal key, which runs `__eq__`'s four reads, 2,764 (2,976, 2,453);
+    and the loop testing 64 keys against a set 1,428 a key (1,541, 1,407).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

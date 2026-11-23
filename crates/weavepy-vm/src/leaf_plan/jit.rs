@@ -1392,6 +1392,21 @@ impl Lower<'_> {
         let at = self.b.ins().iconst(ptr, cache);
         let want = self.b.ins().load(types::I64, f, at, FIELD_VER_OFFSET);
         let idx = self.b.ins().uload32(f, at, FIELD_IDX_OFFSET);
+        // A site whose entry names a member slot reads it first, past none
+        // of the split checks; one that has never read a member slot isn't
+        // compiled to (the helper reads one otherwise).
+        let slots = l.slots_ok && slot_site;
+        let slot = if slots {
+            let slot = self.b.create_block();
+            let split = self.b.create_block();
+            let bit = self.b.ins().band_imm(idx, i64::from(SLOT_FIELD));
+            let is_slot = self.b.ins().icmp_imm(IntCC::NotEqual, bit, 0);
+            self.b.ins().brif(is_slot, slot, &[], split, &[]);
+            self.b.switch_to_block(split);
+            Some(slot)
+        } else {
+            None
+        };
         let lazy = self.b.ins().load(ptr, f, inst, l.inst_dict_lazy);
         let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
         let shared = self.b.ins().uload8(types::I64, f, flag, 0);
@@ -1407,13 +1422,7 @@ impl Lower<'_> {
         let bad = self.b.ins().bor(bad, busy);
         let bad = self.b.ins().bor(bad, empty);
         let bad = self.b.ins().bor(bad, other);
-        // A slot entry fails the split checks (its position is out of any
-        // split range), so the slot read waits behind them; it's compiled
-        // only for a site that has read member slots (the helper reads one
-        // otherwise).
-        let slots = l.slots_ok && slot_site;
-        let slot = if slots { self.b.create_block() } else { miss };
-        self.miss_if(bad, slot);
+        self.miss_if(bad, miss);
         // A block over the class's names that holds the position.
         let keys = self.b.ins().load(ptr, f, block, l.split_keys);
         let ckeys = self.b.ins().load(ptr, f, cls, l.type_shared_keys);
@@ -1424,27 +1433,18 @@ impl Lower<'_> {
             .ins()
             .icmp(IntCC::UnsignedGreaterThanOrEqual, idx, len);
         let bad = self.b.ins().bor(foreign, absent);
-        self.miss_if(bad, slot);
+        self.miss_if(bad, miss);
         let off = self.b.ins().ishl_imm(idx, 4);
         let v = self.b.ins().iadd(block, off);
         let v = self.b.ins().iadd_imm(v, i64::from(l.split_values));
-        let v = if slots {
+        let v = if let Some(slot) = slot {
             let read = self.b.create_block();
             self.b.append_block_param(read, ptr);
             self.b.ins().jump(read, &[v.into()]);
             // A member slot laid out over the entry's layout, and set, with
-            // the class checked and cells unshared. (Past the entry's kind,
-            // everything is read again here: values the split path reads
-            // stay unneeded past it.)
+            // the class checked and cells unshared. (The instance, its
+            // class and the entry, loaded before the branch, hold here.)
             self.b.switch_to_block(slot);
-            let split_miss = self.b.ins().band_imm(idx, i64::from(SLOT_FIELD));
-            let split_miss = self.b.ins().icmp_imm(IntCC::Equal, split_miss, 0);
-            self.miss_if(split_miss, miss);
-            let inst = self.b.ins().load(ptr, f, p, 8);
-            let cls = self.b.ins().load(ptr, f, inst, l.inst_class);
-            let ver = self.b.ins().load(types::I64, f, cls, l.type_attr_version);
-            let at = self.b.ins().iconst(ptr, cache);
-            let want = self.b.ins().load(types::I64, f, at, FIELD_VER_OFFSET);
             let flag = self.b.ins().iconst(ptr, l.cells_unguarded as i64);
             let shared = self.b.ins().uload8(types::I64, f, flag, 0);
             let unset = self.b.ins().icmp_imm(IntCC::Equal, want, 0);
