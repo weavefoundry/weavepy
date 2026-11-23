@@ -217,6 +217,11 @@ fn with_partial_fields<R>(
     /// `SlotStorage::leading_memo`): a store with it skips their
     /// comparison at every call.
     static PARTIAL_LAYOUT: crate::types::LayoutMemo = crate::types::LayoutMemo::new();
+    // (The remembered layout first: it needs no names, so no thread-local.)
+    // SAFETY: a read; `f` runs no code that could borrow the slots.
+    if let Some(fields) = unsafe { inst.slots.peek() }?.leading_memo_hit(&PARTIAL_LAYOUT) {
+        return Some(f(fields));
+    }
     PARTIAL_KEYS.with(|keys| {
         // SAFETY: a read; `f` runs no code that could borrow the slots.
         let slots = unsafe { inst.slots.peek() }?;

@@ -138,6 +138,8 @@ memchr                = "2.8"
 libc                  = "0.2"
 libmimalloc-sys       = { version = "0.1.49", default-features = false }
 rustls                = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# rustls's crypto provider; `hashlib` takes its SHA-256, SHA-384 and SHA-512.
+ring                  = { version = "0.17", default-features = false }
 rustls-pki-types      = "1.7"
 # PKCS#8 "ENCRYPTED PRIVATE KEY" (PBES2) decryption for password-protected
 # keys in SSLContext.load_cert_chain.

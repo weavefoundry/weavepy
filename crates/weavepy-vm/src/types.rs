@@ -4223,6 +4223,25 @@ impl SlotStorage {
         self.leading_interned(names)
     }
 
+    /// [`Self::leading_memo`]'s hit alone: the leading `N` values when the
+    /// store's layout is the one `memo` remembers, which a caller can try
+    /// before it has the names at hand. `None` otherwise (the caller then
+    /// asks [`Self::leading_memo`] with them).
+    #[inline(always)]
+    pub fn leading_memo_hit<const N: usize>(&self, memo: &LayoutMemo) -> Option<[&Object; N]> {
+        let SlotsRef::Fixed(layout, values) = self.view() else {
+            return None;
+        };
+        if SharedSlice::word(layout) != memo.word() {
+            return None;
+        }
+        let values = values.get(..N)?;
+        if values.iter().any(|v| matches!(v, Object::Unbound)) {
+            return None;
+        }
+        Some(std::array::from_fn(|i| &values[i]))
+    }
+
     /// [`Self::leading_memo`], mutably.
     #[inline(always)]
     pub fn leading_memo_mut<const N: usize>(

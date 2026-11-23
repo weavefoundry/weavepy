@@ -2528,6 +2528,23 @@ branch and pull request.
     output once too (251,000 to 205,000, CPython 32,000). CPython keeps
     such text as one or two bytes a character, so its codecs copy units
     where these decode UTF-8.
+  - `hashlib` kept every hasher's state in a process-wide table it never
+    pruned: 300,000 short-lived `sha256()` objects left 156 MB resident.
+    Each entry watches its instance now, and the states of dead ones go
+    whenever the table has doubled (9.6 MB). A method call on a hasher
+    went through the dispatch loop's general native lanes (5,850
+    instructions for `h.update(16 bytes)`, CPython 1,090); `update`,
+    `digest` and `hexdigest` have leaf halves now (1,330), and
+    `sha256(b"hello world").hexdigest()` costs 8,690 (10,220, CPython
+    9,910). SHA-256, SHA-384 and SHA-512 run on `ring`, already linked
+    for TLS, whose assembly takes the CPU's vector or SHA extensions:
+    518 MB/s for SHA-256 on this Intel Mac, which has no SHA extensions
+    (283 before, CPython's OpenSSL 563), and 743 for SHA-512 (530, 843).
+    `ring`'s SHA-1 is slower than the portable one, so SHA-1 stays.
+  - A `partial`'s fields were read through a thread-local holding their
+    names even when the slot layout the call remembers answers without
+    them; the remembered layout is tried first now (a few dozen
+    instructions a call).
   - `f.readinto(b)` of a buffered binary file gave the read-ahead back to
     the descriptor (a seek), read `len(b)` bytes into a fresh vector with
     its own system call, and copied them over: 7,800 instructions a call
