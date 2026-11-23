@@ -845,6 +845,11 @@ pub(crate) mod vm_key {
     pub(crate) const CALL_LEAF: u32 = 118;
     /// A logger class's `isEnabledFor`, for the native log methods.
     pub(crate) const LOG_ENABLED_FOR: u32 = 119;
+    /// Its native `__str__` that runs no Python code of its own (an
+    /// exception's), called with the instance, no bound method built.
+    pub(crate) const STR_NATIVE: u32 = 120;
+    /// Its native `__repr__` likewise (an exception's, `object`'s).
+    pub(crate) const REPR_NATIVE: u32 = 121;
 }
 
 /// A builtin type's pure constructor (see [`TypeObject::pure_new`]).
@@ -3523,6 +3528,17 @@ pub(crate) enum ExcTail {
 }
 
 impl ExcTail {
+    /// The pseudo-slot named `name`, if one is.
+    pub(crate) fn of_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "__traceback__" => Self::Traceback,
+            "__context__" => Self::Context,
+            "__cause__" => Self::Cause,
+            "__suppress_context__" => Self::SuppressContext,
+            _ => return None,
+        })
+    }
+
     /// The slot's name.
     pub(crate) fn name(self) -> &'static str {
         COMMON_SLOT_NAMES[1 + self as usize]
@@ -4401,6 +4417,23 @@ impl SlotStorage {
         self.get(which.name())
     }
 
+    /// [`Self::get`] of an exception's `args`: the first laid-out place
+    /// when the storage has an exception layout (see [`Self::exception`]),
+    /// without comparing names.
+    #[inline]
+    pub(crate) fn exc_args_get(&self) -> Option<&Object> {
+        if let SlotsRef::Fixed(layout, values) = self.view() {
+            if let (Some(DictKey(Object::Str(laid))), Object::Str(key)) =
+                (layout.first(), &common_slot_keys()[0])
+            {
+                if crate::shared_value::SharedStr::ptr_eq(laid, key) {
+                    return values.first().filter(|v| !matches!(v, Object::Unbound));
+                }
+            }
+        }
+        self.get("args")
+    }
+
     /// [`Self::place_mut`] of the exception pseudo-slot `which`, by
     /// [`Self::exc_tail_mut`] when the storage has an exception layout.
     #[inline]
@@ -4728,6 +4761,12 @@ impl SlotStorage {
     #[inline]
     pub(crate) fn exc_tail_get(&self, which: ExcTail) -> Option<&Object> {
         self.get(which.name())
+    }
+
+    /// The populated `args` (see the 64-bit variant).
+    #[inline]
+    pub(crate) fn exc_args_get(&self) -> Option<&Object> {
+        self.get("args")
     }
 
     pub fn insert(&mut self, name: &str, value: Object) -> Option<Object> {
@@ -5270,6 +5309,16 @@ impl PyInstance {
     /// `SlotStorage::exc_tail_get`).
     pub(crate) fn exc_tail_get(&self, which: ExcTail) -> Option<Object> {
         self.slots.borrow().exc_tail_get(which).cloned()
+    }
+
+    /// [`Self::slot_get`] of an exception's `args` (see
+    /// `SlotStorage::exc_args_get`).
+    pub(crate) fn exc_args_get(&self) -> Option<Object> {
+        // SAFETY: the view ends with the clone, before anything runs.
+        if let Some(slots) = unsafe { self.slots.peek() } {
+            return slots.exc_args_get().cloned();
+        }
+        self.slots.borrow().exc_args_get().cloned()
     }
 
     /// Write slot `name` into the side table.

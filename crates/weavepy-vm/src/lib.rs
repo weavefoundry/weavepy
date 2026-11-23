@@ -32987,6 +32987,87 @@ impl Interpreter {
         found
     }
 
+    /// The native `__str__` of `inst`'s class that binds the instance and
+    /// needs no interpreter handle (`BaseException.__str__`), remembered
+    /// per class version. `None` for a Python `__str__`, or none.
+    fn instance_native_str(inst: &PyInstance) -> Option<Rc<crate::object::BuiltinFn>> {
+        Self::instance_native_special(inst, crate::types::vm_key::STR_NATIVE, "__str__")
+    }
+
+    /// `str(inst)` (and `format(inst, '')`) of an exception whose class
+    /// keeps `BaseException.__str__` and `object.__format__`, computed in
+    /// place when it runs no code of the argument's. `None` for anything
+    /// else.
+    pub(crate) fn exc_str_leaf(inst: &Rc<PyInstance>) -> Option<Object> {
+        let cls = inst.cls_raw();
+        if !cls.flags.is_exception
+            || inst.native.get().is_some()
+            || !Self::class_lacks(
+                cls,
+                crate::types::AttrKey::vm(crate::types::vm_key::FORMAT_LACKS),
+                "__format__",
+            )
+            || Self::instance_dunder_function(
+                inst,
+                crate::types::AttrKey::vm(crate::types::vm_key::STR_FN),
+                "__str__",
+            )
+            .is_some()
+        {
+            return None;
+        }
+        let b = Self::instance_native_str(inst)?;
+        if !crate::builtin_types::is_base_exception_str(&b) {
+            return None;
+        }
+        crate::builtin_types::exc_str_text(inst, true)?.ok()
+    }
+
+    /// [`Self::instance_native_str`] of `__repr__` (an exception's,
+    /// `object`'s).
+    fn instance_native_repr(inst: &PyInstance) -> Option<Rc<crate::object::BuiltinFn>> {
+        Self::instance_native_special(inst, crate::types::vm_key::REPR_NATIVE, "__repr__")
+    }
+
+    /// The native special method `name` of `inst`'s class that binds the
+    /// instance and needs no interpreter handle, remembered per class
+    /// version at the VM key `id`. `None` for a Python one, or none.
+    fn instance_native_special(
+        inst: &PyInstance,
+        id: u32,
+        name: &str,
+    ) -> Option<Rc<crate::object::BuiltinFn>> {
+        use crate::types::{AttrKey, LeafAttrKind as K};
+        let cls = inst.cls_raw();
+        let key = AttrKey::vm(id);
+        let ver = cls.attr_version.get();
+        match cls.leaf_attrs.get(key, ver) {
+            Some(K::BuiltinMethod(b)) => return Some(b.clone()),
+            Some(_) => return None,
+            None => {}
+        }
+        if crate::object::exotic_str_keys_possible() {
+            return None;
+        }
+        let found = match cls.lookup(name) {
+            Some(Object::Builtin(b))
+                if b.binds_instance && b.call_kw.is_none() && !builtin_needs_interp(b.name) =>
+            {
+                Some(b)
+            }
+            _ => None,
+        };
+        cls.leaf_attrs.set(
+            key,
+            ver,
+            match &found {
+                Some(b) => K::BuiltinMethod(b.clone()),
+                None => K::Other,
+            },
+        );
+        found
+    }
+
     pub(crate) fn instance_dunder_function(
         inst: &PyInstance,
         key: crate::types::AttrKey,
@@ -34323,11 +34404,15 @@ impl Interpreter {
                 // A plain instance whose class's `__str__` is a Python
                 // function that evaluates as a pure leaf, answering a `str`.
                 [recv @ Object::Instance(inst)] if inst.native.get().is_none() => {
-                    let f = Self::instance_dunder_function(
+                    let Some(f) = Self::instance_dunder_function(
                         inst,
                         crate::types::AttrKey::vm(crate::types::vm_key::STR_FN),
                         "__str__",
-                    )?;
+                    ) else {
+                        // An exception's `BaseException.__str__`, when it
+                        // runs no code of the argument's.
+                        return Self::exc_str_leaf(inst);
+                    };
                     match self.call_pure_leaf_with(&f, Some(recv), &[])? {
                         s @ Object::Str(_) => Some(s),
                         _ => None,
@@ -41128,7 +41213,7 @@ impl Interpreter {
                     .flatten()
                 {
                     frame.push(match r? {
-                        s @ Object::Str(_) => s,
+                        s @ (Object::Str(_) | Object::WStr(_)) => s,
                         r => Object::from_str(Self::require_str_result(r, "__str__")?),
                     });
                 } else {
@@ -46533,7 +46618,21 @@ impl Interpreter {
                 {
                     None
                 }
-                None => instance_method(v, "__str__").map(Err),
+                None => {
+                    // A native `__str__` (an exception's), called with the
+                    // instance.
+                    if let Some(b) = Self::instance_native_str(inst) {
+                        let r = (b.call)(std::slice::from_ref(v))?;
+                        if str_like_object(&r) {
+                            return Ok(r);
+                        }
+                        return Err(type_error(format!(
+                            "__str__ returned non-string (type {})",
+                            r.type_name()
+                        )));
+                    }
+                    instance_method(v, "__str__").map(Err)
+                }
             };
             if let Some(method) = method {
                 let r = match method {
@@ -47032,7 +47131,21 @@ impl Interpreter {
                 "__repr__",
             ) {
                 Some(f) => Some(Ok(f)),
-                None => instance_method(v, "__repr__").map(Err),
+                None => {
+                    // A native one (an exception's), called with the
+                    // instance.
+                    if let Some(b) = Self::instance_native_repr(inst) {
+                        let r = (b.call)(std::slice::from_ref(v))?;
+                        if str_like_object(&r) {
+                            return Ok(r);
+                        }
+                        return Err(type_error(format!(
+                            "__repr__ returned non-string (type {})",
+                            r.type_name()
+                        )));
+                    }
+                    instance_method(v, "__repr__").map(Err)
+                }
             };
             if let Some(method) = method {
                 let r = match method {
@@ -51488,11 +51601,15 @@ impl Interpreter {
         {
             return None;
         }
-        let f = Self::instance_dunder_function(
+        let Some(f) = Self::instance_dunder_function(
             inst,
             crate::types::AttrKey::vm(crate::types::vm_key::STR_FN),
             "__str__",
-        )?;
+        ) else {
+            // A native `__str__` (an exception's), called with the instance.
+            let b = Self::instance_native_str(inst)?;
+            return Some((b.call)(std::slice::from_ref(v)));
+        };
         Some(match self.call_pure_leaf_with(&f, Some(v), &[]) {
             Some(r) => Ok(r),
             None => self.call_python(&f, std::slice::from_ref(v), &[]),
@@ -51520,6 +51637,10 @@ impl Interpreter {
                     };
                     return Self::require_str_result(r, "__str__");
                 }
+            }
+            if let Some(b) = Self::instance_native_str(inst) {
+                let r = (b.call)(std::slice::from_ref(v))?;
+                return Self::require_str_result(r, "__str__");
             }
             if let Some(method) = instance_method(v, "__str__") {
                 let r = self.call(&method, &[], &[], globals)?;
@@ -51606,6 +51727,11 @@ impl Interpreter {
             // bound method built for it.
             if let Some(r) = self.instance_python_repr(v) {
                 return Self::require_str_result(r?, "__repr__");
+            }
+            // A native one (an exception's, `object`'s), likewise.
+            if let Some(b) = Self::instance_native_repr(inst) {
+                let r = (b.call)(std::slice::from_ref(v))?;
+                return Self::require_str_result(r, "__repr__");
             }
             if let Some(method) = instance_method(v, "__repr__") {
                 let r = self.call(&method, &[], &[], globals)?;

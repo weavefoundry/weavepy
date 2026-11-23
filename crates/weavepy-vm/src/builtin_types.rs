@@ -4811,60 +4811,104 @@ pub(crate) fn exc_init(args: &[Object]) -> Result<Object, RuntimeError> {
 /// argument, tuple repr for several. Module-scope for the docs surface
 /// pass (see [`exc_init`]).
 fn exc_str(args: &[Object]) -> Result<Object, RuntimeError> {
-    {
-        let inst = args
-            .first()
-            .ok_or_else(|| crate::error::type_error("expected exception instance".to_owned()))?;
-        if let Object::Instance(inst_rc) = inst {
+    let inst = args
+        .first()
+        .ok_or_else(|| crate::error::type_error("expected exception instance".to_owned()))?;
+    match inst {
+        Object::Instance(inst_rc) => {
+            exc_str_text(inst_rc, false).unwrap_or_else(|| Ok(Object::from_static("")))
+        }
+        _ => Ok(Object::from_static("")),
+    }
+}
+
+/// The address of `BaseException.__str__`'s function (see
+/// [`is_base_exception_str`]).
+static BASE_EXC_STR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether `f` is `BaseException.__str__`.
+pub(crate) fn is_base_exception_str(f: &crate::object::BuiltinFn) -> bool {
+    std::ptr::from_ref(f) as usize == BASE_EXC_STR.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether `o`'s `str` and `repr` are native text, running no code of
+/// anyone's (a container's could reach an instance's `__repr__`).
+fn native_text_item(o: &Object) -> bool {
+    matches!(
+        o,
+        Object::Str(_)
+            | Object::WStr(_)
+            | Object::Int(_)
+            | Object::Bool(_)
+            | Object::None
+            | Object::Float(_)
+            | Object::Bytes(_)
+    )
+}
+
+/// `BaseException.__str__(inst)`'s text, or the error a lone argument's
+/// own `__str__` raised. With `leaf`, `None` unless every argument's
+/// text is native (see [`native_text_item`]) and `args` is a tuple, for
+/// the caller's full path.
+pub(crate) fn exc_str_text(
+    inst_rc: &Rc<crate::types::PyInstance>,
+    leaf: bool,
+) -> Option<Result<Object, RuntimeError>> {
+    let args = inst_rc
+        .exc_args_get()
+        .or_else(|| inst_rc.attr_get_str("args"));
+    let Some(Object::Tuple(items)) = args else {
+        return if leaf {
+            None
+        } else {
+            Some(Ok(Object::from_static("")))
+        };
+    };
+    Some(Ok(match &items[..] {
+        [] => Object::from_static(""),
+        _ if leaf && !items.iter().all(native_text_item) => return None,
+        [single] => {
             // CPython's ``KeyError.__str__`` overrides the default to
             // render the key via ``repr`` — so ``str(KeyError('x'))``
             // is ``"'x'"`` not ``'x'``. We special-case KeyError here
             // because the runtime constructs them from Rust and we
             // can't easily install a per-subclass ``__str__``.
-            let is_key_error = is_subclass_by_name(&inst_rc.cls(), "KeyError");
-            if let Some(Object::Tuple(items)) = exc_attr(inst_rc, "args") {
-                return Ok(match &items[..] {
-                    [] => Object::from_static(""),
-                    [single] => {
-                        if is_key_error {
-                            Object::from_str(single.repr())
-                        } else if matches!(single, Object::Str(_) | Object::WStr(_)) {
-                            // `str(args[0])` of a str IS args[0] — round-
-                            // tripping through a Rust String would mangle
-                            // lone surrogates (test_getargs's surrogate
-                            // keyword message).
-                            single.clone()
-                        } else if matches!(single, Object::Instance(_) | Object::Foreign(_)) {
-                            // A nested exception, other instance, or a
-                            // *foreign* extension object (e.g. a numpy
-                            // scalar) needs its own `__str__`/`tp_str`
-                            // dispatched: CPython's `BaseException.__str__`
-                            // is `str(args[0])`, not `repr`. Without this a
-                            // `OutOfBoundsTimedelta(np.timedelta64(...))`
-                            // stringified to its repr
-                            // (`np.timedelta64(...,'h')`) instead of
-                            // `"... hours"`.
-                            Object::from_str(
-                                crate::builtins::str_reentrant(single)
-                                    .unwrap_or_else(|| single.to_str()),
-                            )
-                        } else {
-                            Object::from_str(single.to_str())
-                        }
-                    }
-                    _ => Object::from_str(format!(
-                        "({})",
-                        items
-                            .iter()
-                            .map(|x| x.repr())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )),
-                });
+            if inst_rc.cls().is_subclass_of(&builtin_types().key_error) {
+                Object::from_str(single.repr())
+            } else if matches!(single, Object::Str(_) | Object::WStr(_)) {
+                // `str(args[0])` of a str IS args[0] — round-
+                // tripping through a Rust String would mangle
+                // lone surrogates (test_getargs's surrogate
+                // keyword message).
+                single.clone()
+            } else if matches!(single, Object::Instance(_) | Object::Foreign(_)) {
+                // A nested exception, other instance, or a
+                // *foreign* extension object (e.g. a numpy
+                // scalar) needs its own `__str__`/`tp_str`
+                // dispatched: CPython's `BaseException.__str__`
+                // is `str(args[0])`, not `repr`. Without this a
+                // `OutOfBoundsTimedelta(np.timedelta64(...))`
+                // stringified to its repr
+                // (`np.timedelta64(...,'h')`) instead of
+                // `"... hours"`.
+                match crate::builtins::str_reentrant_result(single) {
+                    Some(Ok(text)) => Object::from_str(text),
+                    Some(Err(e)) => return Some(Err(e)),
+                    None => Object::from_str(single.to_str()),
+                }
+            } else {
+                Object::from_str(single.to_str())
             }
         }
-        Ok(Object::from_static(""))
-    }
+        _ => Object::from_str(format!(
+            "({})",
+            items
+                .iter()
+                .map(|x| x.repr())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }))
 }
 
 /// CPython's `BaseException.__repr__` — `ClsName(arg_reprs…)`.
@@ -5134,14 +5178,19 @@ fn install_exception_str_repr(base_exception: &Rc<TypeObject>) {
             call_kw: None,
         })),
     );
+    let str_fn = Rc::new(BuiltinFn {
+        name: "__str__",
+        binds_instance: true,
+        call: Box::new(exc_str),
+        call_kw: None,
+    });
+    BASE_EXC_STR.store(
+        Rc::as_ptr(&str_fn) as usize,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     dict.insert(
         DictKey(Object::from_static("__str__")),
-        Object::Builtin(Rc::new(BuiltinFn {
-            name: "__str__",
-            binds_instance: true,
-            call: Box::new(exc_str),
-            call_kw: None,
-        })),
+        Object::Builtin(str_fn),
     );
     dict.insert(
         DictKey(Object::from_static("__repr__")),
@@ -5976,7 +6025,7 @@ fn exception_matches_type(exc: &Object, type_pred: &Object) -> bool {
     }
 }
 
-fn is_subclass_by_name(class: &Rc<TypeObject>, ancestor: &str) -> bool {
+fn is_subclass_by_name(class: &TypeObject, ancestor: &str) -> bool {
     for t in class.mro.borrow().iter() {
         if t.name == ancestor {
             return true;

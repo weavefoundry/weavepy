@@ -2644,6 +2644,34 @@ branch and pull request.
     call with no keywords that passes exactly the parameters binds them in
     order now, and the vector and buffer are made only where they're used
     (1,638; a partial with a stored keyword 1,849, CPython 2,038).
+  - Exceptions printed and inspected took the generic paths:
+    - `str(e)` and `repr(e)` built a bound method for the native
+      `BaseException.__str__` and `__repr__` and called it through the
+      full call machinery, and `f"{e}"` left the frame JIT for the
+      interpreter. The class's native method is now remembered per class
+      version and called with the instance. `str(e)` and `f"{e}"` compute
+      the text in place when every argument's text is native (a string,
+      a number, bytes, `None`), checking `KeyError` by class identity
+      rather than by comparing names along the MRO.
+    - A frame-JIT site reading `e.args`, `e.__context__` or another
+      exception pseudo-slot reached its lane only after every other
+      instance lane missed, and an unset slot's default walked the MRO.
+      Such a site now reads the slot first, at its laid-out place, with
+      the default remembered.
+
+    Instructions per operation (CPython 3.14 in the last column):
+
+    | Operation | Before | Now | CPython |
+    |---|---|---|---|
+    | `str(e)` | 2,347 | 1,003 | 440 |
+    | `f"{e}"` | 2,198 | 658 | 866 |
+    | `repr(e)` | 3,556 | 2,859 | 2,295 |
+    | `e.args` | 663 | 336 | 424 |
+    | `e.__context__`, unset | 869 | 352 | 412 |
+
+    Two old faults went with it: a lone argument whose `__str__` raised
+    gave `str(e)` its repr instead of raising, and `f"{e}"` of an
+    argument with a lone surrogate came out as a private-use character.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

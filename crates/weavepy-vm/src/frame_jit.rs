@@ -9208,6 +9208,37 @@ pub(crate) struct AttrSite {
     /// The version of an exception class whose read of the site's name is
     /// one of its slot descriptors (`e.args`; see [`exc_slot_read`]).
     exc_slot: Cell<u64>,
+    /// That descriptor's default for an unset slot, as [`EXC_DEFAULT_NONE`]
+    /// and its kin.
+    exc_default: Cell<u8>,
+    /// Which pseudo-slot the site's name is: [`EXC_SLOT_ARGS`], an
+    /// [`crate::types::ExcTail`] plus one, or [`EXC_SLOT_OTHER`].
+    exc_which: Cell<u8>,
+}
+
+/// [`AttrSite::exc_which`] of `args`, and of any other slot name.
+const EXC_SLOT_ARGS: u8 = 0;
+const EXC_SLOT_OTHER: u8 = 0xff;
+
+/// [`AttrSite::exc_default`]: the slot descriptor has no default (an unset
+/// slot raises), `None`, `False`, or another value (read from the
+/// descriptor).
+const EXC_DEFAULT_ABSENT: u8 = 0;
+const EXC_DEFAULT_NONE: u8 = 1;
+const EXC_DEFAULT_FALSE: u8 = 2;
+const EXC_DEFAULT_OTHER: u8 = 3;
+
+/// [`exc_slot_read`] at a site that has already found its name to be the
+/// exception class's slot descriptor at the class's current version: the
+/// read every `e.args` after the first makes, ahead of the lanes for
+/// other instances.
+#[inline]
+fn exc_slot_known(site: &AttrSite, inst: &crate::types::PyInstance) -> Option<Object> {
+    let cls = inst.cls_raw();
+    if !cls.flags.is_exception || site.exc_slot.get() != cls.attr_version.get() {
+        return None;
+    }
+    exc_slot_read(site, inst)
 }
 
 /// The value `recv`'s read at `site` finds through the site's caches past
@@ -10013,13 +10044,40 @@ fn exc_slot_read(site: &AttrSite, inst: &crate::types::PyInstance) -> Option<Obj
         return None;
     }
     if site.exc_slot.get() != ver {
-        if !matches!(cls.lookup(name), Some(Object::SlotDescriptor(_))) {
+        let Some(Object::SlotDescriptor(sd)) = cls.lookup(name) else {
             return None;
-        }
+        };
+        site.exc_default.set(match &sd.default {
+            None => EXC_DEFAULT_ABSENT,
+            Some(Object::None) => EXC_DEFAULT_NONE,
+            Some(Object::Bool(false)) => EXC_DEFAULT_FALSE,
+            Some(_) => EXC_DEFAULT_OTHER,
+        });
+        site.exc_which
+            .set(match crate::types::ExcTail::of_name(name) {
+                Some(which) => which as u8 + 1,
+                None if &**name == "args" => EXC_SLOT_ARGS,
+                None => EXC_SLOT_OTHER,
+            });
         site.exc_slot.set(ver);
     }
-    inst.slot_get(name).or_else(|| match cls.lookup(name) {
-        Some(Object::SlotDescriptor(sd)) => sd.default.clone(),
+    let held = match site.exc_which.get() {
+        EXC_SLOT_ARGS => inst.exc_args_get(),
+        w @ 1..=4 => inst.exc_tail_get(match w {
+            1 => crate::types::ExcTail::Traceback,
+            2 => crate::types::ExcTail::Context,
+            3 => crate::types::ExcTail::Cause,
+            _ => crate::types::ExcTail::SuppressContext,
+        }),
+        _ => inst.slot_get(name),
+    };
+    held.or_else(|| match site.exc_default.get() {
+        EXC_DEFAULT_NONE => Some(Object::None),
+        EXC_DEFAULT_FALSE => Some(Object::Bool(false)),
+        EXC_DEFAULT_OTHER => match cls.lookup(name) {
+            Some(Object::SlotDescriptor(sd)) => sd.default.clone(),
+            _ => None,
+        },
         _ => None,
     })
 }
@@ -10156,6 +10214,12 @@ unsafe extern "C" fn attr_local_slow(st: *mut State, site: *const AttrSite) -> u
             }
             // (A class attribute the site has read before.)
             Object::Instance(inst) => {
+                // An exception's pseudo-slot (`e.args`), as the site found
+                // it for the class's version.
+                if let Some(v) = exc_slot_known(site, inst) {
+                    (*st).stack.add(slot).write(v);
+                    return 0;
+                }
                 // A natively served value's public field (`dt.hour`), read
                 // off its packed state: every read of one comes here (the
                 // site keeps nothing for it), so it goes ahead of the
@@ -11058,6 +11122,12 @@ unsafe extern "C" fn attr_stack_slow(st: *mut State, site: *const AttrSite) -> u
             }
             // (A class attribute the site has read before.)
             Object::Instance(inst) => {
+                // An exception's pseudo-slot, as `attr_local_slow` reads it.
+                if let Some(v) = exc_slot_known(site, inst) {
+                    if receiver_leaves(at, v) {
+                        return 0;
+                    }
+                }
                 // A polymorphic site's third class and on, as
                 // `attr_local_slow` reads it first (a receiver whose
                 // release could run code takes the lanes below).
@@ -11578,12 +11648,38 @@ fn fstring_native(op: OpCode, arg: u32) -> bool {
 /// `crate::build_string_at`): `kind`'s low byte names the operation and
 /// the rest its operand (the conversion, or the join's part count). `0`
 /// done in place, anything else declined untouched.
+/// `FORMAT_VALUE` of the exception at `at` whose class keeps
+/// `BaseException.__str__` and `object.__format__` (see
+/// [`Interpreter::exc_str_leaf`]): its text in place, the instance
+/// released (another owner keeping it alive). `false` touches nothing.
+///
+/// # Safety
+///
+/// The slot at `at` is initialized, and nothing else reads it.
+#[inline(never)]
+unsafe fn exc_format_in_place(at: *mut Object) -> bool {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let Object::Instance(inst) = &*at else {
+            return false;
+        };
+        if !droppable(&*at) {
+            return false;
+        }
+        let Some(text) = Interpreter::exc_str_leaf(inst) else {
+            return false;
+        };
+        crate::drop_hot(std::mem::replace(&mut *at, text));
+    }
+    true
+}
+
 unsafe extern "C" fn h_fstring(at: *mut Object, kind: u64) -> u32 {
     // SAFETY: the code passes the operation's initialized stack slots.
     let done = unsafe {
         match kind & 0xff {
             FSTRING_CONVERT => crate::convert_in_place(at, (kind >> 8) as u32),
-            FSTRING_FORMAT => crate::format_simple_in_place(at),
+            FSTRING_FORMAT => crate::format_simple_in_place(at) || exc_format_in_place(at),
             FSTRING_FORMAT_SPEC => crate::format_spec_in_place(at),
             _ => crate::build_string_at(at, (kind >> 8) as usize),
         }
@@ -23979,6 +24075,8 @@ impl<'a> Lower<'a> {
             prop_leaf: Cell::new((0, 0, 0, 0)),
             pub_hint: Cell::new((0, 0)),
             exc_slot: Cell::new(0),
+            exc_default: Cell::new(EXC_DEFAULT_ABSENT),
+            exc_which: Cell::new(EXC_SLOT_OTHER),
         });
         let c = self
             .b

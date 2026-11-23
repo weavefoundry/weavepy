@@ -3817,15 +3817,15 @@ fn property_deleter(args: &[Object]) -> Result<Object, RuntimeError> {
 /// (`property.__get__` / `__set__` / `__delete__`), whose accessors are
 /// ordinary Python functions.
 /// `str(obj)` through the running interpreter (so user `__str__` /
-/// nested-exception rendering dispatches). `None` when no interpreter
-/// is live on this thread.
-pub(crate) fn str_reentrant(obj: &Object) -> Option<String> {
+/// nested-exception rendering dispatches), its error kept. `None` when no
+/// interpreter is live on this thread.
+pub(crate) fn str_reentrant_result(obj: &Object) -> Option<Result<String, RuntimeError>> {
     let ptr = crate::vm_singletons::current_interpreter_ptr()?;
     // SAFETY: the pointer was published by an enclosing VM frame still
     // live on this thread; the GIL keeps the access exclusive.
     let interp = unsafe { &mut *ptr };
     let globals = interp.builtins_dict();
-    interp.stringify_public(obj, &globals).ok()
+    Some(interp.stringify_public(obj, &globals))
 }
 
 pub(crate) fn reentrant_call(callable: &Object, args: &[Object]) -> Result<Object, RuntimeError> {
