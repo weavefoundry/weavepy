@@ -1412,6 +1412,61 @@ fn fresh_result(
     Object::Tuple(t)
 }
 
+/// [`lazy_pure_next`] for a `zip` of `n` (at most four) distinct plain
+/// sequence cursors whose result is unpacked at once: each one's next item
+/// written from `out` as the unpacking leaves them (the last lowest), no
+/// tuple built, and `true`; `false` (nothing taken) unless every cursor
+/// has one.
+///
+/// # Safety
+///
+/// `out` has `n` free slots.
+pub(crate) unsafe fn lazy_pure_cursors_to(l: &PyLazyIter, out: *mut Object, n: usize) -> bool {
+    // SAFETY: nothing below runs code; the view ends with this call.
+    let Some(st) = (unsafe { l.state.peek() }) else {
+        return false;
+    };
+    // (A strict `zip` too: its end is the general step's.)
+    let LazyIterKind::Zip { iters, held, .. } = st else {
+        return false;
+    };
+    if !held.is_empty() || iters.len() != n || n > 4 {
+        return false;
+    }
+    let mut runs: [(*const Object, usize, *mut usize); 4] =
+        [(std::ptr::null(), 0, std::ptr::null_mut()); 4];
+    for (k, it) in iters.iter().enumerate() {
+        let Object::Iter(c) = it else {
+            return false;
+        };
+        // (Distinct cells, so the views never alias.)
+        if iters[..k]
+            .iter()
+            .any(|d| matches!(d, Object::Iter(d) if Rc::ptr_eq(c, d)))
+        {
+            return false;
+        }
+        // SAFETY: distinct cells, each viewed once; nothing runs code until
+        // the views end with this call.
+        let Some((xs, i)) = (unsafe { c.peek_mut() }).and_then(seq_cursor) else {
+            return false;
+        };
+        if *i >= xs.len() {
+            return false;
+        }
+        runs[k] = (xs.as_ptr(), *i, std::ptr::from_mut(i));
+    }
+    for (k, &(xs, i, at)) in runs[..n].iter().enumerate() {
+        // SAFETY: `i` is below its sequence's length (checked above), the
+        // sequences live while their cursors do, and `out` has `n` slots.
+        unsafe {
+            out.add(n - 1 - k).write(crate::clone_hot(&*xs.add(i)));
+            *at = i + 1;
+        }
+    }
+    true
+}
+
 /// [`lazy_pure_next`] for a two-source `zip` whose pair is unpacked at
 /// once: the two items, with no tuple built.
 pub(crate) fn lazy_pure_pair(l: &PyLazyIter) -> Option<(Object, Object)> {

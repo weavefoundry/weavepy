@@ -10364,6 +10364,36 @@ fn seq_scalar_step(cell: &Rc<GilRefCell<PyIterator>>, elem_tag: i64) -> Option<u
             *index -= 1;
             Some(bits)
         }
+        // A plain dict's next key or value, after the first step set its
+        // watch, while the dict keeps its size and keys (see
+        // `Interpreter::core_dict_next`, whose step this is; its end, and
+        // an `OrderedDict`'s values, are the general step's).
+        PyIterator::DictKeys {
+            kind,
+            index,
+            dict: Some(d),
+            len,
+            watch: Some(watch),
+            reverse: false,
+            odict,
+            ..
+        } => {
+            use crate::object::DictViewKind;
+            let take_value = match kind {
+                DictViewKind::Keys => false,
+                DictViewKind::Values if odict.is_none() => true,
+                _ => return None,
+            };
+            // SAFETY: as above.
+            let data = unsafe { d.peek()? };
+            if data.len() != *len || watch.changed() {
+                return None;
+            }
+            let (k, v) = data.get_index(*index)?;
+            let bits = pack(if take_value { v } else { &k.0 }, lane)?;
+            *index += 1;
+            Some(bits)
+        }
         _ => None,
     }
 }

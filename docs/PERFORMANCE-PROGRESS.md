@@ -2672,6 +2672,26 @@ branch and pull request.
     Two old faults went with it: a lone argument whose `__str__` raised
     gave `str(e)` its repr instead of raising, and `f"{e}"` of an
     argument with a lone surrogate came out as a private-use character.
+  - Loops that unpack three or four items, and tier 2's dict loops, took
+    the general steps:
+    - `for a, b, c in zip(xs, ys, zs)` built (or refilled) a result
+      tuple, then unpacked it through the generic helper, and `for a, b,
+      c in rows` stepped the list and unpacked each row the same way. The
+      frame JIT fused only `FOR_ITER` with an `UNPACK_SEQUENCE 2`. It now
+      fuses three and four as well: a `zip` of plain sequences, or a list
+      or tuple whose next item is an exact tuple of that size, writes the
+      items straight onto the stack.
+    - A tier-2 loop over a dict's int keys or values went through two
+      helpers and the interpreter's dict step for each key. It now steps
+      the dict in the scalar lane, with the same checks.
+
+    Instructions per step:
+
+    | Loop | Before | Now | CPython |
+    |---|---|---|---|
+    | `zip` of three lists | 753 | 280 | 370 |
+    | a list of triples | 568 | 167 | 167 |
+    | a dict's int keys, tier 2 | 281 | 130 | 130 |
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

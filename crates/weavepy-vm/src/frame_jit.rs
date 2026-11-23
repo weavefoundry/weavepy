@@ -5083,6 +5083,70 @@ fn fused_pair_at(code: &CodeObject, pc: usize) -> bool {
         && pc + 2 < code.instructions.len()
 }
 
+/// Whether the `FOR_ITER` at `pc` of `code` unpacks three or four items
+/// (the `UNPACK_SEQUENCE` after it), which [`h_for_iter_tuple`] fuses:
+/// their count.
+fn fused_tuple_at(code: &CodeObject, pc: usize) -> Option<u32> {
+    let op = |pc: usize| code.instructions.get(pc).map(|i| (i.op, i.arg));
+    match (op(pc), op(pc + 1)) {
+        (Some((OpCode::ForIter, _)), Some((OpCode::UnpackSequence, n @ 3..=4)))
+            if pc + 2 < code.instructions.len() =>
+        {
+            Some(n)
+        }
+        _ => None,
+    }
+}
+
+/// [`h_for_iter_pair`] for a `FOR_ITER` fused with the `UNPACK_SEQUENCE n`
+/// (three or four) after it: a `zip` of `n` plain sequence cursors, or a
+/// list's or tuple's next item when it is an exact `n`-tuple. `0` the items
+/// written from `out` as the unpacking leaves them (the last lowest), no
+/// tuple built; anything else declined untouched.
+unsafe extern "C" fn h_for_iter_tuple(it: *mut Object, out: *mut Object, n: u64) -> u32 {
+    let n = n as usize;
+    // SAFETY: the code passes an initialized slot with `n` free ones above
+    // it; nothing below runs code while the iterator is borrowed.
+    unsafe {
+        match &*it {
+            Object::Iter(rc) => {
+                let Some(iter) = rc.peek_mut() else {
+                    return 3;
+                };
+                // (The row's items written in place, the last lowest.)
+                let put = |t: &[Object]| {
+                    if t.len() != n {
+                        return false;
+                    }
+                    for (j, x) in t.iter().enumerate() {
+                        out.add(n - 1 - j).write(crate::clone_hot(x));
+                    }
+                    true
+                };
+                let stepped = match iter {
+                    PyIterator::List {
+                        items: xs,
+                        index,
+                        owner: None,
+                    } => match xs.peek().and_then(|xs| xs.get(*index)) {
+                        Some(Object::Tuple(t)) if put(t) => index,
+                        _ => return 3,
+                    },
+                    PyIterator::Tuple { items: xs, index } => match xs.get(*index) {
+                        Some(Object::Tuple(t)) if put(t) => index,
+                        _ => return 3,
+                    },
+                    _ => return 3,
+                };
+                *stepped += 1;
+                0
+            }
+            Object::LazyIter(l) if crate::seqiter::lazy_pure_cursors_to(l, out, n) => 0,
+            _ => 3,
+        }
+    }
+}
+
 /// [`h_for_iter`] switched to a generator's activation (`RELOAD`).
 const FOR_SWITCHED: u32 = 4;
 /// [`h_for_iter`]'s iterator raised (`RAISED`, the state past it).
@@ -18901,7 +18965,7 @@ fn block_starts(code: &CodeObject, depths: &[i64]) -> Vec<bool> {
             if t < n {
                 starts[t] = true;
             }
-            if fused_pair_at(code, pc) {
+            if fused_pair_at(code, pc) || fused_tuple_at(code, pc).is_some() {
                 // Past the `UNPACK_SEQUENCE` a fused step skips.
                 starts[pc + 2] = true;
             }
@@ -23828,6 +23892,28 @@ impl<'a> Lower<'a> {
             self.b.switch_to_block(pair_b);
             let depth = self.depth;
             self.depth += 2;
+            self.set_last(pc + 1);
+            self.goto(pc + 2);
+            self.depth = depth;
+            self.b.switch_to_block(single);
+        }
+        // Likewise a loop that unpacks three or four (`for a, b, c in
+        // zip(xs, ys, zs)`).
+        if let Some(n) = fused_tuple_at(self.code, pc) {
+            let nv = self.b.ins().iconst(types::I64, i64::from(n));
+            let r = self
+                .call(
+                    h_for_iter_tuple as *const () as usize,
+                    &[it, out_slot, nv],
+                    true,
+                )
+                .expect("returns");
+            let tuple_b = self.b.create_block();
+            let single = self.b.create_block();
+            self.b.ins().brif(r, single, &[], tuple_b, &[]);
+            self.b.switch_to_block(tuple_b);
+            let depth = self.depth;
+            self.depth += n as usize;
             self.set_last(pc + 1);
             self.goto(pc + 2);
             self.depth = depth;
