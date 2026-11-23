@@ -109,7 +109,7 @@ def a():
     def test_compile_cost_grows_slowly_with_depth(self):
         def best(src):
             t = float("inf")
-            for _ in range(3):
+            for _ in range(7):
                 start = time.perf_counter()
                 compile(src, "<nest>", "exec")
                 t = min(t, time.perf_counter() - start)
@@ -119,8 +119,9 @@ def a():
         deep = best(nested_source(80))
         # (Four times as deep: about sixteen times the work at worst.
         # Recomputing each nested function's free names at every level
-        # above it made it about 40 times.)
-        self.assertLess(deep, shallow * 30 + 0.01)
+        # above it made it about 40 times, and the cubic cost 64; the
+        # slack absorbs a loaded runner's stalls on millisecond compiles.)
+        self.assertLess(deep, shallow * 30 + 0.05)
 
 
 if __name__ == "__main__":

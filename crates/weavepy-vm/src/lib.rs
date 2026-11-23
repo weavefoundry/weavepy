@@ -30131,7 +30131,7 @@ impl Interpreter {
                 value,
             ))
             // (A `__slots__` member, which the plain store declines.)
-            || Self::leaf_slot_store(code, inst, name_idx, value)
+            || Self::leaf_slot_store(code, inst, attr_pc, name_idx, value)
     }
 
     /// `inst.name = value` into a `__slots__` member of a class the
@@ -30142,6 +30142,7 @@ impl Interpreter {
     fn leaf_slot_store(
         code: &CodeObject,
         inst: &Rc<PyInstance>,
+        attr_pc: usize,
         name_idx: u32,
         value: &Object,
     ) -> bool {
@@ -30161,6 +30162,11 @@ impl Interpreter {
         // SAFETY: the value moves out of the caller's stack slot, as in
         // `core_store_attr`.
         drop(std::mem::replace(slot, unsafe { std::ptr::read(value) }));
+        // (The site's shortcut to the member, for the class: a setter that
+        // only ever runs frameless fills no cache otherwise.)
+        if let Some(ext) = code_vm_ext(code) {
+            slot_field_note_with(code, ext, attr_pc, inst, i as u32, name_idx, false);
+        }
         true
     }
 
@@ -30184,6 +30190,12 @@ impl Interpreter {
     /// position in the class's slot layout.
     fn slot_store_position(inst: &PyInstance, name: &str) -> Option<usize> {
         let cls = inst.cls_raw();
+        // (The layout first: most stores that reach here are a property's
+        // or a class without slots, which a scan of a few names settles.)
+        let layout = cls.slot_layout.get().and_then(Option::as_ref)?;
+        let i = layout
+            .iter()
+            .position(|k| matches!(&k.0, Object::Str(s) if &**s == name))?;
         if crate::object::exotic_str_keys_possible()
             || inst.c_body.get() != 0
             || cls.native_kind.get() != 0
@@ -30200,10 +30212,7 @@ impl Interpreter {
         {
             return None;
         }
-        let layout = cls.slot_layout.get().and_then(Option::as_ref)?;
-        layout
-            .iter()
-            .position(|k| matches!(&k.0, Object::Str(s) if &**s == name))
+        Some(i)
     }
 
     /// Whether [`Self::leaf_slot_store`] would store right now, touching
@@ -88594,6 +88603,21 @@ fn slot_field_note(
     idx: u32,
     name_idx: u32,
 ) {
+    slot_field_note_with(code, ext, pc, inst, idx, name_idx, true);
+}
+
+/// [`slot_field_note`], with the site tables made whether or not the
+/// code has warmed (`warm` false: a frameless setter's store, which runs
+/// only from hot callers and never warms its own tables).
+fn slot_field_note_with(
+    code: &CodeObject,
+    ext: &CodeConstObjects,
+    pc: usize,
+    inst: &PyInstance,
+    idx: u32,
+    name_idx: u32,
+    warm: bool,
+) {
     let ninstrs = code.instructions.len();
     let cls = inst.cls_raw();
     let Some(layout) = cls.slot_layout.get().and_then(Option::as_ref) else {
@@ -88611,7 +88635,7 @@ fn slot_field_note(
     {
         return;
     }
-    if !ext.field_slots.is_allocated() && !site_tables_warm(ext, ninstrs) {
+    if warm && !ext.field_slots.is_allocated() && !site_tables_warm(ext, ninstrs) {
         return;
     }
     let slots = ext.alloc_sites(code, &ext.field_slots, FieldSlot::empty);

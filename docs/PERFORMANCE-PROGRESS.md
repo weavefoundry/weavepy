@@ -2747,7 +2747,13 @@ branch and pull request.
     member by the default `__setattr__` (per class version), and the
     in-line `__getitem__` (above) falls back to the site's direct call,
     not to an exit, when its class guard fails. `class_features` takes
-    479 million instructions (505).
+    479 million instructions (505). The fallback first ran its verdict
+    for every declined store, a property's included, which cost the
+    bench gate's `richards` 2% here and about 16% on CI's runners. It
+    now looks for the name in the class's slot layout first, and a store
+    it makes records the site's slot shortcut, so the next one takes the
+    cached path: a property set `o.p = i` costs 1,192 instructions
+    (1,362 before these changes).
   - Two more sites left compiled code on every run of a battery case: a
     `BUILD_STRING` of more than eight parts (`UUID.__str__`'s f-string
     has nine), and `urljoin`'s `segments[1:-1] = filter(None,
