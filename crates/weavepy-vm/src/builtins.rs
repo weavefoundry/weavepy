@@ -17592,13 +17592,8 @@ fn bytes_split_args(
 /// `b.split()` or `b.split(sep)` of bytes by bytes, no `maxsplit`: each
 /// piece made from its slice once.
 fn bytes_split_plain(data: &[u8], sep: Option<&[u8]>) -> Object {
-    let piece = |p: &[u8]| {
-        if p.is_empty() {
-            Object::new_bytes(Vec::new())
-        } else {
-            Object::Bytes(SharedSlice::from(p))
-        }
-    };
+    // (The empty and one-byte pieces are the shared objects.)
+    let piece = |p: &[u8]| Object::new_bytes(p);
     let mut parts = Vec::new();
     match sep {
         None => {

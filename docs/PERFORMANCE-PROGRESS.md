@@ -2703,6 +2703,15 @@ branch and pull request.
     unsigned result's sign make no extra copies. `format(1234.5678, 'e')`
     takes 2,935 instructions (6,283, CPython 3,153), and `'g'` 2,884
     (4,817, CPython 2,459).
+  - Every one-byte `bytes` result was a new allocation (CPython shares
+    one object per byte value, `bytes([97]) is b"a"`), so splitting into
+    short pieces allocated each one. Those objects are now shared as in
+    CPython. A compiled `sep.join(parts)` of `bytes` went through the
+    general call, which the dispatch takes for `join` because an
+    arbitrary iterable may run code. A list or tuple argument now calls
+    the native body, which reads the parts in place.
+    `b"a b c d".split(b" ")` takes 1,596 instructions (2,078, CPython
+    1,098), and `b" ".join([b, b])` 1,824 (2,146, CPython 1,307).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

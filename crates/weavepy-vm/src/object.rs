@@ -17122,6 +17122,14 @@ impl Object {
             static EMPTY: std::sync::OnceLock<SharedSlice<u8>> = std::sync::OnceLock::new();
             return Object::Bytes(EMPTY.get_or_init(|| SharedSlice::from(&[][..])).clone());
         }
+        if let [b] = v {
+            // And each one-byte object (CPython's `characters` table:
+            // `bytes([97]) is b"a"`), made once.
+            static ONE: std::sync::OnceLock<Vec<SharedSlice<u8>>> = std::sync::OnceLock::new();
+            let table =
+                ONE.get_or_init(|| (0..=255u8).map(|b| SharedSlice::from(&[b][..])).collect());
+            return Object::Bytes(table[usize::from(*b)].clone());
+        }
         Object::Bytes(SharedSlice::from(v))
     }
 

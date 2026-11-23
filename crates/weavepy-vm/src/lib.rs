@@ -18073,7 +18073,17 @@ impl Interpreter {
                 None
             };
             let args = std::slice::from_raw_parts(base.add(first), len - first);
-            let result = if via_call {
+            // `bytes.join` of a list or tuple (of `bytes`, or its error)
+            // reads the parts in place: no iteration for the dispatch to
+            // drive.
+            let joins_in_place = via_call
+                && !b.is_null()
+                && (*b).name == "join"
+                && (*b).call_kw.is_none()
+                && matches!(args, [Object::Bytes(_), Object::List(_) | Object::Tuple(_)]);
+            let result = if joins_in_place {
+                ((*b).call)(args)
+            } else if via_call {
                 let globals = frame.globals.clone();
                 match &*base.add(start) {
                     callable @ (Object::Builtin(_) | Object::Type(_)) => {
