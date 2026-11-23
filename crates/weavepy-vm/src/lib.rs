@@ -23739,6 +23739,11 @@ impl Interpreter {
                 let items: Vec<Object> = match value {
                     Object::Tuple(t) => crate::object::cloned_vec(t),
                     Object::List(l) if !Rc::ptr_eq(l, dst) => l.try_borrow().ok()?.clone(),
+                    // `xs[a:b] = filter(None, ys)` (`urljoin`'s), drained
+                    // whole when that runs no code.
+                    Object::LazyIter(l) if dst.try_borrow_mut().is_ok() => {
+                        crate::seqiter::filter_collect(l)?
+                    }
                     _ => return None,
                 };
                 let mut d = dst.try_borrow_mut().ok()?;
@@ -91277,12 +91282,12 @@ pub(crate) unsafe fn format_spec_in_place(at: *mut Object) -> bool {
 /// The `n` slots from `at` are initialized, and nothing else reads them.
 #[inline]
 pub(crate) unsafe fn build_string_at(at: *mut Object, n: usize) -> bool {
-    if n == 0 || n > 8 || crate::stdlib::tracemalloc_real::is_tracking() {
+    if n == 0 || n > BUILD_STRING_MAX || crate::stdlib::tracemalloc_real::is_tracking() {
         return false;
     }
     // SAFETY: the caller's contract.
     let parts = unsafe { std::slice::from_raw_parts(at, n) };
-    let mut strs: [&str; 8] = [""; 8];
+    let mut strs: [&str; BUILD_STRING_MAX] = [""; BUILD_STRING_MAX];
     for (k, p) in parts.iter().enumerate() {
         match p {
             Object::Str(s) => strs[k] = s,
@@ -91298,6 +91303,10 @@ pub(crate) unsafe fn build_string_at(at: *mut Object, n: usize) -> bool {
     }
     true
 }
+
+/// The most parts [`build_string_at`] joins (an f-string with four
+/// fields and their separators, `UUID.__str__`'s, has nine).
+pub(crate) const BUILD_STRING_MAX: usize = 16;
 
 /// Whether every `RETURN_VALUE` in `code` returns the constant `None`
 /// (what a constructor's `__init__` must return), decided once.

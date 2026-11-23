@@ -2748,6 +2748,13 @@ branch and pull request.
     in-line `__getitem__` (above) falls back to the site's direct call,
     not to an exit, when its class guard fails. `class_features` takes
     479 million instructions (505).
+  - Two more sites left compiled code on every run of a battery case: a
+    `BUILD_STRING` of more than eight parts (`UUID.__str__`'s f-string
+    has nine), and `urljoin`'s `segments[1:-1] = filter(None,
+    segments[1:-1])`, whose `STORE_SLICE` took only a list or tuple. The
+    compiled join now takes up to sixteen parts, and a slice store drains
+    a `filter(None, ...)` or `filter(bool, ...)` over a plain list or
+    tuple in place when its items' truth runs no code.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

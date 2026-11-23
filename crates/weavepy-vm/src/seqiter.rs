@@ -3888,6 +3888,19 @@ pub(crate) fn enumerate_pure_pair(it: &Object) -> Option<(Object, Object)> {
     Some((Object::Int(i), v))
 }
 
+/// The rest of `filter(None, xs)` or `filter(bool, xs)` over a plain list
+/// or tuple cursor whose items' truth runs no code, taken at once (see
+/// [`filter_seq_bulk`]): `None`, nothing consumed, for anything else.
+pub(crate) fn filter_collect(l: &PyLazyIter) -> Option<Vec<Object>> {
+    // SAFETY: nothing below runs code; the view ends with this call.
+    let st = unsafe { l.state.peek() }?;
+    let LazyIterKind::Filter { func, source } = st else {
+        return None;
+    };
+    let mut out = Vec::new();
+    filter_seq_bulk(func, source, &mut out).then_some(out)
+}
+
 /// The truth of a value whose truth is plain data (`None` for anything
 /// whose `__bool__`/`__len__` could run code).
 /// `filter(None, xs)` or `filter(bool, xs)` drained over a plain list or

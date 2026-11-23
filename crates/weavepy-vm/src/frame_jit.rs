@@ -11697,12 +11697,12 @@ const FSTRING_FORMAT_SPEC: u64 = 3;
 
 /// Whether the native code runs the f-string instruction `op` (`arg`):
 /// a conversion, a format (with a spec, but no conversion), or a join of
-/// up to eight parts.
+/// up to [`crate::BUILD_STRING_MAX`] parts.
 fn fstring_native(op: OpCode, arg: u32) -> bool {
     match op {
         OpCode::ConvertValue => matches!(arg & 0x03, 1 | 2),
         OpCode::FormatValue => arg == 0 || arg == 4,
-        OpCode::BuildString => (1..=8).contains(&arg),
+        OpCode::BuildString => (1..=crate::BUILD_STRING_MAX as u32).contains(&arg),
         _ => false,
     }
 }
