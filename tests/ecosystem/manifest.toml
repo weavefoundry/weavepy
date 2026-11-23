@@ -189,7 +189,10 @@ probe = "probes/packaging_probe.py"
 
 [packages.packaging.selftest]
 source = "packaging==26.3"
-requirements = "pytest==8.4.2 pretend==1.0.9 hypothesis==6.155.7 tomli_w==1.2.0"
+# packaging==26.3 repeats the row's pin: the in-tree pip resolves
+# pytest's `packaging>=20` to the newest release instead of keeping the
+# installed one (26.4 broke the 26.3 suite on 2026-11-23).
+requirements = "packaging==26.3 pytest==8.4.2 pretend==1.0.9 hypothesis==6.155.7 tomli_w==1.2.0"
 # Two enumerated trims, both interpreter-speed-bound (measured
 # 2026-08), neither a correctness signal:
 # --ignore=tests/property — upstream's hypothesis property-fuzz lanes
