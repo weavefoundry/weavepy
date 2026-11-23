@@ -721,18 +721,40 @@ fn deque_rotate(args: &[Object]) -> Result<Object, RuntimeError> {
             return Err(type_error("deque.rotate() takes at most one argument"));
         }
     };
+    // The unguarded parts, found in one pass over the slots (see
+    // `fast_parts`); the guarded ones otherwise.
+    if let Some(mut f) = fast_parts(args) {
+        let h = f.head();
+        if let Some(h) = rotate_in(f.d, h, n) {
+            f.bump_state();
+            f.set_head(h);
+        }
+        return Ok(Object::None);
+    }
     let mut st = receiver(args, "rotate")?;
     let data = st.data.clone();
     let mut d = data.borrow_mut();
-    let mut h = st.head().min(d.len());
+    let h = st.head();
+    if let Some(h) = rotate_in(&mut d, h, n) {
+        st.bump_state();
+        st.set_head(h);
+    }
+    Ok(Object::None)
+}
+
+/// Rotate the deque whose items are `d[h..]` right by `n`: the new head,
+/// or `None` when there was nothing to move (fewer than two items; the
+/// state counter moves only otherwise, though a whole turn changes
+/// nothing).
+fn rotate_in(d: &mut Vec<Object>, h: usize, n: i64) -> Option<usize> {
+    let mut h = h.min(d.len());
     let len = d.len() - h;
     if len <= 1 {
-        return Ok(Object::None);
+        return None;
     }
-    st.bump_state();
     let right = n.rem_euclid(len as i64) as usize;
     if right == 0 {
-        return Ok(Object::None);
+        return Some(h);
     }
     if right <= len / 2 {
         if h < right {
@@ -740,7 +762,7 @@ fn deque_rotate(args: &[Object]) -> Result<Object, RuntimeError> {
             // next rotations find it there: a gap the size of one rotation
             // moved the whole deque on every other call.)
             let slack = right.max(len).max(8);
-            grow_front(&mut d, slack);
+            grow_front(d, slack);
             h += slack;
         }
         let end = d.len();
@@ -749,7 +771,7 @@ fn deque_rotate(args: &[Object]) -> Result<Object, RuntimeError> {
         let (front, back) = d.split_at_mut(end - right);
         front[h - right..h].swap_with_slice(back);
         d.truncate(end - right);
-        st.set_head(h - right);
+        Some(h - right)
     } else {
         let left = len - right;
         // (The first `left` items trade places, as one block, with free
@@ -763,9 +785,8 @@ fn deque_rotate(args: &[Object]) -> Result<Object, RuntimeError> {
             d.drain(..h);
             h = 0;
         }
-        st.set_head(h);
+        Some(h)
     }
-    Ok(Object::None)
 }
 
 /// `iter(d)` / `reversed(d)`: a fresh `_deque_iterator` (or reverse

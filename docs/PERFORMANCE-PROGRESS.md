@@ -2730,6 +2730,11 @@ branch and pull request.
     instructions. A comparison at a site that has seen instance operands
     now counts as a dynamic Python call too, so such a loop runs in the
     frame JIT: 817 instructions a step (1,448, CPython 1,177).
+  - `deque.rotate` found the deque's list, head and state counter through
+    the guarded slot path, by name each time, where the end operations
+    take them unguarded in one pass over the slot layout. It now takes
+    them that way too: `d.rotate(1)` costs 636 instructions (982,
+    CPython 542).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
