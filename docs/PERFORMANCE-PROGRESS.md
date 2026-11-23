@@ -2581,10 +2581,11 @@ branch and pull request.
     2 entered by OSR pinned each element in its activation's table, which
     holds them until the activation leaves: `for p in pts: pass` cost 290
     instructions an element where the frame JIT, which counts references
-    instead, takes 39. Tier 2 declines such a loop now unless its function
-    has enough typed arithmetic or a typed Python call to repay the step
-    (`richards`' `for t in tasks: t.run()` keeps it), as it already
-    declined tuple-target loops. Over 512 instances, `t += p.x` costs 164
+    instead, takes 39. Tier 2 declines such a loop now unless the loop
+    itself has enough typed arithmetic or makes a typed Python call to
+    repay the step (`richards`' `for t in tasks: t.run()` keeps it; a call
+    that built the list doesn't count), as it already declined
+    tuple-target loops. Over 512 instances, `t += p.x` costs 164
     instructions an element (550 before, CPython 325), `out.append(p)` 173
     (478, 233), `if p is not prev` 211 (468, 408) and `t += p.norm()` 396
     (495, 1,219); the `float_math` fixture runs 4% fewer instructions. The
@@ -2614,7 +2615,9 @@ branch and pull request.
     1,380, a frozen dataclass's 1,238 (1,933, CPython 1,773); `k in s` 1,468
     (2,160, CPython 1,505), `d[k]` 1,778 (2,466, 1,530), `set(keys)` of 64
     such keys 1,533 a key (2,234, 1,349), and a dict of dataclass keys read
-    with equal keys 3,397 (4,102, 2,669).
+    with equal keys 3,397 (4,102, 2,669). A loop testing 64 such keys
+    against a set costs 1,541 a key (3,007, CPython 1,449), the rest from
+    leaving that loop to the frame JIT (see the loops over objects above).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

@@ -1155,37 +1155,49 @@ fn analyze_admitted(
 /// does a tuple-target loop (see [`unpacks_pairs`]); a body with enough
 /// typed arithmetic, or a typed Python call (which tier 2 makes natively:
 /// `richards`' `for t in tasks: t.run()` ran half again as long in the
-/// frame JIT), keeps tier 2.
+/// frame JIT), keeps tier 2. Only the loop's own blocks count: a call that
+/// built the list (`[P(i) for i in range(n)]`) doesn't repay its steps.
 fn steps_objects(tfunc: &TFunc) -> bool {
-    use crate::ir::TOp;
+    use crate::ir::{TOp, TTerm};
     use crate::value::JitType;
     if GENERIC_LOOPS_ADMITTED.load(std::sync::atomic::Ordering::Relaxed) {
         return false;
     }
-    let pins = tfunc.blocks.iter().any(|b| {
-        matches!(
-            b.term,
-            crate::ir::TTerm::ForList {
-                elem: JitType::Obj,
-                ..
-            }
-        )
-    });
-    if !pins {
-        return false;
-    }
-    let calls = tfunc
-        .blocks
-        .iter()
-        .flat_map(|b| &b.stmts)
-        .filter(|s| {
-            matches!(
-                s.op,
+    let typed_work = |blocks: &[crate::ir::TBlock]| -> usize {
+        blocks
+            .iter()
+            .flat_map(|b| &b.stmts)
+            .map(|s| match s.op {
                 TOp::CallPy { .. } | TOp::CallPyKw { .. } | TOp::CallMethod { .. }
-            ) && tfunc.py_dyn_calls.binary_search(&s.pc).is_err()
-        })
-        .count();
-    typed_arith(tfunc) + calls * call_weight() < PAIR_LOOP_TYPED_WORK
+                    if tfunc.py_dyn_calls.binary_search(&s.pc).is_err() =>
+                {
+                    call_weight()
+                }
+                TOp::IntArith(_)
+                | TOp::FloatArith(_)
+                | TOp::IntTrueDiv
+                | TOp::IntCmp(_)
+                | TOp::FloatCmp(_)
+                | TOp::IntNeg
+                | TOp::FloatNeg
+                | TOp::IntInvert => 1,
+                _ => 0,
+            })
+            .sum()
+    };
+    // (Blocks are in instruction order: a loop's run from its header to
+    // its exit.)
+    tfunc.blocks.iter().enumerate().any(|(h, b)| match b.term {
+        TTerm::ForList {
+            elem: JitType::Obj,
+            exit,
+            ..
+        } => {
+            let end = if exit > h { exit } else { tfunc.blocks.len() };
+            typed_work(&tfunc.blocks[h..end]) < PAIR_LOOP_TYPED_WORK
+        }
+        _ => false,
+    })
 }
 
 /// Whether `tfunc` runs a tuple-target loop (`for a, b in pairs`) natively.
