@@ -2692,6 +2692,17 @@ branch and pull request.
     | `zip` of three lists | 753 | 280 | 370 |
     | a list of triples | 568 | 167 | 167 |
     | a dict's int keys, tier 2 | 281 | 130 | 130 |
+  - A float's `e` and `g` formats formatted it twice: the shortest digits
+    first, padded with zeros if they fit, then the exact digits when they
+    didn't (any value with a long mantissa, `1234.5678`). The shortest try
+    is for round values (`0.5`, `100.0`), whose exact digits sit on a
+    rounding boundary the fast exact algorithm can't settle, so it's now
+    made only for a value whose mantissa ends in many zero bits. A spec of
+    a number no longer computes its `str` first (only the string
+    presentation reads it), and the exponent's normalizing and the
+    unsigned result's sign make no extra copies. `format(1234.5678, 'e')`
+    takes 2,935 instructions (6,283, CPython 3,153), and `'g'` 2,884
+    (4,817, CPython 2,459).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

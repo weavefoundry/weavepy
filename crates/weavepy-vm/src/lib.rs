@@ -82951,6 +82951,16 @@ fn format_via_spec_impl(
             ));
         }
     }
+    // A number with a spec never reads its `str` text (only the string
+    // presentation does, which numbers reject or route elsewhere).
+    if !spec.is_empty()
+        && matches!(
+            value,
+            Object::Float(_) | Object::Int(_) | Object::Bool(_) | Object::Long(_)
+        )
+    {
+        return apply_format_spec_inner(value, spec, "", allow_int_precision);
+    }
     // A surrogate-bearing `WStr` bridges its lone surrogates into the PUA
     // window so the (UTF-8-only) spec engine can pad/slice it; the Object
     // boundary (`FormatValue`/`str.format` via `str_result`) maps them back.
@@ -85746,10 +85756,12 @@ fn finish_float(neg: bool, core: String, p: &ParsedSpec) -> String {
         Some(sep) => group_float_frac(&core, sep),
         None => core,
     };
-    let grouped = match p.grouping {
-        Some(sep) => group_float_core(&core, sep),
-        None => core.clone(),
+    let Some(sep) = p.grouping else {
+        // (No grouping: the digits are the body, signed in place.)
+        let neg = neg && !(p.no_neg_zero && all_digits_zero(&core));
+        return apply_alignment(with_sign_owned(neg, core, p), p, true);
     };
+    let grouped = group_float_core(&core, sep);
     let neg = neg && !(p.no_neg_zero && all_digits_zero(&grouped));
     let body = with_sign(neg, &grouped, p);
     // Zero padding with a thousands separator: the pad zeros join the
@@ -85758,7 +85770,7 @@ fn finish_float(neg: bool, core: String, p: &ParsedSpec) -> String {
     // `_PyUnicode_InsertThousandsGrouping` runs over the padded digit
     // run, and the result may overshoot the width rather than lead
     // with a separator). test_types test_float__format__.
-    if let (Some(sep), Some(width)) = (p.grouping, p.width) {
+    if let Some(width) = p.width {
         let zero_fill = p.fill.unwrap_or(if p.zero { '0' } else { ' ' }) == '0'
             && matches!(p.align, None | Some('='));
         if zero_fill && body.chars().count() < width {
@@ -85910,13 +85922,17 @@ fn normalize_exponent(raw: &str, upper: bool) -> String {
         } else {
             ('+', exp)
         };
-        let digits = if digits.len() < 2 {
-            format!("0{digits}")
-        } else {
-            digits.to_owned()
-        };
-        let e = if upper { 'E' } else { 'e' };
-        format!("{mant}{e}{sign}{digits}")
+        // (One buffer: the mantissa, the marker, the sign, two digits at
+        // least.)
+        let mut out = String::with_capacity(mant.len() + 4 + digits.len());
+        out.push_str(mant);
+        out.push(if upper { 'E' } else { 'e' });
+        out.push(sign);
+        if digits.len() < 2 {
+            out.push('0');
+        }
+        out.push_str(digits);
+        out
     } else {
         raw.to_owned()
     }
@@ -85956,7 +85972,13 @@ fn format_float_general(f: f64, prec: usize, upper: bool, p: &ParsedSpec) -> Str
 /// normal double is under a unit of its 16th digit, so the padded digits
 /// are the nearest), with no exact, big-number formatting.
 fn exp_exact(mag: f64, after: usize) -> String {
-    if after < 15 && (mag == 0.0 || mag.is_normal()) {
+    // The shortest digits first, padded, for a value with a short exact
+    // binary expansion (`0.5`, `100.0`), whose exact digits sit on a
+    // rounding boundary the fast exact algorithm can't settle; any other
+    // value's shortest form is long (`1234.5678`), so its exact digits
+    // come straight from one formatting.
+    let short_mantissa = (mag.to_bits() & ((1 << 52) - 1)).trailing_zeros() >= 24;
+    if after < 15 && (mag == 0.0 || (mag.is_normal() && short_mantissa)) {
         let short = format!("{mag:e}");
         if let Some(k) = short.find('e') {
             let (mant, exp) = (&short[..k], &short[k..]);
@@ -86142,9 +86164,28 @@ fn strip_g_zeros(mut core: String) -> String {
         return core;
     }
     let keep = mant.trim_end_matches('0').trim_end_matches('.').len();
+    if keep == k {
+        return core;
+    }
     // (In place: the exponent, if any, moves down over the zeros.)
     core.replace_range(keep..k, "");
     core
+}
+
+/// [`with_sign`] of an owned body, which an unsigned result keeps.
+fn with_sign_owned(neg: bool, body: String, p: &ParsedSpec) -> String {
+    let sign = if neg {
+        '-'
+    } else {
+        match p.sign {
+            Some(c @ ('+' | ' ')) => c,
+            _ => return body,
+        }
+    };
+    let mut out = String::with_capacity(body.len() + 1);
+    out.push(sign);
+    out.push_str(&body);
+    out
 }
 
 fn with_sign(neg: bool, body: &str, p: &ParsedSpec) -> String {
