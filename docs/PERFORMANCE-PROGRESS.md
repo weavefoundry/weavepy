@@ -2724,6 +2724,12 @@ branch and pull request.
     dynamic Python call when it weighs a loop's typed work. `seq[1]`
     takes 193 instructions (888, CPython 516), and `t += seq[1]` 237
     (1,376, CPython 699).
+  - Tier 2 likewise took a loop that counted `if a < b` of instances with
+    a Python `__lt__`, making each comparison through the interpreter's
+    rich comparison (helper, callee guards, then the method), about 1,000
+    instructions. A comparison at a site that has seen instance operands
+    now counts as a dynamic Python call too, so such a loop runs in the
+    frame JIT: 817 instructions a step (1,448, CPython 1,177).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

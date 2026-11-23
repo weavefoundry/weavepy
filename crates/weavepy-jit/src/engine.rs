@@ -1374,7 +1374,7 @@ fn call_bound(tfunc: &TFunc) -> bool {
         match st.op {
             // (A guarded call the analysis marked runs its callee
             // frameless, which costs as much as a dynamic call.)
-            TOp::CallDyn { .. } | TOp::CallPy { .. } | TOp::DynGetItem
+            TOp::CallDyn { .. } | TOp::CallPy { .. } | TOp::DynGetItem | TOp::DynCompare { .. }
                 if tfunc.py_dyn_calls.binary_search(&st.pc).is_ok() =>
             {
                 calls += 1;
