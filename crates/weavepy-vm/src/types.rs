@@ -213,6 +213,10 @@ pub(crate) enum Verdict {
     /// payload: no `__str__` that dispatch reaches (see
     /// `Interpreter::str_payload_class`); `name` unused.
     StrPayload = 13,
+    /// An instance store of `name` is a `__slots__` member's store: the
+    /// default `__setattr__`, and a writable member without a default
+    /// that the lookup finds first (see `Interpreter::leaf_slot_store`).
+    SlotStore = 14,
 }
 
 pub struct AttrVersion(std::sync::atomic::AtomicU64);

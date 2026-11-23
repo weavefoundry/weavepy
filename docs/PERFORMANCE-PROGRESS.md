@@ -2735,6 +2735,19 @@ branch and pull request.
     take them unguarded in one pass over the slot layout. It now takes
     them that way too: `d.rotate(1)` costs 636 instructions (982,
     CPython 542).
+  - A property setter shared by several classes left compiled code at
+    every store after the first class: the setter's own `self._p = v`
+    took a `__slots__` member's store only through its site's cache, so
+    an instance of another slotted class (or of one that also has a
+    `__dict__`) declined, ran the setter as a frame, and finished the
+    iteration interpreted. The everyday battery's `class_features` runs
+    its case three times, each defining its classes afresh, so two runs
+    in three went that way. A store the cache doesn't serve now takes
+    the member's place when the class stores the name in a `__slots__`
+    member by the default `__setattr__` (per class version), and the
+    in-line `__getitem__` (above) falls back to the site's direct call,
+    not to an exit, when its class guard fails. `class_features` takes
+    479 million instructions (505).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

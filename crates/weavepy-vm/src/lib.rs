@@ -30115,7 +30115,7 @@ impl Interpreter {
         value: &Object,
     ) -> bool {
         let cls = inst.cls_raw();
-        Self::plain_store_class(code, inst, name_idx)
+        (Self::plain_store_class(code, inst, name_idx)
             && Self::core_store_new_attr(
                 code,
                 inst,
@@ -30124,7 +30124,39 @@ impl Interpreter {
                 name_idx,
                 cls.attr_version.get(),
                 value,
-            )
+            ))
+            // (A `__slots__` member, which the plain store declines.)
+            || Self::leaf_slot_store(code, inst, name_idx, value)
+    }
+
+    /// `inst.name = value` into a `__slots__` member of a class the
+    /// site's cache doesn't serve (a setter shared by several slotted
+    /// classes): the member's store, in place, when the class stores
+    /// `name` there by the default `__setattr__`. As `core_store_attr`:
+    /// on `true` the value moved, `false` touched nothing.
+    fn leaf_slot_store(
+        code: &CodeObject,
+        inst: &Rc<PyInstance>,
+        name_idx: u32,
+        value: &Object,
+    ) -> bool {
+        let Some(Object::Str(name)) = code_name_obj(code, name_idx) else {
+            return false;
+        };
+        let Some(i) = Self::slot_store_position(inst, name) else {
+            return false;
+        };
+        // SAFETY: a store between two instructions (see `peek_mut`).
+        let Some(slot) = (unsafe { inst.laid_out_slot_mut(i, value.is_gc_atomic()) }) else {
+            return false;
+        };
+        if !Self::core_droppable(slot) {
+            return false;
+        }
+        // SAFETY: the value moves out of the caller's stack slot, as in
+        // `core_store_attr`.
+        drop(std::mem::replace(slot, unsafe { std::ptr::read(value) }));
+        true
     }
 
     /// Whether [`Self::leaf_attr_store`] would perform this store right
@@ -30138,6 +30170,48 @@ impl Interpreter {
         Self::core_store_attr_ready(code, inst, attr_pc, name_idx)
             || (Self::plain_store_class(code, inst, name_idx)
                 && Self::store_new_attr_ready(code, inst, name_idx))
+            || Self::leaf_slot_store_ready(code, inst, name_idx)
+    }
+
+    /// Where `inst.name = …` stores in `inst`'s laid-out slots when its
+    /// class stores `name` in a `__slots__` member by the default
+    /// `__setattr__` (see [`Self::leaf_slot_store`]): the member's
+    /// position in the class's slot layout.
+    fn slot_store_position(inst: &PyInstance, name: &str) -> Option<usize> {
+        let cls = inst.cls_raw();
+        if crate::object::exotic_str_keys_possible()
+            || inst.c_body.get() != 0
+            || cls.native_kind.get() != 0
+            || crate::capi_watchers::dicts_active()
+            || !cls.memo_verdict(crate::types::Verdict::SlotStore, name, || {
+                !cls.flags.is_builtin
+                    && cls.setattr_is_default()
+                    && matches!(
+                        cls.lookup(name),
+                        Some(Object::SlotDescriptor(s))
+                            if s.name == name && s.default.is_none() && !s.readonly
+                    )
+            })
+        {
+            return None;
+        }
+        let layout = cls.slot_layout.get().and_then(Option::as_ref)?;
+        layout
+            .iter()
+            .position(|k| matches!(&k.0, Object::Str(s) if &**s == name))
+    }
+
+    /// Whether [`Self::leaf_slot_store`] would store right now, touching
+    /// nothing.
+    fn leaf_slot_store_ready(code: &CodeObject, inst: &PyInstance, name_idx: u32) -> bool {
+        let Some(Object::Str(name)) = code_name_obj(code, name_idx) else {
+            return false;
+        };
+        let Some(i) = Self::slot_store_position(inst, name) else {
+            return false;
+        };
+        // SAFETY: an unused view with nothing running.
+        unsafe { inst.laid_out_slot_any(i) }.is_some_and(Self::core_droppable)
     }
 
     /// The constructor shape of [`Self::core_store_attr`]: a

@@ -2317,9 +2317,11 @@ impl<'a> Lower<'a> {
         self.vs = args.to_vec();
         self.depth = start + 2;
         self.last_pc = call_last;
+        // (The method called directly, as the site's ordinary lowering
+        // calls it, when the guard fails: a class whose version moves.)
         if nested {
             self.exit(INTERP, pc);
-        } else if self.container(pc) {
+        } else if self.subscr_ref(pc) || self.container(pc) {
             self.flush();
             self.b.ins().jump(join, &[]);
         }
