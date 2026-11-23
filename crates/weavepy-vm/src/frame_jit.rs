@@ -4822,6 +4822,9 @@ unsafe extern "C" fn h_for_iter_rest(
                 // leaves likewise, a list cursor detaching from its list as
                 // its own end detaches it (where that frees nothing that
                 // could finalize: the list lives on, or holds plain scalars).
+                // (An iterator only the stack holds may free a temporary
+                // list or tuple of plain values as it goes, as a plain
+                // cursor's end does: `for i, x in enumerate([a, b])`.)
                 let frees_nothing = match &mut *inner {
                     PyIterator::List {
                         items,
@@ -4831,7 +4834,7 @@ unsafe extern "C" fn h_for_iter_rest(
                         let ok = items.try_borrow().is_ok_and(|v| {
                             *index >= v.len()
                                 && (crate::sync::Rc::strong_count(items) > 1
-                                    || (!unique && v.iter().all(plain_scalar)))
+                                    || v.iter().all(plain_scalar))
                         });
                         if ok && !unique {
                             *items = crate::sync::Rc::new(crate::sync::RefCell::new(Vec::new()));
@@ -4840,7 +4843,9 @@ unsafe extern "C" fn h_for_iter_rest(
                     }
                     PyIterator::Tuple { items, index } => {
                         *index >= items.len()
-                            && (!unique || crate::shared_value::ThinArc::strong_count(items) > 1)
+                            && (!unique
+                                || crate::shared_value::ThinArc::strong_count(items) > 1
+                                || items.iter().all(|x| plain_scalar(x) || held_elsewhere(x)))
                     }
                     PyIterator::Range { .. } => unique,
                     _ => false,

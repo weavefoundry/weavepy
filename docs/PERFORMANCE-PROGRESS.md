@@ -2755,6 +2755,14 @@ branch and pull request.
     compiled join now takes up to sixteen parts, and a slice store drains
     a `filter(None, ...)` or `filter(bool, ...)` over a plain list or
     tuple in place when its items' truth runs no code.
+  - `for i, x in enumerate([a, b])` left compiled code at its end on
+    every run (`_strptime` begins with such a loop): an `enumerate` only
+    the stack held, over a temporary list only it held, declined to
+    retire at its end, though a plain list cursor in the same position
+    retires and frees its plain items. It now retires as that cursor
+    does: a call of a function with that loop costs 3,342 instructions
+    (4,904, CPython 2,658), and the battery's `datetime_time_ops` 1.5%
+    fewer.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
