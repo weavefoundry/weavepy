@@ -6,7 +6,6 @@
 
 use crate::sync::Rc;
 use crate::sync::RefCell;
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -649,17 +648,35 @@ struct LzmaDecompState {
     check_known: bool,
 }
 
-type CompReg = Mutex<HashMap<i64, Rc<RefCell<LzmaCompState>>>>;
-type DecompReg = Mutex<HashMap<i64, Rc<RefCell<LzmaDecompState>>>>;
+type CompReg = Mutex<super::handle_table::HandleTable<LzmaCompState>>;
+type DecompReg = Mutex<super::handle_table::HandleTable<LzmaDecompState>>;
 
 fn comp_reg() -> &'static CompReg {
     static REG: OnceLock<CompReg> = OnceLock::new();
-    REG.get_or_init(|| Mutex::new(HashMap::new()))
+    REG.get_or_init(Mutex::default)
+}
+
+/// A compressor's state goes with it (see `handle_table`).
+fn comp_died(inst: &PyInstance) {
+    if let Some(id) = super::handle_table::handle_of(inst) {
+        if let Ok(mut reg) = comp_reg().try_lock() {
+            reg.remove(id);
+        }
+    }
+}
+
+/// A decompressor's state goes with it (see `handle_table`).
+fn decomp_died(inst: &PyInstance) {
+    if let Some(id) = super::handle_table::handle_of(inst) {
+        if let Ok(mut reg) = decomp_reg().try_lock() {
+            reg.remove(id);
+        }
+    }
 }
 
 fn decomp_reg() -> &'static DecompReg {
     static REG: OnceLock<DecompReg> = OnceLock::new();
-    REG.get_or_init(|| Mutex::new(HashMap::new()))
+    REG.get_or_init(Mutex::default)
 }
 
 fn lzma_next_id() -> i64 {
@@ -668,11 +685,11 @@ fn lzma_next_id() -> i64 {
 }
 
 fn comp_state(id: i64) -> Option<Rc<RefCell<LzmaCompState>>> {
-    comp_reg().lock().ok()?.get(&id).cloned()
+    comp_reg().lock().ok()?.get(id)
 }
 
 fn decomp_state(id: i64) -> Option<Rc<RefCell<LzmaDecompState>>> {
-    decomp_reg().lock().ok()?.get(&id).cloned()
+    decomp_reg().lock().ok()?.get(id)
 }
 
 /// The `_lzma.LZMAError` exception type (a plain `Exception` subclass, as in
@@ -912,6 +929,7 @@ fn compressor_class() -> Rc<TypeObject> {
                 is_builtin: true,
             },
         )
+        .inspect(|cls| super::handle_table::watch_owner_class(cls, comp_died))
         .expect("LZMACompressor must linearise")
     })
     .clone()
@@ -936,6 +954,7 @@ fn decompressor_class() -> Rc<TypeObject> {
                 is_builtin: true,
             },
         )
+        .inspect(|cls| super::handle_table::watch_owner_class(cls, decomp_died))
         .expect("LZMADecompressor must linearise")
     })
     .clone()
@@ -1062,10 +1081,11 @@ fn compressor_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Objec
     if let Ok(mut reg) = comp_reg().lock() {
         reg.insert(
             id,
-            Rc::new(RefCell::new(LzmaCompState {
+            &inst,
+            LzmaCompState {
                 s: coder,
                 done: false,
-            })),
+            },
         );
     }
     inst.dict_cell()
@@ -1149,7 +1169,8 @@ fn decompressor_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Obj
     if let Ok(mut reg) = decomp_reg().lock() {
         reg.insert(
             id,
-            Rc::new(RefCell::new(LzmaDecompState {
+            &inst,
+            LzmaDecompState {
                 s: coder,
                 format,
                 input: Vec::new(),
@@ -1158,7 +1179,7 @@ fn decompressor_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Obj
                 unused_data: Vec::new(),
                 check: CHECK_NONE,
                 check_known: false,
-            })),
+            },
         );
     }
     let mut d = inst.dict_cell().borrow_mut();

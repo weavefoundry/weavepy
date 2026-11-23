@@ -14,7 +14,6 @@
 
 use crate::sync::Rc;
 use crate::sync::RefCell;
-use std::collections::HashMap;
 
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 
@@ -368,13 +367,33 @@ struct ZlibDecompressorState {
 }
 
 thread_local! {
-    static COMPRESS_REG: crate::gil::ReleaseUnderGil<RefCell<HashMap<i64, Rc<RefCell<CompressState>>>>> = crate::gil::ReleaseUnderGil::new(RefCell::new(HashMap::new()));
-    static DECOMPRESS_REG: crate::gil::ReleaseUnderGil<RefCell<HashMap<i64, Rc<RefCell<DecompressState>>>>> = crate::gil::ReleaseUnderGil::new(RefCell::new(HashMap::new()));
-    static ZDECOMP_REG: crate::gil::ReleaseUnderGil<RefCell<HashMap<i64, Rc<RefCell<ZlibDecompressorState>>>>> = crate::gil::ReleaseUnderGil::new(RefCell::new(HashMap::new()));
+    static COMPRESS_REG: crate::gil::ReleaseUnderGil<RefCell<super::handle_table::HandleTable<CompressState>>> = crate::gil::ReleaseUnderGil::new(RefCell::new(super::handle_table::HandleTable::default()));
+    static DECOMPRESS_REG: crate::gil::ReleaseUnderGil<RefCell<super::handle_table::HandleTable<DecompressState>>> = crate::gil::ReleaseUnderGil::new(RefCell::new(super::handle_table::HandleTable::default()));
+    static ZDECOMP_REG: crate::gil::ReleaseUnderGil<RefCell<super::handle_table::HandleTable<ZlibDecompressorState>>> = crate::gil::ReleaseUnderGil::new(RefCell::new(super::handle_table::HandleTable::default()));
     static NEXT_ID: RefCell<i64> = const { RefCell::new(1) };
     static COMPRESS_CLASS: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
     static DECOMPRESS_CLASS: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
     static ZDECOMP_CLASS: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
+}
+
+/// A streaming object's state goes with it (see `handle_table`); one that
+/// dies on another thread than its table's leaves it to the table's sweep.
+fn compress_died(inst: &PyInstance) {
+    if let Some(id) = super::handle_table::handle_of(inst) {
+        let _ = COMPRESS_REG.try_with(|r| r.try_borrow_mut().map(|mut r| r.remove(id)));
+    }
+}
+
+fn decompress_died(inst: &PyInstance) {
+    if let Some(id) = super::handle_table::handle_of(inst) {
+        let _ = DECOMPRESS_REG.try_with(|r| r.try_borrow_mut().map(|mut r| r.remove(id)));
+    }
+}
+
+fn zdecomp_died(inst: &PyInstance) {
+    if let Some(id) = super::handle_table::handle_of(inst) {
+        let _ = ZDECOMP_REG.try_with(|r| r.try_borrow_mut().map(|mut r| r.remove(id)));
+    }
 }
 
 fn next_id() -> i64 {
@@ -590,20 +609,21 @@ fn zlib_compressobj(args: &[Object], kwargs: &[(String, Object)]) -> Result<Obje
     check_level(level)?;
     check_compress_wbits(wbits)?;
     let id = next_id();
+    let inst = Rc::new(PyInstance::new(compress_class()));
     COMPRESS_REG.with(|r| {
         r.borrow_mut().insert(
             id,
-            Rc::new(RefCell::new(CompressState {
+            &inst,
+            CompressState {
                 c: build_compress(level, wbits, &zdict),
                 done: false,
-            })),
+            },
         );
     });
-    let inst = PyInstance::new(compress_class());
     inst.dict_cell()
         .borrow_mut()
         .insert(DictKey(Object::from_static("_handle")), Object::Int(id));
-    Ok(Object::Instance(Rc::new(inst)))
+    Ok(Object::Instance(inst))
 }
 
 fn zlib_decompressobj(
@@ -614,18 +634,19 @@ fn zlib_decompressobj(
     let zdict = bytes_kwarg(args, kwargs, 1, "zdict")?;
     check_decompress_wbits(wbits)?;
     let id = next_id();
+    let inst = Rc::new(PyInstance::new(decompress_class()));
     DECOMPRESS_REG.with(|r| {
         r.borrow_mut().insert(
             id,
-            Rc::new(RefCell::new(DecompressState {
+            &inst,
+            DecompressState {
                 d: None,
                 wbits,
                 zdict,
                 eof: false,
-            })),
+            },
         );
     });
-    let inst = PyInstance::new(decompress_class());
     {
         let mut d = inst.dict_cell().borrow_mut();
         d.insert(DictKey(Object::from_static("_handle")), Object::Int(id));
@@ -639,7 +660,7 @@ fn zlib_decompressobj(
         );
         d.insert(DictKey(Object::from_static("eof")), Object::Bool(false));
     }
-    Ok(Object::Instance(Rc::new(inst)))
+    Ok(Object::Instance(inst))
 }
 
 fn handle_of(args: &[Object]) -> Result<i64, RuntimeError> {
@@ -668,6 +689,7 @@ fn compress_class() -> Rc<TypeObject> {
         method_into(&mut dict, "compress", compress_compress);
         method_into(&mut dict, "flush", compress_flush);
         let cls = TypeObject::new_user("zlib.Compress", vec![bt.object_.clone()], dict)
+            .inspect(|cls| super::handle_table::watch_owner_class(cls, compress_died))
             .expect("zlib.Compress must linearise");
         *slot.borrow_mut() = Some(cls.clone());
         cls
@@ -684,6 +706,7 @@ fn decompress_class() -> Rc<TypeObject> {
         method_into_kw(&mut dict, "decompress", decompress_decompress);
         method_into(&mut dict, "flush", decompress_flush);
         let cls = TypeObject::new_user("zlib.Decompress", vec![bt.object_.clone()], dict)
+            .inspect(|cls| super::handle_table::watch_owner_class(cls, decompress_died))
             .expect("zlib.Decompress must linearise");
         *slot.borrow_mut() = Some(cls.clone());
         cls
@@ -728,7 +751,7 @@ fn method_into_kw(
 fn compress_compress(args: &[Object]) -> Result<Object, RuntimeError> {
     let id = handle_of(args)?;
     let data = bytes_of(args.get(1))?;
-    let state = COMPRESS_REG.with(|r| r.borrow().get(&id).cloned());
+    let state = COMPRESS_REG.with(|r| r.borrow().get(id));
     let state = state.ok_or_else(|| value_error("zlib: stale compressor"))?;
     let mut st = state.borrow_mut();
     if st.done {
@@ -741,7 +764,7 @@ fn compress_compress(args: &[Object]) -> Result<Object, RuntimeError> {
 fn compress_flush(args: &[Object]) -> Result<Object, RuntimeError> {
     let id = handle_of(args)?;
     let mode = args.get(1).and_then(Object::as_i64).unwrap_or(4); // Z_FINISH
-    let state = COMPRESS_REG.with(|r| r.borrow().get(&id).cloned());
+    let state = COMPRESS_REG.with(|r| r.borrow().get(id));
     let state = state.ok_or_else(|| value_error("zlib: stale compressor"))?;
     let mut st = state.borrow_mut();
     if st.done {
@@ -806,7 +829,7 @@ fn decompress_decompress(
     } else {
         Some(max_length as usize)
     };
-    let state = DECOMPRESS_REG.with(|r| r.borrow().get(&id).cloned());
+    let state = DECOMPRESS_REG.with(|r| r.borrow().get(id));
     let state = state.ok_or_else(|| value_error("zlib: stale decompressor"))?;
     let mut st = state.borrow_mut();
     if st.eof {
@@ -844,7 +867,7 @@ fn decompress_flush(args: &[Object]) -> Result<Object, RuntimeError> {
             return Err(value_error("length must be greater than zero"));
         }
     }
-    let state = DECOMPRESS_REG.with(|r| r.borrow().get(&id).cloned());
+    let state = DECOMPRESS_REG.with(|r| r.borrow().get(id));
     let state = state.ok_or_else(|| value_error("zlib: stale decompressor"))?;
     let mut st = state.borrow_mut();
     // Once the stream has ended, `flush()` has nothing left to do and must
@@ -958,6 +981,7 @@ fn zlibdecompressor_class() -> Rc<TypeObject> {
         method_into(&mut dict, "__reduce__", zlibdecompressor_no_pickle);
         method_into(&mut dict, "__reduce_ex__", zlibdecompressor_no_pickle);
         let cls = TypeObject::new_user("_ZlibDecompressor", vec![bt.object_.clone()], dict)
+            .inspect(|cls| super::handle_table::watch_owner_class(cls, zdecomp_died))
             .expect("zlib._ZlibDecompressor must linearise");
         *slot.borrow_mut() = Some(cls.clone());
         cls
@@ -1019,10 +1043,12 @@ fn zlib_zlibdecompressor(
         }
     }
     let id = next_id();
+    let inst = Rc::new(PyInstance::new(zlibdecompressor_class()));
     ZDECOMP_REG.with(|r| {
         r.borrow_mut().insert(
             id,
-            Rc::new(RefCell::new(ZlibDecompressorState {
+            &inst,
+            ZlibDecompressorState {
                 d: None,
                 wbits,
                 zdict,
@@ -1031,10 +1057,9 @@ fn zlib_zlibdecompressor(
                 needs_input: true,
                 unused_data: Vec::new(),
                 broken: false,
-            })),
+            },
         );
     });
-    let inst = PyInstance::new(zlibdecompressor_class());
     {
         let mut d = inst.dict_cell().borrow_mut();
         d.insert(DictKey(Object::from_static("_handle")), Object::Int(id));
@@ -1048,7 +1073,7 @@ fn zlib_zlibdecompressor(
             Object::Bool(true),
         );
     }
-    Ok(Object::Instance(Rc::new(inst)))
+    Ok(Object::Instance(inst))
 }
 
 fn zlibdecompressor_decompress(
@@ -1075,7 +1100,7 @@ fn zlibdecompressor_decompress(
     } else {
         Some(max_length as usize)
     };
-    let state = ZDECOMP_REG.with(|r| r.borrow().get(&id).cloned());
+    let state = ZDECOMP_REG.with(|r| r.borrow().get(id));
     let state = state.ok_or_else(|| value_error("zlib: stale decompressor"))?;
     let mut st = state.borrow_mut();
     if st.eof {

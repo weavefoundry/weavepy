@@ -2528,10 +2528,21 @@ branch and pull request.
     output once too (251,000 to 205,000, CPython 32,000). CPython keeps
     such text as one or two bytes a character, so its codecs copy units
     where these decode UTF-8.
+  - `zlib`, `bz2`, `lzma` and `compression.zstd` kept every compressor's
+    and decompressor's native state in a table keyed by the handle on the
+    instance, and never let one go: 100,000 `zlib.compressobj()` calls
+    left 6.4 GB resident (CPython 11 MB), 100,000 `decompressobj()` calls
+    1.7 GB, and 20,000 `BZ2Compressor()` 118 MB. The tables are one type
+    now (`stdlib::handle_table`): the classes' instances let their state
+    go as they die, and the states of any that died unseen (a subclass's,
+    one on another thread) go when the table has doubled since its last
+    sweep. The same loops peak at 9.5 to 27 MB, under CPython's 11 to
+    29 MB. (A compiled regular expression's program is still kept for
+    good, about 1 KB a distinct pattern: the matcher reads programs
+    through `'static` references from a lock-free table.)
   - `hashlib` kept every hasher's state in a process-wide table it never
     pruned: 300,000 short-lived `sha256()` objects left 156 MB resident.
-    Each entry watches its instance now, and the states of dead ones go
-    whenever the table has doubled (9.6 MB). A method call on a hasher
+    A hasher's state goes with it now (9.6 MB). A method call on a hasher
     went through the dispatch loop's general native lanes (5,850
     instructions for `h.update(16 bytes)`, CPython 1,090); `update`,
     `digest` and `hexdigest` have leaf halves now (1,330), and

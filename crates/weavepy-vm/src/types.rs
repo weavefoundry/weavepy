@@ -5345,6 +5345,8 @@ impl Drop for PyInstance {
         }
         // A finalizer, if the class has one, already ran: `rc::Rc`'s `Drop`
         // queued this instance for it at its last release.
+        // A native state this instance owns goes with it.
+        crate::stdlib::handle_table::on_instance_death(self);
         let id = std::ptr::from_ref(self) as usize as u64;
         crate::weakref_registry::on_death(id);
         // A collector registry entry's weak handle would keep this

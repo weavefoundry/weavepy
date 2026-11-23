@@ -7,7 +7,6 @@
 
 use crate::sync::Rc;
 use crate::sync::RefCell;
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -140,17 +139,35 @@ unsafe impl Send for BzDecompState {}
 /// Process-global registries keyed by the integer handle stored on each
 /// Python instance. Global (not thread-local) so a compressor/decompressor
 /// created on one thread is reachable from any other (see `testThreading`).
-type CompReg = Mutex<HashMap<i64, Rc<RefCell<BzCompState>>>>;
-type DecompReg = Mutex<HashMap<i64, Rc<RefCell<BzDecompState>>>>;
+type CompReg = Mutex<super::handle_table::HandleTable<BzCompState>>;
+type DecompReg = Mutex<super::handle_table::HandleTable<BzDecompState>>;
 
 fn comp_reg() -> &'static CompReg {
     static REG: OnceLock<CompReg> = OnceLock::new();
-    REG.get_or_init(|| Mutex::new(HashMap::new()))
+    REG.get_or_init(Mutex::default)
+}
+
+/// A compressor's state goes with it (see `handle_table`).
+fn comp_died(inst: &PyInstance) {
+    if let Some(id) = super::handle_table::handle_of(inst) {
+        if let Ok(mut reg) = comp_reg().try_lock() {
+            reg.remove(id);
+        }
+    }
+}
+
+/// A decompressor's state goes with it (see `handle_table`).
+fn decomp_died(inst: &PyInstance) {
+    if let Some(id) = super::handle_table::handle_of(inst) {
+        if let Ok(mut reg) = decomp_reg().try_lock() {
+            reg.remove(id);
+        }
+    }
 }
 
 fn decomp_reg() -> &'static DecompReg {
     static REG: OnceLock<DecompReg> = OnceLock::new();
-    REG.get_or_init(|| Mutex::new(HashMap::new()))
+    REG.get_or_init(Mutex::default)
 }
 
 fn bz_next_id() -> i64 {
@@ -159,11 +176,11 @@ fn bz_next_id() -> i64 {
 }
 
 fn comp_state(id: i64) -> Option<Rc<RefCell<BzCompState>>> {
-    comp_reg().lock().ok()?.get(&id).cloned()
+    comp_reg().lock().ok()?.get(id)
 }
 
 fn decomp_state(id: i64) -> Option<Rc<RefCell<BzDecompState>>> {
-    decomp_reg().lock().ok()?.get(&id).cloned()
+    decomp_reg().lock().ok()?.get(id)
 }
 
 fn eof_error(msg: &str) -> RuntimeError {
@@ -329,6 +346,7 @@ fn compressor_class() -> Rc<TypeObject> {
                 is_builtin: true,
             },
         )
+        .inspect(|cls| super::handle_table::watch_owner_class(cls, comp_died))
         .expect("BZ2Compressor must linearise")
     })
     .clone()
@@ -353,6 +371,7 @@ fn decompressor_class() -> Rc<TypeObject> {
                 is_builtin: true,
             },
         )
+        .inspect(|cls| super::handle_table::watch_owner_class(cls, decomp_died))
         .expect("BZ2Decompressor must linearise")
     })
     .clone()
@@ -395,10 +414,11 @@ fn compressor_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Objec
     if let Ok(mut reg) = comp_reg().lock() {
         reg.insert(
             id,
-            Rc::new(RefCell::new(BzCompState {
+            &inst,
+            BzCompState {
                 c: Compress::new(Compression::new(level as u32), 0),
                 done: false,
-            })),
+            },
         );
     }
     inst.dict_cell()
@@ -441,14 +461,15 @@ fn decompressor_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Obj
     if let Ok(mut reg) = decomp_reg().lock() {
         reg.insert(
             id,
-            Rc::new(RefCell::new(BzDecompState {
+            &inst,
+            BzDecompState {
                 d: Decompress::new(false),
                 input: Vec::new(),
                 eof: false,
                 needs_input: true,
                 unused_data: Vec::new(),
                 errored: false,
-            })),
+            },
         );
     }
     let mut d = inst.dict_cell().borrow_mut();

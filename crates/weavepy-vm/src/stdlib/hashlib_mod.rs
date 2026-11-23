@@ -17,7 +17,6 @@
 
 use crate::sync::Rc;
 use crate::sync::RefCell;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -210,28 +209,13 @@ impl AnyHasher {
 // Process-global state (mirrors the `bz2`/`lzma` streaming objects):
 // hashers live in a registry keyed by an integer handle stored on the
 // instance, so a hasher created on one thread can be updated from
-// another under the GIL (test_hashlib.test_threaded_hashing). Each entry
-// watches its instance: the states of instances that have died go at the
-// next registration once the table has doubled since it was last swept,
-// so it holds about as many states as there are live hashers.
-type HasherReg = Mutex<HasherTable>;
-
-struct HasherTable {
-    states: HashMap<i64, HasherEntry, crate::fasthash::FxBuildHasher>,
-    sweep_at: usize,
-}
-
-/// A registered state and the instance it belongs to.
-type HasherEntry = (crate::sync::Weak<PyInstance>, Rc<RefCell<AnyHasher>>);
+// another under the GIL (test_hashlib.test_threaded_hashing). The table
+// lets the states of dead hashers go (see `handle_table`).
+type HasherReg = Mutex<super::handle_table::HandleTable<AnyHasher>>;
 
 fn hasher_reg() -> &'static HasherReg {
     static REG: OnceLock<HasherReg> = OnceLock::new();
-    REG.get_or_init(|| {
-        Mutex::new(HasherTable {
-            states: HashMap::with_hasher(crate::fasthash::FxBuildHasher),
-            sweep_at: 64,
-        })
-    })
+    REG.get_or_init(Mutex::default)
 }
 
 static HASHER_NEXT_ID: AtomicI64 = AtomicI64::new(1);
@@ -246,24 +230,24 @@ static CTOR_CACHE: Mutex<Option<Rc<RefCell<DictData>>>> = Mutex::new(None);
 
 fn register_hasher(owner: &Rc<PyInstance>, state: AnyHasher) -> i64 {
     let id = HASHER_NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let mut reg = hasher_reg().lock().unwrap();
-    if reg.states.len() >= reg.sweep_at {
-        // (Dropping a state runs no code.)
-        reg.states.retain(|_, (owner, _)| owner.strong_count() > 0);
-        reg.sweep_at = (reg.states.len() * 2).max(64);
-    }
-    reg.states
-        .insert(id, (Rc::downgrade(owner), Rc::new(RefCell::new(state))));
+    hasher_reg().lock().unwrap().insert(id, owner, state);
     id
+}
+
+/// A hasher instance's state goes with it (see `handle_table`).
+fn hasher_died(inst: &PyInstance) {
+    if let Some(id) = super::handle_table::handle_of(inst) {
+        if let Ok(mut reg) = hasher_reg().try_lock() {
+            reg.remove(id);
+        }
+    }
 }
 
 fn lookup_hasher(id: i64) -> Result<Rc<RefCell<AnyHasher>>, RuntimeError> {
     hasher_reg()
         .lock()
         .unwrap()
-        .states
-        .get(&id)
-        .map(|(_, state)| state.clone())
+        .get(id)
         .ok_or_else(|| value_error("hashlib: stale hasher handle"))
 }
 
@@ -376,6 +360,7 @@ fn hasher_class() -> Rc<TypeObject> {
                 is_builtin: true,
             },
         )
+        .inspect(|cls| super::handle_table::watch_owner_class(cls, hasher_died))
         .expect("hasher class must linearise");
         *slot = Some(cls.clone());
         cls
@@ -1235,6 +1220,7 @@ fn blake2_class(
             is_builtin: true,
         },
     )
+    .inspect(|cls| super::handle_table::watch_owner_class(cls, hasher_died))
     .expect("blake2 class must linearise")
 }
 

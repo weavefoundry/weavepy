@@ -82,6 +82,7 @@ pub mod gc_mod;
 #[cfg(unix)]
 pub mod grp_mod;
 pub mod gzip_mod;
+pub(crate) mod handle_table;
 pub mod hashlib_mod;
 pub mod heapq_accel;
 pub mod hmac_mod;
