@@ -4971,7 +4971,7 @@ struct CallCtx {
     /// object address (see [`pin_reusing`]): a loop over the same few
     /// objects reuses their pins instead of growing the table. Advisory;
     /// every hit is checked against the pin it names.
-    pin_memo: [u32; PIN_MEMO],
+    pin_memo: PinMemo,
     /// Python code inspected this activation's frame (its `f_locals`):
     /// the frame's locals were synced from the native buffers then, and
     /// the activation leaves native code after the call that did it,
@@ -5188,33 +5188,53 @@ fn pin_memo_slot(id: usize) -> usize {
         >> (usize::BITS - PIN_MEMO.trailing_zeros())
 }
 
-/// The identity of the object `pins[ix]` holds (`0` for none).
+/// Pin indices recently handed out, each beside a tag of the identity it
+/// was handed out for (see [`pin_memo_tag`]). A tag only screens: a match
+/// is checked against the pin it names, so a stale or colliding entry is a
+/// miss, and a miss compares the set's tags without reading any pin.
+#[derive(Clone, Copy)]
+struct PinMemo {
+    ix: [u32; PIN_MEMO],
+    tag: [u32; PIN_MEMO],
+}
+
+impl PinMemo {
+    const EMPTY: PinMemo = PinMemo {
+        ix: [u32::MAX; PIN_MEMO],
+        tag: [0; PIN_MEMO],
+    };
+}
+
+/// An identity's [`PinMemo`] tag (never `0`, which marks an unused entry).
 #[inline]
-fn pin_memo_holds(pins: &PinTable, ix: u32) -> usize {
-    match pins.get(ix as usize) {
-        Some(Pin::Obj(p)) => pin_identity(p),
-        Some(Pin::List(l, _)) => Rc::as_ptr(l) as usize,
-        None => 0,
-    }
+fn pin_memo_tag(id: usize) -> u32 {
+    ((id >> 3) as u32) | 1
+}
+
+/// The entry of `id`'s set whose tag is its own, if one is.
+#[inline]
+fn pin_memo_find(id: usize, memo: &PinMemo) -> Option<usize> {
+    let s = pin_memo_slot(id);
+    let tag = pin_memo_tag(id);
+    (0..PIN_MEMO_WAYS)
+        .map(|w| s ^ w)
+        .find(|&k| memo.tag[k] == tag)
 }
 
 /// The pin that already holds this very object, when `memo` remembers
 /// one. A pin only owns its object, so two sites that pin the same object
 /// can share one.
 #[inline]
-fn pin_memo_hit(v: &Object, pins: &PinTable, memo: &[u32; PIN_MEMO]) -> Option<u64> {
+fn pin_memo_hit(v: &Object, pins: &PinTable, memo: &PinMemo) -> Option<u64> {
     let id = pin_identity(v);
     if id == 0 {
         return None;
     }
-    let s = pin_memo_slot(id);
-    (0..PIN_MEMO_WAYS).map(|w| s ^ w).find_map(|k| {
-        let hint = memo[k] as usize;
-        match pins.get(hint) {
-            Some(Pin::Obj(p)) if pin_identity(p) == id => Some(hint as u64),
-            _ => None,
-        }
-    })
+    let hint = memo.ix[pin_memo_find(id, memo)?] as usize;
+    match pins.get(hint) {
+        Some(Pin::Obj(p)) if pin_identity(p) == id => Some(hint as u64),
+        _ => None,
+    }
 }
 
 /// The pin that already holds this very list (a row of a nested list
@@ -5223,22 +5243,21 @@ fn pin_memo_hit(v: &Object, pins: &PinTable, memo: &[u32; PIN_MEMO]) -> Option<u
 fn list_pin_memo_hit(
     l: &Rc<crate::sync::RefCell<Vec<Object>>>,
     pins: &PinTable,
-    memo: &[u32; PIN_MEMO],
+    memo: &PinMemo,
 ) -> Option<u64> {
-    let s = pin_memo_slot(Rc::as_ptr(l) as usize);
-    (0..PIN_MEMO_WAYS).map(|w| s ^ w).find_map(|k| {
-        let hint = memo[k] as usize;
-        match pins.get(hint) {
-            Some(Pin::List(p, _)) if Rc::ptr_eq(p, l) => Some(hint as u64),
-            _ => None,
-        }
-    })
+    let hint = memo.ix[pin_memo_find(Rc::as_ptr(l) as usize, memo)?] as usize;
+    match pins.get(hint) {
+        Some(Pin::List(p, _)) if Rc::ptr_eq(p, l) => Some(hint as u64),
+        _ => None,
+    }
 }
 
-/// Remember that pin `ix` will hold `p`'s object: in its first entry,
-/// unless that one remembers another live object, then in its second.
+/// Remember that pin `ix` (the table's next) will hold `p`'s object: in
+/// this identity's own entry or a free one of its set (unused, or naming a
+/// pin past the table's end, which a cleared table left), else in one by
+/// the pin's index, so that a set's entries take turns.
 #[inline]
-fn pin_memo_note(p: &Pin, ix: usize, pins: &PinTable, memo: &mut [u32; PIN_MEMO]) {
+fn pin_memo_note(p: &Pin, ix: usize, memo: &mut PinMemo) {
     let id = match p {
         Pin::Obj(v) => pin_identity(v),
         Pin::List(l, _) => Rc::as_ptr(l) as usize,
@@ -5247,21 +5266,19 @@ fn pin_memo_note(p: &Pin, ix: usize, pins: &PinTable, memo: &mut [u32; PIN_MEMO]
         return;
     }
     let s = pin_memo_slot(id);
-    // A free entry of the set, or this identity's own; else one by the
-    // pin's index, so that a set's entries take turns.
+    let tag = pin_memo_tag(id);
     let k = (0..PIN_MEMO_WAYS)
         .map(|w| s ^ w)
-        .find(|&k| {
-            matches!(pin_memo_holds(pins, memo[k]), 0) || pin_memo_holds(pins, memo[k]) == id
-        })
+        .find(|&k| memo.tag[k] == tag || memo.tag[k] == 0 || memo.ix[k] as usize >= ix)
         .unwrap_or(s ^ (ix % PIN_MEMO_WAYS));
-    memo[k] = ix as u32;
+    memo.tag[k] = tag;
+    memo.ix[k] = ix as u32;
 }
 
 /// Pin `v` in `pins`, reusing the pin that already holds this very object
 /// (see [`pin_memo_hit`]); `None` at the pin cap.
 #[inline]
-fn pin_reusing(v: &Object, pins: &mut PinTable, memo: &mut [u32; PIN_MEMO]) -> Option<u64> {
+fn pin_reusing(v: &Object, pins: &mut PinTable, memo: &mut PinMemo) -> Option<u64> {
     if let Some(bits) = pin_memo_hit(v, pins, memo) {
         return Some(bits);
     }
@@ -5269,7 +5286,7 @@ fn pin_reusing(v: &Object, pins: &mut PinTable, memo: &mut [u32; PIN_MEMO]) -> O
         return None;
     }
     let p = Pin::Obj(v.clone());
-    pin_memo_note(&p, pins.len(), pins, memo);
+    pin_memo_note(&p, pins.len(), memo);
     pins.push(p);
     Some((pins.len() - 1) as u64)
 }
@@ -5740,7 +5757,7 @@ fn lane_tag(t: JitType) -> u32 {
 /// `None` singleton is the nullable lane's `-1`; an instance pins into
 /// the caller's table (capped), reusing the pin that already holds it
 /// (a method returning `self`). Anything else can't ride the lane.
-fn obj_ret_bits(v: &Object, pins: &mut PinTable, memo: &mut [u32; PIN_MEMO]) -> Option<u64> {
+fn obj_ret_bits(v: &Object, pins: &mut PinTable, memo: &mut PinMemo) -> Option<u64> {
     match v {
         Object::None => Some(u64::MAX),
         Object::Instance(_) => pin_reusing(v, pins, memo),
@@ -6901,7 +6918,7 @@ fn fresh_child(ctx: &CallCtx, nc: &NativeCallee, callee_key: *const CodeObject) 
         // callee — keep it observable to callee-side stack walkers.
         frameless_code: Some(nc.code.clone()),
         dyn_callee: None,
-        pin_memo: [u32::MAX; PIN_MEMO],
+        pin_memo: PinMemo::EMPTY,
         introspected: Cell::new(false),
         inspected_locals: std::cell::RefCell::new(None),
         bound: BoundLane::new(),
@@ -9262,7 +9279,7 @@ unsafe extern "C" fn wpjit_list_get(frame: *mut JitFrame, pin: i64, idx: i64) ->
                 return 1;
             }
             jf.ret_bits = ctx.pins.len() as u64;
-            pin_memo_note(&p, ctx.pins.len(), &ctx.pins, &mut ctx.pin_memo);
+            pin_memo_note(&p, ctx.pins.len(), &mut ctx.pin_memo);
             ctx.pins.push(p);
             0
         }
@@ -10208,7 +10225,7 @@ unsafe extern "C" fn wpjit_list_next(frame: *mut JitFrame, pin: i64, idx: i64) -
     let pinned = match outcome {
         Ok(bits) => Some(bits),
         Err(p) => (ctx.pins.len() < RUNTIME_PIN_CAP).then(|| {
-            pin_memo_note(&p, ctx.pins.len(), &ctx.pins, &mut ctx.pin_memo);
+            pin_memo_note(&p, ctx.pins.len(), &mut ctx.pin_memo);
             ctx.pins.push(p);
             (ctx.pins.len() - 1) as u64
         }),
@@ -14417,12 +14434,7 @@ unsafe extern "C" fn wpjit_iter_new(frame: *mut JitFrame, pin: i64) -> i64 {
 /// Pack one yielded element into a compiled loop-variable lane
 /// (RFC 0074 WS3 — the [`weavepy_jit::ITER_ELEM_STR`]-aware sibling
 /// of `wpjit_iter_next`'s packing). `None` = outside the lane.
-fn pack_iter_elem(
-    v: &Object,
-    tag: i64,
-    pins: &mut PinTable,
-    memo: &mut [u32; PIN_MEMO],
-) -> Option<u64> {
+fn pack_iter_elem(v: &Object, tag: i64, pins: &mut PinTable, memo: &mut PinMemo) -> Option<u64> {
     if tag == weavepy_jit::ITER_ELEM_STR {
         return match v {
             Object::Str(_) if pins.len() < RUNTIME_PIN_CAP => {
@@ -15257,7 +15269,7 @@ pub(crate) fn try_call_native_direct(
         // keep the activation observable to callee-side stack walkers.
         frameless_code: Some(code.clone()),
         dyn_callee: None,
-        pin_memo: [u32::MAX; PIN_MEMO],
+        pin_memo: PinMemo::EMPTY,
         introspected: Cell::new(false),
         inspected_locals: std::cell::RefCell::new(None),
         bound: BoundLane::new(),
@@ -16328,7 +16340,7 @@ fn enter_compiled(
         // spine already.
         frameless_code: None,
         dyn_callee: None,
-        pin_memo: [u32::MAX; PIN_MEMO],
+        pin_memo: PinMemo::EMPTY,
         introspected: Cell::new(false),
         inspected_locals: std::cell::RefCell::new(None),
         bound: BoundLane::new(),
@@ -17292,7 +17304,7 @@ fn resume_parked(interp: &mut super::Interpreter, frame: &mut super::Frame) -> J
         // is on the spine already.
         frameless_code: None,
         dyn_callee: None,
-        pin_memo: [u32::MAX; PIN_MEMO],
+        pin_memo: PinMemo::EMPTY,
         introspected: Cell::new(false),
         inspected_locals: std::cell::RefCell::new(None),
         bound: BoundLane::new(),

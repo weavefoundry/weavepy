@@ -23008,6 +23008,9 @@ impl Interpreter {
     /// compares natively (see [`Self::dict_get_hot`]): `None` declines.
     #[inline(always)]
     pub(crate) fn contains_hot(c: &Object, item: &Object) -> Option<bool> {
+        if let Object::Instance(i) = item {
+            return Self::contains_instance_hot(c, i);
+        }
         let found = match c {
             // SAFETY: a read between two instructions (the probe runs no
             // code).
@@ -23018,6 +23021,26 @@ impl Interpreter {
             _ => return None,
         };
         Some(found.1.is_ok())
+    }
+
+    /// [`Self::contains_hot`] for an instance hashed by identity (`obj in
+    /// seen`): `None` declines (another hash, or a stored key of another
+    /// kind with its hash).
+    #[inline(always)]
+    fn contains_instance_hot(c: &Object, i: &Rc<crate::types::PyInstance>) -> Option<bool> {
+        if i.native.get().is_some() || !i.class_dunder(crate::types::Dunder::Hash).object_owner() {
+            return None;
+        }
+        let found = match c {
+            // SAFETY: a read between two instructions (the probe runs no
+            // code).
+            Object::Set(s) => unsafe { s.peek() }?.find_instance_native(i)?,
+            // SAFETY: as above.
+            Object::Dict(d) => unsafe { d.peek() }?.find_instance_native(i)?,
+            Object::FrozenSet(s) => s.find_instance_native(i)?,
+            _ => return None,
+        };
+        Some(found.is_ok())
     }
 
     /// The core loop's commonest subscripts, ahead of
@@ -32414,14 +32437,16 @@ impl Interpreter {
         }
         // A `str`, machine `int` or plain class in a set or dict, the
         // commonest tests (`cls in _atomic_types`), probed in line.
+        // (And an instance hashed by identity, `obj in seen`.)
         if let (
             Object::Set(_) | Object::FrozenSet(_) | Object::Dict(_),
-            Object::Str(_) | Object::Int(_) | Object::Type(_),
+            Object::Str(_) | Object::Int(_) | Object::Type(_) | Object::Instance(_),
         ) = (container, item)
         {
             let probe = match item {
                 Object::Type(t) => crate::object::type_hash_is_identity(t)
                     .then(|| crate::object::LeafProbe::identity_type(item)),
+                Object::Instance(_) => crate::object::LeafProbe::identity_instance(item),
                 _ => crate::object::LeafProbe::new(item),
             };
             if let Some(probe) = probe {

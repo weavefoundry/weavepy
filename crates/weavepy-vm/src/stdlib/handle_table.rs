@@ -10,7 +10,7 @@
 //! instances.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::fasthash::FxBuildHasher;
 use crate::object::{DictKey, Object};
@@ -79,6 +79,16 @@ static OWNERS: AtomicUsize = AtomicUsize::new(0);
 static OWNER_CLASS: [AtomicUsize; OWNER_SLOTS] = [const { AtomicUsize::new(0) }; OWNER_SLOTS];
 static OWNER_HOOK: [AtomicUsize; OWNER_SLOTS] = [const { AtomicUsize::new(0) }; OWNER_SLOTS];
 
+/// One bit per watched class (see [`owner_bit`]): a dying instance whose
+/// class's bit is clear skips the slot scan.
+static OWNER_BITS: AtomicU64 = AtomicU64::new(0);
+
+/// A class address's bit in [`OWNER_BITS`].
+#[inline]
+fn owner_bit(addr: usize) -> u64 {
+    1 << ((addr as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58)
+}
+
 /// Run `hook` on each dying instance of exactly `cls` (not a subclass's),
 /// which lets the instance's table entry go. The class is kept alive from
 /// here on, so no other class ever takes its address.
@@ -96,26 +106,22 @@ pub(crate) fn watch_owner_class(cls: &Rc<TypeObject>, hook: fn(&PyInstance)) {
     OWNER_HOOK[n].store(hook as usize, Ordering::Relaxed);
     OWNER_CLASS[n].store(addr, Ordering::Relaxed);
     OWNERS.store(n + 1, Ordering::Release);
+    OWNER_BITS.fetch_or(owner_bit(addr), Ordering::Release);
 }
 
-/// The hook [`watch_owner_class`] registered for `inst`'s class, if any,
-/// run as `inst` dies (one load for a process that registered none).
+/// The hook [`watch_owner_class`] registered for the class at `cls_addr`
+/// (the dying `inst`'s), if any: one load and a bit test for most classes.
 #[inline]
-pub(crate) fn on_instance_death(inst: &PyInstance) {
-    let n = OWNERS.load(Ordering::Acquire);
-    if n != 0 {
-        on_instance_death_slow(inst, n);
+pub(crate) fn on_instance_death(inst: &PyInstance, cls_addr: usize) {
+    if OWNER_BITS.load(Ordering::Acquire) & owner_bit(cls_addr) != 0 {
+        on_instance_death_slow(inst, cls_addr);
     }
 }
 
 #[cold]
 #[inline(never)]
-fn on_instance_death_slow(inst: &PyInstance, n: usize) {
-    let addr = if crate::gil::free_threading_enabled() {
-        Rc::as_ptr(&inst.cls()) as usize
-    } else {
-        std::ptr::from_ref(inst.cls_raw()) as usize
-    };
+fn on_instance_death_slow(inst: &PyInstance, addr: usize) {
+    let n = OWNERS.load(Ordering::Acquire);
     for i in 0..n {
         if OWNER_CLASS[i].load(Ordering::Relaxed) == addr {
             let hook = OWNER_HOOK[i].load(Ordering::Relaxed);

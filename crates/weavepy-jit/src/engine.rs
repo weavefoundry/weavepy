@@ -1140,7 +1140,52 @@ fn analyze_admitted(
     if unpacks_pairs(&tfunc) {
         return Err(JitVerdict::UnsupportedOpcode("tuple-target loop"));
     }
+    if steps_objects(&tfunc) {
+        return Err(JitVerdict::UnsupportedOpcode("object-element loop"));
+    }
     Ok(tfunc)
+}
+
+/// Whether `tfunc` runs a loop over a list of objects (instances, strings,
+/// tuples) natively with too little typed work to repay its step. Each
+/// element pins (a table entry the activation holds until it leaves), so
+/// a step costs several times the frame JIT's, which counts references
+/// instead: `for p in points: pass` stepped at 290 instructions an element
+/// against the frame JIT's 39. The frame JIT runs such code instead, as it
+/// does a tuple-target loop (see [`unpacks_pairs`]); a body with enough
+/// typed arithmetic, or a typed Python call (which tier 2 makes natively:
+/// `richards`' `for t in tasks: t.run()` ran half again as long in the
+/// frame JIT), keeps tier 2.
+fn steps_objects(tfunc: &TFunc) -> bool {
+    use crate::ir::TOp;
+    use crate::value::JitType;
+    if GENERIC_LOOPS_ADMITTED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    let pins = tfunc.blocks.iter().any(|b| {
+        matches!(
+            b.term,
+            crate::ir::TTerm::ForList {
+                elem: JitType::Obj,
+                ..
+            }
+        )
+    });
+    if !pins {
+        return false;
+    }
+    let calls = tfunc
+        .blocks
+        .iter()
+        .flat_map(|b| &b.stmts)
+        .filter(|s| {
+            matches!(
+                s.op,
+                TOp::CallPy { .. } | TOp::CallPyKw { .. } | TOp::CallMethod { .. }
+            ) && tfunc.py_dyn_calls.binary_search(&s.pc).is_err()
+        })
+        .count();
+    typed_arith(tfunc) + calls * call_weight() < PAIR_LOOP_TYPED_WORK
 }
 
 /// Whether `tfunc` runs a tuple-target loop (`for a, b in pairs`) natively.

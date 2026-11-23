@@ -248,6 +248,20 @@ impl NativeEq for TypeEq<'_> {
     }
 }
 
+/// An instance probe hashed by identity: equal to itself (a stored key of
+/// equal hash but another identity leaves the lookup undecided).
+struct InstEq<'a>(&'a crate::Rc<crate::types::PyInstance>);
+
+impl NativeEq for InstEq<'_> {
+    #[inline(always)]
+    fn native_eq(&self, stored: &DictKey) -> Option<bool> {
+        match &stored.0 {
+            Object::Instance(u) if crate::Rc::ptr_eq(self.0, u) => Some(true),
+            _ => None,
+        }
+    }
+}
+
 /// [`key_bytes_eq`] for a native lookup: in line (calling nothing) up to
 /// 16 bytes, the commonest keys; a longer pair out of line.
 #[inline(always)]
@@ -1320,6 +1334,19 @@ impl<V> Table<V> {
         // (As `identity_hash` hashes a class.)
         let hash = crate::object::pointer_hash(crate::Rc::as_ptr(t).cast());
         self.find_native(hash, &TypeEq(t))
+    }
+
+    /// [`Self::find_native`] for instance `i`, which the caller found
+    /// hashed by identity (no native value; its class keeps `object`'s
+    /// `__hash__`).
+    #[inline(always)]
+    pub fn find_instance_native(
+        &self,
+        i: &crate::Rc<crate::types::PyInstance>,
+    ) -> Option<Result<usize, usize>> {
+        // (As `identity_hash` hashes an instance.)
+        let hash = crate::object::pointer_hash(crate::Rc::as_ptr(i).cast());
+        self.find_native(hash, &InstEq(i))
     }
 
     /// [`Self::find_object_native`], hashing a `str` key first (as an
@@ -2742,6 +2769,15 @@ impl SetMap {
         t: &crate::Rc<crate::types::TypeObject>,
     ) -> Option<Result<usize, usize>> {
         self.0.find_type_native(t)
+    }
+
+    /// [`Table::find_instance_native`] over the set's keys.
+    #[inline(always)]
+    pub fn find_instance_native(
+        &self,
+        i: &crate::Rc<crate::types::PyInstance>,
+    ) -> Option<Result<usize, usize>> {
+        self.0.find_instance_native(i)
     }
 
     /// [`Self::contains`], always in line, for a probe whose hash runs no

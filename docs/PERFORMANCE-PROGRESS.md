@@ -2577,6 +2577,32 @@ branch and pull request.
     after taking a guarded borrow of the stream's state, its buffer, and
     the cache each (730 instructions a call, CPython 350). The leaf half
     reads them through guard-free views first now (575).
+  - A loop over a list of objects (instances, strings, tuples) that tier
+    2 entered by OSR pinned each element in its activation's table, which
+    holds them until the activation leaves: `for p in pts: pass` cost 290
+    instructions an element where the frame JIT, which counts references
+    instead, takes 39. Tier 2 declines such a loop now unless its function
+    has enough typed arithmetic or a typed Python call to repay the step
+    (`richards`' `for t in tasks: t.run()` keeps it), as it already
+    declined tuple-target loops. Over 512 instances, `t += p.x` costs 164
+    instructions an element (550 before, CPython 325), `out.append(p)` 173
+    (478, 233), `if p is not prev` 211 (468, 408) and `t += p.norm()` 396
+    (495, 1,219); the `float_math` fixture runs 4% fewer instructions. The
+    pins' reuse memo screens its entries by an identity tag too, so a miss
+    reads no pins (a loop over 4,096 repeated instances in tier 2, 427 to
+    331).
+  - Every instance's death scanned the classes whose instances own native
+    state (the compressors and hashers) once one had registered, which
+    importing `zlib` or `hashlib` does: 52 instructions an instance. A
+    per-class bit screens the scan now, and the class is read without a
+    borrow (a dying instance has no other owner).
+  - `obj in s` for an instance hashed by identity (a plain class's, its
+    `__hash__` `object`'s) went through the leaf membership test's general
+    path, which asked twice whether the item hashes natively and compared
+    the found key out of line: 767 instructions a test in a loop over a
+    set (CPython 282), 659 over a dict's keys. The hot path finds such an
+    instance natively now, by its pointer hash and identity (443 and 342;
+    a miss 568 to 327, CPython 233).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

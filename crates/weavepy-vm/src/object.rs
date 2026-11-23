@@ -3918,6 +3918,17 @@ impl<'a> LeafProbe<'a> {
         }
     }
 
+    /// A probe for an instance hashed by identity (no native value, and
+    /// its class keeps `object`'s `__hash__`), or `None`.
+    #[inline(always)]
+    pub(crate) fn identity_instance(key: &'a Object) -> Option<Self> {
+        let Object::Instance(i) = key else {
+            return None;
+        };
+        (i.native.get().is_none() && i.class_dunder(crate::types::Dunder::Hash).object_owner())
+            .then(|| Self::with_hash(key, pointer_hash(Rc::as_ptr(i).cast())))
+    }
+
     /// [`Self::new`]'s hash for a key other than a `str` or an `int`.
     #[inline(never)]
     fn other_hash(key: &Object) -> Option<i64> {
@@ -4135,6 +4146,8 @@ impl crate::dictmap::Probe for LeafProbe<'_> {
             (Object::Int(a), Object::Int(b)) => a == b,
             // The same class (a class probe meets its own entry).
             (Object::Type(a), Object::Type(b)) if Rc::ptr_eq(a, b) => true,
+            // The same instance (CPython compares keys with `is` first).
+            (Object::Instance(a), Object::Instance(b)) if Rc::ptr_eq(a, b) => true,
             _ => self.other_eq(key),
         }
     }
