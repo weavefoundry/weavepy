@@ -7679,6 +7679,16 @@ impl Interpreter {
         // on their metaclass; everything else (native objects like files
         // and locks) goes through the generic attribute path, which is
         // type-level for those objects anyway.
+        // A native receiver whose methods follow from its kind alone (a
+        // stream's, a view's): the shared method and the receiver, as a
+        // method call loads them, with no bound method made for the call.
+        if crate::builtins::method_memo_tag(owner).is_some() {
+            if let Some(Object::Builtin(b)) = crate::builtins::lookup_method(owner, name) {
+                if b.binds_instance {
+                    return Ok((Object::Builtin(b), owner.clone()));
+                }
+            }
+        }
         let lookup = |vm: &mut Self, name: &str| -> Result<Option<Object>, RuntimeError> {
             match owner {
                 Object::Instance(_) => Ok(instance_method(owner, name)),
@@ -12741,9 +12751,9 @@ impl Interpreter {
             SPECIAL_AEXIT => "__aexit__",
             _ => return CoreAttr::Decline,
         };
-        // A native file's (`with open(p) as f`): its type's native method,
-        // bound by the call.
-        if let Some(f @ Object::File(_)) = frame.stack.last() {
+        // A native file's (`with open(p) as f`) or view's (`with
+        // f.getbuffer() as v`): its type's native method, bound by the call.
+        if let Some(f @ (Object::File(_) | Object::MemoryView(_))) = frame.stack.last() {
             let Some(Object::Builtin(b)) = builtins::lookup_method(f, name) else {
                 return CoreAttr::Decline;
             };
@@ -12810,8 +12820,32 @@ impl Interpreter {
         }
         // SAFETY: `len > 0`.
         let top = unsafe { base.add(len - 1) };
-        let Object::Instance(inst) = (unsafe { &*top }) else {
-            return None;
+        let inst = match unsafe { &*top } {
+            Object::Instance(inst) => inst,
+            // A native file's or view's: its type's native method, bound
+            // by the call (as `leaf_load_special` takes it).
+            recv @ (Object::File(_) | Object::MemoryView(_)) => {
+                let name = match ins.arg {
+                    SPECIAL_ENTER => "__enter__",
+                    SPECIAL_EXIT => "__exit__",
+                    _ => return None,
+                };
+                let Some(Object::Builtin(b)) = builtins::lookup_method(recv, name) else {
+                    return None;
+                };
+                if !b.binds_instance || !native_call_ic_safe(b.name) {
+                    return None;
+                }
+                // SAFETY: `len < cap`; the receiver moves up into the
+                // self slot.
+                unsafe {
+                    let recv = top.read();
+                    top.write(Object::Builtin(b));
+                    base.add(len).write(recv);
+                }
+                return Some(len + 1);
+            }
+            _ => return None,
         };
         let cls = inst.cls_raw();
         let ver = cls.attr_version.get();

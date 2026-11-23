@@ -623,6 +623,7 @@ pub(crate) fn method_memo_tag(obj: &Object) -> Option<u8> {
         // `inspect` read it). A view over another mapping
         // (`MappingProxyObj`) calls that mapping's own methods instead.
         Object::MappingProxy(_) => 120,
+        Object::MemoryView(_) => 121,
         _ => return None,
     };
     Some(tag)

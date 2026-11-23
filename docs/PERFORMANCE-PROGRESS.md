@@ -2528,6 +2528,14 @@ branch and pull request.
     output once too (251,000 to 205,000, CPython 32,000). CPython keeps
     such text as one or two bytes a character, so its codecs copy units
     where these decode UTF-8.
+  - `with f.getbuffer() as v` (or any `with` over a `memoryview`) loaded
+    `__enter__` and `__exit__` through the generic attribute path, which
+    built a fresh method object and a bound method for each, and called
+    them through the general native lanes: 7,700 instructions, CPython
+    2,400. A view's methods are shared per name now, as a file's are, and
+    `LOAD_SPECIAL` of a file or view leaves the type's method and the
+    receiver for the call, in compiled code too (3,260; `getbuffer()`
+    with its block 3,490, 8,490 before).
   - `zlib`, `bz2`, `lzma` and `compression.zstd` kept every compressor's
     and decompressor's native state in a table keyed by the handle on the
     instance, and never let one go: 100,000 `zlib.compressobj()` calls
