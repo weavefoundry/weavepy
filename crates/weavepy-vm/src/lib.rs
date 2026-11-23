@@ -33832,6 +33832,7 @@ impl Interpreter {
         self.leaf_fns.get_or_init(|| {
             let mut calls = std::collections::HashMap::default();
             let mut len_ptr = 0usize;
+            let mut hash_ptr = 0usize;
             let mut next_ptr = 0usize;
             {
                 let b = self.builtins.borrow();
@@ -33870,6 +33871,9 @@ impl Interpreter {
                         calls.insert(Rc::as_ptr(f) as usize, kind);
                         if name == "len" {
                             len_ptr = Rc::as_ptr(f) as usize;
+                        }
+                        if name == "hash" {
+                            hash_ptr = Rc::as_ptr(f) as usize;
                         }
                     }
                 }
@@ -34186,6 +34190,7 @@ impl Interpreter {
             Rc::new(LeafFns {
                 calls,
                 len_ptr,
+                hash_ptr,
                 next_ptr,
                 methods,
                 method_names,
@@ -34194,6 +34199,12 @@ impl Interpreter {
                 str_ty: bt.str_.clone(),
             })
         })
+    }
+
+    /// Whether a leaf plan register holds the builtin `hash`.
+    #[inline]
+    pub(crate) fn is_builtin_hash_obj(&self, o: &Object) -> bool {
+        matches!(o, Object::Builtin(b) if Rc::as_ptr(b) as usize == self.leaf_fns().hash_ptr)
     }
 
     /// `range(...)` / `list(...)` with a leaf argument shape, built
@@ -78460,6 +78471,9 @@ struct LeafFns {
     calls: std::collections::HashMap<usize, LeafKind, crate::fasthash::FxBuildHasher>,
     /// The builtin `len`'s address (for the fused `len(x)`), or 0.
     len_ptr: usize,
+    /// The builtin `hash`'s address (a leaf plan's fused `hash((a, b))`),
+    /// or 0.
+    hash_ptr: usize,
     /// The builtin `next`'s address (an inline generator resume), or 0.
     next_ptr: usize,
     /// The builtin `range` and `list` types, whose calls with leaf

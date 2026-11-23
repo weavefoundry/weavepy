@@ -264,6 +264,96 @@ enum Op {
         pc: u16,
         name: u16,
     },
+    /// `hash((regs[a], regs[b], regs[c]))` of the first `n` (see
+    /// [`hash_items`]) with `regs[at]` the builtin `hash`, its result in
+    /// `regs[at]`, building no tuple: a `Call` of a global named `hash` on
+    /// the tuple the op before built. Any other callee declines.
+    HashItems {
+        at: u8,
+        a: u8,
+        b: u8,
+        c: u8,
+        n: u8,
+    },
+}
+
+impl Op {
+    /// The registers this op writes (at most two).
+    fn writes(self) -> [Option<u8>; 2] {
+        match self {
+            Op::Move { dst, .. }
+            | Op::Const { dst, .. }
+            | Op::Global { dst, .. }
+            | Op::Deref { dst, .. }
+            | Op::Attr { dst, .. }
+            | Op::Compare { dst, .. }
+            | Op::Is { dst, .. }
+            | Op::Truth { dst, .. }
+            | Op::Unary { dst, .. }
+            | Op::Binary { dst, .. }
+            | Op::Contains { dst, .. }
+            | Op::Subscr { dst, .. }
+            | Op::Tuple { dst, .. }
+            | Op::Slice { dst, .. }
+            | Op::New { dst, .. } => [Some(dst), None],
+            Op::Method { dst, .. } => [Some(dst), dst.checked_add(1)],
+            Op::Swap { a, b } => [Some(a), Some(b)],
+            Op::Call { at, .. } | Op::HashItems { at, .. } => [Some(at), None],
+            Op::BranchIf { .. }
+            | Op::BranchNone { .. }
+            | Op::Jump { .. }
+            | Op::Return { .. }
+            | Op::Decline
+            | Op::StopIter { .. }
+            | Op::StoreAttr { .. } => [None, None],
+        }
+    }
+}
+
+impl Interpreter {
+    /// Whether plan value `v` is the builtin `hash`.
+    #[inline]
+    pub(super) fn is_builtin_hash(&self, v: V) -> bool {
+        // SAFETY: as `norm`.
+        matches!(v, V::R(p) if self.is_builtin_hash_obj(unsafe { &*p }))
+    }
+}
+
+/// The Python hash of a tuple of the first `n` of `items` when each item
+/// hashes natively, running no code (see [`hash_item`]); `None` otherwise.
+#[inline]
+pub(super) fn hash_items(items: [V; 3], n: u8) -> Option<i64> {
+    let mut h = crate::object::TupleHasher::new();
+    for v in &items[..usize::from(n)] {
+        h.push(hash_item(*v)?);
+    }
+    Some(h.finish(usize::from(n)))
+}
+
+/// One tuple item's hash, when it runs no code and can't fail: a native
+/// scalar (not a NaN, which hashes by identity), a `str` or `bytes`, a
+/// tuple of such ([`crate::seqiter::plain_hashable`]), or an instance
+/// hashed by identity.
+#[inline]
+fn hash_item(v: V) -> Option<i64> {
+    match v {
+        V::I(i) => Some(crate::object::py_hash_long_i64(i)),
+        V::B(b) => Some(i64::from(b)),
+        V::N => crate::object::py_hash_value(&Object::None),
+        V::F(x) if !x.is_nan() => Some(crate::object::py_hash_double(x)),
+        // SAFETY: as `norm` (a register's borrowed object outlives the
+        // evaluation).
+        V::R(p) => match unsafe { &*p } {
+            Object::Int(i) => Some(crate::object::py_hash_long_i64(*i)),
+            Object::Str(s) => Some(crate::shared_value::SharedStr::hash_cached(s)),
+            o @ Object::Instance(i) => (i.native.get().is_none()
+                && i.class_dunder(crate::types::Dunder::Hash).object_owner())
+            .then(|| crate::object::identity_hash(o)),
+            o if crate::seqiter::plain_hashable(o, 1) => crate::object::py_hash_value(o),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// A leaf body, translated (see the module docs).
@@ -428,6 +518,57 @@ impl Builder<'_> {
         }
         self.fixups.push((self.ops.len() - 1, target));
         Some(())
+    }
+
+    /// At a one-argument `CALL` (bytecode `pc`): the `Tuple` op just
+    /// emitted, when it built the argument and the callee is the global
+    /// `hash` loaded (with its empty self slot) in straight-line code since
+    /// (no jump, branch or jump target between), so the two fuse into a
+    /// `HashItems`.
+    fn hash_of_tuple(&self, pc: usize) -> Option<Op> {
+        let depth = self.stack.len();
+        let tuple = *self.ops.last()?;
+        let Op::Tuple { dst, .. } = tuple else {
+            return None;
+        };
+        if self.stack.last() != Some(&dst) || depth < 3 {
+            return None;
+        }
+        let callee = self.stack[depth - 3];
+        let body = &self.ops[..self.ops.len() - 1];
+        let gi = body
+            .iter()
+            .rposition(|op| op.writes().contains(&Some(callee)))?;
+        let Op::Global { pc: gpc, .. } = body[gi] else {
+            return None;
+        };
+        let gpc = usize::from(gpc);
+        let ins = self.code.instructions.get(gpc)?;
+        let straight = body[gi..].iter().all(|op| {
+            !matches!(
+                op,
+                Op::Jump { .. } | Op::BranchIf { .. } | Op::BranchNone { .. }
+            )
+        }) && !self.targets.keys().any(|&t| gpc < t && t <= pc);
+        // (The self slot the empty one: `PUSH_NULL`'s constant, or the one
+        // a `LOAD_GLOBAL` pushed with its null.)
+        let null_slot = self.stack[depth - 2];
+        let null = body
+            .iter()
+            .rposition(|op| op.writes().contains(&Some(null_slot)))
+            .is_some_and(|i| {
+                matches!(body[i], Op::Const { k, .. }
+                    if matches!(self.consts.get(usize::from(k)), Some(V::Null)))
+            });
+        (matches!(ins.op, OpCode::LoadGlobal | OpCode::LoadGlobalPushNull)
+            && self
+                .code
+                .names
+                .get(ins.arg as usize)
+                .is_some_and(|n| n.as_str() == "hash")
+            && straight
+            && null)
+            .then_some(tuple)
     }
 
     /// Translate the instruction at `pc`: whether control falls through
@@ -690,6 +831,16 @@ impl Builder<'_> {
                 let depth = self.stack.len();
                 if depth < argc + 2 {
                     return None;
+                }
+                if argc == 1 {
+                    if let Some(Op::Tuple { a, b, c, n, .. }) = self.hash_of_tuple(pc) {
+                        self.ops.pop();
+                        self.canonicalize()?;
+                        self.stack.truncate(depth - 3);
+                        let at = self.push_new()?;
+                        self.ops.push(Op::HashItems { at, a, b, c, n });
+                        return Some(true);
+                    }
                 }
                 self.canonicalize()?;
                 let at = depth - argc - 2;
@@ -1266,6 +1417,12 @@ impl Interpreter {
                 Op::Subscr { dst, a, b } => set!(dst, subscr(&mut owned, get!(a), get!(b))?),
                 Op::Tuple { dst, a, b, c, n } => {
                     set!(dst, new_tuple(&mut owned, [get!(a), get!(b), get!(c)], n)?)
+                }
+                Op::HashItems { at, a, b, c, n } => {
+                    if !self.is_builtin_hash(get!(at)) {
+                        return None;
+                    }
+                    set!(at, V::I(hash_items([get!(a), get!(b), get!(c)], n)?))
                 }
                 Op::Slice { dst, a, b, c, n } => {
                     set!(dst, new_slice(&mut owned, [get!(a), get!(b), get!(c)], n)?)

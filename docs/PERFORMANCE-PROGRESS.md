@@ -2603,6 +2603,18 @@ branch and pull request.
     set (CPython 282), 659 over a dict's keys. The hot path finds such an
     instance natively now, by its pointer hash and identity (443 and 342;
     a miss 568 to 327, CPython 233).
+  - A `__hash__` of the usual shape, `return hash((self.a, self.b))` (a
+    frozen dataclass's too), ran as a leaf plan that built the tuple, called
+    `hash` through the general builtin lane and hashed the tuple: 2,077
+    instructions for `hash(k)` (CPython 1,794). The plan translator fuses a
+    `CALL` of the global `hash` on the tuple the instruction before built
+    into one operation that hashes the items as the tuple would, with no
+    tuple, when the callee is still the builtin (anything else, or an item
+    whose hash could run code, declines to the full call). `hash(k)` costs
+    1,380, a frozen dataclass's 1,238 (1,933, CPython 1,773); `k in s` 1,468
+    (2,160, CPython 1,505), `d[k]` 1,778 (2,466, 1,530), `set(keys)` of 64
+    such keys 1,533 a key (2,234, 1,349), and a dict of dataclass keys read
+    with equal keys 3,397 (4,102, 2,669).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

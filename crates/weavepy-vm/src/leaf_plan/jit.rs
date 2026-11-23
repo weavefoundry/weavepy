@@ -18,8 +18,8 @@
 //! natively too once the callee's own plan is compiled).
 
 use super::{
-    binary, compare, is_same, new_container, new_slice, new_tuple, norm, plan_store, subscr, truth,
-    unary, LeafPlan, LeafRet, Op, Owned, Pending, NEST, V,
+    binary, compare, hash_items, is_same, new_container, new_slice, new_tuple, norm, plan_store,
+    subscr, truth, unary, LeafPlan, LeafRet, Op, Owned, Pending, NEST, V,
 };
 use crate::object::{Object, PyFunction};
 use crate::sync::Rc;
@@ -791,6 +791,36 @@ unsafe extern "C" fn h_tuple(
     match new_tuple(&mut c.owned, items, n as u8) {
         Some(v) => {
             c.put(v);
+            0
+        }
+        None => 1,
+    }
+}
+
+/// `hash` of a tuple of the first `n` of three operands, building no
+/// tuple, when the callee is the builtin `hash` (see [`hash_items`]).
+#[allow(clippy::too_many_arguments)]
+unsafe extern "C" fn h_hash_items(
+    ctx: *mut Ctx<'static>,
+    tf: u64,
+    pf: u64,
+    ta: u64,
+    pa: u64,
+    tb: u64,
+    pb: u64,
+    tc: u64,
+    pc: u64,
+    n: u32,
+) -> u32 {
+    // SAFETY: called by native code with its context.
+    let c = unsafe { cx(ctx) };
+    if !c.interp.is_builtin_hash(value(tf, pf)) {
+        return 1;
+    }
+    let items = [value(ta, pa), value(tb, pb), value(tc, pc)];
+    match hash_items(items, n as u8) {
+        Some(h) => {
+            c.put(V::I(h));
             0
         }
         None => 1,
@@ -2419,6 +2449,19 @@ impl Lower<'_> {
                 );
                 self.check(st);
                 self.set_out(fl, dst, 0);
+            }
+            Op::HashItems { at, a, b, c, n } => {
+                let (tf, pf) = self.get(fl, at);
+                let (ta, pa) = self.get(fl, a);
+                let (tb, pb) = self.get(fl, b);
+                let (tc, pc) = self.get(fl, c);
+                let nv = self.u32c(u32::from(n));
+                let st = self.call(
+                    h_hash_items as *const () as usize,
+                    &[self.ctx, tf, pf, ta, pa, tb, pb, tc, pc, nv],
+                );
+                self.check(st);
+                self.set_out(fl, at, 0);
             }
             Op::Slice { dst, a, b, c, n } => {
                 let (ta, pa) = self.get(fl, a);
