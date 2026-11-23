@@ -12747,6 +12747,12 @@ unsafe extern "C" fn h_subscr_dunder(
         let Some(f) = Interpreter::getitem_dunder(&*code, pc, &*st.stack.add(slot)) else {
             return CALL_DECLINED;
         };
+        // (The site's method, for a recompile to lower in line.)
+        if let Some(ext) = crate::code_vm_ext(&*code) {
+            if !crate::dunder_known(ext, pc) {
+                crate::getitem_note(ext, pc, &f, &*st.stack.add(slot));
+            }
+        }
         dunder_call(st, pc, slot, 2, f, site, None)
     }
 }
@@ -20711,6 +20717,10 @@ impl<'a> Lower<'a> {
                 return false;
             }
             OpCode::ForIter => return self.for_iter(pc, ins.arg),
+            OpCode::BinarySubscr if self.layout.is_some() && self.plan_at(pc).is_some() => {
+                let plans = self.plan_at(pc).expect("checked");
+                return self.inline_subscr(pc, plans);
+            }
             OpCode::BinarySubscr if self.subscr_ref(pc) => true,
             OpCode::UnpackSequence if self.unpack_ref(pc, ins.arg as usize) => true,
             OpCode::StoreSubscr if self.store_subscr_ref(pc) => true,

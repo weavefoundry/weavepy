@@ -252,6 +252,12 @@ pub struct Probes<'a> {
     /// (A global's name index with [`PY_CALLEE_GLOBAL`] set asks the same
     /// of the global that name resolves to.)
     pub py_callee: &'a mut dyn FnMut(u32) -> bool,
+    /// Whether the `BINARY_SUBSCR` at this pc has called a plain Python
+    /// `__getitem__` (the frame JIT lowers that call in line, where tier 2
+    /// makes it through the interpreter's subscript): such a subscript
+    /// of the object lane counts as a dynamic Python call (see
+    /// [`TFunc::py_dyn_calls`]).
+    pub py_getitem: &'a mut dyn FnMut(u32) -> bool,
     /// The observed lane of local `slot` in the requesting activation,
     /// graded like [`Self::param`] (scalars, `str`, `bytes`, and the
     /// object lane; lists and dicts stay `None` for their use-site
@@ -638,6 +644,7 @@ pub fn analyze_with_probes(
         cell: &mut |_| None,
         obj: &mut |_| false,
         py_callee: &mut |_| false,
+        py_getitem: &mut |_| false,
         local: &mut |_| None,
         stack_iter: &mut |_| None,
         pairs: &mut |_| None,
@@ -673,6 +680,7 @@ pub fn analyze_for_ret(
         cell: &mut |_| None,
         obj: &mut |_| false,
         py_callee: &mut |_| false,
+        py_getitem: &mut |_| false,
         local: &mut |_| None,
         stack_iter: &mut |_| None,
         pairs: &mut |_| None,
@@ -9767,6 +9775,9 @@ fn emit_instr(
                 () => {{
                     if !dyn_op_ok(cont, idx_slot.ty) {
                         return Err(JitVerdict::TypeUnknown);
+                    }
+                    if cont == JitType::Obj && (probes.py_getitem)(pc) {
+                        out.py_dyn_calls.push(pc);
                     }
                     *max_call_args = (*max_call_args).max(2);
                     push(TOp::DynGetItem, Some(JitType::Obj), stack, stmts);

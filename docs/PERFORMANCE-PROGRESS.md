@@ -2712,6 +2712,18 @@ branch and pull request.
     the native body, which reads the parts in place.
     `b"a b c d".split(b" ")` takes 1,596 instructions (2,078, CPython
     1,098), and `b" ".join([b, b])` 1,824 (2,146, CPython 1,307).
+  - `obj[key]` of a plain instance whose class's `__getitem__` is a Python
+    function called the method through the frame JIT's direct-call
+    records, where `obj.__getitem__(key)` had its body lowered in line,
+    and tier 2 took a loop with such a subscript and an `int` sum,
+    calling the method through the interpreter's subscript. A subscript
+    site now records the method it called. The frame JIT lowers it in
+    line, as it lowers an operator method, under a guard on the class's
+    version and with no guard on the key; the method's `NotImplemented`
+    is a value like any other. Tier 2 counts such a subscript as a
+    dynamic Python call when it weighs a loop's typed work. `seq[1]`
+    takes 193 instructions (888, CPython 516), and `t += seq[1]` 237
+    (1,376, CPython 699).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

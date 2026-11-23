@@ -11516,6 +11516,13 @@ impl Interpreter {
         let crate::recursion::Enter::Ok(guard) = crate::recursion::enter() else {
             return None;
         };
+        // (The site's method, for the frame JIT to lower in line.)
+        #[cfg(feature = "jit")]
+        if let Some(ext) = code_vm_ext_existing(&frame.code) {
+            if !dunder_known(ext, pc) {
+                getitem_note(ext, pc, &f, &frame.stack[n - 2]);
+            }
+        }
         // Committed.
         let key = frame.stack.pop()?;
         let container = frame.stack.pop()?;
@@ -88637,6 +88644,41 @@ pub(crate) fn dunder_note(
             func: Rc::downgrade(f),
             ver: cls.attr_version.get(),
             right,
+        });
+    }
+}
+
+/// [`DunderSeen::right`] of a `BINARY_SUBSCR`'s `__getitem__`: any key.
+#[cfg(feature = "jit")]
+pub(crate) const DUNDER_ANY_KEY: u8 = 0xff;
+
+/// Record that the `BINARY_SUBSCR` at `pc` called `f`, the plain Python
+/// `__getitem__` of the plain instance `container`'s class, for the frame
+/// JIT to lower in line as it lowers an operator method (any key; the
+/// method's `NotImplemented` is a value like any other).
+#[cfg(feature = "jit")]
+pub(crate) fn getitem_note(
+    ext: &CodeConstObjects,
+    pc: usize,
+    f: &Rc<crate::object::PyFunction>,
+    container: &Object,
+) {
+    let Object::Instance(inst) = container else {
+        return;
+    };
+    let cls = inst.cls_raw();
+    if cls.native_kind.get() != 0 || cls.c_ext_ptr.get() != 0 || inst.native.get().is_some() {
+        return;
+    }
+    let table = ext.dunders.get_or_init(Box::default);
+    // SAFETY: GIL-serialized; the borrow ends here.
+    let seen = unsafe { &mut *table.0.get() };
+    if seen.iter().all(|d| d.pc != pc) {
+        seen.push(DunderSeen {
+            pc,
+            func: Rc::downgrade(f),
+            ver: cls.attr_version.get(),
+            right: Some(DUNDER_ANY_KEY),
         });
     }
 }

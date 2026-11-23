@@ -1778,6 +1778,10 @@ impl JitState {
                         !direct && frameless_py_callee(&f)
                     })
                 },
+                py_getitem: &mut |pc| {
+                    crate::code_vm_ext(code)
+                        .is_some_and(|ext| crate::dunder_known(ext, pc as usize))
+                },
                 local: &mut probe_local,
                 stack_iter: &mut **stack_iter,
                 pairs: &mut **pairs,
@@ -2954,6 +2958,7 @@ fn method_ret_info(
         // Depth bound: no live locals to observe in the nested view.
         obj: &mut |_| false,
         py_callee: &mut |_| false,
+        py_getitem: &mut |_| false,
         local: &mut |_| None,
         stack_iter: &mut |_| None,
         pairs: &mut |_| None,
@@ -4394,6 +4399,7 @@ fn inline_method_body(
         cell: &mut |_| None,
         obj: &mut |_| false,
         py_callee: &mut |_| false,
+        py_getitem: &mut |_| false,
         local: &mut |_| None,
         stack_iter: &mut |_| None,
         pairs: &mut |_| None,

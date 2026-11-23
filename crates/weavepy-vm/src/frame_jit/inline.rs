@@ -214,12 +214,21 @@ pub(super) struct Plan {
     classes: usize,
 }
 
-/// A `BINARY_OP` site's guard on the operands (see `dunder_note`).
+/// A `BINARY_OP` site's guard on the operands (see `dunder_note`), or a
+/// `BINARY_SUBSCR`'s on its container (see `getitem_note`).
 #[derive(Clone, Copy)]
 struct Dunder {
     ver: u64,
     right: Option<u8>,
     arg: u32,
+}
+
+impl Dunder {
+    /// Whether it's a subscript's `__getitem__` (any key, and its result
+    /// taken as it is).
+    fn subscr(self) -> bool {
+        self.right == Some(crate::DUNDER_ANY_KEY)
+    }
 }
 
 /// The `property` getter of the `LOAD_ATTR` at `pc`, to lower in line.
@@ -591,7 +600,10 @@ pub(super) fn plan(
             // (A generator's body takes its calls in line, not a property's
             // getter or an operator's method.)
             let plain = !code.is_generator;
-            (plain && i.op == OpCode::BinaryOp && depths[pc] >= 2 && crate::dunder_known(ext, pc))
+            (plain
+                && matches!(i.op, OpCode::BinaryOp | OpCode::BinarySubscr)
+                && depths[pc] >= 2
+                && crate::dunder_known(ext, pc))
                 || (plain
                     && i.op == OpCode::LoadAttr
                     && depths[pc] >= 1
@@ -627,7 +639,7 @@ pub(super) fn plan(
             }
             continue;
         }
-        if i.op == OpCode::BinaryOp {
+        if matches!(i.op, OpCode::BinaryOp | OpCode::BinarySubscr) {
             match dunder_plan(code, ext, pc, &mut path, &mut left) {
                 Ok(p) => {
                     note(code, pc, "inlined", &p.code.qualname);
@@ -1710,8 +1722,12 @@ impl<'a> Lower<'a> {
             base,
             nlocals,
             borrowed: Vec::new(),
-            method: no_callable
-                .then(|| (borrowed_function(&plan.func), plan.dunder.map(|d| d.arg))),
+            method: no_callable.then(|| {
+                (
+                    borrowed_function(&plan.func),
+                    plan.dunder.filter(|d| !d.subscr()).map(|d| d.arg),
+                )
+            }),
         });
         let site_at = std::ptr::from_ref::<InlineSite>(&site) as i64;
         let method_at = site
@@ -2192,6 +2208,8 @@ impl<'a> Lower<'a> {
         let key = self.b.ins().load(types::I64, FLAGS, sv, IS_KEY);
         let other = self.b.ins().icmp(IntCC::NotEqual, ver, key);
         let wrong = match (d.right, args[1]) {
+            // (A subscript's key, any value.)
+            _ if d.subscr() => self.b.ins().iconst(types::I8, 0),
             (Some(t), Item::Int(_)) => self
                 .b
                 .ins()
@@ -2265,6 +2283,43 @@ impl<'a> Lower<'a> {
         if nested {
             self.exit(INTERP, pc);
         } else if self.binary_plain(pc, arg) {
+            self.flush();
+            self.b.ins().jump(join, &[]);
+        }
+        self.b.switch_to_block(join);
+        self.vs.clear();
+        self.depth = start + 1;
+        self.set_last(pc);
+        if !nested {
+            self.inline_ir += self.b.func.dfg.num_insts() - before;
+        }
+        true
+    }
+
+    /// `BINARY_SUBSCR` at `pc` of the Python `__getitem__` `plans` lowers
+    /// in line, as [`Self::inline_binop`] lowers an operator method: the
+    /// container's guard and the body, with the instruction's other shapes
+    /// for anything the guard doesn't take.
+    pub(super) fn inline_subscr(&mut self, pc: usize, plans: &'a [Plan]) -> bool {
+        let before = self.b.func.dfg.num_insts();
+        let nested = self.inlining();
+        let ki = self.pop();
+        let ci = self.pop();
+        let args = [ci, ki];
+        self.flush();
+        let start = self.depth;
+        let call_last = self.last_pc;
+        let join = self.b.create_block();
+        let slow = self.b.create_block();
+        self.inline_body(pc, &plans[0], &args, start, slow, join, None);
+        self.b.switch_to_block(slow);
+        self.b.set_cold_block(slow);
+        self.vs = args.to_vec();
+        self.depth = start + 2;
+        self.last_pc = call_last;
+        if nested {
+            self.exit(INTERP, pc);
+        } else if self.container(pc) {
             self.flush();
             self.b.ins().jump(join, &[]);
         }
