@@ -17712,13 +17712,13 @@ impl Interpreter {
         // function's arguments bind for the lean call below.
         enum Step {
             Done(Object),
-            Builtin(Rc<crate::object::BuiltinFn>, usize),
+            Builtin(Rc<crate::object::BuiltinFn>, [Object; 4], usize),
             Bound(Rc<crate::object::PyFunction>),
         }
         let depth = crate::recursion::current_depth();
         let args = &frame.stack[callee_slot + 2..];
-        let mut buf: [Object; 4] = std::array::from_fn(|_| Object::None);
-        let mut bound: Vec<Object> = self.pooled_scratch();
+        // (Taken only for a call that binds a frame's locals.)
+        let mut bound: Option<Vec<Object>> = None;
         let step = crate::stdlib::functools_mod::with_partial_call(inst, |func, stored, kw| {
             match func {
                 Object::Function(f) => {
@@ -17730,10 +17730,26 @@ impl Interpreter {
                         && depth < crate::recursion::recursion_limit()
                     {
                         let mut ptrs = [std::ptr::null::<Object>(); 8];
-                        let kws = kw.iter().map(|(k, v)| (&k.0, v));
-                        if let Some(arity) =
+                        // (No keywords, the usual partial: no walk of the
+                        // empty dict.)
+                        let arity = if kw.is_empty() {
+                            Self::leaf_bind_positional(code, stored, args, &mut ptrs).or_else(
+                                || {
+                                    Self::leaf_bind_keywords(
+                                        f,
+                                        code,
+                                        stored,
+                                        args,
+                                        std::iter::empty(),
+                                        &mut ptrs,
+                                    )
+                                },
+                            )
+                        } else {
+                            let kws = kw.iter().map(|(k, v)| (&k.0, v));
                             Self::leaf_bind_keywords(f, code, stored, args, kws, &mut ptrs)
-                        {
+                        };
+                        if let Some(arity) = arity {
                             if let Some(r) =
                                 self.pure_leaf_call(code, f, &ptrs[..arity], false, depth)
                             {
@@ -17751,38 +17767,42 @@ impl Interpreter {
                         return None;
                     }
                     let kws = kw.iter().map(|(k, v)| (&k.0, v));
-                    Self::lean_bind_keywords(f, code, stored, args, kws, &mut bound)?;
+                    let v = bound.insert(self.pooled_scratch());
+                    Self::lean_bind_keywords(f, code, stored, args, kws, v)?;
                     Some(Step::Bound(f.clone()))
                 }
                 Object::Builtin(b) => {
                     let n = stored.len() + args.len();
-                    if !kw.is_empty() || b.binds_instance || n > buf.len() {
+                    if !kw.is_empty() || b.binds_instance || n > 4 {
                         return None;
                     }
+                    let mut buf: [Object; 4] = std::array::from_fn(|_| Object::None);
                     for (slot, v) in buf.iter_mut().zip(stored.iter().chain(args)) {
                         *slot = v.clone();
                     }
-                    Some(Step::Builtin(b.clone(), n))
+                    Some(Step::Builtin(b.clone(), buf, n))
                 }
                 _ => None,
             }
         });
-        let f = match step {
-            Some(Step::Bound(f)) => f,
-            other => {
+        let (f, mut bound) = match (step, bound) {
+            (Some(Step::Bound(f)), Some(bound)) => (f, bound),
+            (other, scratch) => {
                 let r = match other {
                     Some(Step::Done(r)) => Some(r),
                     // (A decline or an error leaves the call to the native
                     // `__call__`, which repeats it: a leaf runs no code, so
                     // nothing is observed twice.)
-                    Some(Step::Builtin(b, n)) => self
+                    Some(Step::Builtin(b, buf, n)) => self
                         .leaf_call_kind(&b)
                         .and_then(|kind| self.leaf_builtin_call(kind, &b, &buf[..n]))
                         .and_then(Result::ok),
                     _ => None,
                 };
-                bound.clear();
-                self.recycle_scratch(bound);
+                if let Some(mut v) = scratch {
+                    v.clear();
+                    self.recycle_scratch(v);
+                }
                 let Some(r) = r else {
                     return false;
                 };
@@ -20625,6 +20645,32 @@ impl Interpreter {
     /// no reference taken (nothing may change them while `out` is in use).
     /// The number of parameters bound, or `None` when anything needs the
     /// generic binder.
+    /// [`Self::leaf_bind_keywords`] of a call with no keywords that passes
+    /// exactly the positional parameters (`head` then `rest`) of a code with
+    /// no `*args`, `**kwargs` or keyword-only ones: the pointers in order,
+    /// and their count. `None` for any other shape.
+    #[inline]
+    fn leaf_bind_positional<'a>(
+        code: &CodeObject,
+        head: &'a [Object],
+        rest: &'a [Object],
+        out: &mut [*const Object; 8],
+    ) -> Option<usize> {
+        let n = head.len() + rest.len();
+        if code.has_varargs
+            || code.has_varkeywords
+            || code.kwonly_count != 0
+            || code.arg_count as usize != n
+            || n > out.len()
+        {
+            return None;
+        }
+        for (p, v) in out.iter_mut().zip(head.iter().chain(rest)) {
+            *p = v;
+        }
+        Some(n)
+    }
+
     fn leaf_bind_keywords<'a>(
         f: &'a PyFunction,
         code: &CodeObject,

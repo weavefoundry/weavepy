@@ -2636,6 +2636,14 @@ branch and pull request.
     before otherwise. A dict read with an equal dataclass key costs 3,150
     (3,393, CPython 2,664), and `a == b` of two dataclasses 1,243 (CPython
     1,435).
+  - A call of a `partial` with two or more stored arguments (one goes in
+    the call's empty self slot instead) bound them through the general
+    keyword binder, walking the partial's empty keyword dict, and took a
+    scratch vector and built a four-slot buffer it used only on other
+    paths: 1,807 instructions for `partial(g, 1, 2)(i)` (CPython 908). A
+    call with no keywords that passes exactly the parameters binds them in
+    order now, and the vector and buffer are made only where they're used
+    (1,638; a partial with a stored keyword 1,849, CPython 2,038).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
