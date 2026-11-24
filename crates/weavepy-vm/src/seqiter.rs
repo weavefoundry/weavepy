@@ -2461,6 +2461,75 @@ pub(crate) fn itertools_pure_next(l: &PyLazyIter) -> Option<Option<Object>> {
             let prev = std::mem::replace(old, new.clone());
             Some(Some(Object::new_tuple_array([prev, new])))
         }
+        // `zip_longest` over plain sequence cursors: each active source's
+        // next item, or the fill value for one finished before or now (a
+        // source finishing now is let go, as the general step lets it go,
+        // when releasing it runs nothing); the step that finishes the last
+        // one ends it, as the general step does.
+        LazyIterKind::ZipLongest {
+            iters,
+            fillvalue,
+            numactive,
+        } => {
+            if iters.is_empty() || *numactive == 0 {
+                return Some(None);
+            }
+            // (A source passed twice, `zip_longest(it, it)`, steps twice:
+            // the general step's.)
+            for (i, a) in iters.iter().enumerate() {
+                if let Some(Object::Iter(a)) = a {
+                    if iters[..i]
+                        .iter()
+                        .any(|b| matches!(b, Some(Object::Iter(b)) if Rc::ptr_eq(a, b)))
+                    {
+                        return None;
+                    }
+                }
+            }
+            let mut items: Vec<Option<Object>> = Vec::with_capacity(iters.len());
+            let mut ending = 0usize;
+            for slot in iters.iter() {
+                items.push(match slot {
+                    None => None,
+                    Some(src) if cursor_at_end(src) => {
+                        if !quiet_source(src) {
+                            return None;
+                        }
+                        ending += 1;
+                        None
+                    }
+                    Some(Object::Iter(c)) => Some(cursor_peek(c)?),
+                    Some(_) => return None,
+                });
+            }
+            // The end: the general step keeps its sources and counts none
+            // active.
+            if ending >= *numactive {
+                *numactive = 0;
+                return Some(None);
+            }
+            let mut result = Vec::with_capacity(iters.len());
+            let mut done = Vec::new();
+            for (slot, item) in iters.iter_mut().zip(items) {
+                match item {
+                    Some(v) => {
+                        if let Some(Object::Iter(c)) = slot {
+                            cursor_advance(c)?;
+                        }
+                        result.push(v);
+                    }
+                    None => {
+                        if let Some(src) = slot.take() {
+                            done.push(src);
+                            *numactive -= 1;
+                        }
+                        result.push(fillvalue.clone());
+                    }
+                }
+            }
+            drop(done);
+            Some(Some(Object::new_tuple(result)))
+        }
         _ => None,
     }
 }

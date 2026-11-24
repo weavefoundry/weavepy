@@ -2863,6 +2863,14 @@ branch and pull request.
     two-record one from 18,602 to 8,284. A `str` buffer is now refused
     when the iterator is made, as CPython refuses it, not at its first
     step.
+  - `itertools.zip_longest` had no step that runs no code, so each item
+    copied the iterator's state (its sources' vector) to protect it from
+    reentrant code. Over plain list and tuple cursors a step now reads
+    each source's next item, or the fill value, in place, lets go of a
+    source that finishes as the general step does (when releasing it
+    runs nothing), and ends as it ends: `list(zip_longest(a, b))` of a
+    three-item list and a one-item list went from 10,567 instructions to
+    7,961 (CPython 4,403).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
