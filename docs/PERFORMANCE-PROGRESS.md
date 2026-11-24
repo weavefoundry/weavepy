@@ -2769,6 +2769,24 @@ branch and pull request.
     does: a call of a function with that loop costs 3,342 instructions
     (4,904, CPython 2,658), and the battery's `datetime_time_ops` 1.5%
     fewer.
+  - A keyword call of a native method cost two to three times its
+    positional form (`x.to_bytes(2, byteorder="big")` 2,038 instructions,
+    `x.to_bytes(2, "big")` 687). The compiled call's lane for a native
+    callee now runs the body on its operands where they sit on the stack,
+    as a positional call's does, and calls the body directly when the
+    interpreter's dispatch would only end up there; a keyword half (the
+    registered builtins that bind keywords by position) keeps each site's
+    binding in a small per-thread memo instead of matching names on every
+    call; and `to_bytes`, `from_bytes`, `str.rsplit` and `str.splitlines`
+    have halves. `x.to_bytes(2, byteorder="big")` takes 1,313
+    instructions (CPython 1,046), `s.splitlines(keepends=True)` 1,714
+    (2,513, CPython 1,394), `sorted(xs, reverse=True)` 1,742 (1,989,
+    CPython 2,153), and tier 2's `dict(a=1, b=2)` 1,542 (1,748), its check
+    now ahead of the function binders that always declined it. Three
+    differences from CPython turned up and are fixed: a list released its
+    items first to last (CPython's `list_dealloc` goes last to first),
+    `to_bytes` and `from_bytes` took `signed` positionally, and both
+    ignored an unknown keyword.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

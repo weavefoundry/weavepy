@@ -12751,6 +12751,35 @@ unsafe fn call_dyn_impl(
             return status;
         }
     }
+    // `dict(k=v, ...)`: the keywords' own name objects are the keys.
+    // (Ahead of the function binders below, which all decline a class.)
+    if kwc > 0 && argc == 0 {
+        if let Object::Type(t) = &callee {
+            if Rc::ptr_eq(t, &crate::builtin_types::builtin_types().dict_) {
+                // SAFETY: per the function contract, the activation keeps
+                // its code object alive.
+                let code = unsafe { &*ctx.code_ptr };
+                if let Some(Object::Tuple(name_items)) =
+                    crate::code_const_objects(code).get(names as usize)
+                {
+                    let mut vals = [const { Object::None }; 8];
+                    if name_items.len() == kwc as usize && kwc as usize <= vals.len() {
+                        for (j, slot) in vals.iter_mut().enumerate().take(kwc as usize) {
+                            // SAFETY: native code wrote `kwc` entries.
+                            let (bits, tag) =
+                                unsafe { (*jf.call_args.add(j), *jf.call_tags.add(j)) };
+                            *slot = unpack_pins(bits, tag, &ctx.pins);
+                        }
+                        if let Some(d) =
+                            crate::Interpreter::dict_of_keywords(name_items, &vals[..kwc as usize])
+                        {
+                            return dyn_leaf_result(jf, ctx, d, int_result);
+                        }
+                    }
+                }
+            }
+        }
+    }
     // A keyword call of a warm pure leaf evaluates frameless on its
     // marshaled values (no Python runs, so nothing needs revalidating).
     // It isn't counted against the native driver, though the frame JIT
@@ -12806,34 +12835,6 @@ unsafe fn call_dyn_impl(
         });
         // SAFETY: as above.
         return unsafe { dyn_call_result(jf, ctx, called, false, true, int_result) };
-    }
-    // `dict(k=v, ...)`: the keywords' own name objects are the keys.
-    if kwc > 0 && argc == 0 {
-        if let Object::Type(t) = &callee {
-            if Rc::ptr_eq(t, &crate::builtin_types::builtin_types().dict_) {
-                // SAFETY: per the function contract, the activation keeps
-                // its code object alive.
-                let code = unsafe { &*ctx.code_ptr };
-                if let Some(Object::Tuple(name_items)) =
-                    crate::code_const_objects(code).get(names as usize)
-                {
-                    let mut vals = [const { Object::None }; 8];
-                    if name_items.len() == kwc as usize && kwc as usize <= vals.len() {
-                        for (j, slot) in vals.iter_mut().enumerate().take(kwc as usize) {
-                            // SAFETY: native code wrote `kwc` entries.
-                            let (bits, tag) =
-                                unsafe { (*jf.call_args.add(j), *jf.call_tags.add(j)) };
-                            *slot = unpack_pins(bits, tag, &ctx.pins);
-                        }
-                        if let Some(d) =
-                            crate::Interpreter::dict_of_keywords(name_items, &vals[..kwc as usize])
-                        {
-                            return dyn_leaf_result(jf, ctx, d, int_result);
-                        }
-                    }
-                }
-            }
-        }
     }
     let n = (argc + kwc) as usize;
     let mut args: Vec<Object> = Vec::with_capacity(n);

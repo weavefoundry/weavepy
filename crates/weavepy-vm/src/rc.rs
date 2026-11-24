@@ -665,11 +665,11 @@ impl<T: ?Sized + 'static> Rc<T> {
                     // The last strong reference: nothing else reads the
                     // items while this release, which runs no code, does.
                     let items = &mut *(*cell).as_ptr();
-                    // (Up to the first item that would die: the usual list
-                    // has none, and then no slot needs rewriting.)
+                    // (Last item first, as CPython's `list_dealloc`, up to
+                    // the first that would die: the usual list has none.)
                     let biased = refcounts_biased();
                     let mut released = 0;
-                    for o in items.iter() {
+                    for o in items.iter().rev() {
                         match o.strong_word() {
                             None => {}
                             Some(word) if biased && plain_release(word) => {}
@@ -677,15 +677,16 @@ impl<T: ?Sized + 'static> Rc<T> {
                         }
                         released += 1;
                     }
-                    if released == items.len() {
-                        items.set_len(0);
+                    let kept = items.len() - released;
+                    // (Released: those slots leave the list.)
+                    items.set_len(kept);
+                    if kept == 0 {
                         drop_arc_in(&mut self.0);
                         return;
                     }
-                    // (Released: those slots become scalars.)
-                    for o in &mut items[..released] {
-                        ptr::write(o, crate::object::Object::None);
-                    }
+                    // The rest go last first too: the vector's own drop
+                    // releases front to back.
+                    items.reverse();
                 }
                 release_nested(LastOwner(ManuallyDrop::new(ManuallyDrop::take(
                     &mut self.0,

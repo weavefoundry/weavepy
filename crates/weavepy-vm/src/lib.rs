@@ -18575,6 +18575,158 @@ impl Interpreter {
             && matches!(plan.user_new, Some(Object::Builtin(_)))
     }
 
+    /// [`Self::core_builtin_kw_lane`]'s native method or function (not a
+    /// class) whose `CALL_KW` operands start at `start` (the callee, its
+    /// self slot, `argc` positionals, `kwc` keyword values and the names
+    /// tuple): its body runs on them where they are, as
+    /// [`Self::core_native_body`] runs a positional call's, the keyword
+    /// values cloned into the pooled pairs. The body runs directly when the
+    /// interpreter's dispatch would only end up calling it; otherwise
+    /// through [`Self::call`]. Then the names tuple, the arguments (the
+    /// keyword values last) and the callee are released, as the drained
+    /// lane releases them. `false` touches nothing.
+    ///
+    /// # Safety
+    ///
+    /// `sw`'s running activation is synced and unborrowed elsewhere, and its
+    /// stack holds the call's operands from `start` to its top.
+    #[inline(never)]
+    unsafe fn core_builtin_kw_in_place(
+        &mut self,
+        sw: &mut CoreSwitch,
+        pc: usize,
+        start: usize,
+        argc: usize,
+        kwc: usize,
+    ) -> bool {
+        const POOL_CAP: usize = 8;
+        const KEPT_PAIRS: usize = 8;
+        // SAFETY: the caller's contract; the stack isn't resized while the
+        // body runs (nested code runs activations of its own).
+        unsafe {
+            let frame = &mut *sw.cur;
+            let len = frame.stack.len();
+            let base = frame.stack.as_mut_ptr();
+            let b: *const crate::object::BuiltinFn =
+                match (&*base.add(start), &*base.add(start + 1)) {
+                    (Object::Builtin(b), _) => Rc::as_ptr(b),
+                    // (A bound method calls its builtin with the receiver first,
+                    // unless the dispatch knows the name: the generator family's
+                    // `.`-names, and a dict subclass's `__getitem__`.)
+                    (Object::BoundMethod(bm), Object::Unbound) => match &bm.function {
+                        Object::Builtin(b)
+                            if !b.name.starts_with('.') && b.name != "__getitem__" =>
+                        {
+                            Rc::as_ptr(b)
+                        }
+                        _ => return false,
+                    },
+                    _ => return false,
+                };
+            let Object::Tuple(names) = &*base.add(len - 1) else {
+                return false;
+            };
+            // Committed.
+            let mut kwargs: Vec<(String, Object)> =
+                self.kw_scratch_pool.borrow_mut().pop().unwrap_or_default();
+            kwargs.truncate(kwc);
+            let values = std::slice::from_raw_parts(base.add(start + 2 + argc), kwc);
+            for (j, (name, v)) in names.iter().zip(values).enumerate() {
+                let Object::Str(name) = name else {
+                    unreachable!("checked by the caller")
+                };
+                let name: &str = name;
+                match kwargs.get_mut(j) {
+                    Some(pair) => {
+                        if pair.0 != name {
+                            pair.0.clear();
+                            pair.0.push_str(name);
+                        }
+                        pair.1 = v.clone();
+                    }
+                    None => kwargs.push((name.to_owned(), v.clone())),
+                }
+            }
+            if matches!(&*base.add(start + 1), Object::Unbound) {
+                if let Object::BoundMethod(bm) = &*base.add(start) {
+                    // (The empty self slot needs no release.)
+                    base.add(start + 1).write(bm.receiver.clone());
+                }
+            }
+            let first = if matches!(&*base.add(start + 1), Object::Unbound) {
+                start + 2
+            } else {
+                start + 1
+            };
+            let args = std::slice::from_raw_parts(base.add(first), start + 2 + argc - first);
+            frame.pc = pc as u32 + 1;
+            let pending = self.core_pending_enter_fast(sw, frame, pc);
+            let b = &*b;
+            // (The names the dispatch takes before reaching the body, or
+            // whose arguments it converts first.)
+            let direct = b.call_kw.as_ref().filter(|_| {
+                !burst_stats::enabled()
+                    && !builtin_needs_interp(b.name)
+                    && !matches!(
+                        b.name,
+                        "len"
+                            | "hash"
+                            | "isinstance"
+                            | "issubclass"
+                            | "repr"
+                            | "str"
+                            | "__new__"
+                            | "open"
+                            | "fspath"
+                            | "fsdecode"
+                            | "fsencode"
+                    )
+            });
+            let result = match direct {
+                Some(call_kw) => call_kw(args, &kwargs),
+                None => {
+                    let globals = frame.globals.clone();
+                    match &*base.add(start) {
+                        callable @ Object::Builtin(_) => {
+                            self.call(callable, args, &kwargs, &globals)
+                        }
+                        callable => self.call(&bm_builtin(callable), args, &kwargs, &globals),
+                    }
+                }
+            };
+            self.core_pending_exit(sw, pending);
+            for pair in &mut kwargs {
+                drop(std::mem::replace(&mut pair.1, Object::None));
+            }
+            if kwargs.len() <= KEPT_PAIRS {
+                let mut pool = self.kw_scratch_pool.borrow_mut();
+                if pool.len() < POOL_CAP {
+                    pool.push(kwargs);
+                }
+            }
+            // The operands leave the stack, then are released: the names,
+            // the arguments in order (the keyword values last), the callee.
+            frame.stack.set_len(start);
+            release_operands(self, base.add(len - 1), 1);
+            release_operands(self, base.add(start + 1), len - 2 - start);
+            release_operands(self, base.add(start), 1);
+            match result {
+                Ok(v) => {
+                    base.add(start).write(v);
+                    frame.stack.set_len(start + 1);
+                    // SAFETY: the running activation's last-pc slot.
+                    *sw.last = pc;
+                }
+                Err(e) => sw.pending = Some(CoreExit::Stop(LeafStop::Raised(e))),
+            }
+            // SAFETY: the running thread's own flag (see `quiet_run`).
+            if sw.pending.is_none() && (*sw.maybe_dead).get() {
+                sw.pending = Some(CoreExit::Stop(LeafStop::Marked));
+            }
+            true
+        }
+    }
+
     /// [`Self::core_builtin_lane`] for the `CALL_KW` at `pc` of a native
     /// callee (see [`Self::kw_lane_callee`]: `sorted(xs, key=f)`,
     /// `xs.sort(reverse=True)`, `int(s, base=2)`), in `sw`'s synced running
@@ -18612,6 +18764,17 @@ impl Interpreter {
         {
             return false;
         }
+        // A native method or function (not a class): its body reads the
+        // operands where they are.
+        // SAFETY: the activation is synced and its stack holds the call's
+        // `n - callee_at` operands.
+        if unsafe { self.core_builtin_kw_in_place(sw, pc, callee_at, argc, kwc) } {
+            return true;
+        }
+        let frame = unsafe { &mut *sw.cur };
+        let Some(Object::Tuple(names)) = frame.stack.last() else {
+            return false;
+        };
         // Committed: the operands leave the stack.
         let mut kwargs: Vec<(String, Object)> =
             self.kw_scratch_pool.borrow_mut().pop().unwrap_or_default();
@@ -29188,6 +29351,71 @@ impl Interpreter {
         Some(obj)
     }
 
+    /// [`Self::core_native_kw_call`]'s binding of a call with `argc`
+    /// positionals and the keywords `names` to a registered builtin's
+    /// parameters `params`: each bound parameter's operand index (the
+    /// positionals from 2, then the keyword values), [`KW_UNBOUND`] for an
+    /// optional parameter the call leaves out, and how many parameters the
+    /// half takes. `None` for a call the half doesn't serve.
+    fn kw_bind_plan(
+        params: leaf_builtins::KwNames,
+        names: &[Object],
+        argc: usize,
+    ) -> Option<([u8; 4], usize)> {
+        // (A parameter named `*name` is keyword-only: no positional binds
+        // it, and the half takes `Unbound` where the call leaves it out. One
+        // named `?name` is optional the same way but may come positionally,
+        // and one named `/name` is positional-only: no keyword binds it.)
+        let keyword_only = |p: &str| p.starts_with('*');
+        let optional = |p: &str| p.starts_with('*') || p.starts_with('?');
+        if params.len() > 4 || params.iter().take(argc).any(|p| keyword_only(p)) {
+            return None;
+        }
+        let mut bound: [Option<u8>; 4] = [None; 4];
+        for (i, slot) in bound.iter_mut().enumerate().take(argc) {
+            *slot = Some(2 + i as u8);
+        }
+        for (j, name) in names.iter().enumerate() {
+            let Object::Str(name) = name else {
+                return None;
+            };
+            let name: &str = name;
+            let i = params.iter().position(|p| {
+                let bare = match p.as_bytes().first() {
+                    Some(b'/') => return false,
+                    Some(b'*' | b'?') => &p[1..],
+                    _ => p,
+                };
+                bare == name
+            })?;
+            if i >= 4 || bound[i].is_some() {
+                return None;
+            }
+            bound[i] = Some((2 + argc + j) as u8);
+        }
+        let mut map = [KW_UNBOUND; 4];
+        let n = if params.iter().any(|p| optional(p)) {
+            for (i, p) in params.iter().enumerate() {
+                match bound[i] {
+                    Some(at) => map[i] = at,
+                    None if optional(p) => {}
+                    None => return None,
+                }
+            }
+            params.len()
+        } else {
+            let n = bound.iter().take_while(|a| a.is_some()).count();
+            if bound[n..].iter().any(Option::is_some) {
+                return None;
+            }
+            for (m, a) in map.iter_mut().zip(&bound[..n]) {
+                *m = a.expect("bound");
+            }
+            n
+        };
+        Some((map, n))
+    }
+
     /// A keyword call of a native method registered with
     /// [`leaf_builtins::register_fast_kw`]: `ops` is the core loop's
     /// `CALL_KW` operands (the callee, the self slot, the positionals, the
@@ -29218,57 +29446,13 @@ impl Interpreter {
         if ops.len() != argc + kwc + 3 || argc + kwc > 4 || crate::trace::any_observers_active() {
             return None;
         }
-        let (params, fast) = leaf_builtins::fast_kw(b)?;
-        // (A parameter named `*name` is keyword-only: no positional binds
-        // it, and the half takes `Unbound` where the call leaves it out. One
-        // named `?name` is optional the same way but may come positionally,
-        // and one named `/name` is positional-only: no keyword binds it.)
-        let keyword_only = |p: &str| p.starts_with('*');
-        let optional = |p: &str| p.starts_with('*') || p.starts_with('?');
-        if params.len() > 4 || params.iter().take(argc).any(|p| keyword_only(p)) {
-            return None;
-        }
-        let mut bound: [Option<&Object>; 4] = [None; 4];
-        for (i, a) in ops[2..2 + argc].iter().enumerate() {
-            bound[i] = Some(a);
-        }
-        for (name, value) in names.iter().zip(&ops[2 + argc..2 + argc + kwc]) {
-            let Object::Str(name) = name else {
-                return None;
-            };
-            let name: &str = name;
-            let i = params.iter().position(|p| {
-                // (One marker byte at most; lengths first.)
-                let bare = match p.as_bytes().first() {
-                    Some(b'/') => return false,
-                    Some(b'*' | b'?') => &p[1..],
-                    _ => p,
-                };
-                bare.len() == name.len() && bare == name
-            })?;
-            if i >= 4 || bound[i].is_some() {
-                return None;
-            }
-            bound[i] = Some(value);
-        }
-        let unbound = Object::Unbound;
-        let n = if params.iter().any(|p| optional(p)) {
-            for (i, p) in params.iter().enumerate() {
-                if bound[i].is_none() {
-                    if !optional(p) {
-                        return None;
-                    }
-                    bound[i] = Some(&unbound);
-                }
-            }
-            params.len()
-        } else {
-            let n = bound.iter().take_while(|a| a.is_some()).count();
-            if bound[n..].iter().any(Option::is_some) {
-                return None;
-            }
-            n
-        };
+        // The site's binding: each bound parameter's operand (an index into
+        // `ops`, `UNBOUND` for an optional one the call left out).
+        let (map, n, fast) = kw_bind_memo(b, ops.last()?, argc, || {
+            let (params, fast) = leaf_builtins::fast_kw(b)?;
+            let (map, n) = Self::kw_bind_plan(params, names, argc)?;
+            Some((map, n, fast))
+        })?;
         if !Self::core_all_droppable(ops) {
             return None;
         }
@@ -29281,9 +29465,15 @@ impl Interpreter {
             // SAFETY: a borrowed copy of the live receiver.
             args[0].write(unsafe { std::ptr::read(recv) });
         }
-        for (slot, a) in args[first..].iter_mut().zip(&bound[..n]) {
-            // SAFETY: a borrowed copy of a live operand.
-            slot.write(unsafe { std::ptr::read(a.expect("bound")) });
+        let unbound = Object::Unbound;
+        for (slot, &at) in args[first..].iter_mut().zip(&map[..n]) {
+            let a = if at == KW_UNBOUND {
+                &unbound
+            } else {
+                ops.get(at as usize)?
+            };
+            // SAFETY: a borrowed copy of a live operand (or of `Unbound`).
+            slot.write(unsafe { std::ptr::read(a) });
         }
         // SAFETY: the first `n + first` entries were written.
         let args = unsafe { std::slice::from_raw_parts(args.as_ptr().cast::<Object>(), n + first) };
@@ -34286,6 +34476,32 @@ impl Interpreter {
                         crate::builtins::str_split_kw_fast,
                     );
                 }
+                if let Some(Object::Builtin(b)) = crate::builtins::lookup_method(&probe, "rsplit") {
+                    leaf_builtins::register_fast_kw(
+                        &b,
+                        &["?sep", "?maxsplit"],
+                        crate::builtins::str_rsplit_kw_fast,
+                    );
+                }
+                if let Some(Object::Builtin(b)) =
+                    crate::builtins::lookup_method(&probe, "splitlines")
+                {
+                    leaf_builtins::register_fast_kw(
+                        &b,
+                        &["?keepends"],
+                        crate::builtins::str_splitlines_kw_fast,
+                    );
+                }
+                // `n.to_bytes(2, byteorder="big")`.
+                if let Some(Object::Builtin(b)) =
+                    crate::builtins::lookup_method(&Object::Int(0), "to_bytes")
+                {
+                    leaf_builtins::register_fast_kw(
+                        &b,
+                        &["?length", "?byteorder", "*signed"],
+                        crate::builtins::int_to_bytes_kw_fast,
+                    );
+                }
                 // `b.decode(errors="replace")` of bytes and bytearrays.
                 for probe in [
                     Object::new_bytes(Vec::<u8>::new()),
@@ -34372,6 +34588,12 @@ impl Interpreter {
                     calls.insert(
                         Rc::as_ptr(&f) as usize,
                         LeafKind::Fast(crate::builtins::int_from_bytes_leaf),
+                    );
+                    // `int.from_bytes(data, byteorder="big")`.
+                    leaf_builtins::register_fast_kw(
+                        &f,
+                        &["bytes", "?byteorder", "*signed"],
+                        crate::builtins::int_from_bytes_kw_fast,
                     );
                 }
             }
@@ -80120,6 +80342,95 @@ type CoreNext = (
 /// beyond what it returns (the full `CALL` marks after every native call;
 /// the leaf burst relies on the body instead). The leaf burst may call
 /// them directly.
+/// [`Interpreter::kw_bind_plan`]'s marker for an optional parameter the
+/// call leaves out.
+const KW_UNBOUND: u8 = u8::MAX;
+
+/// A keyword call site's binding to a registered builtin's leaf half, as
+/// [`kw_bind_memo`] remembers it.
+struct KwBind {
+    /// The builtin and the names tuple, held (so no other object takes
+    /// either's address while the entry lives).
+    builtin: Rc<crate::object::BuiltinFn>,
+    names: Object,
+    argc: usize,
+    generation: u64,
+    map: [u8; 4],
+    n: usize,
+    fast: leaf_builtins::Fast,
+}
+
+/// Recent keyword call sites' bindings, per thread: a site calls the same
+/// builtin with the same names tuple again and again, and binding them by
+/// name each time cost more than the builtin's own work. (Leaked at thread
+/// exit: dropping objects then could outlive their interpreter.)
+struct KwBindMemo([Option<KwBind>; 4]);
+
+impl Drop for KwBindMemo {
+    fn drop(&mut self) {
+        for e in &mut self.0 {
+            std::mem::forget(e.take());
+        }
+    }
+}
+
+/// The binding of a `CALL_KW` of `b` with `argc` positionals and the
+/// keywords tuple `names`: the memo's, or `plan`'s, remembered (`None`, a
+/// site the half doesn't serve, isn't).
+#[inline]
+fn kw_bind_memo(
+    b: &Rc<crate::object::BuiltinFn>,
+    names: &Object,
+    argc: usize,
+    plan: impl FnOnce() -> Option<([u8; 4], usize, leaf_builtins::Fast)>,
+) -> Option<([u8; 4], usize, leaf_builtins::Fast)> {
+    thread_local! {
+        static MEMO: std::cell::RefCell<KwBindMemo> =
+            const { std::cell::RefCell::new(KwBindMemo([const { None }; 4])) };
+    }
+    let Object::Tuple(t) = names else {
+        return None;
+    };
+    let key = t.as_ptr() as usize;
+    let way = ((key >> 4) ^ (key >> 10)) & 3;
+    let generation = leaf_builtins::fast_kw_generation();
+    let hit = MEMO
+        .try_with(|m| {
+            let m = m.try_borrow().ok()?;
+            let e = m.0[way].as_ref()?;
+            let Object::Tuple(en) = &e.names else {
+                return None;
+            };
+            (en.as_ptr() as usize == key
+                && Rc::ptr_eq(&e.builtin, b)
+                && e.argc == argc
+                && e.generation == generation)
+                .then_some((e.map, e.n, e.fast))
+        })
+        .ok()
+        .flatten();
+    if hit.is_some() {
+        return hit;
+    }
+    let (map, n, fast) = plan()?;
+    let _ = MEMO.try_with(|m| {
+        if let Ok(mut m) = m.try_borrow_mut() {
+            // (The entry it replaces releases a builtin and a tuple, which
+            // runs no code.)
+            m.0[way] = Some(KwBind {
+                builtin: b.clone(),
+                names: names.clone(),
+                argc,
+                generation,
+                map,
+                n,
+                fast,
+            });
+        }
+    });
+    Some((map, n, fast))
+}
+
 pub(crate) mod leaf_builtins {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -80243,6 +80554,12 @@ pub(crate) mod leaf_builtins {
 
     /// Bumped by every [`register_fast_kw`] (see [`fast_kw`]'s cache).
     static FAST_KW_GEN: AtomicU64 = AtomicU64::new(1);
+
+    /// The registrations' count (see [`fast_kw`]'s cache).
+    #[inline]
+    pub(crate) fn fast_kw_generation() -> u64 {
+        FAST_KW_GEN.load(Ordering::Acquire)
+    }
 
     /// Builtins opted into the JIT's native method lane (see
     /// `tier2::MethodCallee::Native`), each with its direct operation.

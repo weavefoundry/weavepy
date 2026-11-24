@@ -2323,6 +2323,11 @@ pub fn builtin_classmethod(type_name: &str, attr: &str) -> Option<Object> {
                 f.binds_instance = false;
                 let b = Rc::new(f);
                 crate::leaf_builtins::register_fast(&b, int_from_bytes_fast);
+                crate::leaf_builtins::register_fast_kw(
+                    &b,
+                    &["bytes", "?byteorder", "*signed"],
+                    int_from_bytes_kw_fast,
+                );
                 Object::Builtin(b)
             });
         }
@@ -2348,6 +2353,40 @@ fn int_from_bytes_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> 
         }
         _ => None,
     }
+}
+
+/// `int.from_bytes(bytes, byteorder='big', *, signed=False)`'s keyword
+/// half: `bytes` or `bytearray` data, a `str` order and a `bool` or `int`
+/// flag, each taking its default where the call left it out.
+pub(crate) fn int_from_bytes_kw_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    // (A subclass's result goes through `cls(result)`: the full body's.)
+    let (cls, rest) = match args {
+        [c @ Object::Type(t), rest @ ..] if Rc::ptr_eq(t, &builtin_types().int_) => (Some(c), rest),
+        [Object::Type(_), ..] => return None,
+        _ => (None, args),
+    };
+    let [data @ (Object::Bytes(_) | Object::ByteArray(_)), order, signed] = rest else {
+        return None;
+    };
+    let order = match order {
+        Object::Unbound => Object::from_static("big"),
+        Object::Str(_) => order.clone(),
+        _ => return None,
+    };
+    let signed = match signed {
+        Object::Unbound => Object::Bool(false),
+        Object::Bool(_) | Object::Int(_) => signed.clone(),
+        _ => return None,
+    };
+    let mut full = [const { Object::None }; 4];
+    let offset = usize::from(cls.is_some());
+    if let Some(c) = cls {
+        full[0] = c.clone();
+    }
+    full[offset] = data.clone();
+    full[offset + 1] = order;
+    full[offset + 2] = signed;
+    Some(int_from_bytes_body(&full[..offset + 3], &[], offset))
 }
 
 fn builtin_classmethod_fresh(type_name: &str, attr: &str) -> Option<Object> {
@@ -6008,6 +6047,19 @@ fn int_as_integer_ratio(args: &[Object]) -> Result<Object, RuntimeError> {
 // keyword-only, so this must accept keywords (pandas' offsets / hypothesis
 // call `n.to_bytes(length, byteorder, signed=...)` by keyword).
 fn int_to_bytes(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+    // (`signed` is keyword-only.)
+    if args.len() > 3 {
+        return Err(type_error(format!(
+            "to_bytes() takes at most 2 positional arguments ({} given)",
+            args.len() - 1
+        )));
+    }
+    int_to_bytes_body(args, kwargs)
+}
+
+/// [`int_to_bytes`] past its arity check: a keyword half passes `signed`
+/// fourth.
+fn int_to_bytes_body(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     let n_obj = args
         .first()
         .ok_or_else(|| type_error("to_bytes() requires self"))?;
@@ -6017,6 +6069,14 @@ fn int_to_bytes(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
         && n_obj.as_bigint().is_none()
     {
         return Err(type_error("to_bytes(): self is not an integer"));
+    }
+    if !kwargs.is_empty() {
+        check_kw_names(
+            "to_bytes",
+            &["length", "byteorder", "signed"],
+            args.len() - 1,
+            kwargs,
+        )?;
     }
     let length = match arg_or_kw(args, 1, kwargs, "length") {
         Some(Object::Int(i)) if *i >= 0 => *i as usize,
@@ -6090,6 +6150,34 @@ fn int_to_bytes(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
 
 // CPython signature: `int.from_bytes(bytes, byteorder='big', *, signed=False)`.
 // `byteorder` is positional-or-keyword, `signed` keyword-only.
+/// A keyword call's names against a method's parameters `names`, the
+/// first `npos` of which the positionals filled: CPython's errors for an
+/// unknown name and for one the positionals already gave.
+fn check_kw_names(
+    fname: &str,
+    names: &[&str],
+    npos: usize,
+    kwargs: &[(String, Object)],
+) -> Result<(), RuntimeError> {
+    for (k, _) in kwargs {
+        match names.iter().position(|n| n == k) {
+            Some(i) if i < npos => {
+                return Err(type_error(format!(
+                    "argument for {fname}() given by name ('{k}') and position ({})",
+                    i + 1
+                )))
+            }
+            Some(_) => {}
+            None => {
+                return Err(type_error(format!(
+                    "{fname}() got an unexpected keyword argument '{k}'"
+                )))
+            }
+        }
+    }
+    Ok(())
+}
+
 fn int_from_bytes_method(
     args: &[Object],
     kwargs: &[(String, Object)],
@@ -6102,6 +6190,31 @@ fn int_from_bytes_method(
             .map(|o| o.is_int_like() || matches!(o, Object::Type(_)))
             .unwrap_or(false),
     );
+    // (`signed` is keyword-only.)
+    if args.len() - offset > 2 {
+        return Err(type_error(format!(
+            "from_bytes() takes at most 2 positional arguments ({} given)",
+            args.len() - offset
+        )));
+    }
+    if !kwargs.is_empty() {
+        check_kw_names(
+            "from_bytes",
+            &["bytes", "byteorder", "signed"],
+            args.len() - offset,
+            kwargs,
+        )?;
+    }
+    int_from_bytes_body(args, kwargs, offset)
+}
+
+/// [`int_from_bytes_method`] past its argument checks, the data at
+/// `offset`: a keyword half passes `signed` third.
+fn int_from_bytes_body(
+    args: &[Object],
+    kwargs: &[(String, Object)],
+    offset: usize,
+) -> Result<Object, RuntimeError> {
     let data_obj = args
         .get(offset)
         .ok_or_else(|| type_error("from_bytes() missing data"))?;
@@ -12066,6 +12179,68 @@ pub(crate) fn str_split_kw_fast(args: &[Object]) -> Option<Result<Object, Runtim
         _ => return None,
     };
     Some(str_split(&[recv.clone(), sep, maxsplit], &[]))
+}
+
+/// `s.rsplit(sep=None, maxsplit=-1)`'s keyword half, as
+/// [`str_split_kw_fast`] is `split`'s.
+pub(crate) fn str_rsplit_kw_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [recv @ Object::Str(_), sep, maxsplit] = args else {
+        return None;
+    };
+    let sep = match sep {
+        Object::Unbound => Object::None,
+        Object::None | Object::Str(_) => sep.clone(),
+        _ => return None,
+    };
+    let maxsplit = match maxsplit {
+        Object::Unbound => Object::Int(-1),
+        Object::Int(_) => maxsplit.clone(),
+        _ => return None,
+    };
+    Some(str_rsplit(&[recv.clone(), sep, maxsplit], &[]))
+}
+
+/// `s.splitlines(keepends=False)`'s keyword half: a `bool` or `int` flag
+/// (whose truth runs no code).
+pub(crate) fn str_splitlines_kw_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [recv @ Object::Str(_), keepends] = args else {
+        return None;
+    };
+    let keepends = match keepends {
+        Object::Unbound => Object::Bool(false),
+        Object::Bool(_) | Object::Int(_) => keepends.clone(),
+        _ => return None,
+    };
+    Some(str_splitlines(&[recv.clone(), keepends], &[]))
+}
+
+/// `n.to_bytes(length=1, byteorder='big', *, signed=False)`'s keyword
+/// half: an `int` length, a `str` order and a `bool` or `int` flag, each
+/// taking its default where the call left it out.
+pub(crate) fn int_to_bytes_kw_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [recv @ (Object::Int(_) | Object::Bool(_) | Object::Long(_)), length, order, signed] = args
+    else {
+        return None;
+    };
+    let length = match length {
+        Object::Unbound => Object::Int(1),
+        Object::Int(_) => length.clone(),
+        _ => return None,
+    };
+    let order = match order {
+        Object::Unbound => Object::from_static("big"),
+        Object::Str(_) => order.clone(),
+        _ => return None,
+    };
+    let signed = match signed {
+        Object::Unbound => Object::Bool(false),
+        Object::Bool(_) | Object::Int(_) => signed.clone(),
+        _ => return None,
+    };
+    Some(int_to_bytes_body(
+        &[recv.clone(), length, order, signed],
+        &[],
+    ))
 }
 
 fn str_split(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
