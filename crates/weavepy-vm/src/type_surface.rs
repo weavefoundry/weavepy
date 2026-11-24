@@ -1234,6 +1234,23 @@ fn unwrap_shim(inner: Rc<BuiltinFn>, owner: &Rc<TypeObject>) -> Object {
                 return Ok(());
             }
         }
+        // An exact builtin value of the owner's own type (`str.upper(w)`),
+        // by address: no class to fetch.
+        let bt = crate::builtin_types::builtin_types();
+        let exact = match first {
+            Object::Str(_) => Some(&bt.str_),
+            Object::List(_) => Some(&bt.list_),
+            Object::Dict(_) => Some(&bt.dict_),
+            Object::Tuple(_) => Some(&bt.tuple_),
+            Object::Set(_) => Some(&bt.set_),
+            Object::Int(_) => Some(&bt.int_),
+            Object::Float(_) => Some(&bt.float_),
+            Object::Bytes(_) => Some(&bt.bytes_),
+            _ => None,
+        };
+        if exact.is_some_and(|t| std::ptr::eq(Rc::as_ptr(t), owner.as_ptr())) {
+            return Ok(());
+        }
         if let Some(owner) = owner.upgrade() {
             let cls = crate::builtins::class_of(first);
             if !cls.is_subclass_of(&owner) {

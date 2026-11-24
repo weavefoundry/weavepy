@@ -141,7 +141,14 @@ impl Interpreter {
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<Option<Object>, RuntimeError> {
         if let Object::Iter(c) = it {
-            return c.borrow_mut().next_value_checked();
+            let mut cur = c.borrow_mut();
+            // (A list's or tuple's cursor with an item left: the item, in
+            // one view; the end and every other cursor, the full step.)
+            if let Some(v) = cur.pure_peek() {
+                cur.pure_skip();
+                return Ok(Some(v));
+            }
+            return cur.next_value_checked();
         }
         self.iter_step(it, globals)
     }
@@ -294,6 +301,34 @@ impl Interpreter {
                 let r = match self.pure_callback(&f, &all, true) {
                     Some(r) => Ok(r),
                     None => self.call(&f, &all, &[], globals),
+                };
+                match r {
+                    Ok(r) => out.push(r),
+                    Err(e) => return stop(e),
+                }
+            }
+        }
+        // A leaf builtin callback (`map(str.upper, words)`, `map(abs, xs)`),
+        // its kind resolved once: each item through its body in place; one
+        // it declines or raises on takes the full call (a leaf runs no
+        // code, so nothing is observed twice).
+        let leaf = match &func {
+            Object::Builtin(b) => self.leaf_call_kind(b).map(|k| (b.clone(), k)),
+            _ => None,
+        };
+        if let Some((b, kind)) = leaf {
+            loop {
+                let v = match self.seq_step_source(&source, globals) {
+                    Ok(Some(v)) => v,
+                    Ok(None) => return Ok(true),
+                    Err(e) => return stop(e),
+                };
+                let r = match self.leaf_builtin_call(kind, &b, std::slice::from_ref(&v)) {
+                    Some(Ok(r)) => {
+                        self.release(v);
+                        Ok(r)
+                    }
+                    _ => self.seq_call1(&func, v, globals),
                 };
                 match r {
                     Ok(r) => out.push(r),

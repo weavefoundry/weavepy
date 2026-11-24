@@ -17720,6 +17720,7 @@ impl Interpreter {
         enum Step {
             Done(Object),
             Builtin(Rc<crate::object::BuiltinFn>, [Object; 4], usize),
+            Type(Rc<TypeObject>, [Object; 4], usize),
             Bound(Rc<crate::object::PyFunction>),
         }
         let depth = crate::recursion::current_depth();
@@ -17789,6 +17790,40 @@ impl Interpreter {
                     }
                     Some(Step::Builtin(b.clone(), buf, n))
                 }
+                // A builtin type (`partial(int, base=16)`): its keywords in
+                // the places of the parameters they name, for the native
+                // constructor, which runs no code.
+                Object::Type(t) if t.flags.is_builtin => {
+                    let n = stored.len() + args.len();
+                    let total = n + kw.len();
+                    if total > 4 {
+                        return None;
+                    }
+                    let mut buf: [Object; 4] = std::array::from_fn(|_| Object::Unbound);
+                    for (slot, v) in buf.iter_mut().zip(stored.iter().chain(args)) {
+                        *slot = v.clone();
+                    }
+                    if !kw.is_empty() {
+                        let params = crate::builtin_kw_params(t)?;
+                        if total > params.len() {
+                            return None;
+                        }
+                        for (k, v) in kw.iter() {
+                            let Object::Str(name) = &k.0 else {
+                                return None;
+                            };
+                            let at = params.iter().position(|p| *p == name.as_ref())?;
+                            if at < n || !matches!(buf[at], Object::Unbound) {
+                                return None;
+                            }
+                            buf[at] = v.clone();
+                        }
+                        if buf[..total].iter().any(|v| matches!(v, Object::Unbound)) {
+                            return None;
+                        }
+                    }
+                    Some(Step::Type(t.clone(), buf, total))
+                }
                 _ => None,
             }
         });
@@ -17804,6 +17839,7 @@ impl Interpreter {
                         .leaf_call_kind(&b)
                         .and_then(|kind| self.leaf_builtin_call(kind, &b, &buf[..n]))
                         .and_then(Result::ok),
+                    Some(Step::Type(t, buf, n)) => self.leaf_type_call(&t, &buf[..n]),
                     _ => None,
                 };
                 if let Some(mut v) = scratch {
@@ -49501,49 +49537,7 @@ impl Interpreter {
                         return Ok(keys);
                     }
                 }
-                if let Object::Instance(inst) = v {
-                    let cls = inst.cls();
-                    if !cls.flags.is_builtin {
-                        let err_is_type_error = |vm: &mut Self, e: &RuntimeError| match e {
-                            RuntimeError::PyException(pe) => vm
-                                .exception_matches(
-                                    &pe.instance,
-                                    &Object::Type(builtin_types().type_error.clone()),
-                                )
-                                .unwrap_or(false),
-                            RuntimeError::Internal(_) => false,
-                        };
-                        // `PyObject_LengthHint` order: `__len__` first; a
-                        // raising `__len__` propagates unless it's a
-                        // TypeError (test_iterlen.test_issue1242657's
-                        // `list(BadLen())` must surface the RuntimeError).
-                        let mut need_hint = cls.lookup("__length_hint__").is_some();
-                        if cls.lookup("__len__").is_some() {
-                            if let Some(len_m) = instance_method(v, "__len__") {
-                                match self.call(&len_m, &[], &[], globals) {
-                                    Ok(_) => need_hint = false,
-                                    Err(e) => {
-                                        if !err_is_type_error(self, &e) {
-                                            return Err(e);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if need_hint {
-                            if let Some(hint) = instance_method(v, "__length_hint__") {
-                                match self.call(&hint, &[], &[], globals) {
-                                    Ok(_) => {}
-                                    Err(e) => {
-                                        if !err_is_type_error(self, &e) {
-                                            return Err(e);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+                self.probe_length_hint(v, globals)?;
                 let it = self.make_iter(v, globals)?;
                 let mut out = Vec::new();
                 if let Object::Generator(g) = &it {
@@ -49632,7 +49626,116 @@ impl Interpreter {
         }
     }
 
-    /// Pull at most `n + 1` items from `v` for `UNPACK_SEQUENCE`. CPython's
+    /// CPython's `PyObject_LengthHint` probe of a plain instance before a
+    /// container is built or extended from it: `__len__` first, then the
+    /// `__length_hint__` special lookup, their call observable (and an
+    /// error other than `TypeError` raised from it), the size unused.
+    fn probe_length_hint(
+        &mut self,
+        v: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<(), RuntimeError> {
+        if let Object::Instance(inst) = v {
+            let cls = inst.cls();
+            if !cls.flags.is_builtin {
+                let err_is_type_error = |vm: &mut Self, e: &RuntimeError| match e {
+                    RuntimeError::PyException(pe) => vm
+                        .exception_matches(
+                            &pe.instance,
+                            &Object::Type(builtin_types().type_error.clone()),
+                        )
+                        .unwrap_or(false),
+                    RuntimeError::Internal(_) => false,
+                };
+                // `PyObject_LengthHint` order: `__len__` first; a
+                // raising `__len__` propagates unless it's a
+                // TypeError (test_iterlen.test_issue1242657's
+                // `list(BadLen())` must surface the RuntimeError).
+                let mut need_hint = cls.lookup("__length_hint__").is_some();
+                if cls.lookup("__len__").is_some() {
+                    if let Some(len_m) = instance_method(v, "__len__") {
+                        match self.call(&len_m, &[], &[], globals) {
+                            Ok(_) => need_hint = false,
+                            Err(e) => {
+                                if !err_is_type_error(self, &e) {
+                                    return Err(e);
+                                }
+                            }
+                        }
+                    }
+                }
+                if need_hint {
+                    if let Some(hint) = instance_method(v, "__length_hint__") {
+                        match self.call(&hint, &[], &[], globals) {
+                            Ok(_) => {}
+                            Err(e) => {
+                                if !err_is_type_error(self, &e) {
+                                    return Err(e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `b` is the exact `list`'s or `set`'s own method of its name
+    /// (`recv` one of them), not another type's body of the same name
+    /// called on it.
+    fn is_container_method(b: &Rc<crate::object::BuiltinFn>, recv: &Object) -> bool {
+        matches!(recv, Object::List(_) | Object::Set(_))
+            && matches!(
+                crate::builtins::lookup_method(recv, b.name),
+                Some(Object::Builtin(m)) if Rc::ptr_eq(&m, b)
+            )
+    }
+
+    /// `recv.extend(src)` (a list) or `recv.update(src)` (a set) over an
+    /// iterable the interpreter steps: each item added as it comes, so the
+    /// items before an error stay added and the source sees the receiver
+    /// grow, as in CPython.
+    fn extend_live(
+        &mut self,
+        recv: &Object,
+        src: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
+        // (`list.extend` asks the source's length first, as CPython's
+        // `list_extend` does; `set.update` doesn't.)
+        if matches!(recv, Object::List(_)) {
+            self.probe_length_hint(src, globals)?;
+        }
+        let it = self.make_iter(src, globals)?;
+        // A generator's yields go straight into the receiver from its lean
+        // resume (each as it's yielded, with no code run in between), what
+        // the sink can't take coming back here.
+        let sink = match (recv, &it) {
+            (Object::List(l), Object::Generator(_)) => Some(FoldSink::Collect(l.as_ptr())),
+            (Object::Set(s), Object::Generator(_)) if !crate::builtins::set_ops_deferred() => {
+                Some(FoldSink::AddTo(Rc::as_ptr(s)))
+            }
+            _ => None,
+        };
+        loop {
+            let x = match &it {
+                Object::Generator(g) => self.gen_drain_next(g, sink, false)?,
+                _ => self.iter_next(&it, globals)?,
+            };
+            let Some(x) = x else {
+                return Ok(Object::None);
+            };
+            match recv {
+                Object::List(l) => l.borrow_mut().push(x),
+                _ => {
+                    crate::builtins::set_add(&[recv.clone(), x])?;
+                }
+            }
+        }
+    }
+
+    /// Pull at most `n + 1` items from `v` for `UNPACK_SEQUENCE`.    /// Pull at most `n + 1` items from `v` for `UNPACK_SEQUENCE`. CPython's
     /// `unpack_iterable` walks the iterator protocol directly (no `__len__`
     /// or `__length_hint__` probe) and stops at the first surplus item, so
     /// a too-long iterator keeps its remaining items and an unbounded
@@ -63679,6 +63782,19 @@ impl Interpreter {
                     // first iterate them into out-of-range int items. `list.extend`
                     // always iterates, so this is restricted to a bytearray
                     // receiver.
+                    // `list.extend(it)` / `set.update(it)` of an exact list
+                    // or set over an iterable only the interpreter can step:
+                    // each item added as it comes, as CPython's
+                    // `list_extend_iter` and `set_update_internal` add them
+                    // (a generator that reads the receiver sees it grow).
+                    if args.len() == 2
+                        && object_needs_vm_iter(&args[1])
+                        && ((b.name == "extend" && matches!(args[0], Object::List(_)))
+                            || (b.name == "update" && matches!(args[0], Object::Set(_))))
+                        && Self::is_container_method(b, &args[0])
+                    {
+                        return self.extend_live(&args[0], &args[1], outer_globals);
+                    }
                     if b.name == "extend"
                         && matches!(args.first(), Some(Object::ByteArray(_)))
                         && args.get(1).is_some_and(|a| {
@@ -79867,6 +79983,9 @@ enum FoldSink {
     Sum(*mut SumState),
     Collect(*mut Vec<Object>),
     Truth(bool),
+    /// `set.update()`'s set, which takes a `str`, `int` or tuple of them
+    /// that it can hash and compare with no code run.
+    AddTo(*const RefCell<crate::object::SetData>),
 }
 
 impl FoldSink {
@@ -79888,6 +80007,33 @@ impl FoldSink {
                 // SAFETY: the yielded value moves out.
                 unsafe { (*out).push(top.read()) };
                 true
+            }
+            Self::AddTo(set) => {
+                // SAFETY: the caller's contract; the set is the consumer's,
+                // alive while the resume runs, and a view of it that no
+                // other borrow holds runs no code.
+                unsafe {
+                    let k = &*top;
+                    if !matches!(k, Object::Str(_) | Object::Int(_) | Object::Tuple(_)) {
+                        return false;
+                    }
+                    let Some(probe) = crate::object::LeafProbe::new(k) else {
+                        return false;
+                    };
+                    let Some(m) = (*set).peek_mut() else {
+                        return false;
+                    };
+                    if m.get_index_of(&probe).is_some() {
+                        // (Present: the yielded value, a plain one, drops.)
+                        drop(top.read());
+                    } else if probe.miss_is_exact() {
+                        m.insert(DictKey(top.read()));
+                    } else {
+                        // (A key of another kind that may equal it.)
+                        return false;
+                    }
+                    true
+                }
             }
             // SAFETY: the caller's contract.
             Self::Truth(decides) => match unsafe { &*top } {
@@ -88611,17 +88757,7 @@ pub(crate) fn inst_method_unshadowed_by(
 /// base=16)`, `enumerate(xs, start=1)`, `str(b, encoding="utf-8")`).
 #[cfg(feature = "jit")]
 pub(crate) fn builtin_kw_positional(ty: &Rc<TypeObject>, argc: usize, names: &Object) -> bool {
-    let bt = builtin_types();
-    // (A `/` marks a positional-only parameter.)
-    let params: &[&str] = if Rc::ptr_eq(ty, &bt.int_) {
-        &["/x", "base"]
-    } else if Rc::ptr_eq(ty, &bt.enumerate_) {
-        &["iterable", "start"]
-    } else if Rc::ptr_eq(ty, &bt.str_) {
-        &["object", "encoding", "errors"]
-    } else if Rc::ptr_eq(ty, &bt.bytes_) || Rc::ptr_eq(ty, &bt.bytearray_) {
-        &["source", "encoding", "errors"]
-    } else {
+    let Some(params) = builtin_kw_params(ty) else {
         return false;
     };
     let Object::Tuple(names) = names else {
@@ -88633,6 +88769,24 @@ pub(crate) fn builtin_kw_positional(ty: &Rc<TypeObject>, argc: usize, names: &Ob
             let p = params[argc + j];
             !p.starts_with('/') && matches!(n, Object::Str(s) if s.as_ref() == p)
         })
+}
+
+/// The parameters of the builtin types whose keyword calls
+/// [`builtin_kw_positional`] maps to positions (a `/` marks a
+/// positional-only one).
+pub(crate) fn builtin_kw_params(ty: &Rc<TypeObject>) -> Option<&'static [&'static str]> {
+    let bt = builtin_types();
+    Some(if Rc::ptr_eq(ty, &bt.int_) {
+        &["/x", "base"]
+    } else if Rc::ptr_eq(ty, &bt.enumerate_) {
+        &["iterable", "start"]
+    } else if Rc::ptr_eq(ty, &bt.str_) {
+        &["object", "encoding", "errors"]
+    } else if Rc::ptr_eq(ty, &bt.bytes_) || Rc::ptr_eq(ty, &bt.bytearray_) {
+        &["source", "encoding", "errors"]
+    } else {
+        return None;
+    })
 }
 
 /// The leaf builtin's kind the `CALL` at `pc` last settled on.

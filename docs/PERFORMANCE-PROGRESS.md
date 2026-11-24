@@ -2934,6 +2934,23 @@ branch and pull request.
     `batched` and `zip_longest` now step a finished list iterator to its
     end, so one the caller still holds sees no later appends, as in
     CPython (it returned them).
+  - `list.extend()` and `set.update()` over a generator or an iterator
+    class collected every item before adding any, so a generator that
+    read the receiver saw it unchanged (`xs.extend(len(xs) for _ in
+    range(3))` gave `[0, 0, 0]`, CPython `[0, 1, 2]`). They now add
+    each item as it comes; a generator's lean resume moves each yield
+    straight into the list, or into the set when it hashes with no code
+    run, which is also faster: nine items 8,384 instructions to 7,820
+    for `extend` and 11,962 to 8,523 for `update` (CPython 5,371 and
+    6,402). A `functools.partial` over a builtin type with stored
+    keywords (`partial(int, base=16)`) took the generic call; its
+    keywords now fill the parameters they name for the type's native
+    constructor, as a keyword call of the type does: 4,835 to 1,861
+    (CPython 3,171). `list(map(f, xs))` with a leaf builtin `f`
+    (`str.upper`, `abs`) resolves its body once instead of per item,
+    steps a list or tuple source in one view, and an unbound method's
+    receiver check takes an exact builtin value by its type's address
+    (four words 7,561 to 6,654, CPython 4,066).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

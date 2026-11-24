@@ -16338,6 +16338,12 @@ fn take_dead_set_ops(q: &mut Vec<(DeferredSet, SetInplaceOp)>) -> Vec<SetInplace
 /// Drain and return any deferred ops queued against `ptr`. The queue
 /// borrow is released before the caller applies them, so a further
 /// re-entrant mutation during replay can queue again without conflict.
+/// Whether any set mutation is waiting in the deferred queue (see
+/// `SET_DEFERRED_OPS`), which a direct insert would overtake.
+pub(crate) fn set_ops_deferred() -> bool {
+    SET_DEFERRED_OPS.with(|q| q.try_borrow().map_or(true, |q| !q.is_empty()))
+}
+
 fn take_deferred_set_ops(set: &Rc<RefCell<crate::object::SetData>>) -> Vec<SetInplaceOp> {
     let (drained, dead) = SET_DEFERRED_OPS.with(|q| {
         let mut q = q.borrow_mut();
@@ -16428,7 +16434,7 @@ fn set_iter_items(obj: &Object) -> Result<Vec<DictKey>, RuntimeError> {
     }
 }
 
-fn set_add(args: &[Object]) -> Result<Object, RuntimeError> {
+pub(crate) fn set_add(args: &[Object]) -> Result<Object, RuntimeError> {
     let v = args
         .get(1)
         .cloned()
