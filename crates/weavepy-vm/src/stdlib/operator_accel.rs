@@ -132,7 +132,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         // have no dunders, so the native arithmetic is the whole call (a
         // core-loop or compiled caller, and a `partial` over one, run it in
         // place). Anything else declines to the full body.
-        for (name, fast) in BINARY_FAST {
+        for (name, fast) in BINARY_FAST.iter().chain(OTHER_FAST) {
             if let Some(Object::Builtin(b)) = d.get(&crate::object::StrKey(name)) {
                 crate::leaf_builtins::register_fast(b, *fast);
             }
@@ -346,10 +346,59 @@ const BINARY_FAST: &[(&str, crate::leaf_builtins::Fast)] = &[
     ("rshift", |a| binary_fast(a, BinOpKind::RShift)),
 ];
 
-/// Whether `f` is one of [`BINARY_FAST`]'s halves, which run no code (a
-/// frameless leaf may call them).
+/// The leaf halves of the unary and comparison functions: a plain int or
+/// float operand has no dunders, so the native operation is the whole call
+/// (`sorted(xs, key=operator.neg)` computes its keys in place).
+const OTHER_FAST: &[(&str, crate::leaf_builtins::Fast)] = &[
+    ("neg", |a| unary_fast(a, UnaryKind::Neg)),
+    ("pos", |a| unary_fast(a, UnaryKind::Pos)),
+    ("invert", |a| unary_fast(a, UnaryKind::Invert)),
+    ("inv", |a| unary_fast(a, UnaryKind::Invert)),
+    ("lt", |a| compare_fast(a, CompareKind::Lt)),
+    ("le", |a| compare_fast(a, CompareKind::LtE)),
+    ("eq", |a| compare_fast(a, CompareKind::Eq)),
+    ("ne", |a| compare_fast(a, CompareKind::NotEq)),
+    ("gt", |a| compare_fast(a, CompareKind::Gt)),
+    ("ge", |a| compare_fast(a, CompareKind::GtE)),
+];
+
+fn unary_fast(args: &[Object], op: UnaryKind) -> Option<Result<Object, RuntimeError>> {
+    Some(Ok(match (args, op) {
+        ([Object::Int(x)], UnaryKind::Neg) => Object::Int(x.checked_neg()?),
+        ([Object::Int(x)], UnaryKind::Pos) => Object::Int(*x),
+        ([Object::Int(x)], UnaryKind::Invert) => Object::Int(!x),
+        ([Object::Float(x)], UnaryKind::Neg) => Object::Float(-x),
+        ([Object::Float(x)], UnaryKind::Pos) => Object::Float(*x),
+        _ => return None,
+    }))
+}
+
+fn compare_fast(args: &[Object], op: CompareKind) -> Option<Result<Object, RuntimeError>> {
+    use std::cmp::Ordering;
+    let ord = match args {
+        [Object::Int(x), Object::Int(y)] => Some(x.cmp(y)),
+        [Object::Float(x), Object::Float(y)] => x.partial_cmp(y),
+        _ => return None,
+    };
+    let r = match op {
+        CompareKind::Lt => ord == Some(Ordering::Less),
+        CompareKind::LtE => matches!(ord, Some(Ordering::Less | Ordering::Equal)),
+        CompareKind::Eq => ord == Some(Ordering::Equal),
+        // (NaN is unequal to everything, itself included.)
+        CompareKind::NotEq => ord != Some(Ordering::Equal),
+        CompareKind::Gt => ord == Some(Ordering::Greater),
+        CompareKind::GtE => matches!(ord, Some(Ordering::Greater | Ordering::Equal)),
+    };
+    Some(Ok(Object::Bool(r)))
+}
+
+/// Whether `f` is one of [`BINARY_FAST`]'s or [`OTHER_FAST`]'s halves,
+/// which run no code (a frameless leaf may call them).
 pub(crate) fn is_fast_half(f: crate::leaf_builtins::Fast) -> bool {
-    BINARY_FAST.iter().any(|&(_, p)| std::ptr::fn_addr_eq(p, f))
+    BINARY_FAST
+        .iter()
+        .chain(OTHER_FAST)
+        .any(|&(_, p)| std::ptr::fn_addr_eq(p, f))
 }
 
 fn binary(args: &[Object], op: BinOpKind, name: &str) -> Result<Object, RuntimeError> {

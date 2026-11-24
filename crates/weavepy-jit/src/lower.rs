@@ -156,6 +156,11 @@ struct Lowerer<'a, 'b> {
     /// `Some` only when the embedder registered a poll helper and the
     /// function has loop headers to instrument.
     poll_countdown: Option<Variable>,
+    /// Each obj-global's pin index for this native run, by the helper's
+    /// argument ([`Self::emit_push_global_obj`]): `i64::MIN` until a
+    /// load asks the helper, which answers one pin per activation and
+    /// token, so later loads (a loop's every iteration) reuse it.
+    global_obj_vars: HashMap<i64, Variable>,
     /// The abstract operand stack: SSA value + lane.
     vstack: Vec<(Value, JitType)>,
     /// The local each loaded value came from (see [`Self::recv_facts`]).
@@ -288,6 +293,7 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             quad_sig: None,
             poll_sig: None,
             poll_countdown: None,
+            global_obj_vars: HashMap::default(),
             vstack: Vec::new(),
             local_of: HashMap::default(),
             recv_facts: Vec::new(),
@@ -434,6 +440,28 @@ impl<'a, 'b> Lowerer<'a, 'b> {
             let seed = self.b.ins().iconst(types::I64, runtime::JIT_POLL_STRIDE);
             self.b.def_var(var, seed);
             self.poll_countdown = Some(var);
+        }
+
+        // The obj-globals' pin registers, unknown until first asked.
+        let mut codes: Vec<i64> = self
+            .tfunc
+            .blocks
+            .iter()
+            .flat_map(|b| &b.stmts)
+            .filter_map(|st| match st.op {
+                TOp::PushGlobalObj { token, lane } => {
+                    Some(runtime::global_obj_list_code(token, lane))
+                }
+                _ => None,
+            })
+            .collect();
+        codes.sort_unstable();
+        codes.dedup();
+        for code in codes {
+            let var = self.b.declare_var(types::I64);
+            let unknown = self.b.ins().iconst(types::I64, i64::MIN);
+            self.b.def_var(var, unknown);
+            self.global_obj_vars.insert(code, var);
         }
 
         // Declare + initialise a variable per managed local.
@@ -1516,15 +1544,27 @@ impl<'a, 'b> Lowerer<'a, 'b> {
     /// interpreter re-executes the `LOAD_GLOBAL`.
     fn emit_push_global_obj(&mut self, token: u32, lane: JitType, pc: u32) {
         let snapshot = self.vstack.clone();
+        let code = runtime::global_obj_list_code(token, lane);
+        // A load after the first in this run reads the pin it got.
+        let known = self.global_obj_vars.get(&code).copied();
+        let join = known.map(|var| {
+            let cached = self.b.use_var(var);
+            let miss = self.b.ins().icmp_imm(IntCC::Equal, cached, i64::MIN);
+            let ask = self.b.create_block();
+            let join = self.b.create_block();
+            self.b.append_block_param(join, types::I64);
+            self.b
+                .ins()
+                .brif(miss, ask, &[], join, &[BlockArg::from(cached)]);
+            self.b.switch_to_block(ask);
+            (var, join)
+        });
         let sig = self.pin_helper_sig();
         let helper = self
             .b
             .ins()
             .iconst(self.ptr_ty, runtime::global_obj_helper_addr() as i64);
-        let tokenv = self
-            .b
-            .ins()
-            .iconst(types::I64, runtime::global_obj_list_code(token, lane));
+        let tokenv = self.b.ins().iconst(types::I64, code);
         let call = self
             .b
             .ins()
@@ -1533,6 +1573,15 @@ impl<'a, 'b> Lowerer<'a, 'b> {
         let bad = self.b.ins().icmp_imm(IntCC::SignedLessThan, res, -1);
         let cont = self.guard(bad, pc, &snapshot);
         self.b.switch_to_block(cont);
+        let res = match join {
+            Some((var, join)) => {
+                self.b.def_var(var, res);
+                self.b.ins().jump(join, &[BlockArg::from(res)]);
+                self.b.switch_to_block(join);
+                self.b.block_params(join)[0]
+            }
+            None => res,
+        };
         self.vstack.push((res, lane));
     }
 

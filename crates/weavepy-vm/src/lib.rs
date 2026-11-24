@@ -34354,7 +34354,7 @@ impl Interpreter {
                 calls.insert(Rc::as_ptr(&f) as usize, LeafKind::ObjectNew);
             }
             let mut methods = Vec::new();
-            let table: [(LeafRecv, Object, &[(&'static str, LeafKind)]); 7] = [
+            let table: [(LeafRecv, Object, &[(&'static str, LeafKind)]); 8] = [
                 (
                     LeafRecv::List,
                     Object::new_list(Vec::new()),
@@ -34473,6 +34473,17 @@ impl Interpreter {
                         ),
                         // (A machine int's popcount, or a big one's.)
                         ("bit_count", LeafKind::Opaque),
+                    ],
+                ),
+                // (Each reads the float's bits and runs no code.)
+                (
+                    LeafRecv::Float,
+                    Object::Float(0.0),
+                    &[
+                        ("is_integer", LeafKind::Opaque),
+                        ("as_integer_ratio", LeafKind::Opaque),
+                        ("hex", LeafKind::Opaque),
+                        ("conjugate", LeafKind::Opaque),
                     ],
                 ),
                 (
@@ -34896,6 +34907,7 @@ impl Interpreter {
             Object::Set(_) => LeafRecv::Set,
             Object::Str(_) => LeafRecv::Str,
             Object::Int(_) => LeafRecv::Int,
+            Object::Float(_) => LeafRecv::Float,
             Object::Bytes(_) => LeafRecv::Bytes,
             Object::ByteArray(_) => LeafRecv::ByteArray,
             _ => return None,
@@ -79011,6 +79023,7 @@ enum LeafRecv {
     Set,
     Str,
     Int,
+    Float,
     Bytes,
     ByteArray,
 }
@@ -79027,6 +79040,7 @@ fn leaf_recv_tag(recv: &Object) -> Option<u64> {
         | Object::Set(_)
         | Object::Str(_)
         | Object::Int(_)
+        | Object::Float(_)
         | Object::Bytes(_)
         | Object::ByteArray(_) => builtin_recv_tag(recv),
         _ => None,

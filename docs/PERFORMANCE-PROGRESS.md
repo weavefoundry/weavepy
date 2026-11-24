@@ -2821,6 +2821,19 @@ branch and pull request.
     as the separator split's already was), and a short string's list
     takes its fields' bound, half its length. `"-".join(s.split())` went
     from 1.44 times CPython's instructions to 1.27.
+  - `operator.neg`, `pos`, `invert` and the six comparisons had no leaf
+    halves (the arithmetic functions did), so `sorted(xs,
+    key=operator.neg)` called the key per item through the full call:
+    4,743 instructions against CPython's 2,891. A plain int or float now
+    takes the native operation in place (2,930), and `operator.lt(i, 5)`
+    costs 410 against 601. Float receivers join the leaf method table,
+    so `x.is_integer()` and `x.as_integer_ratio()` run in place (568 to
+    456, CPython 406).
+  - Tier 2 loaded a global object (`type`, `int`, a module) through its
+    helper at every use, about 40 instructions a load each iteration,
+    though the helper pins one object per activation. The compiled code
+    now keeps the pin it got for the rest of the run: `type(x) is int`
+    in a tier-2 loop went from 693 instructions to 635.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
