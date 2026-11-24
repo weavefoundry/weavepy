@@ -2798,6 +2798,13 @@ branch and pull request.
     `hasattr` of a module takes the same answer. `int.bit_count`,
     `bytes.find` and `bytes.hex` became leaves too, and `b.hex(":")`
     writes its separator as it writes the digits.
+  - `sum(xs)` of a list or tuple with floats declined the compiled call's
+    leaf, which took only machine ints, and went through the full call,
+    whose switch from the integer loop to the compensated float loop
+    added through the generic binary operation: `sum([1.5, 2.5, 3.5])`
+    cost 1,746 instructions (CPython 1,331). The leaf now falls back to
+    the numeric sum, which runs no code, and the switch adds the float
+    directly: 649.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

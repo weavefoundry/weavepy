@@ -9073,11 +9073,16 @@ pub(crate) fn sum_numeric_sequence(
                     // CPython leaves its integer loop permanently on overflow.
                     // If this addition yields a float, its float loop follows;
                     // later floats reached through generic arithmetic don't.
-                    total = crate::binary_op(
-                        &Object::Int(integer),
-                        item,
-                        weavepy_compiler::BinOpKind::Add,
-                    )?;
+                    // (A float's is `float(integer) + item`, the machine
+                    // int rounded to the nearest double.)
+                    total = match item {
+                        Object::Float(value) => Object::Float(integer as f64 + *value),
+                        _ => crate::binary_op(
+                            &Object::Int(integer),
+                            item,
+                            weavepy_compiler::BinOpKind::Add,
+                        )?,
+                    };
                     break;
                 }
             }

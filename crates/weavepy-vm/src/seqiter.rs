@@ -3746,9 +3746,20 @@ pub(crate) fn sum_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> 
     };
     // (A byte string's or buffer's bytes: their total can't overflow.)
     let bytes_total = |b: &[u8]| b.iter().map(|&x| u64::from(x)).sum::<u64>() as i64;
+    // (A list or tuple with floats, or past a machine int: the numeric
+    // sum's int-then-float loops, which run no code either.)
+    let numeric = || crate::builtins::sum_numeric_sequence(&args[0], &Object::Int(0));
     match args {
-        [Object::Tuple(t)] => t.iter().try_for_each(&mut add)?,
-        [Object::List(l)] => l.try_borrow().ok()?.iter().try_for_each(&mut add)?,
+        [Object::Tuple(t)] => {
+            if t.iter().try_for_each(&mut add).is_none() {
+                return numeric();
+            }
+        }
+        [Object::List(l)] => {
+            if l.try_borrow().ok()?.iter().try_for_each(&mut add).is_none() {
+                return numeric();
+            }
+        }
         [Object::Bytes(b)] => return Some(Ok(Object::Int(bytes_total(b)))),
         [Object::ByteArray(b)] => return Some(Ok(Object::Int(bytes_total(&b.try_borrow().ok()?)))),
         _ => return None,
