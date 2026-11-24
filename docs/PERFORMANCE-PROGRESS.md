@@ -2950,7 +2950,13 @@ branch and pull request.
     (`str.upper`, `abs`) resolves its body once instead of per item,
     steps a list or tuple source in one view, and an unbound method's
     receiver check takes an exact builtin value by its type's address
-    (four words 7,561 to 6,654, CPython 4,066).
+    (four words 7,561 to 6,654, CPython 4,066). `list()`, `tuple()`,
+    `set()` and `sorted()` of an enum class whose metaclass iterates it
+    with `enum`'s own `EnumType.__iter__` read the members from
+    `_member_map_` in `_member_names_` order, as that generator yields
+    them, instead of calling it and resuming the generator per member
+    (none while a tracer or profiler would see it): `list(Color)` of
+    two members 11,311 to 3,297 (CPython 5,731).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

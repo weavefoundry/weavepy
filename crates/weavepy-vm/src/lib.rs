@@ -49413,6 +49413,11 @@ impl Interpreter {
         if let Some(items) = crate::stdlib::struct_mod::array_items(v) {
             return Ok(items);
         }
+        if let Object::Type(t) = v {
+            if let Some(items) = Self::enum_members(t) {
+                return Ok(items);
+            }
+        }
         if let Object::LazyIter(l) = v {
             if let Some(items) = crate::seqiter::islice_collect(l) {
                 return Ok(items);
@@ -49624,6 +49629,47 @@ impl Interpreter {
                 Ok(out)
             }
         }
+    }
+
+    /// The members of an enum class whose metaclass iterates it with
+    /// `enum`'s own `EnumType.__iter__` (`list(Color)`): its
+    /// `_member_map_` entries in `_member_names_` order, as that
+    /// generator yields them, read with no code run. `None` for anything
+    /// else (a name the map lacks, whose `KeyError` the generator
+    /// raises), or while a tracer or profiler would see the generator.
+    fn enum_members(cls: &Rc<TypeObject>) -> Option<Vec<Object>> {
+        if cls.metaclass_is_type() || crate::trace::any_observers_active() {
+            return None;
+        }
+        let meta = cls.metaclass_or_type();
+        let Some(Object::Function(f)) = meta.lookup("__iter__") else {
+            return None;
+        };
+        // SAFETY: GIL-serialized raw read of the function's code cell.
+        let code: &CodeObject = unsafe { &*f.code.as_ptr() };
+        if code.qualname != "EnumType.__iter__"
+            || !f.globals.try_borrow().is_ok_and(|g| {
+                matches!(
+                    g.get(&crate::object::StrKey("__name__")),
+                    Some(Object::Str(n)) if &**n == "enum"
+                )
+            })
+        {
+            return None;
+        }
+        let (Some(Object::Dict(map)), Some(Object::List(names))) =
+            (cls.lookup("_member_map_"), cls.lookup("_member_names_"))
+        else {
+            return None;
+        };
+        let (map, names) = (map.try_borrow().ok()?, names.try_borrow().ok()?);
+        names
+            .iter()
+            .map(|n| match n {
+                Object::Str(_) => map.get(&DictKey(n.clone())).cloned(),
+                _ => None,
+            })
+            .collect()
     }
 
     /// CPython's `PyObject_LengthHint` probe of a plain instance before a
