@@ -12090,7 +12090,14 @@ fn str_split_whitespace(s: &str, ascii: bool, maxsplit: i64) -> Vec<Object> {
     // Presized: `collect()` over a filtered split carries no size hint.
     // English prose averages under five letters a word, so a quarter of
     // the length covers a sentence without growing (each growth copies).
-    let mut out = Vec::with_capacity((s.len() / 4).min(256) + 1);
+    // (A short string's fields can't outnumber half its length, rounded
+    // up: `"a b c d"` takes four slots, not two and then a regrowth.)
+    let cap = if s.len() <= 16 {
+        s.len().div_ceil(2)
+    } else {
+        (s.len() / 4).min(256) + 1
+    };
+    let mut out = Vec::with_capacity(cap);
     let limit = if maxsplit < 0 { i64::MAX } else { maxsplit };
     let mut splits = 0i64;
     if ascii {
@@ -12116,7 +12123,12 @@ fn str_split_whitespace(s: &str, ascii: bool, maxsplit: i64) -> Vec<Object> {
             while i < b.len() && !is_space(b[i]) {
                 i += 1;
             }
-            out.push(Object::Str(SharedStr::from_ascii(&s[start..i])));
+            // (A one-character field is the shared string, as CPython's.)
+            out.push(Object::Str(if i - start == 1 {
+                SharedStr::ascii_char(b[start])
+            } else {
+                SharedStr::from_ascii(&s[start..i])
+            }));
             splits += 1;
         }
         return out;

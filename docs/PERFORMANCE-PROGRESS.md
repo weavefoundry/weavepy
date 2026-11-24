@@ -2815,6 +2815,12 @@ branch and pull request.
     from the keyword names as `dict(a=1, b=2)` does (2,300);
     `d.update(a=1, b=2)` stores the name objects through the leaf's
     insert (3,031 to 1,796, CPython 1,882).
+  - `s.split()` on whitespace sized its list for a quarter of the text's
+    length, so `"a b c d"` grew it twice, and allocated every field: a
+    one-character field is now the shared string, as CPython's is (and
+    as the separator split's already was), and a short string's list
+    takes its fields' bound, half its length. `"-".join(s.split())` went
+    from 1.44 times CPython's instructions to 1.27.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
