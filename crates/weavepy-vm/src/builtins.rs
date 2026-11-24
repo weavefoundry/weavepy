@@ -15358,6 +15358,33 @@ pub(crate) fn bytes_decode_kw_fast(args: &[Object]) -> Option<Result<Object, Run
     }
 }
 
+/// `b.find(sub[, start[, end]])` of `bytes` with a `bytes` or `int`
+/// needle and `int` bounds: the full body, which then runs no code.
+pub(crate) fn bytes_find_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    match args {
+        [Object::Bytes(_), Object::Bytes(_) | Object::Int(_), rest @ ..]
+            if rest.len() <= 2 && rest.iter().all(|a| matches!(a, Object::Int(_))) =>
+        {
+            Some(bytes_find(args))
+        }
+        _ => None,
+    }
+}
+
+/// `b.hex([sep[, bytes_per_sep]])` of `bytes` with an exact `str` or
+/// `bytes` separator and an `int` group size: the full body, which then
+/// runs no code (only a separator's own `__len__` could).
+pub(crate) fn bytes_hex_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    match args {
+        [Object::Bytes(_)]
+        | [Object::Bytes(_), Object::Str(_) | Object::Bytes(_)]
+        | [Object::Bytes(_), Object::Str(_) | Object::Bytes(_), Object::Int(_)] => {
+            Some(bytes_hex_kw(args, &[]))
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn bytes_decode_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let (recv, rest) = args.split_first()?;
     if rest.len() > 1 && !(rest.len() == 2 && is_builtin_error_handler(&rest[1])) {
@@ -17163,11 +17190,37 @@ fn hex_ascii(data: &[u8]) -> SharedStr {
     }
 }
 
+/// [`hex_ascii`] with the ASCII byte `sep` between bytes' digits.
+fn hex_ascii_sep(data: &[u8], sep: u8) -> SharedStr {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let len = (data.len() * 3).saturating_sub(1);
+    // SAFETY: hex digits and `sep` are ASCII, one code point a byte, `len`
+    // in all.
+    unsafe {
+        SharedStr::build_unchecked(len, Some(len), |w| {
+            for (i, &b) in data.iter().enumerate() {
+                if i > 0 {
+                    w.push(&[sep]);
+                }
+                w.push(&[HEX[usize::from(b >> 4)], HEX[usize::from(b & 15)]]);
+            }
+        })
+    }
+}
+
 fn bytes_hex_kw(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
     // `b.hex()` of bytes without a separator: the digits straight into the
     // string's own allocation.
     if let ([Object::Bytes(b)], []) = (args, kwargs) {
         return Ok(Object::Str(hex_ascii(b)));
+    }
+    // `b.hex(":")`: one ASCII separator between every byte's digits.
+    if let ([Object::Bytes(b), Object::Str(sep)], []) = (args, kwargs) {
+        if let &[c] = sep.as_bytes() {
+            if c.is_ascii() {
+                return Ok(Object::Str(hex_ascii_sep(b, c)));
+            }
+        }
     }
     let data = match args.first() {
         Some(Object::MemoryView(mv)) => mv.to_bytes(),

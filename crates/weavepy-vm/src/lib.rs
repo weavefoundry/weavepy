@@ -34421,12 +34421,18 @@ impl Interpreter {
                             "bit_length",
                             LeafKind::Fast(crate::builtins::int_bit_length_leaf),
                         ),
+                        // (A machine int's popcount, or a big one's.)
+                        ("bit_count", LeafKind::Opaque),
                     ],
                 ),
                 (
                     LeafRecv::Bytes,
                     Object::new_bytes(Vec::new()),
-                    &[("decode", LeafKind::Fast(crate::builtins::bytes_decode_leaf))],
+                    &[
+                        ("decode", LeafKind::Fast(crate::builtins::bytes_decode_leaf)),
+                        ("find", LeafKind::Fast(crate::builtins::bytes_find_leaf)),
+                        ("hex", LeafKind::Fast(crate::builtins::bytes_hex_leaf)),
+                    ],
                 ),
                 // A buffer built a byte or a chunk at a time, and read back.
                 (
@@ -35357,10 +35363,19 @@ impl Interpreter {
             // A plain module's global (`hasattr(os, 'getpid')`): its
             // dictionary's value (`ModuleType`'s descriptors are dunders;
             // a missing name may reach a module `__getattr__`).
+            //
+            // A missing one with a default, the module defining no
+            // `__getattr__`, is the default (`getattr(os, "name", None)`).
             Object::Module(m)
                 if !name.starts_with("__") && !crate::object::module_classes_possible() =>
             {
-                return m.dict.borrow().get(&crate::object::StrKey(name)).cloned();
+                let dict = m.dict.borrow();
+                if let Some(v) = dict.get(&crate::object::StrKey(name)) {
+                    return Some(v.clone());
+                }
+                let d = default?;
+                return (!dict.contains_key(&crate::object::StrKey("__getattr__")))
+                    .then(|| d.clone());
             }
             // A generator's (or coroutine's) public name it doesn't have
             // (`hasattr(gen, "keys")`, as a mapping update probes its
@@ -35401,14 +35416,24 @@ impl Interpreter {
             | Object::ByteArray(_)
                 if !name.starts_with('_') && !probe =>
             {
-                return match builtins::lookup_method(recv, name)? {
-                    m @ Object::Builtin(_) if matches!(&m, Object::Builtin(b) if b.binds_instance) => {
+                return match builtins::lookup_method(recv, name) {
+                    Some(m @ Object::Builtin(_)) if matches!(&m, Object::Builtin(b) if b.binds_instance) => {
                         Some(Object::BoundMethod(Rc::new(BoundMethod::new(
                             recv.clone(),
                             m,
                         ))))
                     }
-                    _ => None,
+                    Some(_) => None,
+                    // (A miss the full path found, remembered per class
+                    // version, is the default, as for any other built-in
+                    // value below.)
+                    None => {
+                        let d = default?;
+                        let c = builtin_value_class(recv)?;
+                        (c.verdict_cached(crate::types::Verdict::ValueAttrMissing, name)
+                            == Some(true))
+                        .then(|| d.clone())
+                    }
                 };
             }
             // A built-in value's class the full path found has no such

@@ -2787,6 +2787,17 @@ branch and pull request.
     items first to last (CPython's `list_dealloc` goes last to first),
     `to_bytes` and `from_bytes` took `signed` positionally, and both
     ignored an unknown keyword.
+  - `getattr(obj, name, default)` of a missing attribute took the full
+    call on a module (7,015 instructions, CPython 1,039), which built and
+    formatted the `AttributeError` it then dropped, and on a string or
+    container (2,062 and 2,039), whose method lookup missed and declined.
+    The compiled call's leaf now answers a module's miss with the default
+    when the module has no `__getattr__` (885), and a string's or
+    container's with it once the full path has recorded the miss for the
+    class, as it already did for other built-in values (768 and 764);
+    `hasattr` of a module takes the same answer. `int.bit_count`,
+    `bytes.find` and `bytes.hex` became leaves too, and `b.hex(":")`
+    writes its separator as it writes the digits.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
