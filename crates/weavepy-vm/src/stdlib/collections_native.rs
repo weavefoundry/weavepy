@@ -2109,15 +2109,19 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             ("_most_common_plain", most_common_plain),
             ("_log_methods", log_methods),
         ] {
-            d.insert(
-                DictKey(Object::from_static(name)),
-                Object::Builtin(Rc::new(BuiltinFn {
-                    name,
-                    binds_instance: false,
-                    call: Box::new(f),
-                    call_kw: None,
-                })),
-            );
+            let b = Rc::new(BuiltinFn {
+                name,
+                binds_instance: false,
+                call: Box::new(f),
+                call_kw: None,
+            });
+            // The copy and the count ranking read plain values and decline
+            // anything else: their bodies run no code, so compiled callers
+            // call them in place (`copy.deepcopy`, `most_common(n)`).
+            if name != "_log_methods" {
+                crate::leaf_builtins::register(&b);
+            }
+            d.insert(DictKey(Object::from_static(name)), Object::Builtin(b));
         }
         let mut reg = |export: &'static str,
                        name: &'static str,

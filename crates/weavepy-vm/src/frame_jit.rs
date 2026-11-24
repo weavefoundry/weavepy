@@ -8250,13 +8250,34 @@ unsafe extern "C" fn h_load_method(
             return 0;
         }
         let Some(ms) = ext.method_slot(pc) else {
-            // An attribute the instance holds itself (a stored callable,
-            // `self.fget(x)`), at a site that never needed a method slot.
             if let Object::Instance(inst) = &*top {
-                if Interpreter::default_getattribute(inst.cls_raw())
-                    && crate::inst_may_shadow(inst, code, name)
-                {
-                    return u32::from(!Interpreter::core_value_method(code, name, pc, top));
+                let cls = inst.cls_raw();
+                if Interpreter::default_getattribute(cls) {
+                    // An attribute the instance holds itself (a stored
+                    // callable, `self.fget(x)`), at a site that never needed
+                    // a method slot.
+                    if crate::inst_may_shadow(inst, code, name) {
+                        return u32::from(!Interpreter::core_value_method(code, name, pc, top));
+                    }
+                    // A plain function the class resolves the name to, at a
+                    // site that has no method slot (its first call changed
+                    // the class, and the core loop's fused call took the
+                    // calls after): the method, kept in the site's in-line
+                    // cache from here on.
+                    let found = ext.name_objs.get(name as usize).and_then(|n| match n {
+                        Object::Str(n) => cls.lookup(n),
+                        _ => None,
+                    });
+                    if let Some(f @ Object::Function(_)) = found {
+                        if !cache.is_null() {
+                            let ver = cls.attr_version.get();
+                            fill_method_cache(&mut *cache, cls, ver, &f, ext, name);
+                        }
+                        let recv = top.read();
+                        top.write(f);
+                        st.stack.add(len).write(recv);
+                        return 0;
+                    }
                 }
             }
             return 1;
@@ -8321,14 +8342,31 @@ unsafe extern "C" fn h_load_method(
                                 ms.set(ver, &f);
                                 Object::Function(f)
                             }
-                            // A value the class holds (a static method's
-                            // function): the value with an empty self slot,
-                            // as the core loop's arm loads it.
-                            None => {
-                                return u32::from(!Interpreter::core_value_method(
-                                    code, name, pc, top,
-                                ))
-                            }
+                            None => match ext.name_objs.get(name as usize).and_then(|n| match n {
+                                Object::Str(n) => cls.lookup(n),
+                                _ => None,
+                            }) {
+                                // A plain function the class resolves the
+                                // name to at a version no memo has seen (the
+                                // site's first call changed the class): the
+                                // site's method from here on.
+                                Some(Object::Function(f)) => {
+                                    ms.set(ver, &f);
+                                    let f = Object::Function(f);
+                                    if !cache.is_null() {
+                                        fill_method_cache(&mut *cache, cls, ver, &f, ext, name);
+                                    }
+                                    f
+                                }
+                                // A value the class holds (a static method's
+                                // function): the value with an empty self
+                                // slot, as the core loop's arm loads it.
+                                _ => {
+                                    return u32::from(!Interpreter::core_value_method(
+                                        code, name, pc, top,
+                                    ))
+                                }
+                            },
                         },
                     },
                 };
@@ -17972,6 +18010,11 @@ unsafe extern "C" fn h_get_iter(at: *mut Object) -> u32 {
             Object::Iter(_) | Object::LazyIter(_) | Object::Generator(_)
         ) {
             return 0;
+        }
+        // An open file is its own iterator (a closed one's `ValueError` is
+        // the core loop's to raise).
+        if let Object::File(f) = v {
+            return u32::from(f.is_closed());
         }
         // A list or tuple subclass inheriting `__iter__`: its value's
         // iterator, as `Interpreter::make_iter` makes it.

@@ -18359,6 +18359,9 @@ impl Interpreter {
                 let Some(v) = op.and_then(|op| set_algebra_fast(a, b, op)) else {
                     return false;
                 };
+                // (A heap result: compiled code takes the helper that keeps
+                // one, not the numbers', which would leave after it.)
+                Self::heap_result_note(frame, pc);
                 let b = frame.stack.pop().expect("checked above");
                 let a = frame.stack.pop().expect("checked above");
                 frame.stack.push(v);

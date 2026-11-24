@@ -2888,6 +2888,27 @@ branch and pull request.
     registrations quadratic (about 4,000 instructions each by the time
     `datetime` registers its own); the sweep now runs when the registry
     has doubled.
+  - A scan of the idiom sweeps for sites where compiled code leaves for
+    the interpreter on every iteration found four more. Set algebra
+    (`a | b`) ran in the core loop's set lane, which didn't note its
+    heap result, so the site compiled as a number site and left after
+    every set; it notes it now (1,647 instructions to 1,487, CPython
+    1,298). Iterating an `io.StringIO` left at `GET_ITER`, which knew
+    only iterators and builtin sequences: an open file is now its own
+    iterator there (8,658 to 7,522). `copy.deepcopy` of a plain tree and
+    `Counter.most_common(n)` call native helpers that weren't
+    registered as leaves, so each call left: registered, `deepcopy` of
+    a small dict went from 9,819 to 4,265 (CPython 18,346) and
+    `most_common(1)` from 7,547 to 2,690 (CPython 6,791).
+  - A method whose first call from a site changes its class (a class
+    attribute set lazily, as `string.Template`'s compiled pattern is)
+    left that site without a method slot: the core loop's fused call
+    took the calls after, and compiled code's method load, finding no
+    slot, left for the interpreter on every call. The load now resolves
+    a plain function by the class's own lookup and keeps it in the
+    site's in-line cache: such a call went from 2,491 instructions to
+    357 (CPython 654), and `Template.substitute(a=1, b=2, c=3)` from
+    27,396 to 24,899.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
