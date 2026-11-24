@@ -29300,6 +29300,56 @@ impl Interpreter {
     /// handler builds it from their strings. `ops` is the core loop's
     /// `CALL_KW` operands; `None` (nothing touched) for the full handler.
     #[inline(never)]
+    /// `d.update(k=v, ...)` of an exact dict, keywords only: each keyword's
+    /// own name object stored as [`builtins::dict_insert_exact`] stores a
+    /// key (whose probe runs no code), the result `None`. `None` for the
+    /// full call, which a store declined partway repeats in full: storing
+    /// the same keywords again leaves the same dict.
+    pub(crate) fn core_dict_update_kw(ops: &[Object], argc: usize) -> Option<Object> {
+        let d = match (ops.first()?, ops.get(1)?) {
+            (Object::BoundMethod(bm), Object::Unbound) if !bm.redispatch_descriptor => {
+                match (&bm.function, &bm.receiver) {
+                    (Object::Builtin(b), Object::Dict(d))
+                        if b.binds_instance && b.name == "update" =>
+                    {
+                        d
+                    }
+                    _ => return None,
+                }
+            }
+            (Object::Builtin(b), Object::Dict(d)) if b.binds_instance && b.name == "update" => d,
+            _ => return None,
+        };
+        let Object::Tuple(names) = ops.last()? else {
+            return None;
+        };
+        if argc != 0 || ops.len() != names.len() + 3 || crate::trace::any_observers_active() {
+            return None;
+        }
+        for (name, v) in names.iter().zip(&ops[2..2 + names.len()]) {
+            if !matches!(name, Object::Str(_)) {
+                return None;
+            }
+            match builtins::dict_insert_exact(d, name.clone(), v.clone()) {
+                Ok(old) => drop(old),
+                Err(_) => return None,
+            }
+        }
+        Some(Object::None)
+    }
+
+    /// `types.SimpleNamespace(k=v, ...)` (the exact class, keywords only):
+    /// a namespace over [`Self::core_dict_kw`]'s dictionary, as its
+    /// constructor builds it.
+    pub(crate) fn core_namespace_kw(ops: &[Object]) -> Option<Object> {
+        let Object::Dict(d) = Self::core_dict_kw(ops)? else {
+            return None;
+        };
+        let ns = Object::SimpleNamespace(d);
+        gc_trace::track(&ns);
+        Some(ns)
+    }
+
     fn core_dict_kw(ops: &[Object]) -> Option<Object> {
         let (Object::Unbound, Some(Object::Tuple(names))) = (ops.get(1)?, ops.last()) else {
             return None;

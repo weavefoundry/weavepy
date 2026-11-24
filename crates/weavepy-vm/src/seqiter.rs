@@ -3296,6 +3296,30 @@ fn native_sort_keys(items: &[Object], key: &Object) -> Option<Vec<Object>> {
     }
     let is_len =
         matches!(key, Object::Builtin(b) if Rc::as_ptr(b) as usize == interp.leaf_fns().len_ptr);
+    // A builtin the leaf registry vouches runs no code (`abs`), or a bound
+    // one over its receiver (`d.get`): its leaf half on each item.
+    let leaf = match key {
+        _ if is_len => None,
+        Object::Builtin(b) => Some((b, None)),
+        Object::BoundMethod(bm) if !bm.redispatch_descriptor => match &bm.function {
+            Object::Builtin(b) => Some((b, Some(&bm.receiver))),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some((b, recv)) = leaf {
+        if let Some(kind) = interp.leaf_call_kind(b) {
+            let mut keys = Vec::with_capacity(items.len());
+            for item in items {
+                let k = match recv {
+                    Some(r) => interp.leaf_builtin_call(kind, b, &[r.clone(), item.clone()]),
+                    None => interp.leaf_builtin_call(kind, b, std::slice::from_ref(item)),
+                };
+                keys.push(k?.ok()?);
+            }
+            return Some(keys);
+        }
+    }
     let call_fast = if is_len {
         None
     } else {
@@ -3718,7 +3742,7 @@ fn min_max_kw_fast(args: &[Object], want_max: bool) -> Option<Result<Object, Run
         return None;
     };
     if !matches!(key, Object::Unbound | Object::None) {
-        return None;
+        return min_max_keyed(iterable, key, default, want_max);
     }
     let empty = match iterable {
         Object::List(l) => l.try_borrow().ok()?.is_empty(),
@@ -3732,6 +3756,68 @@ fn min_max_kw_fast(args: &[Object], want_max: bool) -> Option<Result<Object, Run
         };
     }
     min_max_fast(std::slice::from_ref(iterable), want_max)
+}
+
+/// [`min_max_kw_fast`] with a key function [`native_sort_keys`] computes
+/// without running code (`max(d, key=d.get)`), over a list's, a tuple's or
+/// a dict's items whose keys are all ints, all floats or all strings: the
+/// first item with the least (or greatest) key, as CPython keeps it.
+fn min_max_keyed(
+    iterable: &Object,
+    key: &Object,
+    default: &Object,
+    want_max: bool,
+) -> Option<Result<Object, RuntimeError>> {
+    let items: Vec<Object> = match iterable {
+        Object::List(l) => l.try_borrow().ok()?.clone(),
+        Object::Tuple(t) => crate::object::cloned_vec(t),
+        Object::Dict(d) => d.try_borrow().ok()?.keys().map(|k| k.0.clone()).collect(),
+        _ => return None,
+    };
+    if items.is_empty() {
+        return match default {
+            Object::Unbound => None,
+            d => Some(Ok(d.clone())),
+        };
+    }
+    let keys = native_sort_keys(&items, key)?;
+    // (Whether `a` replaces the best so far `b`: strictly beyond it.)
+    let beyond = |a: &Object, b: &Object| -> Option<bool> {
+        Some(match (a, b) {
+            (Object::Int(x), Object::Int(y)) => {
+                if want_max {
+                    x > y
+                } else {
+                    x < y
+                }
+            }
+            (Object::Float(x), Object::Float(y)) => {
+                if want_max {
+                    x > y
+                } else {
+                    x < y
+                }
+            }
+            (Object::Str(x), Object::Str(y)) => {
+                let (x, y): (&str, &str) = (x, y);
+                if want_max {
+                    x > y
+                } else {
+                    x < y
+                }
+            }
+            _ => return None,
+        })
+    };
+    let mut best = 0;
+    for i in 1..keys.len() {
+        if beyond(&keys[i], &keys[best])? {
+            best = i;
+        }
+    }
+    // (A lone item's key still has to be one of the plain kinds.)
+    beyond(&keys[0], &keys[0])?;
+    Some(Ok(items[best].clone()))
 }
 
 /// `sum(xs)` of plain ints that stays a machine int.

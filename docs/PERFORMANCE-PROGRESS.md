@@ -2805,6 +2805,16 @@ branch and pull request.
     cost 1,746 instructions (CPython 1,331). The leaf now falls back to
     the numeric sum, which runs no code, and the switch adds the float
     directly: 649.
+  - `max(d, key=d.get)` and `sorted(xs, key=abs)` called their key per
+    item through the full call (4,990 and 3,825 instructions, CPython
+    3,072 and 2,770): a builtin or bound method the leaf registry vouches
+    for (`abs`, `d.get`, `str.lower`) now computes the keys natively, and
+    `min` and `max` take them when they're all ints, all floats or all
+    strings (2,916 and 2,920). `types.SimpleNamespace(a=1, b=2)` took the
+    full constructor (4,792, CPython 2,760) and now builds its dictionary
+    from the keyword names as `dict(a=1, b=2)` does (2,300);
+    `d.update(a=1, b=2)` stores the name objects through the leaf's
+    insert (3,031 to 1,796, CPython 1,882).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

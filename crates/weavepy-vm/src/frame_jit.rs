@@ -16336,6 +16336,7 @@ unsafe extern "C" fn h_call_kw(st: *mut State, code: *const CodeObject, pc: u64,
             }
             Object::BoundMethod(_) | Object::Builtin(_) => {
                 Interpreter::core_native_kw_call(ops, argc)
+                    .or_else(|| Interpreter::core_dict_update_kw(ops, argc))
             }
             // `dict(k=v, ...)`: the keywords' own names are the keys, as the
             // core loop's arm builds it.
@@ -16343,6 +16344,12 @@ unsafe extern "C" fn h_call_kw(st: *mut State, code: *const CodeObject, pc: u64,
                 if argc == 0 && Rc::ptr_eq(ty, &crate::builtin_types::builtin_types().dict_) =>
             {
                 Interpreter::core_dict_kw(ops)
+            }
+            Object::Type(ty)
+                if argc == 0
+                    && Rc::ptr_eq(ty, &crate::builtin_types::builtin_types().simple_namespace_) =>
+            {
+                Interpreter::core_namespace_kw(ops)
             }
             // `int(text, base=16)`, `enumerate(xs, start=1)`: keywords that
             // name the next positional parameters in order, so the operands
