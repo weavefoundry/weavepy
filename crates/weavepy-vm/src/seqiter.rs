@@ -1655,6 +1655,111 @@ pub(crate) fn machine_collect(l: &PyLazyIter) -> Option<Vec<Object>> {
     Some(out)
 }
 
+/// The items a list's or tuple's cursor has left, cloned (which runs no
+/// code), the cursor moved past them (the step that finds its end still
+/// to come). `None`, touching nothing, for any other source.
+fn cursor_take_rest(source: &Object) -> Option<Vec<Object>> {
+    use crate::object::PyIterator;
+    let Object::Iter(c) = source else {
+        return None;
+    };
+    // SAFETY: reads and an index move that run no code; the view ends here.
+    match unsafe { c.peek_mut() }? {
+        PyIterator::Tuple { items, index } => {
+            let rest = items
+                .get(*index..)
+                .map_or_else(Vec::new, <[Object]>::to_vec);
+            *index += rest.len();
+            Some(rest)
+        }
+        PyIterator::List {
+            items,
+            index,
+            owner: None,
+        } => {
+            let rest = unsafe { items.peek() }?
+                .get(*index..)
+                .map_or_else(Vec::new, <[Object]>::to_vec);
+            *index += rest.len();
+            Some(rest)
+        }
+        _ => None,
+    }
+}
+
+/// `pairwise(xs)` or a non-strict (or evenly dividing) `batched(xs, n)`
+/// over a list's or tuple's cursor, drained at once: every pair or batch
+/// left, the adapter left as its last step leaves it (its source stepped
+/// to its end and let go). Only where letting go of the source runs
+/// nothing; `None`, nothing consumed, for anything else.
+pub(crate) fn window_collect(l: &PyLazyIter) -> Option<Vec<Object>> {
+    use crate::object::PyIterator;
+    // SAFETY: nothing below runs code (clones, tuples, quiet releases);
+    // the view ends with this call.
+    let st = unsafe { l.state.peek_mut() }?;
+    let (source, rest_len) = match st {
+        LazyIterKind::Pairwise { source, old } if old.as_ref().is_none_or(plain_value) => {
+            (source, None)
+        }
+        LazyIterKind::Batched { source, n, strict } => (source, Some((*n, *strict))),
+        _ => return None,
+    };
+    if !quiet_source(source.as_ref()?) {
+        return None;
+    }
+    // (A strict batching whose last batch would be short raises: the
+    // general step's.)
+    if let Some((n, true)) = rest_len {
+        let Some(Object::Iter(c)) = source.as_ref() else {
+            return None;
+        };
+        // SAFETY: a read that runs no code.
+        let left = match unsafe { c.peek() }? {
+            PyIterator::Tuple { items, index } => items.len().saturating_sub(*index),
+            PyIterator::List {
+                items,
+                index,
+                owner: None,
+            } => unsafe { items.peek() }?.len().saturating_sub(*index),
+            _ => return None,
+        };
+        if left % n != 0 {
+            return None;
+        }
+    }
+    let rest = cursor_take_rest(source.as_ref()?)?;
+    let src = source.take()?;
+    exhaust_cursor(&src);
+    let mut out = Vec::new();
+    match st {
+        LazyIterKind::Pairwise { old, .. } => {
+            let mut it = rest.into_iter();
+            let mut prev = old.take().or_else(|| it.next());
+            out.reserve(it.len());
+            for x in it {
+                let p = prev.replace(x.clone()).expect("a previous item");
+                out.push(Object::new_tuple_array([p, x]));
+            }
+            drop(prev);
+        }
+        LazyIterKind::Batched { n, .. } => {
+            let n = *n;
+            out.reserve(rest.len().div_ceil(n));
+            let mut it = rest.into_iter();
+            loop {
+                let batch: Vec<Object> = it.by_ref().take(n).collect();
+                if batch.is_empty() {
+                    break;
+                }
+                out.push(Object::new_tuple(batch));
+            }
+        }
+        _ => unreachable!("matched above"),
+    }
+    drop(src);
+    Some(out)
+}
+
 /// `accumulate(xs)` with no function over a plain list or tuple cursor:
 /// every remaining running total (the initial value first, when one is
 /// still to come), the adapter left as its last step leaves it: its total
@@ -1817,6 +1922,20 @@ pub(crate) fn cursor_at_end(it: &Object) -> bool {
             owner: None,
         }) => unsafe { items.peek() }.is_some_and(|v| *index >= v.len()),
         _ => false,
+    }
+}
+
+/// The step that finds the end of a cursor [`cursor_at_end`] found at its
+/// end, so one someone else holds is exhausted as a general step leaves
+/// it (a list's sees no later appends). Runs no code.
+fn exhaust_cursor(it: &Object) {
+    if let Object::Iter(c) = it {
+        // SAFETY: a step that runs no code at the end; the view ends here.
+        if let Some(cur) = unsafe { c.peek_mut() } {
+            let end = cur.next_value();
+            debug_assert!(end.is_none());
+            drop(end);
+        }
     }
 }
 
@@ -2449,6 +2568,7 @@ pub(crate) fn itertools_pure_next(l: &PyLazyIter) -> Option<Option<Object>> {
                 if !(plain_value(old) && quiet_source(source)) {
                     return None;
                 }
+                exhaust_cursor(source);
                 let (src, prev) = (std::mem::replace(source, Object::None), old.clone());
                 *st = LazyIterKind::Pairwise {
                     source: None,
@@ -2460,6 +2580,61 @@ pub(crate) fn itertools_pure_next(l: &PyLazyIter) -> Option<Option<Object>> {
             let new = ready_next(source)?;
             let prev = std::mem::replace(old, new.clone());
             Some(Some(Object::new_tuple_array([prev, new])))
+        }
+        // `batched` over a list's or tuple's cursor: the next `n` items (as
+        // many as are left, at the end of a non-strict one), with no code
+        // run. A short last batch, or the end itself, takes the step that
+        // finds the cursor's end and lets go of the source, as the general
+        // step does, when releasing it runs nothing; a strict one's short
+        // batch is the general step's (it raises).
+        LazyIterKind::Batched { source, n, strict } => {
+            use crate::object::PyIterator;
+            let (n, strict) = (*n, *strict);
+            let Some(Object::Iter(c)) = source.as_ref() else {
+                return None;
+            };
+            let left = {
+                // SAFETY: a read that runs no code; the view ends here.
+                match unsafe { c.peek() }? {
+                    PyIterator::Tuple { items, index } => items.len().saturating_sub(*index),
+                    PyIterator::List {
+                        items,
+                        index,
+                        owner: None,
+                    } => unsafe { items.peek() }?.len().saturating_sub(*index),
+                    _ => return None,
+                }
+            };
+            let last = left < n;
+            if last && ((strict && left > 0) || !quiet_source(source.as_ref()?)) {
+                return None;
+            }
+            let mut batch = Vec::with_capacity(left.min(n));
+            {
+                // SAFETY: steps that run no code; the view ends here.
+                let cur = unsafe { c.peek_mut() }?;
+                while batch.len() < n {
+                    let Some(v) = cur.pure_peek() else {
+                        break;
+                    };
+                    cur.pure_skip();
+                    batch.push(v);
+                }
+                if last {
+                    let end = cur.next_value();
+                    debug_assert!(end.is_none());
+                    drop(end);
+                }
+                // (A full batch that ends the cursor leaves the end for the
+                // next step, as the general step does.)
+            }
+            if last {
+                drop(source.take());
+                if batch.is_empty() {
+                    return Some(None);
+                }
+            }
+            Some(Some(Object::new_tuple(batch)))
         }
         // `zip_longest` over plain sequence cursors: each active source's
         // next item, or the fill value for one finished before or now (a
@@ -2495,6 +2670,7 @@ pub(crate) fn itertools_pure_next(l: &PyLazyIter) -> Option<Option<Object>> {
                         if !quiet_source(src) {
                             return None;
                         }
+                        exhaust_cursor(src);
                         ending += 1;
                         None
                     }

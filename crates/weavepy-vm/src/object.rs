@@ -13767,6 +13767,7 @@ impl Object {
                 DictViewKind::Items => {
                     if let Object::Tuple(t) = item {
                         if t.len() == 2 {
+                            crate::builtins::ensure_dict_key(&t[0])?;
                             if let Some(stored) = crate::builtins::dict_lookup(&v.dict, &t[0])? {
                                 return member_eq(&stored, &t[1]);
                             }

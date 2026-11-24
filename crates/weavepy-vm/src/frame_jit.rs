@@ -12795,6 +12795,9 @@ unsafe extern "C" fn h_subscr_dunder(
         if let Some(fast) = getitem_leaf_of(&*st.stack.add(slot)) {
             return pair_leaf_call(st, pc, slot, fast, false);
         }
+        if let Some(f) = missing_dunder(&*st.stack.add(slot), &*st.stack.add(slot + 1)) {
+            return dunder_call(st, pc, slot, 2, f, site, None);
+        }
         let Some(f) = Interpreter::getitem_dunder(&*code, pc, &*st.stack.add(slot)) else {
             return CALL_DECLINED;
         };
@@ -12838,6 +12841,39 @@ unsafe fn binop_leaf(st: &mut State, pc: usize, slot: usize, op: BinOpKind, inpl
 
 /// The leaf half of the native `__getitem__` of the instance `v`'s plain
 /// Python class (see [`Interpreter::instance_getitem_leaf`]).
+/// The plain Python `__missing__` of a dict subclass that keeps
+/// `dict.__getitem__` (a `Counter`'s, a user class's), when `container`
+/// is one of its instances and the `str` or `int` key is settled absent
+/// with no code run: CPython's `dict_subscript` calls it with the key, as
+/// [`h_subscr_dunder`] then does in place.
+fn missing_dunder(container: &Object, key: &Object) -> Option<Rc<crate::object::PyFunction>> {
+    let Object::Instance(inst) = container else {
+        return None;
+    };
+    let Some(Object::Dict(d)) = inst.native.get() else {
+        return None;
+    };
+    let cls = inst.cls_raw();
+    let getitem = cls.dunder(crate::types::Dunder::GetItem);
+    if !getitem.present()
+        || !getitem.builtin_owner()
+        || !cls.dunder(crate::types::Dunder::Missing).present()
+    {
+        return None;
+    }
+    let probe = crate::object::LeafProbe::new(key)?;
+    {
+        let m = d.try_borrow().ok()?;
+        if m.get(&probe).is_some() || !probe.miss_is_exact() {
+            return None;
+        }
+    }
+    match cls.lookup("__missing__")? {
+        Object::Function(f) => Some(f),
+        _ => None,
+    }
+}
+
 fn getitem_leaf_of(v: &Object) -> Option<crate::leaf_builtins::Fast> {
     match v {
         Object::Instance(inst) => Interpreter::instance_getitem_leaf(inst),
@@ -16767,6 +16803,25 @@ unsafe fn spread_native(st: &mut State, pc: usize, start: usize) -> Option<u32> 
     // room up to `st.cap`.
     unsafe {
         let base = st.stack;
+        // A builtin type whose native constructor builds the value from
+        // the items with no code run (`zip(*rows)`, `tuple(*a)`), as the
+        // `CALL` arm builds it.
+        if let (Object::Type(t), Object::Unbound) = (&*base.add(start), &*base.add(start + 1)) {
+            match &*base.add(start + 3) {
+                Object::Unbound => {}
+                Object::Dict(d) if d.try_borrow().is_ok_and(|d| d.is_empty()) => {}
+                _ => return None,
+            }
+            let v = match &*base.add(start + 2) {
+                Object::Tuple(items) => crate::seqiter::builtin_ctor_pure(t, items)?,
+                Object::List(l) => crate::seqiter::builtin_ctor_pure(t, &l.try_borrow().ok()?)?,
+                _ => return None,
+            };
+            crate::release_run(base.add(start), 4);
+            base.add(start).write(v);
+            st.len = start + 1;
+            return Some(0);
+        }
         let (b, recv) = match (&*base.add(start), &*base.add(start + 1)) {
             (Object::Builtin(b), Object::Unbound) if !b.binds_instance => (b, None),
             (Object::BoundMethod(bm), Object::Unbound) if !bm.redispatch_descriptor => {
@@ -23151,13 +23206,17 @@ impl<'a> Lower<'a> {
         let key = self.pop();
         let cont = self.pop();
         let slot = self.depth;
-        // A site that has run an instance's Python `__getitem__`: that
-        // first, the native containers' paths only when it declines.
+        // A site that has run an instance's Python `__getitem__` (or a
+        // dict subclass's `__missing__`): that first, the native
+        // containers' paths only when it declines. The call can switch, so
+        // the copies below (`d[k] += 1`'s) go to the frame's stack first.
         if !self.inlining()
             && self.code.instructions[pc].op == OpCode::BinarySubscr
             && crate::instance_site(self.ext, pc)
-            && self.vs.iter().all(|i| matches!(i, Item::Mem(_)))
         {
+            if !self.vs.iter().all(|i| matches!(i, Item::Mem(_))) {
+                self.flush();
+            }
             return self.subscr_dunder_first(pc, slot, cont, key);
         }
         let tuple = self.seq_index_site(pc, cont);

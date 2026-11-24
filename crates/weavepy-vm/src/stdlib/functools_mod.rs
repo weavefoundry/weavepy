@@ -472,8 +472,35 @@ fn cmp_to_key(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
         return Err(type_error("cmp_to_key() requires functools to be imported"));
     };
     let factory = interp.load_attr_public(&functools, "_CmpToKey")?;
+    if let Object::Type(t) = &factory {
+        if t.immutable.get() {
+            CMP_TO_KEY_CLASS.with(|c| c.set(Rc::as_ptr(t) as usize));
+        }
+    }
     let globals = interp.builtins_dict();
     interp.call(&factory, &[mycmp], &[], &globals)
+}
+
+thread_local! {
+    /// The address of the frozen `functools._CmpToKey` class (an immutable
+    /// type, as CPython's `functools.KeyWrapper`), recorded by
+    /// [`cmp_to_key`]; zero until the first call.
+    static CMP_TO_KEY_CLASS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The comparison function a `cmp_to_key(mycmp)` key factory wraps, when
+/// `key` is one: a sort by it can compare items with `mycmp(a, b) < 0`
+/// directly, which is what the wrappers' `<` does (CPython's
+/// `KeyWrapper.__lt__`), without making a wrapper per item.
+pub(crate) fn cmp_key_func(key: &Object) -> Option<Object> {
+    let Object::Instance(inst) = key else {
+        return None;
+    };
+    let cls = inst.class.try_borrow().ok()?;
+    if Rc::as_ptr(&cls) as usize != CMP_TO_KEY_CLASS.with(|c| c.get()) || !cls.immutable.get() {
+        return None;
+    }
+    inst.slots.try_borrow().ok()?.get("_mycmp").cloned()
 }
 
 // ---------------------------------------------------------------------------

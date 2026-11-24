@@ -232,6 +232,7 @@ cmp_to_key = _cmp_to_key_py
 class _CmpKey:
     __slots__ = ('obj', '_mycmp')
     __hash__ = None
+    __weave_immutable_type__ = True
 
     def __lt__(self, other):
         return self._mycmp(self.obj, other.obj) < 0
@@ -251,6 +252,7 @@ class _CmpKey:
 
 class _CmpToKey:
     __slots__ = ('_mycmp',)
+    __weave_immutable_type__ = True
 
     def __init__(self, mycmp):
         self._mycmp = mycmp

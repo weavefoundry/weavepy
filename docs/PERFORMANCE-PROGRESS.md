@@ -2909,6 +2909,31 @@ branch and pull request.
     site's in-line cache: such a call went from 2,491 instructions to
     357 (CPython 654), and `Template.substitute(a=1, b=2, c=3)` from
     27,396 to 24,899.
+  - A sixth idiom sweep (`target/mb/i6/i6.py`, 62 cases) ranked the
+    next gaps. `sorted(xs, key=cmp_to_key(f))` made a key object per
+    item and ran a Python `__lt__` per comparison; a sort whose key is
+    the frozen `functools` key factory (an immutable class now, as
+    CPython's `KeyWrapper` is) compares the items with `f(a, b) < 0`
+    directly, a pure-leaf `f` in place: three items 33,160 instructions
+    to 6,509 (CPython 8,470). A dict subclass's miss (`Counter`'s
+    `c[w]`) left compiled code to call `__missing__`: the subscript's
+    direct-call lane now calls a plain Python `__missing__` when a `str`
+    or `int` key is settled absent, and the core loop marks the site so
+    `c[w] += 1`, whose copies of `c` and `w` the lane writes out first,
+    compiles with it (`Counter()` and nine increments 52,722 to 19,942,
+    CPython 23,663; one miss 4,813 to 805, CPython 1,045).
+  - `(k, v) in d.items()`, `v in d.values()` and `k in d.keys()` answer
+    in compiled code when no comparison can run Python (1,773 to 689,
+    CPython 860), and an unhashable key there raises `TypeError` as
+    CPython does (it answered `False`). `zip(*rows)` and other builtin
+    types called with a spread build in place instead of leaving at
+    `CALL_FUNCTION_EX` (3,722 to 1,627, CPython 1,986). `list()` of
+    `pairwise` or `batched` over a list or tuple takes the windows at
+    once (eight items 8,657 to 5,300 and 9,085 to 5,137, CPython 4,681
+    and 4,250), and `batched` steps such a source in place. `pairwise`,
+    `batched` and `zip_longest` now step a finished list iterator to its
+    end, so one the caller still holds sees no later appends, as in
+    CPython (it returned them).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

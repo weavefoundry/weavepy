@@ -32792,6 +32792,42 @@ impl Interpreter {
             // A class's `__dict__` view (`'__dict__' in type.__dict__`, as
             // `inspect` asks) tests the class dict it wraps.
             Object::MappingProxy(d) => Self::leaf_contains(&Object::Dict(d.clone()), item),
+            // (A dict subclass's view keeps its instance alive, which the
+            // full handler releases.)
+            Object::DictView(view) if view.owner.is_none() => match view.kind {
+                crate::object::DictViewKind::Keys => {
+                    Self::leaf_contains(&Object::Dict(view.dict.clone()), item)
+                }
+                // `(k, v) in d.items()`: CPython's `dictitems_contains`, the
+                // key probed and its value compared with `v`; anything but
+                // a pair is absent (a tuple subclass's instance declines).
+                crate::object::DictViewKind::Items => {
+                    let pair = match item {
+                        Object::Tuple(t) if t.len() == 2 => t,
+                        Object::Tuple(_) => return Some(false),
+                        Object::Instance(_) => return None,
+                        _ => return Some(false),
+                    };
+                    let probe = crate::object::LeafProbe::new(&pair[0])?;
+                    // SAFETY: a read between two instructions (the probe
+                    // runs no code); the value is cloned before comparing.
+                    let found = unsafe { view.dict.peek() }?.get(&probe).cloned();
+                    match found {
+                        Some(v) => member(&v, &pair[1]),
+                        None => probe.miss_is_exact().then_some(false),
+                    }
+                }
+                crate::object::DictViewKind::Values => {
+                    // SAFETY: as above (the member test runs no code).
+                    let d = unsafe { view.dict.peek() }?;
+                    for x in d.values() {
+                        if member(x, item)? {
+                            return Some(true);
+                        }
+                    }
+                    Some(false)
+                }
+            },
             // An instance whose class's Python `__contains__` evaluates as a
             // pure leaf with a scalar answer (anything else is the full
             // path's, which runs it again: nothing observed the first).
@@ -38399,6 +38435,19 @@ impl Interpreter {
                     let r = match crate::builtins::dict_lookup(&d, &i)? {
                         Some(found) => found,
                         None if cls.dunder(crate::types::Dunder::Missing).present() => {
+                            // (Compiled code calls a plain Python
+                            // `__missing__` itself once its site has run
+                            // one: see `h_subscr_dunder`.)
+                            #[cfg(feature = "jit")]
+                            if let Some(ext) = code_vm_ext(&frame.code) {
+                                let pc = (frame.pc as usize).wrapping_sub(1);
+                                if frame.code.instructions.get(pc).map(|i| i.op)
+                                    == Some(OpCode::BinarySubscr)
+                                    && !instance_site(ext, pc)
+                                {
+                                    instance_site_note(ext, frame.code.instructions.len(), pc);
+                                }
+                            }
                             match instance_method(&v, "__missing__") {
                                 Some(miss) => self.call(
                                     &miss,
@@ -49338,6 +49387,9 @@ impl Interpreter {
             if let Some(items) = crate::seqiter::machine_collect(l) {
                 return Ok(items);
             }
+            if let Some(items) = crate::seqiter::window_collect(l) {
+                return Ok(items);
+            }
         }
         if let Some(items) = crate::seqiter::enumerate_seq_collect(v) {
             return Ok(items);
@@ -51267,6 +51319,18 @@ impl Interpreter {
             }
             return result;
         };
+        // `key=cmp_to_key(mycmp)`: the items compare by `mycmp(a, b) < 0`,
+        // what the key wrappers' `<` would run, without a wrapper per item.
+        if let Some(mycmp) = crate::stdlib::functools_mod::cmp_key_func(f) {
+            if reverse {
+                items.reverse();
+            }
+            let result = self.sort_by_cmp(items, &mycmp, globals);
+            if reverse {
+                items.reverse();
+            }
+            return result;
+        }
         let mut decorated: Vec<(Object, Object)> = Vec::with_capacity(items.len());
         // `key=len`: each length as `len(x)` takes it, without the general
         // call's dispatch per item (as the call arms recognize the builtin).
@@ -51376,6 +51440,36 @@ impl Interpreter {
         }
         self.run_pending_finalizers();
         result
+    }
+
+    /// Sort `items` stably by an old-style comparison function, `a` before
+    /// `b` when `mycmp(a, b) < 0` (see `functools_mod::cmp_key_func`). A
+    /// pure-leaf `mycmp` evaluates in place; after one decline the rest
+    /// take the full call.
+    fn sort_by_cmp(
+        &mut self,
+        items: &mut [Object],
+        mycmp: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<(), RuntimeError> {
+        let mut pure = crate::seqiter::pure_callback_maybe(mycmp);
+        crate::timsort::sort(items, |a, b| {
+            let args = [a.clone(), b.clone()];
+            let r = match pure
+                .then(|| self.pure_callback(mycmp, &args, true))
+                .flatten()
+            {
+                Some(r) => r,
+                None => {
+                    pure = false;
+                    self.call(mycmp, &args, &[], globals)?
+                }
+            };
+            match r {
+                Object::Int(n) => Ok(n < 0),
+                r => self.dispatch_compare_op(&r, &Object::Int(0), CompareKind::Lt, globals),
+            }
+        })
     }
 
     /// Sort `v` stably by the keys `key` projects, with the comparison
@@ -57602,6 +57696,7 @@ impl Interpreter {
         match y {
             Object::DictView(v) => match v.kind {
                 crate::object::DictViewKind::Keys => {
+                    crate::builtins::ensure_dict_key(item)?;
                     Ok(crate::builtins::dict_lookup(&v.dict, item)?.is_some())
                 }
                 crate::object::DictViewKind::Items => {
@@ -57611,6 +57706,7 @@ impl Interpreter {
                     if t.len() != 2 {
                         return Ok(false);
                     }
+                    crate::builtins::ensure_dict_key(&t[0])?;
                     match crate::builtins::dict_lookup(&v.dict, &t[0])? {
                         None => Ok(false),
                         Some(found) => Ok(found.is_same(&t[1])
