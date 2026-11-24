@@ -257,8 +257,8 @@ class unpack_iterator:
         return (self._len - self._offset) // self._size
 
 
-# The iterator's step is native while it has a chunk left (CPython's is a
-# C type); its end, and anything unusual, is the method above.
+# The iterator's step, and its end, are native (CPython's is a C type);
+# anything unusual is the method above.
 if hasattr(_impl, "_unpack_iterator_methods"):
     for _owner, _name, _method in _impl._unpack_iterator_methods(unpack_iterator):
         setattr(_owner, _name, _method)
@@ -272,6 +272,12 @@ def _make_unpack_iterator(fmt, buffer, size):
     if size == 0:
         raise error("cannot iteratively unpack with a struct of length 0")
     buffer = _readable(buffer)
+    # (A non-buffer, `str` above all, is refused here, as CPython's
+    # `iter_unpack` refuses it, not at the first step.)
+    if not isinstance(buffer, (bytes, bytearray, memoryview)):
+        raise TypeError(
+            f"a bytes-like object is required, not '{type(buffer).__name__}'"
+        )
     if len(buffer) % size != 0:
         raise error(
             "iterative unpacking requires a buffer of a multiple of "
@@ -291,6 +297,12 @@ def _make_unpack_iterator(fmt, buffer, size):
 def iter_unpack(format, buffer, /):
     """Iterate over `buffer` in `calcsize(format)` chunks."""
     return _make_unpack_iterator(format, buffer, calcsize(format))
+
+
+# A `bytes` or `bytearray` buffer's iterator is built natively; anything
+# else is the function above.
+if hasattr(_impl, "_native_iter_unpack"):
+    iter_unpack = _impl._native_iter_unpack(iter_unpack, unpack_iterator)
 
 
 def _clearcache():

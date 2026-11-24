@@ -2845,6 +2845,24 @@ branch and pull request.
     1,298), `xs.pop(0)` from 1,484 to 1,237, and `d.pop(k, None)` from
     616 to 319. The sort itself skips the run stack (an allocation) for
     a list shorter than a minimum run, as CPython's does.
+  - A native classmethod called through its class
+    (`itertools.chain.from_iterable(xs)`) left compiled code for the
+    interpreter on every call: the builtin lane admitted a bound native
+    method only over an instance. A native function bound to a class now
+    runs through the lane's full call, the class first:
+    `list(chain.from_iterable(xs))` went from 6,280 instructions to 3,620
+    (CPython 3,475).
+  - `struct.iter_unpack` was three Python frames before the iterator
+    existed, `list()` of it called its Python `__length_hint__` and found
+    the native step again on every item, and its end ran the Python
+    `__next__` just to raise `StopIteration`. A `bytes` or `bytearray`
+    buffer's iterator is now built natively, the hint is native, the end
+    raises natively, and `list()` of an iterator whose `__next__` has a
+    native fast half calls the half in a loop: building one went from
+    5,663 instructions to 1,463 (CPython 1,215), and `list()` of a
+    two-record one from 18,602 to 8,284. A `str` buffer is now refused
+    when the iterator is made, as CPython refuses it, not at its first
+    step.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

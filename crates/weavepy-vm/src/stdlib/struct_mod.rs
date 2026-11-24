@@ -973,6 +973,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         );
         register(&mut d, "_array_methods", array_methods);
         register(&mut d, "_unpack_iterator_methods", unpack_iterator_methods);
+        register(&mut d, "_native_iter_unpack", b_native_iter_unpack);
         register(&mut d, "_all_exact", all_exact);
     }
     Rc::new(PyModule {
@@ -1622,8 +1623,8 @@ fn array_next_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     Some(Ok(item))
 }
 
-/// An `unpack_iterator`'s next tuple while it has one (its end is the
-/// Python method's): the format's fields read at the iterator's offset,
+/// An `unpack_iterator`'s next tuple while it has one, or its end's
+/// `StopIteration`: the format's fields read at the iterator's offset,
 /// which then moves on by the format's size.
 fn unpack_iter_next_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let [Object::Instance(it)] = args else {
@@ -1646,7 +1647,9 @@ fn unpack_iter_next_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>
         return None;
     };
     if *offset >= *len {
-        return None;
+        // (The end raises natively: the Python method's raise is a frame
+        // and an exception unwound through it.)
+        return Some(Err(crate::error::stop_iteration()));
     }
     let cf = compiled_for(fmt)?;
     let off = usize::try_from(*offset).ok()?;
@@ -1688,7 +1691,7 @@ fn unpack_iter_next_named(it: &crate::types::PyInstance) -> Option<Result<Object
             return None;
         };
         if offset >= len {
-            return None;
+            return Some(Err(crate::error::stop_iteration()));
         }
         let buffer = match laid {
             Some([_, b, ..]) => b,
@@ -1768,11 +1771,52 @@ fn unpack_iterator_methods(args: &[Object]) -> Result<Object, RuntimeError> {
             std::sync::atomic::Ordering::Relaxed,
         );
     }
-    Ok(Object::new_list(vec![Object::new_tuple(vec![
+    let mut out = vec![Object::new_tuple(vec![
         Object::Type(cls.clone()),
         Object::from_static("__next__"),
         fast_method(cls, "__next__", unpack_iter_next_fast, orig, false),
-    ])]))
+    ])];
+    let hint = cls
+        .dict
+        .borrow()
+        .get(&crate::object::StrKey("__length_hint__"))
+        .cloned();
+    if let Some(hint) = hint {
+        out.push(Object::new_tuple(vec![
+            Object::Type(cls.clone()),
+            Object::from_static("__length_hint__"),
+            fast_method(
+                cls,
+                "__length_hint__",
+                unpack_iter_length_hint_fast,
+                hint,
+                false,
+            ),
+        ]));
+    }
+    Ok(Object::new_list(out))
+}
+
+/// An `unpack_iterator`'s `__length_hint__`, the chunks still to come, from
+/// its own layout's slots (anything else is the Python method's).
+fn unpack_iter_length_hint_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Instance(it)] = args else {
+        return None;
+    };
+    let layout = it.cls_raw().own_slot_layout().filter(|layout| {
+        crate::shared_value::SharedSlice::word(layout)
+            == UNPACK_ITER_LAYOUT.load(std::sync::atomic::Ordering::Relaxed)
+    })?;
+    let slots = it.slots.try_borrow().ok()?;
+    let [_, _, Object::Int(size), Object::Int(offset), Object::Int(len)] =
+        slots.values_for_layout(layout)?
+    else {
+        return None;
+    };
+    if *size <= 0 {
+        return None;
+    }
+    Some(Ok(Object::Int((len - offset).div_euclid(*size))))
 }
 
 /// `_array_methods(array, array_iterator)`: the native item methods of
@@ -2292,6 +2336,83 @@ fn b_native_pack_into(args: &[Object]) -> Result<Object, RuntimeError> {
     let obj = native_with_fallback("pack_into", pack_into_fast, fallback);
     crate::descr_registry::register_text_signature(&obj, "(format, buffer, offset, /, *v)");
     Ok(obj)
+}
+
+thread_local! {
+    /// Each interpreter's `unpack_iterator` class and its slot layout, by
+    /// the interpreter's address (see [`b_native_iter_unpack`]); the class
+    /// held weakly, so a torn-down interpreter's entry never answers.
+    static UNPACK_ITER_CLASSES: std::cell::RefCell<
+        Vec<(
+            usize,
+            crate::sync::Weak<crate::types::TypeObject>,
+            crate::shared_value::SharedSlice<DictKey>,
+        )>,
+    > = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `_native_iter_unpack(python_iter_unpack, unpack_iterator)`: the public
+/// `struct.iter_unpack` (see [`iter_unpack_fast`]), with the running
+/// interpreter's iterator class noted for it.
+fn b_native_iter_unpack(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [fallback, Object::Type(cls)] = args else {
+        return Err(type_error(
+            "_native_iter_unpack() takes the Python iter_unpack and the iterator class",
+        ));
+    };
+    let (Some(layout), Some(interp)) = (
+        cls.own_slot_layout().cloned(),
+        crate::vm_singletons::current_interpreter_ptr(),
+    ) else {
+        return Ok(fallback.clone());
+    };
+    UNPACK_ITER_CLASSES.with(|c| {
+        let mut c = c.borrow_mut();
+        c.retain(|(p, w, _)| *p != interp as usize && w.strong_count() > 0);
+        c.push((interp as usize, Rc::downgrade(cls), layout));
+    });
+    let obj = native_with_fallback("iter_unpack", iter_unpack_fast, fallback);
+    crate::descr_registry::register_text_signature(&obj, "(format, buffer, /)");
+    Ok(obj)
+}
+
+/// `iter_unpack(format, buffer)` over an exact `bytes` or `bytearray`
+/// whose length the format's size divides: the iterator built in place, as
+/// the Python function's `_make_unpack_iterator` builds it. Anything else
+/// (a view, another buffer, an error to raise) is the Python function's.
+fn iter_unpack_fast(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Str(fmt), buffer @ (Object::Bytes(_) | Object::ByteArray(_))] = a else {
+        return None;
+    };
+    let len = match buffer {
+        Object::Bytes(b) => b.len(),
+        Object::ByteArray(b) => b.try_borrow().ok()?.len(),
+        _ => return None,
+    };
+    let size = compiled_for(fmt)?.size;
+    if size == 0 || len % size != 0 {
+        return None;
+    }
+    let interp = crate::vm_singletons::current_interpreter_ptr()? as usize;
+    let (cls, layout) = UNPACK_ITER_CLASSES.with(|c| {
+        let c = c.try_borrow().ok()?;
+        let (_, w, layout) = c.iter().find(|(p, _, _)| *p == interp)?;
+        Some((w.upgrade()?, layout.clone()))
+    })?;
+    if layout.len() != 5 {
+        return None;
+    }
+    let values = vec![
+        Object::Str(fmt.clone()),
+        buffer.clone(),
+        Object::Int(i64::try_from(size).ok()?),
+        Object::Int(0),
+        Object::Int(i64::try_from(len).ok()?),
+    ];
+    let slots = crate::types::SlotStorage::from_layout(layout, values);
+    Some(Ok(Object::Instance(Rc::new(
+        crate::types::PyInstance::with_slots(cls, slots),
+    ))))
 }
 
 fn b_iter_unpack(args: &[Object]) -> Result<Object, RuntimeError> {

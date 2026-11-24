@@ -17920,7 +17920,10 @@ impl Interpreter {
         match recv {
             Some(recv) => {
                 if !b.binds_instance {
-                    return None;
+                    // A native classmethod's function bound to its class
+                    // (`chain.from_iterable(xs)`): the full call, with the
+                    // class first, as the dispatch makes it.
+                    return matches!(recv, Object::Type(_)).then_some(true);
                 }
                 // Calling a method body on any receiver is what the full
                 // handler's dispatch does for these names.
@@ -49503,6 +49506,28 @@ impl Interpreter {
                         match self.gen_drain_next(g, Some(sink), false)? {
                             Some(x) => out.push(x),
                             None => return Ok(out),
+                        }
+                    }
+                }
+                // A native `__next__` with a fast half (`struct.iter_unpack`'s
+                // iterator, an array's): its steps in a row, the half found
+                // once (it runs no code, so the class stays as it was); a
+                // declined step goes on through the general loop.
+                if let Object::Instance(inst) = &it {
+                    if !crate::gil::free_threading_enabled()
+                        && !crate::trace::any_observers_active()
+                    {
+                        if let Some(fast) = self.core_leaf_next_fast(inst) {
+                            loop {
+                                match fast(std::slice::from_ref(&it)) {
+                                    Some(Ok(x)) => out.push(x),
+                                    Some(Err(e)) if crate::seqiter::is_stop_iteration(&e) => {
+                                        return Ok(out);
+                                    }
+                                    Some(Err(e)) => return Err(e),
+                                    None => break,
+                                }
+                            }
                         }
                     }
                 }
@@ -87122,10 +87147,14 @@ fn exception_init_call(b: &crate::object::BuiltinFn, recv: &Object) -> bool {
 /// dispatch knows by name.
 #[inline]
 fn lane_recv_ok(b: &crate::object::BuiltinFn, recv: &Object, via_call: bool) -> bool {
-    b.binds_instance
-        // (A site settled on a plain instance's native `__init__` may see
-        // a dict payload later, which the dispatch routes.)
-        && (via_call || b.name != "__init__" || native_init_call(b, recv) || container_init_call(b, recv))
+    if !b.binds_instance {
+        // A native classmethod's function bound to its class, through the
+        // full call (see `Interpreter::builtin_lane`).
+        return via_call && matches!(recv, Object::Type(_));
+    }
+    // (A site settled on a plain instance's native `__init__` may see
+    // a dict payload later, which the dispatch routes.)
+    (via_call || b.name != "__init__" || native_init_call(b, recv) || container_init_call(b, recv))
         && (!via_call
             || builtins::method_memo_tag(recv).is_some()
             // A builtin subclass's instance (`Counter.items`): the method
