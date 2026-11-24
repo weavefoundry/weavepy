@@ -2834,6 +2834,17 @@ branch and pull request.
     though the helper pins one object per activation. The compiled code
     now keeps the pin it got for the rest of the run: `type(x) is int`
     in a tier-2 loop went from 693 instructions to 635.
+  - Compiled code runs a local list's, dict's, set's or str's method in
+    place through a kernel when it has one (`append`, `get`, `strip`),
+    and otherwise took the fused method call, which decodes the call's
+    instructions and finds the method again on every call. A method with
+    a fast half (`sort`, `dict.pop(k, d)`, `str.encode`), `list.pop(i)`,
+    and a body that's a leaf whole now go through the native method site
+    instance methods use, the receiver's tag checked in line: on a short
+    list `xs.sort()` went from 1,728 instructions to 1,377 (CPython
+    1,298), `xs.pop(0)` from 1,484 to 1,237, and `d.pop(k, None)` from
+    616 to 319. The sort itself skips the run stack (an allocation) for
+    a list shorter than a minimum run, as CPython's does.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

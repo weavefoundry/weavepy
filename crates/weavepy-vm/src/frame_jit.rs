@@ -7549,6 +7549,10 @@ unsafe extern "C" fn h_local_method(
     }
 }
 
+/// [`InstMethodSite::ver`] for an exact builtin receiver. (Class attribute
+/// versions count up from 1.)
+const BUILTIN_RECV: u64 = 0;
+
 /// A `x.m(<arguments>)` site of compiled code whose method is native (see
 /// [`h_inst_native`]).
 pub(crate) struct InstMethodSite {
@@ -7556,7 +7560,9 @@ pub(crate) struct InstMethodSite {
     /// The fast half the call site settled on, or `None` for a body that
     /// is a leaf whole.
     fast: Option<crate::leaf_builtins::Fast>,
-    /// The receiver's class attribute version the method was cached under.
+    /// The receiver's class attribute version the method was cached under,
+    /// or [`BUILTIN_RECV`] for an exact builtin receiver (its tag checked
+    /// in line, so nothing shadows the method).
     ver: u64,
     nargs: u32,
     call_pc: u32,
@@ -7587,14 +7593,16 @@ unsafe extern "C" fn h_inst_native(
     // and the arguments' initialized places, and its own site.
     unsafe {
         let site = &*site;
-        let Object::Instance(inst) = &*recv else {
-            return 1;
-        };
-        let cls = inst.cls_raw();
-        if cls.attr_version.get() != site.ver
-            || !crate::inst_method_unshadowed_by(cls, inst, &site.name, site.hash)
-        {
-            return 1;
+        if site.ver != BUILTIN_RECV {
+            let Object::Instance(inst) = &*recv else {
+                return 1;
+            };
+            let cls = inst.cls_raw();
+            if cls.attr_version.get() != site.ver
+                || !crate::inst_method_unshadowed_by(cls, inst, &site.name, site.hash)
+            {
+                return 1;
+            }
         }
         // Bitwise views, never dropped: the method reads them (and clones
         // what it keeps).
@@ -21551,11 +21559,38 @@ impl<'a> Lower<'a> {
                         Arg::Small(v) => (false, u32::MAX - v.min(u32::MAX - 1)),
                     })
                     .collect();
-                self.inst_native_call(pc, call_pc, &args, ver, fast, f);
+                let want = self.tags.instance;
+                self.native_method_call(pc, call_pc, &args, ver, want, fast, f);
             }
             return;
         };
         let Some(kernel) = kernel_for(tag, kind, args.len()) else {
+            // A fast half, `pop(i)`, or a body that's a leaf whole, through
+            // the native method site (whose call can raise), the receiver's
+            // tag checked in line.
+            let fast = match (tag, kind) {
+                (_, crate::LeafKind::Fast(fast)) => Some(fast),
+                (1, crate::LeafKind::ListPop) | (1..=3, crate::LeafKind::Opaque) => None,
+                _ => return,
+            };
+            if self.inlining() {
+                return;
+            }
+            let args: Vec<(bool, u32)> = args
+                .iter()
+                .map(|a| match *a {
+                    Arg::Local(i) => (true, i),
+                    Arg::Const(c) => (false, c),
+                    Arg::Small(v) => (false, u32::MAX - v.min(u32::MAX - 1)),
+                })
+                .collect();
+            let want = match tag {
+                1 => self.tags.list,
+                2 => self.tags.dict,
+                3 => self.tags.set,
+                _ => self.tags.str,
+            };
+            self.native_method_call(pc, call_pc, &args, BUILTIN_RECV, want, fast, f);
             return;
         };
         let want = match tag {
@@ -21622,18 +21657,22 @@ impl<'a> Lower<'a> {
     }
 
     /// `LOAD_FAST x; x.m(<local, constant or small int arguments>); CALL`
-    /// on an instance whose method site cached a native method: the
+    /// on an instance whose method site cached a native method (or on an
+    /// exact builtin receiver whose method has a fast half, `ver`
+    /// [`BUILTIN_RECV`] and `want` its tag): the
     /// receiver's tag checked in line and the method called through
     /// [`h_inst_native`] on the operands in place (a small int, `(false,
     /// u32::MAX - v)` in `args`, in the slot it would take), continuing
     /// after the `CALL`. Lowering continues (at the general fused call)
     /// where the receiver is something else or the helper declines.
-    fn inst_native_call(
+    #[allow(clippy::too_many_arguments)]
+    fn native_method_call(
         &mut self,
         pc: usize,
         call_pc: usize,
         args: &[(bool, u32)],
         ver: u64,
+        want: u8,
         fast: Option<crate::leaf_builtins::Fast>,
         f: Rc<crate::object::BuiltinFn>,
     ) {
@@ -21642,10 +21681,7 @@ impl<'a> Lower<'a> {
         let declined = self.b.create_block();
         let recv = self.local_addr(self.code.instructions[pc].arg);
         let t = self.tag_at(recv);
-        let other = self
-            .b
-            .ins()
-            .icmp_imm(IntCC::NotEqual, t, i64::from(self.tags.instance));
+        let other = self.b.ins().icmp_imm(IntCC::NotEqual, t, i64::from(want));
         self.branch_out(other, declined);
         let mut addrs = Vec::with_capacity(2);
         for (j, &(local, i)) in args.iter().enumerate() {

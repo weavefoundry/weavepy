@@ -54,6 +54,19 @@ where
         pending: Vec::new(),
     };
     let minrun = compute_minrun(n);
+    // A list shorter than a minimum run is one run, binary-sorted from its
+    // ascending (or reversed descending) prefix, as CPython's `list.sort`
+    // sorts it: no run stack, so no allocation.
+    if minrun == n {
+        // SAFETY: as below, `0..n` lies in `v`.
+        unsafe {
+            let run = ms.count_run(0, n)?;
+            if run < n {
+                ms.binarysort(0, n, run)?;
+            }
+        }
+        return Ok(());
+    }
     let mut lo = 0;
     let mut nremaining = n;
     // SAFETY: every index handed to the helpers below lies in `v`, which is
