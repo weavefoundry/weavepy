@@ -2871,6 +2871,23 @@ branch and pull request.
     runs nothing), and ends as it ends: `list(zip_longest(a, b))` of a
     three-item list and a one-item list went from 10,567 instructions to
     7,961 (CPython 4,403).
+  - Importing a module decoded each code object's names through the
+    process-wide name pool (a lock and a hash of the text) even when the
+    module's other functions had decoded the same name (`self`), hashed
+    each name's text again for the code's lookup table though the pooled
+    string caches its hash, and checked every string constant's whole
+    text for ASCII before finding its first non-name character (a
+    docstring's first space). A module's names are now pooled once per
+    module, a code object's names find their interned strings through a
+    small memo keyed by the pooled name, the hashes come from the
+    interned strings, and the constant check stops at its first non-name
+    character: `import dataclasses`, `inspect`, `logging`, `json` and
+    `typing` took 2.8% fewer instructions together (1.31 to 1.27 times
+    CPython's). Registering a native builtin as a leaf also swept the
+    whole registry for dead entries each time, which made a module's
+    registrations quadratic (about 4,000 instructions each by the time
+    `datetime` registers its own); the sweep now runs when the registry
+    has doubled.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

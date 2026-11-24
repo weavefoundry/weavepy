@@ -57,6 +57,13 @@ impl Name {
     pub fn ptr_eq(a: &Name, b: &Name) -> bool {
         Arc::ptr_eq(&a.0, &b.0)
     }
+
+    /// The text's address: equal pooled names share it (a memo keyed by it
+    /// holds the name, so no other text comes to sit there).
+    #[inline]
+    pub fn addr(&self) -> usize {
+        Arc::as_ptr(&self.0).cast::<u8>() as usize
+    }
 }
 
 /// The pool's hasher (FxHash's): a rotate, an exclusive-or and a

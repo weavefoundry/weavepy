@@ -278,6 +278,14 @@ impl<'a> Module<'a> {
         ))
     }
 
+    /// How many identifiers the module has (see the module docs).
+    fn identifier_count(&self) -> Option<usize> {
+        let b = self
+            .bytes
+            .get(self.names_at..self.names_at.checked_add(4)?)?;
+        Some(u32::from_le_bytes(b.try_into().ok()?) as usize)
+    }
+
     /// The text of the identifier numbered `i` (see the module docs).
     fn identifier(&self, i: usize) -> Option<&'a str> {
         let bytes = self.bytes;
@@ -681,7 +689,9 @@ impl Reader<'_> {
     /// An identifier [`Writer::name`] wrote.
     fn name(&mut self, module: &Module) -> Option<Name> {
         let i = usize::try_from(self.uint()?).ok()?;
-        Some(Name::new(module.identifier(i)?))
+        module
+            .buffer
+            .name(i, module.identifier_count()?, || module.identifier(i))
     }
 
     /// A name table [`Writer::names`] wrote.

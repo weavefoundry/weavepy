@@ -1464,6 +1464,46 @@ pub(crate) fn intern_name(name: &str) -> Object {
     })
 }
 
+/// [`intern_name`] for a code object's name, through a per-thread memo
+/// of recent names by the pooled name's address: the names a module's
+/// code objects share (`self`, `append`) skip the pool's hash and probe.
+/// Each entry holds its name, so no other text comes to sit at its
+/// address.
+pub(crate) fn intern_code_name(name: &weavepy_compiler::Name) -> Object {
+    const N: usize = 512;
+    thread_local! {
+        static MEMO: crate::gil::ReleaseUnderGil<
+            RefCell<[Option<(weavepy_compiler::Name, SharedStr)>; N]>,
+        > = const { crate::gil::ReleaseUnderGil::new(RefCell::new([const { None }; N])) };
+    }
+    let addr = name.addr();
+    let slot = (addr >> 4 ^ addr >> 13) % N;
+    let hit = MEMO
+        .try_with(|m| {
+            let m = m.try_borrow().ok()?;
+            match &m[slot] {
+                Some((n, pooled)) if weavepy_compiler::Name::ptr_eq(n, name) => {
+                    Some(pooled.clone())
+                }
+                _ => None,
+            }
+        })
+        .ok()
+        .flatten();
+    if let Some(pooled) = hit {
+        return Object::Str(pooled);
+    }
+    let obj = intern_name(name);
+    if let Object::Str(pooled) = &obj {
+        let _ = MEMO.try_with(|m| {
+            if let Ok(mut m) = m.try_borrow_mut() {
+                m[slot] = Some((name.clone(), pooled.clone()));
+            }
+        });
+    }
+    obj
+}
+
 /// `sys.intern` for an existing string: the pooled object for its value,
 /// which becomes `text` itself on first sight. The native unpickler interns
 /// attribute names this way, exactly as `load_build` does.
@@ -1523,7 +1563,9 @@ pub(crate) fn cpython_interns_constant(s: &str) -> bool {
         (Some(c), None) if (c as u32) < 256 => return true,
         _ => {}
     }
-    s.is_ascii() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    // (Every name character is ASCII, so one pass that stops at the first
+    // other character, a docstring's first space, decides.)
+    s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 /// Is `o` the pooled (`sys.intern`) instance for its value? `marshal`

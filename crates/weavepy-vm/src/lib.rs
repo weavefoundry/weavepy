@@ -80574,7 +80574,8 @@ pub(crate) mod leaf_builtins {
     }
 
     /// The registrations by address (a dead builtin's entry is replaced by
-    /// whatever registers at its address next, and dropped at a push).
+    /// whatever registers at its address next, and dropped at a sweep, see
+    /// `push`).
     static REGISTRY: parking_lot::Mutex<Option<LeafMap>> = parking_lot::Mutex::new(None);
     static GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -80596,9 +80597,18 @@ pub(crate) mod leaf_builtins {
     }
 
     fn push(b: &Rc<crate::object::BuiltinFn>, entry: Entry) {
+        // (Dead entries are dropped when the map has doubled since the last
+        // sweep, not at every push, which made registering a module's
+        // builtins quadratic. Until then a dead one only holds its
+        // allocation, which keeps any other builtin from its address, and
+        // `lookup` checks that the entry's builtin is alive.)
+        static SWEPT_AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let mut reg = REGISTRY.lock();
         let reg = reg.get_or_insert_with(LeafMap::default);
-        reg.retain(|_, (w, _)| w.strong_count() > 0);
+        if reg.len() >= (2 * SWEPT_AT.load(Ordering::Relaxed)).max(256) {
+            reg.retain(|_, (w, _)| w.strong_count() > 0);
+            SWEPT_AT.store(reg.len(), Ordering::Relaxed);
+        }
         reg.insert(Rc::as_ptr(b) as usize, (Rc::downgrade(b), entry));
         GENERATION.fetch_add(1, Ordering::Release);
     }
@@ -92116,63 +92126,74 @@ fn code_vm_ext_build(code: &CodeObject) -> &CodeConstObjects {
     // SAFETY: as in `code_vm_ext` (this is the slot's one producer;
     // `marshal` only ever creates the empty default).
     unsafe {
-        code.vm_ext.get_or_init(|| CodeConstObjects {
-            objects: code
-                .constants
-                .iter()
-                .map(constant_to_object_interned)
-                .collect(),
-            name_hashes: code
+        code.vm_ext.get_or_init(|| {
+            // The names' pooled strings, and their hashes from those
+            // strings' caches: a name many code objects share (`self`,
+            // `append`) is hashed once.
+            let name_objs: Vec<Object> = code
                 .names
                 .iter()
-                .map(|n| crate::object::py_str_hash(n))
-                .collect(),
-            name_objs: code
+                .map(crate::stdlib::sys::intern_code_name)
+                .collect();
+            let name_hashes = code
                 .names
                 .iter()
-                .map(|n| crate::stdlib::sys::intern_name(n))
-                .collect(),
-            cell_args: code
-                .cellvars
-                .iter()
-                .map(|c| {
-                    code.varnames
-                        .iter()
-                        .position(|n| n == c)
-                        .map_or(u32::MAX, |i| i as u32)
+                .zip(&name_objs)
+                .map(|(n, o)| match o {
+                    Object::Str(s) => SharedStr::hash_cached(s),
+                    _ => crate::object::py_str_hash(n),
                 })
-                .collect(),
-            site_ranks: std::sync::OnceLock::new(),
-            method_slots: SiteSlots::new(),
-            stamp_slots: SiteSlots::new(),
-            attr_poly: SiteSlots::new(),
-            call_slots: SiteSlots::new(),
-            pure_leaf: std::sync::atomic::AtomicU8::new(0),
-            leaf_tries: std::sync::atomic::AtomicU64::new(0),
-            dunders: std::sync::OnceLock::new(),
-            fast_pairs: std::sync::OnceLock::new(),
-            gen_fast: std::sync::atomic::AtomicU8::new(0),
-            gen_stalls: std::sync::atomic::AtomicU32::new(0),
-            varkw_local: std::sync::atomic::AtomicU8::new(0),
-            gen_start: std::sync::atomic::AtomicU32::new(0),
-            field_slots: SiteSlots::new(),
-            native_sites: std::sync::OnceLock::new(),
-            instance_sites: std::sync::OnceLock::new(),
-            heap_sites: std::sync::OnceLock::new(),
-            leaf_sites: SiteSlots::new(),
-            leaf_plan: std::sync::OnceLock::new(),
-            returns_none: std::sync::atomic::AtomicU8::new(0),
-            store_init: std::sync::OnceLock::new(),
-            calls: std::sync::atomic::AtomicU8::new(0),
-            loop_iters: std::sync::atomic::AtomicU8::new(0),
-            name_memos: std::sync::OnceLock::new(),
-            gen_names: std::sync::OnceLock::new(),
-            ident_strs: std::sync::OnceLock::new(),
-            positions: std::sync::OnceLock::new(),
-            #[cfg(feature = "jit")]
-            frame_jit: frame_jit::Slot::default(),
-            cold_sites: std::sync::atomic::AtomicU32::new(0),
-            dispatch_len: code_dispatch_len(code),
+                .collect();
+            CodeConstObjects {
+                objects: code
+                    .constants
+                    .iter()
+                    .map(constant_to_object_interned)
+                    .collect(),
+                name_hashes,
+                name_objs: name_objs.into_iter().collect(),
+                cell_args: code
+                    .cellvars
+                    .iter()
+                    .map(|c| {
+                        code.varnames
+                            .iter()
+                            .position(|n| n == c)
+                            .map_or(u32::MAX, |i| i as u32)
+                    })
+                    .collect(),
+                site_ranks: std::sync::OnceLock::new(),
+                method_slots: SiteSlots::new(),
+                stamp_slots: SiteSlots::new(),
+                attr_poly: SiteSlots::new(),
+                call_slots: SiteSlots::new(),
+                pure_leaf: std::sync::atomic::AtomicU8::new(0),
+                leaf_tries: std::sync::atomic::AtomicU64::new(0),
+                dunders: std::sync::OnceLock::new(),
+                fast_pairs: std::sync::OnceLock::new(),
+                gen_fast: std::sync::atomic::AtomicU8::new(0),
+                gen_stalls: std::sync::atomic::AtomicU32::new(0),
+                varkw_local: std::sync::atomic::AtomicU8::new(0),
+                gen_start: std::sync::atomic::AtomicU32::new(0),
+                field_slots: SiteSlots::new(),
+                native_sites: std::sync::OnceLock::new(),
+                instance_sites: std::sync::OnceLock::new(),
+                heap_sites: std::sync::OnceLock::new(),
+                leaf_sites: SiteSlots::new(),
+                leaf_plan: std::sync::OnceLock::new(),
+                returns_none: std::sync::atomic::AtomicU8::new(0),
+                store_init: std::sync::OnceLock::new(),
+                calls: std::sync::atomic::AtomicU8::new(0),
+                loop_iters: std::sync::atomic::AtomicU8::new(0),
+                name_memos: std::sync::OnceLock::new(),
+                gen_names: std::sync::OnceLock::new(),
+                ident_strs: std::sync::OnceLock::new(),
+                positions: std::sync::OnceLock::new(),
+                #[cfg(feature = "jit")]
+                frame_jit: frame_jit::Slot::default(),
+                cold_sites: std::sync::atomic::AtomicU32::new(0),
+                dispatch_len: code_dispatch_len(code),
+            }
         })
     }
 }

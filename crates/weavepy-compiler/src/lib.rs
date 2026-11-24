@@ -1100,7 +1100,13 @@ struct LazyTable<T> {
 
 /// The encoding of a module in the code cache's native form (see
 /// `native_code`): its own bytes, or, say, a mapping of the cache file.
-pub struct TableBuffer(Box<dyn CodeBytes>, std::sync::atomic::AtomicU8);
+pub struct TableBuffer(
+    Box<dyn CodeBytes>,
+    std::sync::atomic::AtomicU8,
+    /// The module's identifiers as pooled names, by number, each made on
+    /// its first read (see [`TableBuffer::name`]).
+    std::sync::OnceLock<Box<[std::sync::OnceLock<crate::name::Name>]>>,
+);
 
 /// Where a [`TableBuffer`] gets its bytes.
 pub trait CodeBytes: Send + Sync + 'static {
@@ -1123,7 +1129,11 @@ impl CodeBytes for Box<[u8]> {
 
 impl TableBuffer {
     pub fn new(bytes: impl CodeBytes) -> Self {
-        TableBuffer(Box::new(bytes), std::sync::atomic::AtomicU8::new(0))
+        TableBuffer(
+            Box::new(bytes),
+            std::sync::atomic::AtomicU8::new(0),
+            std::sync::OnceLock::new(),
+        )
     }
 
     /// Whether the module's identifier text is UTF-8, as its first read
@@ -1131,6 +1141,28 @@ impl TableBuffer {
     /// rather than at each identifier's every read.
     pub(crate) fn names_utf8(&self) -> u8 {
         self.1.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The pooled name for identifier `i` of the `count` the module has,
+    /// made from its `text` on its first read: a name the module's code objects
+    /// share (`self`, `append`) goes through the pool once.
+    pub(crate) fn name<'t>(
+        &self,
+        i: usize,
+        count: usize,
+        text: impl FnOnce() -> Option<&'t str>,
+    ) -> Option<crate::name::Name> {
+        let memo = self
+            .2
+            .get_or_init(|| (0..count).map(|_| std::sync::OnceLock::new()).collect());
+        let Some(slot) = memo.get(i) else {
+            return Some(crate::name::Name::new(text()?));
+        };
+        if let Some(name) = slot.get() {
+            return Some(name.clone());
+        }
+        let name = crate::name::Name::new(text()?);
+        Some(slot.get_or_init(|| name).clone())
     }
 
     pub(crate) fn set_names_utf8(&self, ok: bool) {
