@@ -1692,9 +1692,18 @@ pub(crate) fn dd_missing_pure(
     key: &Object,
 ) -> Option<Object> {
     let ours = DD_MISSING.load(std::sync::atomic::Ordering::Relaxed);
-    match inst.cls_raw().lookup("__missing__") {
-        Some(Object::Builtin(b)) if Rc::as_ptr(&b) as usize == ours && ours != 0 => {}
-        _ => return None,
+    // (The class's `__missing__` is the native one, remembered per class
+    // version.)
+    let cls = inst.cls_raw();
+    if ours == 0
+        || !cls.memo_verdict(crate::types::Verdict::DefaultDictMissing, "", || {
+            matches!(
+                cls.lookup("__missing__"),
+                Some(Object::Builtin(b)) if Rc::as_ptr(&b) as usize == ours
+            )
+        })
+    {
+        return None;
     }
     if crate::capi_watchers::dicts_active() {
         return None;

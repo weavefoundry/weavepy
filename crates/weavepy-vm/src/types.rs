@@ -254,6 +254,10 @@ pub(crate) enum Verdict {
     /// and `__init__` (see `stdlib::weakref_real::keyedref_pure_new`);
     /// `name` unused.
     KeyedRefPlainNew = 24,
+    /// The class (a `defaultdict` or a subclass) keeps the native
+    /// `__missing__` (see `stdlib::collections_native::dd_missing_pure`);
+    /// `name` unused.
+    DefaultDictMissing = 25,
 }
 
 pub struct AttrVersion(std::sync::atomic::AtomicU64);

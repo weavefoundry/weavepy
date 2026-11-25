@@ -3176,7 +3176,11 @@ branch and pull request.
     repeaters and chains counted as sources whose step runs no code. A
     `cycle` over a plain cursor, or replaying its saved items, now does
     too: `list(islice(cycle("ab"), 5))` went from 12,154 to 9,882
-    (CPython 4,806).
+    (CPython 4,806). A `defaultdict` miss filled natively looked
+    `__missing__` up on the class each time to check that it is the
+    native one. That check is now remembered per class version, and
+    counting eleven words with `d[w] += 1` went from 19,473 to 17,291
+    (CPython 15,140).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
