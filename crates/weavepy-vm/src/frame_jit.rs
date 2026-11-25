@@ -6865,6 +6865,12 @@ unsafe extern "C" fn h_store_subscr_ref(
             return len - 3;
         }
         own_operands(at, &[val, cont, key], owned);
+        // An instance whose `__setitem__` only stores into a dict attribute
+        // (`self.data[key] = value`): that store, in place.
+        if Interpreter::setitem_delegate(&*at.add(1), &*at.add(2), &*at) {
+            crate::release_run(at, 3);
+            return len - 3;
+        }
         h_container(st, ins, code, pc, len, flags >> 8)
     }
 }

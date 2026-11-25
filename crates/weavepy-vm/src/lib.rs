@@ -33152,6 +33152,65 @@ impl Interpreter {
         }
     }
 
+    /// `container[key] = value` for an instance whose class's Python
+    /// `__setitem__` is the delegating shape (see
+    /// [`setitem_delegate_shape`]) over an exact dict attribute: the dict's
+    /// store, in place, as the method would make it. `false` touched
+    /// nothing (a key that hashes or compares in Python, a target other
+    /// than a dict, or a tracer that would see the method run).
+    pub(crate) fn setitem_delegate(container: &Object, key: &Object, value: &Object) -> bool {
+        let Object::Instance(inst) = container else {
+            return false;
+        };
+        let cls = inst.cls_raw();
+        if inst.native.get().is_some()
+            || cls.native_kind.get() != 0
+            || cls.c_ext_ptr.get() != 0
+            || crate::trace::any_observers_active()
+        {
+            return false;
+        }
+        let Some(f) = Self::instance_dunder_function(
+            inst,
+            crate::types::AttrKey::vm(crate::types::vm_key::SETITEM),
+            "__setitem__",
+        ) else {
+            return false;
+        };
+        // SAFETY: GIL-serialized raw read of the function's code cell.
+        let code: &CodeObject = unsafe { &*f.code.as_ptr() };
+        let Some((name, index)) = setitem_delegate_shape(code) else {
+            return false;
+        };
+        let Some(attr) =
+            code_name_obj(code, name).and_then(|name| Self::leaf_getattr_value(container, name))
+        else {
+            return false;
+        };
+        // (`self.maps[0]`: an exact list's or tuple's item in range.)
+        let target = match (index, attr) {
+            (None, t) => t,
+            (Some(i), Object::List(l)) => {
+                match l.try_borrow().ok().and_then(|v| v.get(i as usize).cloned()) {
+                    Some(t) => t,
+                    None => return false,
+                }
+            }
+            (Some(i), Object::Tuple(t)) => match t.get(i as usize) {
+                Some(t) => t.clone(),
+                None => return false,
+            },
+            _ => return false,
+        };
+        if !matches!(target, Object::Dict(_)) {
+            return false;
+        }
+        matches!(
+            crate::builtins::dict_setitem_leaf(&[target, key.clone(), value.clone()]),
+            Some(Ok(_))
+        )
+    }
+
     /// [`Self::leaf_instance_len`] for a class (`len(SomeEnum)`) whose
     /// metaclass's `__len__` is a Python function that evaluates as a pure
     /// leaf: its answer in place, found through the metaclass's length
@@ -92094,6 +92153,68 @@ fn effect_setter_shape(code: &CodeObject) -> bool {
             && none.op == OpCode::LoadConst
             && matches!(code.constants.get(none.arg as usize), Some(Constant::None))
             && ret.op == OpCode::ReturnValue)
+}
+
+/// The attribute name index of a `__setitem__(self, key, value)` whose
+/// body is exactly `self.<name>[key] = value; return None` (a mapping
+/// wrapper's, as `UserDict` writes it) or `self.<name>[<i>][key] = value;
+/// return None` for a small int `i` (`ChainMap`'s `self.maps[0]`), and
+/// that `i`.
+pub(crate) fn setitem_delegate_shape(code: &CodeObject) -> Option<(u32, Option<u32>)> {
+    if code.arg_count != 3
+        || code.kwonly_count != 0
+        || code.has_varargs
+        || code.has_varkeywords
+        || !code.cellvars.is_empty()
+    {
+        return None;
+    }
+    let body = code.instructions.as_slice();
+    let body = match body.first() {
+        Some(i) if i.op == OpCode::Resume => &body[1..],
+        _ => body,
+    };
+    let local = |i: &weavepy_compiler::Instruction, n: u32| {
+        matches!(
+            i.op,
+            OpCode::LoadFast | OpCode::LoadFastBorrow | OpCode::LoadFastCheck
+        ) && i.arg == n
+    };
+    let rest = match body {
+        [pair, rest @ ..]
+            if matches!(
+                pair.op,
+                OpCode::LoadFastLoadFast | OpCode::LoadFastBorrowLoadFastBorrow
+            ) && pair.arg == 2 << 4 =>
+        {
+            rest
+        }
+        [v, recv, rest @ ..] if local(v, 2) && local(recv, 0) => rest,
+        _ => return None,
+    };
+    let (attr, index, tail) = match rest {
+        [attr, small, sub, tail @ ..]
+            if attr.op == OpCode::LoadAttr
+                && small.op == OpCode::LoadSmallInt
+                && sub.op == OpCode::BinarySubscr =>
+        {
+            (attr, Some(small.arg), tail)
+        }
+        [attr, tail @ ..] if attr.op == OpCode::LoadAttr => (attr, None, tail),
+        _ => return None,
+    };
+    match tail {
+        [key, store, none, ret]
+            if local(key, 1)
+                && store.op == OpCode::StoreSubscr
+                && none.op == OpCode::LoadConst
+                && matches!(code.constants.get(none.arg as usize), Some(Constant::None))
+                && ret.op == OpCode::ReturnValue =>
+        {
+            Some((attr.arg, index))
+        }
+        _ => None,
+    }
 }
 
 /// `CONVERT_VALUE` (`arg`'s low bits: `1` for `!s`, `2` for `!r`) of the

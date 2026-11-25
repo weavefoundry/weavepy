@@ -3024,6 +3024,15 @@ branch and pull request.
     `TD(a=1)` is `dict(a=1)`; compiled code left the loop for it each
     call. A class whose metaclass's `__call__` is a builtin type is now
     called as that type (5,472 to 1,882, CPython 2,230).
+  - A Python `__setitem__` can't run as a leaf (leaf evaluation buffers
+    attribute stores but not item stores), so every store into a mapping
+    wrapper took a frame: `c[k] = v` with `self.data[k] = v` as the
+    method cost 3,414 instructions (CPython 1,083). A class whose
+    `__setitem__` is exactly `self.<attr>[key] = value; return None`
+    (`UserDict`'s, a wrapper's), or `self.<attr>[<i>][key] = value` for
+    a small int (`ChainMap`'s `self.maps[0]`), now stores into that dict
+    in place when the store runs no code (1,256; `UserDict` 1,257,
+    CPython 1,012; a `ChainMap` 3,527 to 1,394, CPython 1,212).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
