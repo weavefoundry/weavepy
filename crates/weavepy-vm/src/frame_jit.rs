@@ -7707,6 +7707,12 @@ unsafe extern "C" fn h_store_attr(
         }
         // (A site that has only run frameless has no inline cache yet.)
         match local {
+            // A `threading.local`'s entry, through its native hook (the
+            // value cloned in, the slot's reference released).
+            Object::Instance(_) if Interpreter::local_store_fast(code, local, name, &*slot) => {
+                crate::drop_hot_at(slot);
+                0
+            }
             Object::Instance(inst) => u32::from(!Interpreter::leaf_attr_store_any(
                 code,
                 inst,
@@ -11825,6 +11831,14 @@ unsafe extern "C" fn h_stack_store_attr(code: *const CodeObject, pc: u64, at: *m
             _ => return 1,
         };
         let name = code.instructions[pc].arg;
+        // A `threading.local`'s entry, through its native hook (the value
+        // cloned in: both operands leave).
+        if droppable(recv) && droppable(val) && Interpreter::local_store_fast(code, recv, name, val)
+        {
+            crate::drop_hot_at(at.add(1));
+            crate::drop_hot_at(at);
+            return 0;
+        }
         if !droppable(recv)
             || !(Interpreter::core_store_attr(code, inst, pc, name, val)
                 || Interpreter::leaf_attr_store_any(code, inst, pc, name, val))

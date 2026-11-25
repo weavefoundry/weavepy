@@ -10938,6 +10938,37 @@ impl Interpreter {
         Some(act)
     }
 
+    /// `recv.<co_names[name_idx]> = value` on a `threading.local` whose
+    /// class keeps the native `__setattr__` hook, where the store runs no
+    /// Python code (see `local_native::setattr_fast`): `true` once stored
+    /// (the value cloned in), `false` touching nothing.
+    pub(crate) fn local_store_fast(
+        code: &CodeObject,
+        recv: &Object,
+        name_idx: u32,
+        value: &Object,
+    ) -> bool {
+        let Object::Instance(inst) = recv else {
+            return false;
+        };
+        if Self::default_setattr(inst.cls_raw()) {
+            return false;
+        }
+        let Some(b) = Self::instance_native_dunder(
+            inst,
+            crate::types::AttrKey::vm(crate::types::vm_key::SETATTR_NATIVE),
+            "__setattr__",
+            false,
+        ) else {
+            return false;
+        };
+        let Some(name) = code_name_obj(code, name_idx) else {
+            return false;
+        };
+        crate::stdlib::local_native::is_hook(&b, true)
+            && crate::stdlib::local_native::setattr_fast(recv, name, value)
+    }
+
     /// `obj.name = value` (the `STORE_ATTR` at `frame.pc`) for a `property`
     /// whose setter is a registered leaf builtin (a native class's
     /// settable field): the setter runs in place and both operands leave

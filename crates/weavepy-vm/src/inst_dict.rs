@@ -1581,6 +1581,27 @@ impl crate::types::PyInstance {
         }
     }
 
+    /// Attribute `name` (Python hash `hash`) read in place from either
+    /// layout, with no code run: a published dict probed by the hash, a
+    /// split layout at the position `memo` last found it (see
+    /// [`SplitValues::get_memo`]). `None` when absent or borrowed.
+    pub fn attr_get_memo(&self, name: &str, hash: i64, memo: &PosMemo) -> Option<Object> {
+        match self.dict.published() {
+            Some(d) => d
+                .try_borrow()
+                .ok()?
+                .get(&crate::object::StrKeyHashed { s: name, hash })
+                .cloned(),
+            None => self
+                .dict
+                .split_cell()
+                .try_borrow()
+                .ok()?
+                .get_memo(name, hash, memo)
+                .cloned(),
+        }
+    }
+
     /// Attribute `name`'s value (either layout), without materializing
     /// a split layout and without running code.
     pub fn attr_get_str(&self, name: &str) -> Option<Object> {

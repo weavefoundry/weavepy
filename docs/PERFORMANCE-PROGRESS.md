@@ -3163,6 +3163,14 @@ branch and pull request.
     `KeyedRef` (a `ref` subclass with a `key` slot), and that ran its
     Python `__new__` and `__init__`. While the class keeps them, it is
     now built in place (`wvd[k] = v` 10,194 to 6,847, CPython 5,995).
+  - A `threading.local` attribute store left compiled code every time:
+    the interpreter stored it in place through the class's native
+    `__setattr__` hook, but the compiled store helpers had no such arm.
+    Both now do (`tl.x = i` 1,966 to 726, CPython 954). `SimpleQueue`'s
+    native `put` and `get` found `_queue` and `_locked` by scanning the
+    instance's names. They now use the names' hashes and remembered
+    positions (`PyInstance::attr_get_memo`), and a put and get went from
+    3,626 to 2,415 instructions in one run (CPython 945).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
