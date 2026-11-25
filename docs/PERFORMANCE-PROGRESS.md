@@ -3084,6 +3084,18 @@ branch and pull request.
     1,437), one returning `member.name` from 2,798 to 1,798 (CPython
     1,556), and one returning `member.value` from 2,116 to 1,773 (CPython
     1,553).
+  - `array.array` is a Python class whose item methods the `_struct`
+    module serves natively, but its construction still ran the Python
+    `__new__` (with `*rest` and `**kwargs` packed), `_setup` and a
+    `**kwargs` `__init__`. `array.array("i")` cost 9,027 instructions
+    (CPython 1,535). The class now has a pure constructor: for a numeric
+    typecode, and a list of plain ints or floats it holds, the instance
+    is laid out in place as `_setup` lays one out, while the class keeps
+    its own `__new__` and `__init__` (and no tracer or profiler is
+    watching). `array.array("i")` is now 1,704 instructions and
+    `array.array("i", [1, 2, 3])` 3,080, down from 20,899 (CPython 3,039).
+    `__new__`'s parameters are now positional-only, so
+    `array.array("i", initializer=[1])` raises CPython's `TypeError`.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

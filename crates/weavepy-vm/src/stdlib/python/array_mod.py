@@ -207,7 +207,7 @@ class array:
 
         return types.GenericAlias(cls, item)
 
-    def __new__(cls, typecode=_MISSING, initializer=_MISSING, *rest, **kwargs):
+    def __new__(cls, typecode=_MISSING, initializer=_MISSING, /, *rest, **kwargs):
         if typecode is _MISSING:
             raise TypeError(
                 "array() takes at least 1 argument (0 given)"
@@ -219,7 +219,7 @@ class array:
         # CPython rejects keywords only for the exact base type; subclasses
         # route extra keywords to their own __init__ (SF bug #1486663).
         if kwargs and cls is array:
-            raise TypeError("array() takes no keyword arguments")
+            raise TypeError("array.array() takes no keyword arguments")
         if not isinstance(typecode, str) or len(typecode) != 1:
             raise TypeError(
                 "array() argument 1 must be a unicode character, not %s"

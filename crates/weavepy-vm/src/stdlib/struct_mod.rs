@@ -1422,6 +1422,96 @@ fn array_slice_fast(recv: &Object, sl: &crate::object::PySlice) -> Option<Object
     array_over(inst, values, run)
 }
 
+/// `array(typecode)` or `array(typecode, items)` of a list of plain ints
+/// or floats that the typecode holds, for a numeric typecode and the
+/// `array` class itself while its `__new__` and `__init__` are the
+/// module's own (a verdict kept per class version): the instance laid
+/// out as `_setup` lays one out, over the packed items, as `__new__`
+/// leaves it. `None` for any other call (a `'u'` or `'w'` array, which
+/// may warn, another initializer, a value out of range), or while a
+/// tracer or profiler would see the methods.
+fn array_pure_new(cls: &Rc<crate::types::TypeObject>, args: &[Object]) -> Option<Object> {
+    let (code, items) = match args {
+        [Object::Str(code)] => (code, None),
+        [Object::Str(code), Object::List(items)] => (code, Some(items)),
+        _ => return None,
+    };
+    let [typecode] = *code.as_bytes() else {
+        return None;
+    };
+    let size = array_item_size(typecode)?;
+    if Rc::as_ptr(cls) as usize != ARRAY_CLASS.load(std::sync::atomic::Ordering::Relaxed)
+        || crate::trace::any_observers_active()
+    {
+        return None;
+    }
+    let own = |name: &str| match cls.dict.borrow().get(&crate::object::StrKey(name)) {
+        Some(Object::Function(f)) => f.code().qualname == format!("array.{name}"),
+        Some(Object::StaticMethod(m)) => {
+            matches!(m.func(), Object::Function(f) if f.code().qualname == format!("array.{name}"))
+        }
+        _ => false,
+    };
+    if !cls.memo_verdict(crate::types::Verdict::ArrayPlainNew, "", || {
+        own("__new__") && own("__init__")
+    }) {
+        return None;
+    }
+    let layout = cls.own_slot_layout()?;
+    if crate::shared_value::SharedSlice::word(layout)
+        != ARRAY_LAYOUT.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return None;
+    }
+    let mut buf = Vec::new();
+    if let Some(items) = items {
+        let items = items.try_borrow().ok()?;
+        buf.reserve(items.len() * size);
+        let mut packed = [0u8; 8];
+        for v in items.iter() {
+            let n = array_item_write(typecode, v, &mut packed)?;
+            buf.extend_from_slice(&packed[..n]);
+        }
+    }
+    // (`_KINDS` and `_INT_RANGES`: an int's range by width and sign.)
+    let (kind, lo, hi) = match typecode {
+        b'f' | b'd' => (1, Object::Int(0), Object::Int(0)),
+        _ => {
+            let shift = 64 - 8 * size as u32;
+            if typecode.is_ascii_lowercase() {
+                (
+                    0,
+                    Object::Int(i64::MIN >> shift),
+                    Object::Int(i64::MAX >> shift),
+                )
+            } else if shift == 0 {
+                (
+                    0,
+                    Object::Int(0),
+                    Object::Long(Rc::new(num_bigint::BigInt::from(u64::MAX))),
+                )
+            } else {
+                (0, Object::Int(0), Object::Int((1i64 << (8 * size)) - 1))
+            }
+        }
+    };
+    let values = [
+        Object::Str(code.clone()),
+        Object::Str(code.clone()),
+        Object::Int(size as i64),
+        Object::new_bytearray(buf),
+        Object::Int(kind),
+        lo,
+        hi,
+    ];
+    Some(Object::Instance(Rc::new(
+        crate::types::PyInstance::with_slots(
+            cls.clone(),
+            crate::types::SlotStorage::from_layout_array(layout.clone(), values),
+        ),
+    )))
+}
+
 /// `a.__copy__()` (`copy.copy(a)`) of an instance of the `array` class
 /// itself with a numeric typecode: a new array over a copy of its bytes.
 fn array_copy_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
@@ -1842,6 +1932,8 @@ fn array_methods(args: &[Object]) -> Result<Object, RuntimeError> {
         Rc::as_ptr(cls) as usize,
         std::sync::atomic::Ordering::Relaxed,
     );
+    // (Plain constructions build in place: see `array_pure_new`.)
+    cls.pure_new.set(Some(array_pure_new));
     for (owner, known) in [(cls, &ARRAY_LAYOUT), (iter_cls, &ARRAY_ITER_LAYOUT)] {
         if let Some(layout) = owner.own_slot_layout() {
             known.store(

@@ -242,6 +242,10 @@ pub(crate) enum Verdict {
     /// The class reads `_name_` and `_value_` of its instances from their
     /// dicts under the default attribute access; `name` unused.
     EnumFields = 21,
+    /// The class (`array.array`) keeps its module's own `__new__` and
+    /// `__init__` (see `stdlib::struct_mod::array_pure_new`); `name`
+    /// unused.
+    ArrayPlainNew = 22,
 }
 
 pub struct AttrVersion(std::sync::atomic::AtomicU64);
