@@ -3110,6 +3110,15 @@ branch and pull request.
     (CPython 1,494). `list()` of an instance looked up `__len__` and
     `__length_hint__` on the class each time to decide what to probe;
     their absence is now remembered per class version.
+  - `dataclasses.asdict` recursed through `_asdict_inner` in Python, a
+    call, a `fields()` tuple and a `getattr` per field (24,387
+    instructions for three fields, one a list; CPython 15,074). With
+    the default `dict` factory, a tree of plain dataclass instances
+    (fields read from their dicts, no descriptor of the name on the
+    class), exact lists, tuples and dicts, and plain scalars now copies
+    natively (`_weave_collections._asdict_plain`): 7,461. Any other value
+    (a namedtuple, a set, an enum, a slots dataclass), a custom factory,
+    or a watching tracer or profiler takes the Python copy.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

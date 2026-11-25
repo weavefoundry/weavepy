@@ -1866,6 +1866,160 @@ fn deepcopy_plain(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(deep_plain(x, &mut memo, 0).unwrap_or(Object::None))
 }
 
+/// `_asdict_plain(obj, field_marker)`: `dataclasses.asdict(obj)` with the
+/// default `dict` factory, for a tree of plain dataclass instances, exact
+/// lists, tuples and dicts, and `None`, bools, numbers, strings and bytes:
+/// the copy `_asdict_inner` makes, read with no code run. `field_marker`
+/// is `dataclasses._FIELD` (the kind of field `fields()` keeps). `None`
+/// for anything else (another value, a field read through a descriptor,
+/// a tree too deep), which the Python path copies, or while a trace or
+/// profile hook watches.
+fn asdict_plain(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [obj @ Object::Instance(_), Object::Instance(marker)] = args else {
+        return Ok(Object::None);
+    };
+    if crate::trace::any_observers_active() || crate::object::exotic_str_keys_possible() {
+        return Ok(Object::None);
+    }
+    Ok(asdict_value(obj, marker, 0).unwrap_or(Object::None))
+}
+
+/// [`asdict_plain`]'s copy of `x`, `depth` levels down.
+fn asdict_value(x: &Object, marker: &Rc<crate::types::PyInstance>, depth: u32) -> Option<Object> {
+    if depth >= DEEPCOPY_DEPTH {
+        return None;
+    }
+    match x {
+        Object::None
+        | Object::Bool(_)
+        | Object::Int(_)
+        | Object::Long(_)
+        | Object::Float(_)
+        | Object::Complex(_)
+        | Object::Str(_)
+        | Object::Bytes(_) => Some(x.clone()),
+        Object::List(l) => {
+            let items = l.try_borrow().ok()?.clone();
+            let out = items
+                .iter()
+                .map(|v| asdict_value(v, marker, depth + 1))
+                .collect::<Option<Vec<_>>>()?;
+            let y = Object::new_list(out);
+            crate::gc_trace::track(&y);
+            Some(y)
+        }
+        Object::Tuple(t) => {
+            let out = t
+                .iter()
+                .map(|v| asdict_value(v, marker, depth + 1))
+                .collect::<Option<Vec<_>>>()?;
+            Some(Object::new_tuple(out))
+        }
+        Object::Dict(d) => {
+            let entries: Vec<(Object, Object)> = d
+                .try_borrow()
+                .ok()?
+                .iter()
+                .map(|(k, v)| (k.0.clone(), v.clone()))
+                .collect();
+            let mut out =
+                DictData::with_capacity_and_hasher(entries.len(), crate::fasthash::FxBuildHasher);
+            for (k, v) in &entries {
+                let (k, v) = (
+                    asdict_value(k, marker, depth + 1)?,
+                    asdict_value(v, marker, depth + 1)?,
+                );
+                // (Keys of these kinds hash natively.)
+                out.insert(DictKey(k), v);
+            }
+            let y = Object::Dict(Rc::new(RefCell::new(out)));
+            crate::gc_trace::track(&y);
+            Some(y)
+        }
+        Object::Instance(inst) => asdict_instance(inst, marker, depth),
+        _ => None,
+    }
+}
+
+/// [`asdict_value`] of a plain dataclass instance: its fields (the
+/// `__dataclass_fields__` entries whose `_field_type` is `marker`), in
+/// order, each read from its dict under the default attribute access with
+/// no descriptor of the name on the class.
+fn asdict_instance(
+    inst: &Rc<crate::types::PyInstance>,
+    marker: &Rc<crate::types::PyInstance>,
+    depth: u32,
+) -> Option<Object> {
+    let cls = inst.cls_raw();
+    if inst.native.get().is_some()
+        || cls.native_kind.get() != 0
+        || cls.c_ext_ptr.get() != 0
+        || !cls
+            .dunder(crate::types::Dunder::GetAttribute)
+            .object_owner()
+    {
+        return None;
+    }
+    let Some(Object::Dict(fields)) = cls.lookup("__dataclass_fields__") else {
+        return None;
+    };
+    let fields: Vec<Object> = fields.try_borrow().ok()?.values().cloned().collect();
+    let mut out = DictData::with_capacity_and_hasher(fields.len(), crate::fasthash::FxBuildHasher);
+    for f in &fields {
+        let Object::Instance(fi) = f else {
+            return None;
+        };
+        let (name, kind) = {
+            let slots = fi.slots.try_borrow().ok()?;
+            (
+                slots.get("name")?.clone(),
+                slots.get("_field_type")?.clone(),
+            )
+        };
+        // (A class variable or init-only pseudo-field: not a field.)
+        match &kind {
+            Object::Instance(k) if Rc::ptr_eq(k, marker) => {}
+            Object::Instance(_) => continue,
+            _ => return None,
+        }
+        let Object::Str(name) = name else {
+            return None;
+        };
+        // (A class attribute of the name may only be a plain default.)
+        match cls.lookup(&name) {
+            None
+            | Some(
+                Object::None
+                | Object::Bool(_)
+                | Object::Int(_)
+                | Object::Float(_)
+                | Object::Str(_)
+                | Object::Bytes(_),
+            ) => {}
+            Some(_) => return None,
+        }
+        let v = match inst.dict.published() {
+            Some(d) => d
+                .try_borrow()
+                .ok()?
+                .get(&crate::object::StrKey(&name))
+                .cloned(),
+            None => inst
+                .dict
+                .split_cell()
+                .try_borrow()
+                .ok()?
+                .get_str(&name)
+                .cloned(),
+        }?;
+        let v = asdict_value(&v, marker, depth + 1)?;
+        out.insert(DictKey(Object::Str(name)), v);
+    }
+    let y = Object::Dict(Rc::new(RefCell::new(out)));
+    crate::gc_trace::track(&y);
+    Some(y)
+}
+
 /// `_most_common_plain(counter, n)`: `Counter.most_common(n)` of an exact
 /// `Counter` (the caller checks) whose counts are all plain ints: the `n`
 /// largest `(key, count)` pairs, ties in insertion order, as
@@ -2107,6 +2261,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 deepcopy_plain as fn(&[Object]) -> Result<Object, RuntimeError>,
             ),
             ("_most_common_plain", most_common_plain),
+            ("_asdict_plain", asdict_plain),
             ("_log_methods", log_methods),
         ] {
             let b = Rc::new(BuiltinFn {
