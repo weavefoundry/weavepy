@@ -88,6 +88,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             Object::Type(ref_type()),
         );
         d.insert(
+            DictKey(Object::from_static("_install_weak_tables")),
+            b("_install_weak_tables", install_weak_tables),
+        );
+        d.insert(
             DictKey(Object::from_static("ProxyType")),
             Object::Type(proxy_type()),
         );
@@ -249,6 +253,203 @@ pub fn c_referent(obj: &Object) -> Option<Option<Object>> {
 /// Referent of a ref/proxy wrapper through its per-instance deref
 /// closure. `Some(Some(target))` while live, `Some(None)` once dead,
 /// `None` when `obj` isn't a weakref wrapper at all.
+/// `_install_weak_tables(WeakKeyDictionary, WeakSet)`: serve the plain
+/// lookups of the two classes natively for keys that compare by identity
+/// (see [`identity_keyed`]), each falling back to the Python method it
+/// replaces for anything else.
+fn install_weak_tables(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Type(wkd), Object::Type(ws)] = args else {
+        return Err(type_error("_install_weak_tables() expects two classes"));
+    };
+    let own = |cls: &Rc<TypeObject>, name: &str| cls.dict.borrow().get(&StrKey(name)).cloned();
+    if let (Some(getitem), Some(get), Some(contains), Some(setitem)) = (
+        own(wkd, "__getitem__"),
+        own(wkd, "get"),
+        own(wkd, "__contains__"),
+        own(wkd, "__setitem__"),
+    ) {
+        crate::stdlib::struct_mod::install_fast_methods(
+            wkd,
+            [
+                (
+                    "__getitem__",
+                    wkd_getitem_fast as crate::leaf_builtins::Fast,
+                    getitem,
+                ),
+                ("get", wkd_get_fast, get),
+                ("__contains__", wkd_contains_fast, contains),
+                ("__setitem__", wkd_setitem_fast, setitem),
+            ],
+        );
+    }
+    if let (Some(add), Some(contains)) = (own(ws, "add"), own(ws, "__contains__")) {
+        crate::stdlib::struct_mod::install_fast_methods(
+            ws,
+            [
+                ("add", weakset_add_fast as crate::leaf_builtins::Fast, add),
+                ("__contains__", weakset_contains_fast, contains),
+            ],
+        );
+    }
+    Ok(Object::None)
+}
+
+/// Whether `key` compares and hashes by identity, so the stored weak
+/// reference equal to `ref(key)` is the one whose referent is `key`
+/// itself: a function, a class whose metaclass keeps `type`'s `__eq__`
+/// and `__hash__`, or a plain instance (weakly referenceable) whose class
+/// keeps `object`'s.
+fn identity_keyed(key: &Object) -> bool {
+    match key {
+        Object::Function(_) => true,
+        Object::Type(t) => crate::object::type_hash_is_identity(t),
+        Object::Instance(i) => {
+            let cls = i.cls_raw();
+            i.native.get().is_none()
+                && cls.native_kind.get() == 0
+                && cls.c_ext_ptr.get() == 0
+                && cls.dunder(crate::types::Dunder::Eq).object_owner()
+                && cls.dunder(crate::types::Dunder::Hash).object_owner()
+                && supports_weakref(key)
+        }
+        _ => false,
+    }
+}
+
+/// A probe for a weak table's entry for `key` (see [`identity_keyed`]):
+/// the stored live weak reference whose referent is `key`.
+struct ReferentProbe<'a> {
+    key: &'a Object,
+    hash: i64,
+}
+
+impl crate::dictmap::Probe for ReferentProbe<'_> {
+    fn probe_hash(&self) -> i64 {
+        self.hash
+    }
+
+    fn probe_eq(&self, stored: &DictKey) -> bool {
+        match &stored.0 {
+            Object::Instance(inst) => matches!(
+                reg::wrapper_deref_in_place(inst),
+                Some(Ok(r)) if r.is_same(self.key)
+            ),
+            _ => false,
+        }
+    }
+}
+
+/// The probe for `key` and the weak table's `data` attribute of `recv`,
+/// when the lookup is one the fast halves settle.
+fn weak_table_parts(recv: &Object, key: &Object) -> Option<(Object, i64)> {
+    if !identity_keyed(key) || crate::trace::any_observers_active() {
+        return None;
+    }
+    let Object::Instance(inst) = recv else {
+        return None;
+    };
+    let data = match inst.dict.published() {
+        Some(d) => d.try_borrow().ok()?.get(&StrKey("data")).cloned(),
+        None => inst
+            .dict
+            .split_cell()
+            .try_borrow()
+            .ok()?
+            .get_str("data")
+            .cloned(),
+    }?;
+    // (As a `ref`'s hash is its referent's, see `weakref_native_hash`.)
+    let hash =
+        crate::object::py_hash_value(key).unwrap_or_else(|| crate::object::identity_hash(key));
+    Some((data, hash))
+}
+
+/// `WeakKeyDictionary` lookups: the value of the entry for `key`, or
+/// `None` for a miss (`Some(None)`) or a shape the Python method takes.
+fn wkd_lookup(recv: &Object, key: &Object) -> Option<Option<Object>> {
+    let (Object::Dict(d), hash) = weak_table_parts(recv, key)? else {
+        return None;
+    };
+    let d = d.try_borrow().ok()?;
+    Some(
+        d.get_full(&ReferentProbe { key, hash })
+            .map(|(_, _, v)| v.clone()),
+    )
+}
+
+/// `wkd[key]` (a miss raises through the Python method).
+fn wkd_getitem_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [recv, key] = args else {
+        return None;
+    };
+    wkd_lookup(recv, key)?.map(Ok)
+}
+
+/// `wkd.get(key[, default])`.
+fn wkd_get_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let (recv, key, default) = match args {
+        [recv, key] => (recv, key, Object::None),
+        [recv, key, default] => (recv, key, default.clone()),
+        _ => return None,
+    };
+    Some(Ok(wkd_lookup(recv, key)?.unwrap_or(default)))
+}
+
+/// `key in wkd`.
+fn wkd_contains_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [recv, key] = args else {
+        return None;
+    };
+    Some(Ok(Object::Bool(wkd_lookup(recv, key)?.is_some())))
+}
+
+/// `wkd[key] = value` for a key already present: the value replaced, the
+/// stored reference kept (as a dict store under an equal key keeps it). A
+/// new key takes the Python method, which makes its reference.
+fn wkd_setitem_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [recv, key, value] = args else {
+        return None;
+    };
+    let (Object::Dict(d), hash) = weak_table_parts(recv, key)? else {
+        return None;
+    };
+    let old = {
+        let mut d = d.try_borrow_mut().ok()?;
+        let (i, _, _) = d.get_full(&ReferentProbe { key, hash })?;
+        let (_, slot) = d.get_index_mut(i)?;
+        std::mem::replace(slot, value.clone())
+    };
+    drop(old);
+    Some(Ok(Object::None))
+}
+
+/// `WeakSet` membership of `item`, or `None` for a shape the Python
+/// method takes.
+fn weakset_has(recv: &Object, item: &Object) -> Option<bool> {
+    let (Object::Set(s), hash) = weak_table_parts(recv, item)? else {
+        return None;
+    };
+    let s = s.try_borrow().ok()?;
+    Some(s.get_full(&ReferentProbe { key: item, hash }).is_some())
+}
+
+/// `item in weakset`.
+fn weakset_contains_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [recv, item] = args else {
+        return None;
+    };
+    Some(Ok(Object::Bool(weakset_has(recv, item)?)))
+}
+
+/// `weakset.add(item)` of an item already present: nothing to do (the
+/// Python method's new reference would compare equal and be dropped).
+fn weakset_add_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [recv, item] = args else {
+        return None;
+    };
+    weakset_has(recv, item)?.then_some(Ok(Object::None))
+}
+
 fn wrapper_referent(obj: &Object) -> Option<Option<Object>> {
     let Object::Instance(inst) = obj else {
         return None;

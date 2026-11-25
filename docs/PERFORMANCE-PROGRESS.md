@@ -3146,6 +3146,20 @@ branch and pull request.
     allocates two throwaway globals dicts or copies its pairs into a
     second list, and sizes the dict once (`dict((k, v) for k, v in
     pairs)` of ten pairs went from 15,945 to 14,508, CPython 10,769).
+  - `WeakKeyDictionary` and `WeakSet` lookups ran their Python methods,
+    which make a `ref` of the key and probe the table through the
+    reentrant path (weak references compare through their referents):
+    `wkd[k]` cost 13,908 instructions (CPython 1,996), `k in weakset`
+    12,930. `functools.singledispatch` looks its dispatch cache up this
+    way on every call, so a dispatched call cost 19,575 (CPython 3,646).
+    For a key that compares and hashes by identity (a class, a function,
+    a plain instance), the entry is the stored live reference whose
+    referent is the key itself. The tables' `__getitem__`, `get`,
+    `__contains__`, a `__setitem__` of a present key and a `WeakSet.add`
+    of a present item now find it natively. Other keys, and any lookup
+    while a tracer or profiler watches, take the Python methods. `wkd[k]`
+    went to 1,455, `weakset.add(x)` from 9,647 to 1,026, and a
+    singledispatch call to 4,184.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

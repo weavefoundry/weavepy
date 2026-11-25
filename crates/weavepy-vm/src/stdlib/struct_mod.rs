@@ -1175,7 +1175,7 @@ type KwCall =
 
 /// Put a [`fast_method`] in `cls`'s dictionary for each `(name, fast,
 /// original)`.
-fn install_fast_methods<const N: usize>(
+pub(crate) fn install_fast_methods<const N: usize>(
     cls: &Rc<crate::types::TypeObject>,
     methods: [(&'static str, Fast, Object); N],
 ) {
