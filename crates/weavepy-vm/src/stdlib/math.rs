@@ -1896,6 +1896,33 @@ fn math_modf(args: &[Object]) -> Result<Object, RuntimeError> {
     ]))
 }
 
+/// `comb(n, k)` or `perm(n, k)` of two machine ints whose product stays
+/// within 128 bits at every step (each step of `comb` is exact:
+/// `C(n, i + 1) = C(n, i) * (n - i) / (i + 1)`). `None` for a negative
+/// argument (whose error the general path raises) or an overflow (which
+/// it computes with big ints).
+fn comb_perm_small(n: i64, k: i64, comb: bool) -> Option<Object> {
+    if n < 0 || k < 0 {
+        return None;
+    }
+    if k > n {
+        return Some(Object::Int(0));
+    }
+    let (n, k) = (n as u128, k as u128);
+    let steps = if comb { k.min(n - k) } else { k };
+    let mut r: u128 = 1;
+    for i in 0..steps {
+        r = r.checked_mul(n - i)?;
+        if comb {
+            r /= i + 1;
+        }
+    }
+    Some(match i64::try_from(r) {
+        Ok(v) => Object::Int(v),
+        Err(_) => Object::int_from_bigint(num_bigint::BigInt::from(r)),
+    })
+}
+
 fn math_comb(args: &[Object]) -> Result<Object, RuntimeError> {
     use num_traits::{Signed, ToPrimitive};
     if args.len() != 2 {
@@ -1903,6 +1930,11 @@ fn math_comb(args: &[Object]) -> Result<Object, RuntimeError> {
             "comb() takes exactly 2 arguments ({} given)",
             args.len()
         )));
+    }
+    if let [Object::Int(n), Object::Int(k)] = args {
+        if let Some(r) = comb_perm_small(*n, *k, true) {
+            return Ok(r);
+        }
     }
     let n = index_bigint(&args[0])?;
     let k = index_bigint(&args[1])?;
@@ -1946,6 +1978,11 @@ fn math_perm(args: &[Object]) -> Result<Object, RuntimeError> {
     // perm(n) and perm(n, None) are factorial(n).
     if matches!(args.get(1), None | Some(Object::None)) {
         return factorial_impl(&args[0]);
+    }
+    if let [Object::Int(n), Object::Int(k)] = args {
+        if let Some(r) = comb_perm_small(*n, *k, false) {
+            return Ok(r);
+        }
     }
     let n = index_bigint(&args[0])?;
     let k = index_bigint(&args[1])?;

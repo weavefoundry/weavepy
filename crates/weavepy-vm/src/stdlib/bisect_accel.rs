@@ -255,7 +255,7 @@ fn internal_bisect_right(
         let mid = lo + (hi - lo) / 2;
         let mut litem = item_at(interp, a, mid)?;
         if let Some(k) = key {
-            litem = interp.call_object(k.clone(), &[litem], &[])?;
+            litem = key_of(interp, k, litem)?;
         }
         // `item < litem` → search left half.
         if less(interp, item, &litem)? {
@@ -265,6 +265,19 @@ fn internal_bisect_right(
         }
     }
     Ok(lo)
+}
+
+/// `key(item)` for a probe: in place when the call runs no Python code (an
+/// `itemgetter`, a pure-leaf function), else through the full call.
+fn key_of(
+    interp: &mut crate::Interpreter,
+    key: &Object,
+    item: Object,
+) -> Result<Object, RuntimeError> {
+    if let Some(v) = interp.pure_callback(key, std::slice::from_ref(&item), true) {
+        return Ok(v);
+    }
+    interp.call_object(key.clone(), &[item], &[])
 }
 
 /// `internal_bisect_left`: leftmost index keeping everything `< item` to its
@@ -285,7 +298,7 @@ fn internal_bisect_left(
         let mid = lo + (hi - lo) / 2;
         let mut litem = item_at(interp, a, mid)?;
         if let Some(k) = key {
-            litem = interp.call_object(k.clone(), &[litem], &[])?;
+            litem = key_of(interp, k, litem)?;
         }
         // `litem < item` → search right half.
         if less(interp, &litem, item)? {

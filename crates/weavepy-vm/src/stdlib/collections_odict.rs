@@ -821,9 +821,25 @@ fn install_odict(args: &[Object]) -> Result<Object, RuntimeError> {
 /// module's own: the instance over an empty dict, as `__new__` and that
 /// `__init__` leave it. `None` for any call with arguments.
 fn od_pure_new(cls: &Rc<TypeObject>, args: &[Object]) -> Option<Object> {
-    if !args.is_empty() {
-        return None;
-    }
+    // `OrderedDict(pairs)` of a list or tuple of `(key, value)` tuples, or
+    // `OrderedDict(d)` of an exact dict, with `str` or `int` keys: the
+    // entries in order, stored as `__init__`'s `self[key] = value` stores
+    // them (each by the store's leaf half).
+    let pairs: Option<Vec<(Object, Object)>> = match args {
+        [] => None,
+        [Object::List(l)] => Some(od_pairs(&l.try_borrow().ok()?)?),
+        [Object::Tuple(t)] => Some(od_pairs(t)?),
+        [Object::Dict(d)] => Some(
+            d.try_borrow()
+                .ok()?
+                .iter()
+                .map(|(k, v)| {
+                    matches!(k.0, Object::Str(_) | Object::Int(_)).then(|| (k.0.clone(), v.clone()))
+                })
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        _ => return None,
+    };
     match cls.lookup("__init__") {
         Some(Object::Function(f)) if f.code().qualname == "OrderedDict.__init__" => {}
         _ => return None,
@@ -831,7 +847,29 @@ fn od_pure_new(cls: &Rc<TypeObject>, args: &[Object]) -> Option<Object> {
     let inst = Rc::new(PyInstance::with_native(cls.clone(), Object::new_dict()));
     let obj = Object::Instance(inst);
     crate::gc_trace::track(&obj);
+    // (A store the leaf declines leaves the unseen instance to be dropped
+    // and the full constructor to run.)
+    for (k, v) in pairs.into_iter().flatten() {
+        match od_setitem_leaf(&[obj.clone(), k, v]) {
+            Some(Ok(_)) => {}
+            _ => return None,
+        }
+    }
     Some(obj)
+}
+
+/// `(key, value)` pairs of exact two-item tuples with `str` or `int` keys,
+/// in order; `None` for any other item.
+fn od_pairs(items: &[Object]) -> Option<Vec<(Object, Object)>> {
+    items
+        .iter()
+        .map(|p| match p {
+            Object::Tuple(t) if t.len() == 2 && matches!(t[0], Object::Str(_) | Object::Int(_)) => {
+                Some((t[0].clone(), t[1].clone()))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// A new view of `od` of the given kind (0 keys, 1 values, 2 items): an

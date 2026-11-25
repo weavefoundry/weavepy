@@ -88600,6 +88600,9 @@ fn builtin_fn_lane_ok_uncached(name: &str) -> bool {
             | "pack" | "unpack" | "calcsize"
             // functools (whose callbacks run through reentrant calls)
             | "reduce"
+            // `itertools.tee`'s native body (a source's `__iter__` runs
+            // through a reentrant call)
+            | "tee_native"
             // `operator`'s getters' and `methodcaller`'s calls (a Python
             // `__getitem__`, getter or method runs through a reentrant call)
             | ".itemgetter.__call__" | ".attrgetter.__call__" | ".methodcaller.__call__"

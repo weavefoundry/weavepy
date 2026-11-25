@@ -246,6 +246,10 @@ pub(crate) enum Verdict {
     /// `__init__` (see `stdlib::struct_mod::array_pure_new`); `name`
     /// unused.
     ArrayPlainNew = 22,
+    /// The class reads `self._core` from the instance dict: the default
+    /// attribute access, and no `_core` on the class (see
+    /// `stdlib::itertools_mod::core_next_fast`); `name` unused.
+    CoreInDict = 23,
 }
 
 pub struct AttrVersion(std::sync::atomic::AtomicU64);

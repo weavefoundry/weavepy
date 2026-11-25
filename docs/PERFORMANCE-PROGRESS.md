@@ -3119,6 +3119,25 @@ branch and pull request.
     natively (`_weave_collections._asdict_plain`): 7,461. Any other value
     (a namedtuple, a set, an enum, a slots dataclass), a custom factory,
     or a watching tracer or profiler takes the Python copy.
+  - `itertools.tee([1, 2, 3])` cost 38,843 instructions (CPython 2,478).
+    Each branch ran the Python `_tee.__new__`, whose native core call
+    left compiled code every time: a module builtin that the in-place
+    builtin lane doesn't list runs through the interpreter. `tee` now
+    builds the shared data object and its branches natively
+    (`tee_native`, listed for the lane). Each branch is still a `_tee`
+    instance, which can be weakly referenced as CPython's tee objects
+    can, over a native core. `_tee.__next__` gained a leaf half that
+    steps that core over the shared buffer, or a source whose step runs
+    no code, in place. Creation went to 9,308, and draining two
+    three-item branches from 66,691 to 28,744 (CPython 5,178).
+    `math.comb` and `math.perm` of machine ints now multiply in 128-bit
+    integers, falling back to big ints on overflow: `comb(10, 3)` went
+    from 3,744 to 630 (CPython 683). `itertools.compress` over two
+    sequences steps in place when its selectors are plain bools, ints
+    or `None` (`list(compress(...))` of four items 8,123 to 6,207, CPython
+    3,325). `bisect` calls a key that runs no code (an `itemgetter`) in
+    place (6,951 to 4,119, CPython 2,340). `OrderedDict(pairs)` and
+    `OrderedDict(d)` with `str` or `int` keys build in place.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

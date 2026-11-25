@@ -51,6 +51,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         reg!("islice_set_cnt", islice_set_cnt);
         reg!("repeat_core", repeat_core);
         reg!("tee_core", tee_core);
+        reg!("tee_native", tee_native);
         reg!("lazy_state", lazy_state);
         reg!("count_core", count_core);
         reg!("cycle_core", cycle_core);
@@ -76,14 +77,32 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         reg!("_register_types", register_types);
         // `__next__` for the classes whose Python one is
         // `return next(self._core)`: a method (it binds the instance).
+        let core_next_fn = Rc::new(BuiltinFn {
+            name: "__next__",
+            binds_instance: true,
+            call: Box::new(core_next),
+            call_kw: None,
+        });
+        crate::leaf_builtins::register_fast(&core_next_fn, core_next_fast);
+        // `__iter__` returning the instance (CPython's `PyObject_SelfIter`,
+        // `_tee`'s): a method with a leaf half.
+        let iter_self_fn = Rc::new(BuiltinFn {
+            name: "__iter__",
+            binds_instance: true,
+            call: Box::new(iter_self),
+            call_kw: None,
+        });
+        crate::leaf_builtins::register_fast(&iter_self_fn, |a| match a {
+            [o] => Some(Ok(o.clone())),
+            _ => None,
+        });
+        d.insert(
+            DictKey(Object::from_static("_iter_self")),
+            Object::Builtin(iter_self_fn),
+        );
         d.insert(
             DictKey(Object::from_static("_core_next")),
-            Object::Builtin(Rc::new(BuiltinFn {
-                name: "__next__",
-                binds_instance: true,
-                call: Box::new(core_next),
-                call_kw: None,
-            })),
+            Object::Builtin(core_next_fn),
         );
         reg!("groupby_core", groupby_core);
         reg!("grouper_core", grouper_core);
@@ -281,6 +300,96 @@ fn repeat_core(args: &[Object]) -> Result<Object, RuntimeError> {
 /// live entry.
 static TEE_REGISTRY: Mutex<Option<HashMap<usize, Weak<RefCell<TeeShared>>>>> = Mutex::new(None);
 
+/// `tee_native(iterable, n, tee_cls, data_cls)`: `itertools.tee(iterable,
+/// n)` for a plain int `n` of at least one and an iterable that isn't a
+/// tee already (whose copies are the Python path's), built as the Python
+/// `tee` builds it, with no frame per branch: one `data_cls` instance
+/// (`_tee_dataobject`) over `iter(iterable)`, and `n` instances of
+/// `tee_cls` (`_tee`) over it, each with a native branch as its `_core`.
+/// `None` for any other call, which the Python body then makes.
+fn tee_native(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [iterable, Object::Int(n), Object::Type(tee_cls), Object::Type(data_cls)] = args else {
+        return Ok(Object::None);
+    };
+    let Ok(n) = usize::try_from(*n) else {
+        return Ok(Object::None);
+    };
+    if n == 0
+        || n > 1 << 16
+        || matches!(iterable, Object::LazyIter(l) if l.cls.is_some())
+        || crate::builtins::class_of(iterable).is_subclass_of(tee_cls)
+    {
+        return Ok(Object::None);
+    }
+    let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() else {
+        return Ok(Object::None);
+    };
+    // SAFETY: published by the enclosing VM frame on this thread.
+    let interp = unsafe { &mut *ptr };
+    let globals = interp.builtins_dict();
+    let source = interp.make_iter(iterable, &globals)?;
+    // (As `_tee_dataobject.__init__` leaves it.)
+    let data = crate::types::PyInstance::new(data_cls.clone());
+    {
+        let buffer = Object::new_list(Vec::new());
+        crate::gc_trace::track_built(&buffer);
+        let [k_source, k_buffer, k_busy] = tee_keys();
+        let mut d = data.dict_cell().borrow_mut();
+        d.insert(k_source.clone(), source);
+        d.insert(k_buffer.clone(), buffer);
+        d.insert(k_busy.clone(), Object::Bool(false));
+    }
+    let data = Object::Instance(Rc::new(data));
+    crate::gc_trace::track(&data);
+    // (The first branch registers the shared state the others read.)
+    let first = tee_core(&[data.clone(), Object::Int(0)])?;
+    let shared = match &first {
+        Object::LazyIter(l) => match &*l.state.borrow() {
+            LazyIterKind::TeeBranch { shared, .. } => shared.clone(),
+            _ => return Ok(Object::None),
+        },
+        _ => return Ok(Object::None),
+    };
+    // Each branch an instance of `tee_cls` (weakly referenceable, as
+    // CPython's tee objects are) with its `_data` and native `_core`, as
+    // `_tee.__new__` leaves it.
+    let branch = |core: Object| {
+        let inst = crate::types::PyInstance::new(tee_cls.clone());
+        {
+            let [k_data, k_core] = tee_branch_keys();
+            let mut d = inst.dict_cell().borrow_mut();
+            d.insert(k_data.clone(), data.clone());
+            d.insert(k_core.clone(), core);
+        }
+        let obj = Object::Instance(Rc::new(inst));
+        crate::gc_trace::track(&obj);
+        obj
+    };
+    let mut out = Vec::with_capacity(n);
+    out.push(branch(first));
+    for _ in 1..n {
+        out.push(branch(make_lazy(LazyIterKind::TeeBranch {
+            shared: shared.clone(),
+            data: data.clone(),
+            index: 0,
+        })));
+    }
+    Ok(Object::new_tuple(out))
+}
+
+/// A `_tee` instance's attribute keys (`_data`, `_core`), built once.
+fn tee_branch_keys() -> &'static [DictKey; 2] {
+    static KEYS: std::sync::OnceLock<[DictKey; 2]> = std::sync::OnceLock::new();
+    KEYS.get_or_init(|| ["_data", "_core"].map(|k| DictKey(Object::from_static(k))))
+}
+
+/// The `_tee_dataobject` attribute keys (`source`, `buffer`, `busy`),
+/// built once.
+fn tee_keys() -> &'static [DictKey; 3] {
+    static KEYS: std::sync::OnceLock<[DictKey; 3]> = std::sync::OnceLock::new();
+    KEYS.get_or_init(|| ["source", "buffer", "busy"].map(|k| DictKey(Object::from_static(k))))
+}
+
 /// `tee_core(data, index)` — one branch over a `_tee_dataobject`.
 fn tee_core(args: &[Object]) -> Result<Object, RuntimeError> {
     let [data, index] = args else {
@@ -297,12 +406,13 @@ fn tee_core(args: &[Object]) -> Result<Object, RuntimeError> {
     let shared = match registry.get(&key).and_then(Weak::upgrade) {
         Some(shared) => shared,
         None => {
+            let [k_source, k_buffer, _] = tee_keys();
             let d = inst.dict_cell().borrow();
-            let source = match d.get(&DictKey(Object::from_static("source"))) {
+            let source = match d.get(k_source) {
                 Some(Object::None) | None => None,
                 Some(src) => Some(src.clone()),
             };
-            let buffer = match d.get(&DictKey(Object::from_static("buffer"))) {
+            let buffer = match d.get(k_buffer) {
                 Some(Object::List(items)) => items.clone(),
                 _ => return Err(type_error("tee_core: data.buffer must be a list")),
             };
@@ -513,6 +623,50 @@ fn core_next(args: &[Object]) -> Result<Object, RuntimeError> {
         Some(v) => Ok(v),
         None => Err(crate::error::stop_iteration()),
     }
+}
+
+/// `__iter__(self)`: `self`.
+fn iter_self(args: &[Object]) -> Result<Object, RuntimeError> {
+    match args {
+        [o] => Ok(o.clone()),
+        _ => Err(type_error(format!(
+            "expected 0 arguments, got {}",
+            args.len().saturating_sub(1)
+        ))),
+    }
+}
+
+/// [`core_next`]'s leaf half for an instance (a `_tee`, a subclass's):
+/// its `_core`, read from its dict under the default attribute access,
+/// stepped when the step runs no code. `None` for anything else (an
+/// adapter itself, a step that needs the interpreter, the end).
+fn core_next_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Instance(inst)] = args else {
+        return None;
+    };
+    let cls = inst.cls_raw();
+    if !cls.memo_verdict(crate::types::Verdict::CoreInDict, "", || {
+        cls.dunder(crate::types::Dunder::GetAttribute)
+            .object_owner()
+            && cls.lookup("_core").is_none()
+    }) {
+        return None;
+    }
+    let [_, k_core] = tee_branch_keys();
+    let core = match inst.dict.published() {
+        Some(d) => d.try_borrow().ok()?.get(k_core).cloned(),
+        None => inst
+            .dict
+            .split_cell()
+            .try_borrow()
+            .ok()?
+            .get_str("_core")
+            .cloned(),
+    }?;
+    let Object::LazyIter(l) = &core else {
+        return None;
+    };
+    crate::seqiter::itertools_pure_next(l)?.map(Ok)
 }
 
 /// `_register_types(namespace)`: mark the module's exact classes.

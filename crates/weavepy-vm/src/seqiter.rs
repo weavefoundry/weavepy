@@ -2515,6 +2515,54 @@ pub(crate) fn itertools_pure_next(l: &PyLazyIter) -> Option<Option<Object>> {
     }
     match st {
         LazyIterKind::Chain { source, active } => chain_pure_next(source, active).map(Some),
+        // `compress` over two distinct plain sequence cursors: the data
+        // items whose selector is a plain bool, int or `None`, skipped or
+        // taken in place (a dropped item is the sequence's too). Either
+        // source's end, and any other selector, take the general step.
+        LazyIterKind::Compress { data, selectors } => {
+            let (Object::Iter(dc), Object::Iter(sc)) = (&*data, &*selectors) else {
+                return None;
+            };
+            if Rc::ptr_eq(dc, sc) {
+                return None;
+            }
+            loop {
+                let (d, s) = (cursor_peek(dc)?, cursor_peek(sc)?);
+                let keep = match s {
+                    Object::Bool(b) => b,
+                    Object::Int(i) => i != 0,
+                    Object::None => false,
+                    _ => return None,
+                };
+                cursor_advance(dc)?;
+                cursor_advance(sc)?;
+                if keep {
+                    return Some(Some(d));
+                }
+            }
+        }
+        // A tee branch: the shared buffer's next item, or one pulled from
+        // a source whose step runs no code (its end, and any other
+        // source, take the general step).
+        LazyIterKind::TeeBranch { shared, index, .. } => {
+            // SAFETY: as above (distinct cells).
+            let sh = unsafe { shared.peek_mut() }?;
+            if sh.busy {
+                return None;
+            }
+            // SAFETY: as above.
+            let buf = unsafe { sh.buffer.peek_mut() }?;
+            let item = match buf.get(*index) {
+                Some(v) => v.clone(),
+                None => {
+                    let v = ready_next(sh.source.as_ref()?)?;
+                    buf.push(v.clone());
+                    v
+                }
+            };
+            *index += 1;
+            Some(Some(item))
+        }
         LazyIterKind::Count { current, step } => {
             let (Object::Int(a), Object::Int(b)) = (&*current, &*step) else {
                 return None;
