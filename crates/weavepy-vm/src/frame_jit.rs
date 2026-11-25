@@ -10087,6 +10087,19 @@ unsafe fn descr_get(st: *mut State, site: &AttrSite, at: *mut Object, local: boo
             site.no_descr.set(inst.cls_raw().attr_version.get());
             return CALL_DECLINED;
         };
+        // `member.name` / `member.value` through `enum.property`: the
+        // member's field, read in place (a stack receiver another owner
+        // holds released).
+        if local || Rc::strong_count(inst) > 1 {
+            if let Some(v) = Interpreter::enum_property_value(&descr, inst) {
+                let base = st.stack.add(slot);
+                if !local {
+                    crate::drop_hot_at(base);
+                }
+                base.write(v);
+                return 0;
+            }
+        }
         let owner = Object::Type(inst.cls());
         // The call's operands from the site's slot: the descriptor, the
         // receiver (a local's copied, the stack's moved up) and its class.

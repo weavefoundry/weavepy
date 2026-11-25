@@ -34068,6 +34068,10 @@ impl Interpreter {
         if inst.native.get().is_some() || crate::object::exotic_str_keys_possible() {
             return None;
         }
+        // An enum member keeping `Enum.__hash__`: its name's hash.
+        if let Some(h) = Self::enum_hash(inst) {
+            return Some(h);
+        }
         // (The function memoized for the class's version, as the full
         // hash reads it.)
         let f = Self::instance_dunder_function(
@@ -47437,46 +47441,142 @@ impl Interpreter {
         }
         let cls = inst.cls_raw();
         if !cls.memo_verdict(crate::types::Verdict::EnumStr, "", || {
-            if crate::object::exotic_str_keys_possible()
-                || cls.native_kind.get() != 0
-                || cls.c_ext_ptr.get() != 0
-                || !cls.dunder(crate::types::Dunder::GetAttribute).object_owner()
-                || cls.lookup("_name_").is_some()
+            Self::enum_name_readable(cls)
                 // (An assigned `__name__` lives in the class dict.)
-                || cls.lookup("__name__").is_some()
-                || cls
+                && cls.lookup("__name__").is_none()
+                && !cls
                     .lookup_with_owner("__class__")
                     .is_some_and(|(_, owner)| !owner.flags.is_builtin)
-            {
-                return false;
-            }
-            matches!(
-                cls.lookup("__str__"),
-                Some(Object::Function(f)) if Self::stdlib_fn_is(&f, "enum", "Enum.__str__")
-            )
+                && matches!(
+                    cls.lookup("__str__"),
+                    Some(Object::Function(f)) if Self::stdlib_fn_is(&f, "enum", "Enum.__str__")
+                )
         }) {
             return None;
         }
-        let name = match inst.dict.published() {
-            Some(dict) => dict
-                .try_borrow()
-                .ok()?
-                .get(&DictKey(Object::from_static("_name_")))
-                .cloned()?,
-            None => {
-                let split = inst.dict.split_cell().try_borrow().ok()?;
-                let ix = split.position_str("_name_")?;
-                split.values().get(ix)?.clone()
-            }
-        };
-        let Object::Str(name) = name else {
-            return None;
-        };
+        let name = Self::enum_member_name(inst)?;
         let mut out = String::with_capacity(cls.name.len() + 1 + name.len());
         out.push_str(&cls.name);
         out.push('.');
         out.push_str(&name);
         Some(Object::from_str(out))
+    }
+
+    /// `hash(member)` of an enum member whose class keeps `enum`'s own
+    /// `Enum.__hash__` (`hash(self._name_)`) under the default attribute
+    /// access (a verdict kept per class version): its `_name_`'s hash.
+    /// `None` for anything else, or while a tracer or profiler would see
+    /// the method.
+    pub(crate) fn enum_hash(inst: &crate::types::PyInstance) -> Option<i64> {
+        if crate::trace::any_observers_active() {
+            return None;
+        }
+        let cls = inst.cls_raw();
+        if !cls.memo_verdict(crate::types::Verdict::EnumHash, "", || {
+            Self::enum_name_readable(cls)
+                && matches!(
+                    cls.lookup("__hash__"),
+                    Some(Object::Function(f)) if Self::stdlib_fn_is(&f, "enum", "Enum.__hash__")
+                )
+        }) {
+            return None;
+        }
+        let name = Self::enum_member_name(inst)?;
+        crate::object::py_hash_value(&Object::Str(name))
+    }
+
+    /// Whether `self._name_` of `cls`'s instances is their dict's entry:
+    /// the default attribute access, and nothing named `_name_` on the
+    /// class (a descriptor would answer first).
+    fn enum_name_readable(cls: &TypeObject) -> bool {
+        !crate::object::exotic_str_keys_possible()
+            && cls.native_kind.get() == 0
+            && cls.c_ext_ptr.get() == 0
+            && cls
+                .dunder(crate::types::Dunder::GetAttribute)
+                .object_owner()
+            && cls.lookup("_name_").is_none()
+    }
+
+    /// An enum member's `_name_` from its dict, when an exact `str`.
+    fn enum_member_name(inst: &crate::types::PyInstance) -> Option<SharedStr> {
+        match Self::enum_member_field(inst, "_name_")? {
+            Object::Str(name) => Some(name),
+            _ => None,
+        }
+    }
+
+    /// The entry `field` of an instance's dict.
+    fn enum_member_field(inst: &crate::types::PyInstance, field: &'static str) -> Option<Object> {
+        match inst.dict.published() {
+            Some(dict) => dict
+                .try_borrow()
+                .ok()?
+                .get(&DictKey(Object::from_static(field)))
+                .cloned(),
+            None => {
+                let split = inst.dict.split_cell().try_borrow().ok()?;
+                let ix = split.position_str(field)?;
+                split.values().get(ix).cloned()
+            }
+        }
+    }
+
+    /// `member.name` or `member.value` through `descr`, an `enum.property`
+    /// whose class keeps `enum`'s own `property.__get__` and whose `fget`
+    /// is `Enum.name` or `Enum.value` (`return self._name_` /
+    /// `return self._value_`), over a member whose class reads both
+    /// fields from its dict (verdicts kept per class version): the
+    /// field. `None` for anything else, or while a tracer or profiler
+    /// would see the calls.
+    pub(crate) fn enum_property_value(descr: &PyInstance, inst: &PyInstance) -> Option<Object> {
+        if crate::trace::any_observers_active() {
+            return None;
+        }
+        let dcls = descr.cls_raw();
+        if !dcls.memo_verdict(crate::types::Verdict::EnumPropertyGet, "", || {
+            !crate::object::exotic_str_keys_possible()
+                && matches!(
+                    dcls.lookup("__get__"),
+                    Some(Object::Function(f)) if Self::stdlib_fn_is(&f, "enum", "property.__get__")
+                )
+        }) {
+            return None;
+        }
+        let cls = inst.cls_raw();
+        if !cls.memo_verdict(crate::types::Verdict::EnumFields, "", || {
+            Self::enum_name_readable(cls) && cls.lookup("_value_").is_none()
+        }) {
+            return None;
+        }
+        // (Which field the getter reads, remembered for the function.)
+        thread_local! {
+            static FGET: std::cell::RefCell<Option<(crate::sync::Weak<PyFunction>, Option<&'static str>)>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        let Some(Object::Function(fget)) = Self::enum_member_field(descr, "fget") else {
+            return None;
+        };
+        let known = FGET.with(|m| {
+            m.borrow().as_ref().and_then(|(w, field)| {
+                std::ptr::eq(w.as_ptr(), Rc::as_ptr(&fget)).then_some(*field)
+            })
+        });
+        let field = match known {
+            Some(field) => field,
+            None => {
+                let field = if Self::stdlib_fn_is(&fget, "enum", "Enum.name") {
+                    Some("_name_")
+                } else if Self::stdlib_fn_is(&fget, "enum", "Enum.value") {
+                    Some("_value_")
+                } else {
+                    None
+                };
+                FGET.with(|m| *m.borrow_mut() = Some((Rc::downgrade(&fget), field)));
+                field
+            }
+        }?;
+        Self::enum_member_field(inst, field)
     }
 
     /// `format(inst, spec)` with no code run: the payload's own
@@ -51313,6 +51413,9 @@ impl Interpreter {
                 if let Some(h) = crate::stdlib::decimal_native::leaf_hash(inst) {
                     return Ok(Object::Int(h));
                 }
+            }
+            if let Some(h) = Self::enum_hash(inst) {
+                return Ok(Object::Int(h));
             }
             if let Some(f) = Self::instance_dunder_function(
                 inst,

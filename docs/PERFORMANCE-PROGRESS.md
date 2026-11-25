@@ -3072,6 +3072,18 @@ branch and pull request.
     3,783 to 1,255 (CPython 1,942); `"-".join` of `StrEnum` members
     3,385 to 1,177 (CPython 1,185); `"%s" % StrEnum.A` 2,399 to 1,023
     (CPython 1,031).
+  - Enum members as dict keys hashed through `Enum.__hash__`
+    (`hash(self._name_)`), a leaf evaluation on every probe, and
+    `member.name` and `member.value` called `enum.property.__get__`,
+    which calls the getter. A member whose class keeps `enum`'s own
+    `__hash__` now hashes its `_name_` in place. When the descriptor's
+    class keeps `enum`'s own `__get__` and its getter is `Enum.name` or
+    `Enum.value`, the read takes the member's `_name_` or `_value_` from
+    its dict. Both decline while a tracer or profiler is watching. A
+    function returning `d[member]` went from 1,896 to 1,337 (CPython
+    1,437), one returning `member.name` from 2,798 to 1,798 (CPython
+    1,556), and one returning `member.value` from 2,116 to 1,773 (CPython
+    1,553).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

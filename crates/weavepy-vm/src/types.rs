@@ -233,6 +233,15 @@ pub(crate) enum Verdict {
     /// The class's `__format__` is `enum`'s own `Enum.__format__`; `name`
     /// unused.
     EnumFormat = 18,
+    /// The class hashes with `enum`'s own `Enum.__hash__` under the default
+    /// attribute access (see `Interpreter::enum_hash`); `name` unused.
+    EnumHash = 19,
+    /// The class (`enum.property`) keeps `enum`'s own `property.__get__`
+    /// (see `Interpreter::enum_property_value`); `name` unused.
+    EnumPropertyGet = 20,
+    /// The class reads `_name_` and `_value_` of its instances from their
+    /// dicts under the default attribute access; `name` unused.
+    EnumFields = 21,
 }
 
 pub struct AttrVersion(std::sync::atomic::AtomicU64);
