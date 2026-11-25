@@ -1098,6 +1098,9 @@ fn csv_reader(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
             d.insert(dialect_keys().dialect.clone(), dialect);
             d.insert(keys.cfg.clone(), cfg);
             d.insert(keys.line_num.clone(), Object::Int(0));
+            // (No `__next__` in progress, so the leaf half reads the first
+            // row too.)
+            d.insert(keys.fields_live.clone(), Object::Bool(false));
         }
         Ok(Object::Instance(Rc::new(inst)))
     })
@@ -1217,7 +1220,7 @@ fn reader_iternext(args: &[Object]) -> Result<Object, RuntimeError> {
 /// directly (see [`split_direct`]); any other runs through the machine. A
 /// record that goes on past its line, a line the machine raises on, a line
 /// that isn't a plain `str`, a quoting style that converts fields to
-/// `float`, a reader in the middle of a call or before its first row, and
+/// `float`, a reader in the middle of a call, and
 /// any other input decline to the full parser, which then reads the same
 /// line.
 fn reader_next_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
@@ -1243,19 +1246,34 @@ fn reader_next_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let fields = match &src {
         Object::Iter(it) => {
             let mut it = it.try_borrow_mut().ok()?;
-            let (line, index) = match &mut *it {
-                crate::object::PyIterator::List { items, index, .. } => {
+            // (`None` at the source's end, with no record begun: the end.)
+            let next = match &mut *it {
+                crate::object::PyIterator::List {
+                    items,
+                    index,
+                    owner: None,
+                } => {
                     let items = items.try_borrow().ok()?;
                     match items.get(*index) {
-                        Some(Object::Str(s)) => (s.clone(), index),
+                        Some(Object::Str(s)) => Some((s.clone(), index)),
+                        None => None,
                         _ => return None,
                     }
                 }
                 crate::object::PyIterator::Tuple { items, index } => match items.get(*index) {
-                    Some(Object::Str(s)) => (s.clone(), index),
+                    Some(Object::Str(s)) => Some((s.clone(), index)),
+                    None => None,
                     _ => return None,
                 },
                 _ => return None,
+            };
+            let Some((line, index)) = next else {
+                // The step that finds the end, as the full path's leaves the
+                // iterator, then the end itself.
+                let end = it.next_value();
+                debug_assert!(end.is_none());
+                drop(end);
+                return Some(Err(stop_iteration()));
             };
             let fields = record_fields(cfg, &line)?;
             *index += 1;

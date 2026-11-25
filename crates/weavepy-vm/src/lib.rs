@@ -49680,6 +49680,49 @@ impl Interpreter {
         }
     }
 
+    /// Whether `f` is the function `qualname` of the frozen stdlib module
+    /// `module` (its globals' `__name__`).
+    fn stdlib_fn_is(f: &crate::object::PyFunction, module: &str, qualname: &str) -> bool {
+        // SAFETY: GIL-serialized raw read of the function's code cell.
+        let code: &CodeObject = unsafe { &*f.code.as_ptr() };
+        code.qualname == qualname
+            && f.globals.try_borrow().is_ok_and(|g| {
+                matches!(
+                    g.get(&crate::object::StrKey("__name__")),
+                    Some(Object::Str(n)) if &**n == module
+                )
+            })
+    }
+
+    /// `os.fspath(p)` of a `pathlib` path whose class keeps `pathlib`'s own
+    /// `__fspath__` (`f`) and `__str__`, once its string is cached in the
+    /// `_str` slot: that string, as those two methods return it. `None`
+    /// for anything else, or while a tracer or profiler would see them.
+    /// [`Self::pathlib_cached_str`] of an instance, its class's
+    /// `__fspath__` looked up first.
+    pub(crate) fn pathlib_fspath(inst: &PyInstance) -> Option<Object> {
+        match inst.cls_raw().lookup("__fspath__") {
+            Some(Object::Function(f)) => Self::pathlib_cached_str(inst, &f),
+            _ => None,
+        }
+    }
+
+    fn pathlib_cached_str(inst: &PyInstance, f: &crate::object::PyFunction) -> Option<Object> {
+        if crate::trace::any_observers_active()
+            || !Self::stdlib_fn_is(f, "pathlib", "PurePath.__fspath__")
+        {
+            return None;
+        }
+        match inst.cls_raw().lookup("__str__") {
+            Some(Object::Function(g)) if Self::stdlib_fn_is(&g, "pathlib", "PurePath.__str__") => {}
+            _ => return None,
+        }
+        match inst.slots.try_borrow().ok()?.get("_str") {
+            Some(s @ Object::Str(_)) => Some(s.clone()),
+            _ => None,
+        }
+    }
+
     /// The members of an enum class whose metaclass iterates it with
     /// `enum`'s own `EnumType.__iter__` (`list(Color)`): its
     /// `_member_map_` entries in `_member_names_` order, as that
@@ -62003,6 +62046,14 @@ impl Interpreter {
                     Object::Instance(i) => i.cls().lookup("__fspath__"),
                     _ => None,
                 };
+                // A `pathlib` path whose string is cached: `pathlib`'s own
+                // `__fspath__` returns `str(self)`, which its own `__str__`
+                // answers from the `_str` slot, with no code to run.
+                if let (Object::Instance(inst), Some(Object::Function(f))) = (obj, &raw) {
+                    if let Some(s) = Self::pathlib_cached_str(inst, f) {
+                        return Ok(s);
+                    }
+                }
                 match raw {
                     Some(m) if !matches!(m, Object::None) => {
                         let method =

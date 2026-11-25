@@ -2977,6 +2977,15 @@ branch and pull request.
     one default dialect (15,112 to 5,665, CPython 3,631). A store into a
     `SimpleNamespace`'s attribute left compiled code: it goes into the
     namespace's dictionary in place (1,409 to 496, CPython 542).
+  - A reader's row step has a leaf half, but a new reader declined it
+    until its first row had run the full parser, and `list()` stops
+    trying a fast half once it declines: every row of `list(csv.reader(
+    lines))` took the full path, and the end raised through it. A new
+    reader now starts with no row in progress, and the half steps a
+    list's or tuple's iterator to its end itself: two rows 30,186 to
+    16,881 (CPython 7,911). `os.fspath()` of a `pathlib` path whose
+    class keeps `pathlib`'s own `__fspath__` and `__str__` returns its
+    cached string in place (4,183 to 2,021, CPython 1,898).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

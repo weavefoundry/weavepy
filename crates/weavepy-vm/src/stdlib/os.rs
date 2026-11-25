@@ -8932,6 +8932,9 @@ fn normpath_lexical(s: &str) -> String {
 fn fspath_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     match args {
         [x @ (Object::Str(_) | Object::Bytes(_))] => Some(Ok(x.clone())),
+        // A `pathlib` path whose string is cached (see
+        // `Interpreter::pathlib_fspath`).
+        [Object::Instance(inst)] => crate::Interpreter::pathlib_fspath(inst).map(Ok),
         _ => None,
     }
 }
