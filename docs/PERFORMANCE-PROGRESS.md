@@ -3171,6 +3171,12 @@ branch and pull request.
     instance's names. They now use the names' hashes and remembered
     positions (`PyInstance::attr_get_memo`), and a put and get went from
     3,626 to 2,415 instructions in one run (CPython 945).
+  - An adapter whose source is a `cycle` (`islice(cycle(xs), n)`) took
+    the general step for every item, since only plain cursors, counters,
+    repeaters and chains counted as sources whose step runs no code. A
+    `cycle` over a plain cursor, or replaying its saved items, now does
+    too: `list(islice(cycle("ab"), 5))` went from 12,154 to 9,882
+    (CPython 4,806).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

@@ -1197,6 +1197,19 @@ fn src_ready(it: &Object, leaf: bool) -> bool {
             LazyIterKind::Chain { source, active } => {
                 !leaf && chain_pure_ready(source.as_ref(), active.as_ref())
             }
+            // A `cycle` over a plain cursor with an item left, or replaying
+            // the items it saved (`islice(cycle(xs), n)`), for one-source
+            // adapters only, as for `chain` (a cursor, never another
+            // adapter, as its source).
+            LazyIterKind::Cycle { source, saved, .. } => {
+                !leaf
+                    && match source {
+                        Some(src @ Object::Iter(_)) => src_ready(src, false),
+                        Some(_) => false,
+                        // SAFETY: as above (a distinct cell).
+                        None => unsafe { saved.peek() }.is_some_and(|b| !b.is_empty()),
+                    }
+            }
             _ => false,
         }),
         _ => false,
