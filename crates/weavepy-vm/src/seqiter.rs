@@ -2869,12 +2869,13 @@ pub(crate) fn builtin_ctor_arms(cls: &Rc<TypeObject>, args: &[Object]) -> Option
             receiver_class,
         ));
     }
-    // `str(x)` of a `str` subclass's instance that keeps `str`'s own
-    // `__str__`: its payload (as `Interpreter::do_str_call` answers).
+    // `str(x)` of an instance that renders with no code run (a `str`,
+    // `int` or `float` subclass's payload, an enum member's name), as
+    // `Interpreter::do_str_call` answers.
     if Rc::ptr_eq(cls, &bt.str_) {
         return match args {
             [Object::Str(_)] => Some(args[0].clone()),
-            [Object::Instance(inst)] => Interpreter::str_payload(inst),
+            [Object::Instance(inst)] => Interpreter::quick_str(inst),
             _ => None,
         };
     }

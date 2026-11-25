@@ -217,6 +217,22 @@ pub(crate) enum Verdict {
     /// default `__setattr__`, and a writable member without a default
     /// that the lookup finds first (see `Interpreter::leaf_slot_store`).
     SlotStore = 14,
+    /// The class, an `int`, `float` or `str` subclass, answers `str(x)` of
+    /// its instances with their payload's text: its `__str__` is the
+    /// base's own method stored in a Python class (an `IntEnum`'s or
+    /// `StrEnum`'s), or a number's `__str__` and `__repr__` both come from
+    /// the base (see `Interpreter::num_str_payload_class`); `name` unused.
+    NumStrPayload = 15,
+    /// The class's `__format__` is its payload type's own, which formats
+    /// the payload (an empty spec is `str(x)`); `name` unused.
+    FormatPayload = 16,
+    /// The class answers `str(x)` with `enum`'s own `Enum.__str__` under
+    /// the default attribute access (see `Interpreter::enum_str`); `name`
+    /// unused.
+    EnumStr = 17,
+    /// The class's `__format__` is `enum`'s own `Enum.__format__`; `name`
+    /// unused.
+    EnumFormat = 18,
 }
 
 pub struct AttrVersion(std::sync::atomic::AtomicU64);

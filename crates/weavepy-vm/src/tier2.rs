@@ -15035,6 +15035,16 @@ unsafe extern "C" fn wpjit_str_mod(
         _ => return 3,
     };
     let rhs = unpack_pins(rhs_bits as u64, rhs_tag as u32, &ctx.pins);
+    // `"%s" % SomeStrEnum.A`: payloads, formatted without running Python.
+    if let Object::Str(t) = &lhs {
+        if let Some(out) = crate::percent_format_payloads_checked(t, &rhs) {
+            if ctx.pins.len() < RUNTIME_PIN_CAP {
+                jf.ret_bits = ctx.pins.len() as u64;
+                ctx.pins.push(Pin::Obj(Object::from_str(out)));
+                return 0;
+            }
+        }
+    }
     // Scalar and exact-`str`/tuple-of-scalar operands format without
     // running Python; anything else may dispatch `__str__`/`__repr__`.
     let may_run_python = !matches!(

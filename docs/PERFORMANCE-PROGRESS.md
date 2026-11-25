@@ -3051,6 +3051,27 @@ branch and pull request.
     operator over the payloads through the numbers' own arms: `a + 1`
     3,528 to 497 (CPython 403), `a < 2` 3,439 to 537 (CPython 416).
     `IntFlag`'s own `|` and any Python override still take the call.
+  - Text of `str`, `int` and `float` subclass instances took the general
+    path. An f-string looked up and bound the base's `__format__` and
+    called it through the full call path (about 3,000 instructions;
+    CPython about 1,300), and `str()` repeated its lookups on each call.
+    Two verdicts kept per class version now settle them. The first is
+    whether `str(x)` is the payload's text: a `__str__` that is the
+    base's own method stored in a Python class (`IntEnum`'s and
+    `StrEnum`'s), or a number's `__str__` and `__repr__` both from the
+    base. The second is whether `__format__` is the payload type's own.
+    An enum member whose class keeps `enum`'s own `Enum.__str__` (and
+    `Enum.__format__`) renders `Class.name` from its dict the same way
+    (unless a tracer or profiler is watching). `str.join` reads `str`
+    subclass items as their payloads, as CPython's join does, and `%`
+    with bare `%s` conversions and the `!s` conversion that compiled
+    `"%s-%s" % (a, b)` becomes take these texts too. `f"{I(5)}"` 3,855
+    to 753 (CPython 1,475); `f"{StrEnum.A}"` 3,106 to 766 (CPython
+    1,227); `str(I(5))` 2,743 to 765 (CPython 879);
+    `f"{Color.RED}"` 14,818 to 1,447 (CPython 3,130); `str(Color.RED)`
+    3,783 to 1,255 (CPython 1,942); `"-".join` of `StrEnum` members
+    3,385 to 1,177 (CPython 1,185); `"%s" % StrEnum.A` 2,399 to 1,023
+    (CPython 1,031).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

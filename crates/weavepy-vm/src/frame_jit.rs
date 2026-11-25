@@ -5991,10 +5991,13 @@ unsafe extern "C" fn k_str_join(
     // join with no iteration hook.
     unsafe {
         let strs = match &*a {
-            Object::List(l) => l
-                .peek()
-                .is_some_and(|xs| xs.iter().all(|x| matches!(x, Object::Str(_)))),
-            Object::Tuple(t) => t.iter().all(|x| matches!(x, Object::Str(_))),
+            Object::List(l) => l.peek().is_some_and(|xs| {
+                xs.iter()
+                    .all(|x| crate::builtins::join_item_str(x).is_some())
+            }),
+            Object::Tuple(t) => t
+                .iter()
+                .all(|x| crate::builtins::join_item_str(x).is_some()),
             _ => false,
         };
         if !strs {

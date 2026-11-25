@@ -12460,26 +12460,39 @@ fn str_join(args: &[Object]) -> Result<Object, RuntimeError> {
 /// Return `None` for shapes that need the general Unicode/iterator path.
 /// The result is written straight into its final allocation, and knows its
 /// code-point count when every part (and the separator) already does.
+/// The text `str.join` reads from `item`: an exact `str`, or a `str`
+/// subclass's payload (CPython's `PyUnicode_Join` reads any `str`'s data
+/// directly, calling no `__str__`). `None` for anything else.
+#[inline]
+pub(crate) fn join_item_str(item: &Object) -> Option<&SharedStr> {
+    match item {
+        Object::Str(s) => Some(s),
+        Object::Instance(i) => match i.native.get() {
+            Some(Object::Str(s)) => Some(s),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn join_exact_strings(items: &[Object], sep: &SharedStr) -> Option<Object> {
     let gaps = items.len().saturating_sub(1);
     let mut size = sep.len().checked_mul(gaps)?;
     // The separator is usually a constant: counting it once memoises it.
     let mut chars = SharedStr::char_count(sep).checked_mul(gaps);
     for item in items {
-        let Object::Str(s) = item else {
-            return None;
-        };
+        let s = join_item_str(item)?;
         size = size.checked_add(s.len())?;
         chars = chars.and_then(|n| Some(n + SharedStr::known_char_count(s)?));
     }
     if items.len() == 1 {
-        return Some(items[0].clone());
+        // (An exact `str` is the result itself; a subclass's, its text.)
+        return join_item_str(&items[0]).map(|s| Object::Str(s.clone()));
     }
     let fill = |out: &mut crate::shared_value::TextWriter<'_>| {
-        let mut items = items.iter().filter_map(|item| match item {
-            Object::Str(s) => Some(s.as_bytes()),
-            _ => None,
-        });
+        let mut items = items
+            .iter()
+            .filter_map(|item| join_item_str(item).map(|s| s.as_bytes()));
         if let Some(first) = items.next() {
             out.push(first);
         }

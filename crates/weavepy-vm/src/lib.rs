@@ -22543,6 +22543,12 @@ impl Interpreter {
             {
                 Object::from_str(percent_format(t, args).ok()?)
             }
+            // A template of bare `%s` conversions over `str`, `int` or
+            // `float` subclass instances that render as their payloads
+            // (`"%s" % SomeStrEnum.A`): each instance is its `str()`.
+            (Object::Str(t), args) if kind == BinOpKind::Mod && percent_payload_args(args) => {
+                Object::from_str(percent_format_payloads(t, args)?)
+            }
             // (A dict another owner holds: its release frees nothing.)
             (Object::Str(t), Object::Dict(d))
                 if kind == BinOpKind::Mod && Rc::strong_count(d) > 1 =>
@@ -31102,6 +31108,15 @@ impl Interpreter {
                                 Err(_) => break,
                             }
                         }
+                        // (`"%s" % SomeStrEnum.A`: see `percent_format_payloads`.)
+                        (Object::Str(a), args)
+                            if kind == BinOpKind::Mod && percent_payload_args(args) =>
+                        {
+                            match percent_format_payloads(a, args) {
+                                Some(s) => Object::from_str(s),
+                                None => break,
+                            }
+                        }
                         (Object::Str(a), args @ Object::Dict(d))
                             if kind == BinOpKind::Mod && Rc::strong_count(d) > 1 =>
                         {
@@ -36553,11 +36568,13 @@ impl Interpreter {
                     && leaf_str(&args[2])
             }
             K::StrJoin => {
+                // (A `str` subclass's item is read as its payload.)
+                let item = |x: &Object| leaf_str(x) || crate::builtins::join_item_str(x).is_some();
                 args.len() == 2
                     && leaf_str(&args[0])
                     && match &args[1] {
-                        O::List(l) => l.try_borrow().is_ok_and(|l| l.iter().all(leaf_str)),
-                        O::Tuple(t) => t.iter().all(leaf_str),
+                        O::List(l) => l.try_borrow().is_ok_and(|l| l.iter().all(item)),
+                        O::Tuple(t) => t.iter().all(item),
                         _ => false,
                     }
             }
@@ -47334,6 +47351,210 @@ impl Interpreter {
             && instance_method(&Object::Instance(inst.clone()), "__str__").is_none()
     }
 
+    /// `str(inst)` of an `int`, `float` or `str` subclass's instance whose
+    /// class renders it as the base does (see
+    /// [`Self::num_str_payload_class`], remembered per class version): the
+    /// payload's text. `None` for anything else.
+    pub(crate) fn num_str_payload(inst: &crate::types::PyInstance) -> Option<Object> {
+        let native @ (Object::Int(_) | Object::Long(_) | Object::Float(_) | Object::Str(_)) =
+            inst.native.get()?
+        else {
+            return None;
+        };
+        let cls = inst.cls_raw();
+        if !cls.memo_verdict(crate::types::Verdict::NumStrPayload, "", || {
+            Self::num_str_payload_class(cls, native)
+        }) {
+            return None;
+        }
+        match native {
+            Object::Str(_) => Some(native.clone()),
+            _ => crate::object::native_scalar_repr(native),
+        }
+    }
+
+    /// Whether `cls`, whose instances carry a payload like `native`, gives
+    /// `str(x)` as the payload's own text. Its `__str__` may be the base
+    /// type's own method stored in a Python class (`ReprEnum` stores
+    /// `int.__repr__` or `str.__str__` so). Otherwise, for a number,
+    /// neither `__str__` nor `__repr__` may come from a Python class:
+    /// `object.__str__` then renders the base's `__repr__`, which reads
+    /// only the payload. (A `str` subclass's other cases are
+    /// [`Self::str_payload`]'s.)
+    fn num_str_payload_class(cls: &TypeObject, native: &Object) -> bool {
+        if cls.native_kind.get() != 0
+            || cls.c_ext_ptr.get() != 0
+            || crate::object::exotic_str_keys_possible()
+        {
+            return false;
+        }
+        let base = crate::builtins::class_of(native);
+        let is_str = matches!(native, Object::Str(_));
+        let name = if is_str { "__str__" } else { "__repr__" };
+        let base_render = base
+            .lookup(name)
+            .or_else(|| builtin_slot_wrapper(&base, name));
+        let s = cls.lookup_with_owner("__str__");
+        if let (Some((Object::Builtin(b), owner)), Some(Object::Builtin(r))) = (&s, &base_render) {
+            if !owner.flags.is_builtin && Rc::ptr_eq(b, r) {
+                return true;
+            }
+        }
+        let builtin_or_absent =
+            |x: Option<(Object, Rc<TypeObject>)>| x.is_none_or(|(_, owner)| owner.flags.is_builtin);
+        !is_str && builtin_or_absent(s) && builtin_or_absent(cls.lookup_with_owner("__repr__"))
+    }
+
+    /// `str(inst)` of a `str`, `int` or `float` subclass's instance that
+    /// renders as its payload (see [`Self::str_payload`] and
+    /// [`Self::num_str_payload`]), as an exact `str`. `None` for anything
+    /// else.
+    pub(crate) fn payload_str(inst: &Rc<crate::types::PyInstance>) -> Option<Object> {
+        match inst.native.get()? {
+            Object::Str(_) => Self::str_payload(inst).or_else(|| Self::num_str_payload(inst)),
+            Object::Int(_) | Object::Long(_) | Object::Float(_) => Self::num_str_payload(inst),
+            _ => None,
+        }
+    }
+
+    /// `str(inst)` with no code run: a `str`, `int` or `float` subclass's
+    /// payload text ([`Self::payload_str`]), or an enum member's
+    /// `Class.name` ([`Self::enum_str`]). `None` for anything else.
+    pub(crate) fn quick_str(inst: &Rc<crate::types::PyInstance>) -> Option<Object> {
+        Self::payload_str(inst).or_else(|| Self::enum_str(inst))
+    }
+
+    /// `str(member)` of an enum member whose class keeps `enum`'s own
+    /// `Enum.__str__` (`"%s.%s" % (self.__class__.__name__, self._name_)`)
+    /// under the default attribute access, with no `__class__`, `_name_` or
+    /// assigned `__name__` in the way (a verdict kept per class version): the
+    /// class's name and the member's `_name_`, read from its dict. `None`
+    /// for anything else (a `_name_` that isn't an exact `str`), or while a
+    /// tracer or profiler would see the method.
+    pub(crate) fn enum_str(inst: &crate::types::PyInstance) -> Option<Object> {
+        if crate::trace::any_observers_active() {
+            return None;
+        }
+        let cls = inst.cls_raw();
+        if !cls.memo_verdict(crate::types::Verdict::EnumStr, "", || {
+            if crate::object::exotic_str_keys_possible()
+                || cls.native_kind.get() != 0
+                || cls.c_ext_ptr.get() != 0
+                || !cls.dunder(crate::types::Dunder::GetAttribute).object_owner()
+                || cls.lookup("_name_").is_some()
+                // (An assigned `__name__` lives in the class dict.)
+                || cls.lookup("__name__").is_some()
+                || cls
+                    .lookup_with_owner("__class__")
+                    .is_some_and(|(_, owner)| !owner.flags.is_builtin)
+            {
+                return false;
+            }
+            matches!(
+                cls.lookup("__str__"),
+                Some(Object::Function(f)) if Self::stdlib_fn_is(&f, "enum", "Enum.__str__")
+            )
+        }) {
+            return None;
+        }
+        let name = match inst.dict.published() {
+            Some(dict) => dict
+                .try_borrow()
+                .ok()?
+                .get(&DictKey(Object::from_static("_name_")))
+                .cloned()?,
+            None => {
+                let split = inst.dict.split_cell().try_borrow().ok()?;
+                let ix = split.position_str("_name_")?;
+                split.values().get(ix)?.clone()
+            }
+        };
+        let Object::Str(name) = name else {
+            return None;
+        };
+        let mut out = String::with_capacity(cls.name.len() + 1 + name.len());
+        out.push_str(&cls.name);
+        out.push('.');
+        out.push_str(&name);
+        Some(Object::from_str(out))
+    }
+
+    /// `format(inst, spec)` with no code run: the payload's own
+    /// `__format__` (see [`Self::format_payload`]), or `enum`'s own
+    /// `Enum.__format__` (`str.__format__(str(self), spec)`) over a
+    /// [`Self::quick_str`]. `None` for anything else; `Some(Err)` for a
+    /// spec the value rejects.
+    pub(crate) fn quick_format(
+        inst: &Rc<crate::types::PyInstance>,
+        spec: &str,
+    ) -> Option<Result<String, RuntimeError>> {
+        if Self::format_payload(inst) {
+            if spec.is_empty() {
+                return match Self::payload_str(inst)? {
+                    Object::Str(s) => Some(Ok(s.to_string())),
+                    _ => None,
+                };
+            }
+            let native = inst.native.get()?.clone();
+            return Some(format_via_spec(&native, spec));
+        }
+        if crate::trace::any_observers_active() {
+            return None;
+        }
+        let cls = inst.cls_raw();
+        if !cls.memo_verdict(crate::types::Verdict::EnumFormat, "", || {
+            !crate::object::exotic_str_keys_possible()
+                && matches!(
+                    cls.lookup("__format__"),
+                    Some(Object::Function(f)) if Self::stdlib_fn_is(&f, "enum", "Enum.__format__")
+                )
+        }) {
+            return None;
+        }
+        let text = Self::quick_str(inst)?;
+        if spec.is_empty() {
+            return Some(Ok(text.to_str()));
+        }
+        Some(format_via_spec(&text, spec))
+    }
+
+    /// Whether `inst`'s class formats it with its payload type's own
+    /// `__format__` (an `int`, `float` or `str` subclass's, `IntEnum`'s and
+    /// `StrEnum`'s), remembered per class version: `format(x, spec)` is
+    /// then the payload's for a non-empty spec, and `str(x)` for an empty
+    /// one.
+    pub(crate) fn format_payload(inst: &crate::types::PyInstance) -> bool {
+        let Some(native @ (Object::Int(_) | Object::Long(_) | Object::Float(_) | Object::Str(_))) =
+            inst.native.get()
+        else {
+            return false;
+        };
+        let cls = inst.cls_raw();
+        cls.memo_verdict(crate::types::Verdict::FormatPayload, "", || {
+            if cls.native_kind.get() != 0
+                || cls.c_ext_ptr.get() != 0
+                || crate::object::exotic_str_keys_possible()
+            {
+                return false;
+            }
+            // (Nothing in a class dict, or a built-in's entry: the base's
+            // slot, which comes before `object`'s on the MRO.)
+            match cls.lookup_with_owner("__format__") {
+                None => true,
+                Some((_, owner)) if owner.flags.is_builtin => true,
+                Some((Object::Builtin(x), _)) => {
+                    let base = crate::builtins::class_of(native);
+                    matches!(
+                        base.lookup("__format__")
+                            .or_else(|| builtin_slot_wrapper(&base, "__format__")),
+                        Some(Object::Builtin(y)) if Rc::ptr_eq(&x, &y)
+                    )
+                }
+                Some(_) => false,
+            }
+        })
+    }
+
     fn do_str_call(
         &mut self,
         v: &Object,
@@ -47350,6 +47571,9 @@ impl Interpreter {
         }
         if let Object::Instance(inst) = v {
             if let Some(s) = Self::str_payload(inst) {
+                return Ok(s);
+            }
+            if let Some(s) = Self::num_str_payload(inst).or_else(|| Self::enum_str(inst)) {
                 return Ok(s);
             }
             // An exact `decimal.Decimal` (see `stdlib::decimal_native`).
@@ -47749,6 +47973,16 @@ impl Interpreter {
                 if let Some(r) = crate::stdlib::decimal_native::leaf_format(inst, spec) {
                     return Ok(r);
                 }
+            }
+            // The payload type's own `__format__` (an `IntEnum`'s, a plain
+            // `str` subclass's): the payload formatted, or `str(self)` for
+            // an empty spec, as that method does.
+            // (Or `Enum.__format__` over a member's name.)
+            if let Some(r) = Self::quick_format(inst, spec) {
+                return r;
+            }
+            if Self::format_payload(inst) && spec.is_empty() {
+                return self.stringify(value, globals);
             }
             let lacks_format = Self::class_lacks(
                 inst.cls_raw(),
@@ -52770,6 +53004,11 @@ impl Interpreter {
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<String, RuntimeError> {
         if let Object::Instance(inst) = v {
+            // A subclass of `str`, `int` or `float` that renders as its
+            // payload.
+            if let Some(Object::Str(s)) = Self::quick_str(inst) {
+                return Ok(s.to_string());
+            }
             // A Python `__str__` (cached on the class): evaluated in place
             // when a pure leaf, else called with the instance, without a
             // bound method.
@@ -57466,6 +57705,9 @@ impl Interpreter {
     ) -> Result<Object, RuntimeError> {
         if let Object::Str(t) = a {
             if let Some(out) = percent_render_plain_value(t, b) {
+                return Ok(Object::from_str(out));
+            }
+            if let Some(out) = percent_format_payloads_checked(t, b) {
                 return Ok(Object::from_str(out));
             }
         }
@@ -84790,6 +85032,82 @@ pub(crate) enum PercentMode {
 
 /// A `%`-format argument (or argument tuple) of scalars and exact
 /// strings: its conversions run no Python code.
+/// `template % args` for a template of bare `%s` conversions whose `args`
+/// hold instances that render with no code run (see
+/// `Interpreter::quick_str`), every other item being
+/// what [`percent_leaf_args`] takes: each instance is its `str()`, so the
+/// text is the payloads'. `None`, having run nothing, for anything else
+/// (or an error, which the full handler raises).
+fn percent_format_payloads(template: &str, args: &Object) -> Option<String> {
+    if !percent_only_bare_s(template) {
+        return None;
+    }
+    let sub = |o: &Object| match o {
+        Object::Instance(i) => Interpreter::quick_str(i),
+        o => Some(o.clone()),
+    };
+    let args = match args {
+        Object::Tuple(items) => {
+            Object::new_tuple(items.iter().map(sub).collect::<Option<Vec<_>>>()?)
+        }
+        o => sub(o)?,
+    };
+    if !percent_leaf_args(&args) || percent_args_need_bridge(&args) {
+        return None;
+    }
+    percent_format(template, &args).ok()
+}
+
+/// [`percent_format_payloads`] when `args` is the shape it takes (see
+/// [`percent_payload_args`]).
+#[inline]
+pub(crate) fn percent_format_payloads_checked(template: &str, args: &Object) -> Option<String> {
+    if !percent_payload_args(args) {
+        return None;
+    }
+    percent_format_payloads(template, args)
+}
+
+/// Whether every conversion in `template` is a bare `%s` (or a literal
+/// `%%`): no flags, width, precision or mapping key.
+fn percent_only_bare_s(template: &str) -> bool {
+    let b = template.as_bytes();
+    let mut i = 0;
+    while let Some(at) = memchr::memchr(b'%', &b[i..]) {
+        match b.get(i + at + 1) {
+            Some(b's' | b'%') => i += at + 2,
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Whether `args` (a `%` operator's right operand) holds an instance,
+/// every other item being what
+/// [`percent_leaf_args`] takes (the instances are checked as they're
+/// replaced). Each instance is held elsewhere too, so releasing the
+/// operand runs nothing.
+fn percent_payload_args(args: &Object) -> bool {
+    let inst = |o: &Object| matches!(o, Object::Instance(i) if Rc::strong_count(i) > 1);
+    match args {
+        Object::Tuple(items) => {
+            items.iter().any(inst)
+                && items.iter().all(|o| {
+                    inst(o)
+                        || matches!(
+                            o,
+                            Object::Int(_)
+                                | Object::Float(_)
+                                | Object::Str(_)
+                                | Object::Bool(_)
+                                | Object::None
+                        )
+                })
+        }
+        other => inst(other),
+    }
+}
+
 fn percent_leaf_args(args: &Object) -> bool {
     let leaf = |o: &Object| {
         matches!(
@@ -92513,11 +92831,20 @@ pub(crate) unsafe fn convert_in_place(top: *mut Object, arg: u32) -> bool {
             Some(r) => Object::Str(SharedStr::from(r.as_str())),
             None => return false,
         },
+        // `!s` of an instance that renders with no code run (a `str` or
+        // `int` subclass's payload, an enum member's name), held elsewhere
+        // too.
+        (1, Object::Instance(inst)) if Rc::strong_count(inst) > 1 => {
+            match Interpreter::quick_str(inst) {
+                Some(r) => r,
+                None => return false,
+            }
+        }
         _ => return false,
     };
     // SAFETY: the replaced value is a scalar, which owes no drop, or a
-    // string, or a list or tuple of scalars, released here (no release of
-    // theirs runs Python).
+    // string, or a list or tuple of scalars, or an instance another owner
+    // holds, released here (no release of theirs runs Python).
     unsafe { top.replace(v) };
     true
 }
@@ -92541,6 +92868,16 @@ pub(crate) unsafe fn format_simple_in_place(top: *mut Object) -> bool {
             Object::Float(f) => {
                 let r = SharedStr::from(crate::object::float_repr(*f).as_str());
                 top.write(Object::Str(r));
+            }
+            // A `str`, `int` or `float` subclass's instance that formats
+            // and renders as its payload (`f"{SomeIntEnum.A}"`), held
+            // elsewhere too (its release runs nothing).
+            Object::Instance(inst) if Rc::strong_count(inst) > 1 => {
+                let Some(Ok(r)) = Interpreter::quick_format(inst, "") else {
+                    return false;
+                };
+                drop_hot_at(top);
+                top.write(Object::from_str(r));
             }
             _ => return false,
         }
