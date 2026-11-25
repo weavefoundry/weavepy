@@ -3180,7 +3180,11 @@ branch and pull request.
     `__missing__` up on the class each time to check that it is the
     native one. That check is now remembered per class version, and
     counting eleven words with `d[w] += 1` went from 19,473 to 17,291
-    (CPython 15,140).
+    (CPython 15,140). `Struct.unpack` and `Struct.pack` read the
+    instance's `_fmt` by scanning its names on every call. They now use
+    the name's hash and remembered position (`Struct("<ihd").unpack(b)`
+    from about 2,300 to about 1,700 instructions, CPython about 1,050;
+    these runs are noisy).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

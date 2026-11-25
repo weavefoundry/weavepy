@@ -1081,7 +1081,17 @@ fn struct_format(recv: &Object) -> Option<std::rc::Rc<CompiledFormat>> {
     if class != STRUCT_CLASS.load(std::sync::atomic::Ordering::Relaxed) {
         return None;
     }
-    match inst.attr_get_str("_fmt")? {
+    // (The name's hash computed once, its position remembered.)
+    struct FmtName {
+        hash: i64,
+        memo: crate::inst_dict::PosMemo,
+    }
+    static NAME: std::sync::OnceLock<FmtName> = std::sync::OnceLock::new();
+    let n = NAME.get_or_init(|| FmtName {
+        hash: crate::object::py_str_hash("_fmt"),
+        memo: crate::inst_dict::PosMemo::new(),
+    });
+    match inst.attr_get_memo("_fmt", n.hash, &n.memo)? {
         Object::Str(fmt) => compiled_for(&fmt),
         _ => None,
     }

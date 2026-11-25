@@ -1571,7 +1571,7 @@ impl crate::types::PyInstance {
             Some(d) => d
                 .try_borrow()
                 .ok()?
-                .get(&crate::object::StrKey(name))
+                .get(&crate::object::StrKeyHashed { s: name, hash })
                 .cloned(),
             None => {
                 let s = self.dict.split_cell().try_borrow().ok()?;
