@@ -33134,6 +33134,47 @@ impl Interpreter {
         }
     }
 
+    /// [`Self::leaf_instance_len`] for a class (`len(SomeEnum)`) whose
+    /// metaclass's `__len__` is a Python function that evaluates as a pure
+    /// leaf: its answer in place, found through the metaclass's length
+    /// cache. `None` for anything else, or an answer `len()` would reject
+    /// (the full path then runs it, which nothing observed).
+    fn leaf_class_len(&self, cls: &Rc<TypeObject>, v: &Object) -> Option<Object> {
+        use crate::types::LeafAttrKind as K;
+        if crate::object::exotic_str_keys_possible() {
+            return None;
+        }
+        let meta = cls.metaclass_or_type();
+        let key = crate::types::AttrKey::vm(crate::types::vm_key::LEN);
+        let ver = meta.attr_version.get();
+        let f = match meta.leaf_attrs.get(key, ver) {
+            Some(K::Method(w)) => w.upgrade()?,
+            Some(_) => return None,
+            None => {
+                let kind = match meta.lookup("__len__") {
+                    Some(Object::Function(f)) => K::Method(Rc::downgrade(&f)),
+                    _ => K::Other,
+                };
+                let found = matches!(kind, K::Method(_));
+                meta.leaf_attrs.set(key, ver, kind);
+                return if found {
+                    self.leaf_class_len(cls, v)
+                } else {
+                    None
+                };
+            }
+        };
+        let code = f.code();
+        let depth = crate::recursion::current_depth();
+        if !code_is_pure_leaf(&code) || depth >= crate::recursion::recursion_limit() {
+            return None;
+        }
+        match self.pure_leaf_call(&code, &f, &[std::ptr::from_ref(v)], false, depth)? {
+            Object::Int(n) if n >= 0 => Some(Object::Int(n)),
+            _ => None,
+        }
+    }
+
     /// [`Self::leaf_instance_len`] for a class whose `__len__` is a builtin
     /// registered with a leaf fast half (see `leaf_builtins::register_fast`;
     /// the length cache marks it with a `Value`): the half's answer, or
@@ -34454,6 +34495,10 @@ impl Interpreter {
                     &[
                         ("__len__", LeafKind::Len),
                         ("get", LeafKind::DictGet),
+                        (
+                            "__getitem__",
+                            LeafKind::Fast(crate::builtins::dict_getitem_leaf),
+                        ),
                         (
                             "setdefault",
                             LeafKind::Fast(crate::builtins::dict_setdefault_leaf),
@@ -36058,6 +36103,10 @@ impl Interpreter {
                 // (The common containers' lengths read in line.)
                 let n = match args {
                     [O::Instance(_)] => return self.leaf_instance_len(&args[0]).map(Ok),
+                    // `len(SomeEnum)`: the metaclass's `__len__`.
+                    [O::Type(t)] if !t.metaclass_is_type() => {
+                        return self.leaf_class_len(t, &args[0]).map(Ok);
+                    }
                     [O::List(l)] => Some(l.try_borrow().ok()?.len()),
                     [O::Tuple(t)] => Some(t.len()),
                     [O::Str(s)] => Some(crate::object::str_char_len(s)),
@@ -49638,6 +49687,45 @@ impl Interpreter {
     /// else (a name the map lacks, whose `KeyError` the generator
     /// raises), or while a tracer or profiler would see the generator.
     fn enum_members(cls: &Rc<TypeObject>) -> Option<Vec<Object>> {
+        let (map, names) = Self::enum_tables(cls)?;
+        let (map, names) = (map.try_borrow().ok()?, names.try_borrow().ok()?);
+        names
+            .iter()
+            .map(|n| match n {
+                Object::Str(_) => map.get(&DictKey(n.clone())).cloned(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `iter(SomeEnum)` for a compiled loop's `GET_ITER`, where the
+    /// iterator is never seen: `map(cls._member_map_.__getitem__,
+    /// cls._member_names_)`, which yields what `EnumType.__iter__`'s
+    /// generator does, read as lazily from the same live tables, without
+    /// the call and the generator's resumes. `None` as for
+    /// [`Self::enum_members`].
+    #[cfg(feature = "jit")]
+    pub(crate) fn enum_iter_lazy(cls: &Rc<TypeObject>) -> Option<Object> {
+        let (map, names) = Self::enum_tables(cls)?;
+        let map = Object::Dict(map);
+        let getitem @ Object::Builtin(_) = crate::builtins::lookup_method(&map, "__getitem__")?
+        else {
+            return None;
+        };
+        let func = Object::BoundMethod(Rc::new(BoundMethod::new(map, getitem)));
+        let names = Object::List(names).make_iter().ok()?;
+        Some(crate::seqiter::lazy_map1(
+            func,
+            Object::Iter(Rc::new(RefCell::new(names))),
+        ))
+    }
+
+    /// The `_member_map_` dict and `_member_names_` list of an enum class
+    /// whose metaclass iterates it with `enum`'s own `EnumType.__iter__`,
+    /// unless a tracer or profiler would see that generator.
+    fn enum_tables(
+        cls: &Rc<TypeObject>,
+    ) -> Option<(Rc<RefCell<DictData>>, Rc<RefCell<Vec<Object>>>)> {
         if cls.metaclass_is_type() || crate::trace::any_observers_active() {
             return None;
         }
@@ -49662,14 +49750,7 @@ impl Interpreter {
         else {
             return None;
         };
-        let (map, names) = (map.try_borrow().ok()?, names.try_borrow().ok()?);
-        names
-            .iter()
-            .map(|n| match n {
-                Object::Str(_) => map.get(&DictKey(n.clone())).cloned(),
-                _ => None,
-            })
-            .collect()
+        Some((map, names))
     }
 
     /// CPython's `PyObject_LengthHint` probe of a plain instance before a

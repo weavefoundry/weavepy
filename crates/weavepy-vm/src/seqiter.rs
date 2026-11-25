@@ -78,6 +78,16 @@ fn lazy(kind: LazyIterKind) -> Object {
     Object::LazyIter(Rc::new(PyLazyIter::new(kind)))
 }
 
+/// `map(func, it)` over one iterator already made.
+#[cfg(feature = "jit")]
+pub(crate) fn lazy_map1(func: Object, it: Object) -> Object {
+    lazy(LazyIterKind::Map {
+        func,
+        iters: vec![it],
+        strict: false,
+    })
+}
+
 /// `iter(obj)` for a constructor argument when it needs no interpreter:
 /// an iterator is its own iterator, and the native containers build
 /// theirs directly. `None` for anything that might run Python code.

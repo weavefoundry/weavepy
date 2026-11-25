@@ -2956,7 +2956,15 @@ branch and pull request.
     `_member_map_` in `_member_names_` order, as that generator yields
     them, instead of calling it and resuming the generator per member
     (none while a tracer or profiler would see it): `list(Color)` of
-    two members 11,311 to 3,297 (CPython 5,731).
+    two members 11,311 to 3,297 (CPython 5,731). A compiled loop's
+    `GET_ITER` of such a class, which left for the interpreter, now
+    takes `map(cls._member_map_.__getitem__, cls._member_names_)`, the
+    same items read as lazily from the same live tables (a member added
+    mid-loop is still seen), stepped in place: `for m in Color` over
+    three members 11,362 to 5,932 (CPython 4,580). `len()` of a class
+    whose metaclass `__len__` evaluates as a pure leaf runs it in place
+    instead of through the builtin lane and a bound method: `len(Color)`
+    3,260 to 2,127 (CPython 1,000).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

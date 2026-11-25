@@ -18071,6 +18071,15 @@ unsafe extern "C" fn h_get_iter(at: *mut Object) -> u32 {
         if let Object::File(f) = v {
             return u32::from(f.is_closed());
         }
+        // An enum class (`for m in Color`): its members as `EnumType`'s
+        // own `__iter__` yields them (see `Interpreter::enum_iter_lazy`).
+        if let Object::Type(t) = v {
+            let Some(it) = Interpreter::enum_iter_lazy(t) else {
+                return 1;
+            };
+            crate::drop_hot(std::mem::replace(&mut *at, it));
+            return 0;
+        }
         // A list or tuple subclass inheriting `__iter__`: its value's
         // iterator, as `Interpreter::make_iter` makes it.
         if let Object::Instance(inst) = v {
