@@ -3096,6 +3096,13 @@ branch and pull request.
     `array.array("i", [1, 2, 3])` 3,080, down from 20,899 (CPython 3,039).
     `__new__`'s parameters are now positional-only, so
     `array.array("i", initializer=[1])` raises CPython's `TypeError`.
+  - The enum member reads above found `_name_`, `_value_` and the
+    descriptor's `fget` by scanning the dict's names, 181 instructions a
+    name. They now use the names' hashes, computed once, and the
+    positions they last had in a split layout. The interpreter's
+    attribute path takes the same in-place read. A function returning
+    `member.name` is now 1,569 (CPython 1,556), `member.value` 1,594
+    (CPython 1,561), and `d[member]` 1,216 (CPython 1,434).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

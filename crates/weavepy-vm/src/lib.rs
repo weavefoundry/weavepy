@@ -11384,6 +11384,34 @@ impl Interpreter {
     /// `__getitem__` (the site's remembered function) is a pure leaf: the
     /// result replaces the operands, as the full call would leave it.
     /// `false` touches nothing.
+    /// The `LOAD_ATTR` at `frame`'s pc of an enum member's `name` or
+    /// `value` through `enum.property` (see [`Self::enum_property_value`]):
+    /// the field in place of the receiver, no activation. `false` touches
+    /// nothing.
+    fn try_enum_property_read(&mut self, frame: &mut Frame) -> bool {
+        let pc = frame.pc as usize;
+        let Some(ins) = frame.code.instructions.get(pc) else {
+            return false;
+        };
+        if ins.op != OpCode::LoadAttr {
+            return false;
+        }
+        let Some(Object::Instance(inst)) = frame.stack.last() else {
+            return false;
+        };
+        let Some((descr, _)) = Self::descr_getter(&frame.code, inst, ins.arg) else {
+            return false;
+        };
+        let Some(v) = Self::enum_property_value(&descr, inst) else {
+            return false;
+        };
+        let recv = frame.stack.pop().expect("checked above");
+        frame.stack.push(v);
+        frame.pc = pc as u32 + 1;
+        self.release(recv);
+        true
+    }
+
     fn try_leaf_getitem(&mut self, frame: &mut Frame) -> bool {
         let pc = frame.pc as usize;
         let n = frame.stack.len();
@@ -19377,6 +19405,11 @@ impl Interpreter {
         // SAFETY: see `CoreSwitch`: the running activation is synced.
         if !descr && self.try_leaf_getitem(unsafe { &mut *sw.cur }) {
             note(unsafe { &*sw.cur }, pc);
+            return true;
+        }
+        // `member.name` / `member.value`: the field, no activation.
+        // SAFETY: as above.
+        if descr && self.try_enum_property_read(unsafe { &mut *sw.cur }) {
             return true;
         }
         let mut tmp = None;
@@ -47500,25 +47533,44 @@ impl Interpreter {
 
     /// An enum member's `_name_` from its dict, when an exact `str`.
     fn enum_member_name(inst: &crate::types::PyInstance) -> Option<SharedStr> {
-        match Self::enum_member_field(inst, "_name_")? {
+        match Self::enum_member_field(inst, ENUM_NAME)? {
             Object::Str(name) => Some(name),
             _ => None,
         }
     }
 
-    /// The entry `field` of an instance's dict.
-    fn enum_member_field(inst: &crate::types::PyInstance, field: &'static str) -> Option<Object> {
+    /// The entry [`ENUM_FIELDS`]`[field]` of an instance's dict: the name's
+    /// hash computed once, and its position in a split layout remembered
+    /// (see [`crate::inst_dict::PosMemo`]).
+    fn enum_member_field(inst: &crate::types::PyInstance, field: usize) -> Option<Object> {
+        struct FieldName {
+            hash: i64,
+            memo: crate::inst_dict::PosMemo,
+        }
+        static NAMES: std::sync::OnceLock<[FieldName; 3]> = std::sync::OnceLock::new();
+        let names = NAMES.get_or_init(|| {
+            ENUM_FIELDS.map(|name| FieldName {
+                hash: crate::object::py_str_hash(name),
+                memo: crate::inst_dict::PosMemo::new(),
+            })
+        });
+        let (name, n) = (*ENUM_FIELDS.get(field)?, names.get(field)?);
         match inst.dict.published() {
             Some(dict) => dict
                 .try_borrow()
                 .ok()?
-                .get(&DictKey(Object::from_static(field)))
+                .get(&crate::object::StrKeyHashed {
+                    s: name,
+                    hash: n.hash,
+                })
                 .cloned(),
-            None => {
-                let split = inst.dict.split_cell().try_borrow().ok()?;
-                let ix = split.position_str(field)?;
-                split.values().get(ix).cloned()
-            }
+            None => inst
+                .dict
+                .split_cell()
+                .try_borrow()
+                .ok()?
+                .get_memo(name, n.hash, &n.memo)
+                .cloned(),
         }
     }
 
@@ -47551,10 +47603,10 @@ impl Interpreter {
         }
         // (Which field the getter reads, remembered for the function.)
         thread_local! {
-            static FGET: std::cell::RefCell<Option<(crate::sync::Weak<PyFunction>, Option<&'static str>)>> =
+            static FGET: std::cell::RefCell<Option<(crate::sync::Weak<PyFunction>, Option<usize>)>> =
                 const { std::cell::RefCell::new(None) };
         }
-        let Some(Object::Function(fget)) = Self::enum_member_field(descr, "fget") else {
+        let Some(Object::Function(fget)) = Self::enum_member_field(descr, ENUM_FGET) else {
             return None;
         };
         let known = FGET.with(|m| {
@@ -47566,9 +47618,9 @@ impl Interpreter {
             Some(field) => field,
             None => {
                 let field = if Self::stdlib_fn_is(&fget, "enum", "Enum.name") {
-                    Some("_name_")
+                    Some(ENUM_NAME)
                 } else if Self::stdlib_fn_is(&fget, "enum", "Enum.value") {
-                    Some("_value_")
+                    Some(ENUM_VALUE)
                 } else {
                     None
                 };
@@ -82335,6 +82387,13 @@ fn class_dunder_new(cls: &TypeObject) -> Option<Object> {
     }
     None
 }
+
+/// The instance-dict names the enum fast paths read (see
+/// `Interpreter::enum_member_field`), by index.
+const ENUM_FIELDS: [&str; 3] = ["_name_", "_value_", "fget"];
+const ENUM_NAME: usize = 0;
+const ENUM_VALUE: usize = 1;
+const ENUM_FGET: usize = 2;
 
 /// Whether `inst`, a subclass instance of a built-in type with no `tp_str`
 /// of its own (`int`, `float`, `complex`, `list`, `dict`, `tuple`),
