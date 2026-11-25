@@ -83,6 +83,34 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         register_kw(&mut d, "b2a_uu", b2a_uu_kw);
         register_kw(&mut d, "a2b_qp", a2b_qp_kw);
         register_kw(&mut d, "b2a_qp", b2a_qp_kw);
+        // The bodies over a `bytes`, `bytearray` or (for the decoders) `str`
+        // argument run no code (only another object's buffer hook could):
+        // their positional calls run in place.
+        for (name, fast) in [
+            ("b2a_base64", b2a_base64_fast as crate::leaf_builtins::Fast),
+            ("a2b_base64", a2b_base64_fast),
+            ("a2b_hex", a2b_hex_fast),
+            ("unhexlify", a2b_hex_fast),
+            ("crc32", crc32_fast),
+        ] {
+            if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static(name))) {
+                crate::leaf_builtins::register_fast(b, fast);
+            }
+        }
+        // (And their keyword calls, `b2a_base64(s, newline=False)` as
+        // `base64.b64encode` makes it.)
+        for (name, names, fast) in [
+            (
+                "b2a_base64",
+                &["/data", "*newline"] as crate::leaf_builtins::KwNames,
+                b2a_base64_kw_fast as crate::leaf_builtins::Fast,
+            ),
+            ("a2b_base64", &["/data", "*strict_mode"], a2b_base64_kw_fast),
+        ] {
+            if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static(name))) {
+                crate::leaf_builtins::register_fast_kw(b, names, fast);
+            }
+        }
     }
     Rc::new(PyModule {
         name: "binascii".to_owned(),
@@ -202,6 +230,78 @@ fn truthy_kw(kwargs: &[(String, Object)], key: &str) -> Option<bool> {
 fn hex_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     match args {
         [Object::Bytes(_) | Object::ByteArray(_)] => Some(b2a_hex_kw(args, &[])),
+        _ => None,
+    }
+}
+
+/// Whether `o` is a `bytes` or `bytearray`, whose bytes the bodies read
+/// with no code run.
+fn plain_bytes(o: &Object) -> bool {
+    matches!(o, Object::Bytes(_) | Object::ByteArray(_))
+}
+
+/// `b2a_base64(data)` of plain bytes.
+fn b2a_base64_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    match args {
+        [d] if plain_bytes(d) => Some(b2a_base64_kw(args, &[])),
+        _ => None,
+    }
+}
+
+/// `a2b_base64(data)` of plain bytes or a `str`.
+fn a2b_base64_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    match args {
+        [d] if plain_bytes(d) || matches!(d, Object::Str(_)) => Some(a2b_base64_kw(args, &[])),
+        _ => None,
+    }
+}
+
+/// The keyword half's call of `body` on `data` and its one keyword-only
+/// flag (`Unbound` when the call left it out).
+fn with_flag(
+    data: &Object,
+    flag: &Object,
+    name: &str,
+    body: fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError>,
+) -> Result<Object, RuntimeError> {
+    let args = std::slice::from_ref(data);
+    match flag {
+        Object::Unbound => body(args, &[]),
+        f => body(args, &[(name.to_owned(), f.clone())]),
+    }
+}
+
+/// `b2a_base64(data, *, newline)`'s keyword half, as [`b2a_base64_fast`].
+fn b2a_base64_kw_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    match args {
+        [d, nl] if plain_bytes(d) => Some(with_flag(d, nl, "newline", b2a_base64_kw)),
+        _ => None,
+    }
+}
+
+/// `a2b_base64(data, *, strict_mode)`'s keyword half, as
+/// [`a2b_base64_fast`].
+fn a2b_base64_kw_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    match args {
+        [d, strict] if plain_bytes(d) || matches!(d, Object::Str(_)) => {
+            Some(with_flag(d, strict, "strict_mode", a2b_base64_kw))
+        }
+        _ => None,
+    }
+}
+
+/// `unhexlify(data)` of plain bytes or a `str`.
+fn a2b_hex_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    match args {
+        [d] if plain_bytes(d) || matches!(d, Object::Str(_)) => Some(a2b_hex(args)),
+        _ => None,
+    }
+}
+
+/// `crc32(data[, value])` of plain bytes and an `int`.
+fn crc32_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    match args {
+        [d] | [d, Object::Int(_)] if plain_bytes(d) => Some(crc32(args)),
         _ => None,
     }
 }

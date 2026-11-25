@@ -2985,7 +2985,13 @@ branch and pull request.
     list's or tuple's iterator to its end itself: two rows 30,186 to
     16,881 (CPython 7,911). `os.fspath()` of a `pathlib` path whose
     class keeps `pathlib`'s own `__fspath__` and `__str__` returns its
-    cached string in place (4,183 to 2,021, CPython 1,898).
+    cached string in place (4,183 to 2,021, CPython 1,898). The
+    `binascii` encoders and decoders, whose bodies run no code over a
+    `bytes`, `bytearray` or `str` argument, took the general builtin call
+    unless called with keywords: they have fast halves now, for keyword
+    calls too (`b2a_base64(b)` 4,054 to 1,081, CPython 1,113;
+    `base64.b64encode` 3,184 to 2,150 and `b64decode` 4,541 to 3,428,
+    CPython 1,938 and 3,016).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
