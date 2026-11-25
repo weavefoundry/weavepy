@@ -11047,14 +11047,32 @@ impl Interpreter {
             || code.has_varargs
             || code.has_varkeywords
             || !code_is_effect_leaf(&code)
-            || code_vm_ext(&code)
-                .is_none_or(|e| e.pure_leaf.load(std::sync::atomic::Ordering::Relaxed) != 16)
             || !pure_leaf_warm(&code)
         {
             return false;
         }
         let args: [*const Object; 2] = [receiver, value];
-        self.leaf_init_eval(&code, f, &args).is_some()
+        // The setter shape (`self._x = value`) through its own evaluator;
+        // any other effect leaf (a setter that checks its value first) as
+        // the general evaluation runs it, its stores committed at the
+        // return and its result (`None`) let go.
+        let shape = code_vm_ext(&code).map_or(0, |e| {
+            e.pure_leaf.load(std::sync::atomic::Ordering::Relaxed)
+        });
+        if shape == 16 {
+            return self.leaf_init_eval(&code, f, &args).is_some();
+        }
+        let depth = crate::recursion::current_depth();
+        if depth >= crate::recursion::recursion_limit() {
+            return false;
+        }
+        match self.pure_leaf_call(&code, f, &args, true, depth) {
+            Some(r) => {
+                drop(r);
+                true
+            }
+            None => false,
+        }
     }
 
     /// `receiver.name = value` (the `STORE_ATTR` at `pc` of `code`) for a

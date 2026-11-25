@@ -3007,6 +3007,14 @@ branch and pull request.
     the protocol sweep 2,930 to 1,414 (CPython 1,066), a frozen
     dataclass's `hash(f)` 3,405 to 1,363 (CPython 1,755). An owner in a
     reference cycle still waits for the next collection.
+  - An eighth sweep (`target/mb/i8/i8.py`, object-oriented idioms) found
+    property setters that check their value first (`if v < -273: raise
+    ValueError` before `self._c = v`) taking a frame on every store: the
+    store's leaf lane took only the plain `self._x = value` shape. Any
+    setter that is an effect leaf now runs in place through the general
+    evaluation, its stores committed at the return (`t.c = i` 3,988 to
+    1,405, CPython 1,916). A method load that misses on an instance tries
+    a pure-leaf `__getattr__` in place, as an attribute read does.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

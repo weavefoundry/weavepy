@@ -8791,6 +8791,28 @@ unsafe fn method_slow(st: *mut State, site: *mut MethodSite) -> u32 {
                         return 0;
                     }
                 }
+                // A missing name a class's pure-leaf `__getattr__` answers
+                // (`w.count` of a wrapper delegating to its target), as the
+                // attribute load evaluates it: the value and an empty self
+                // slot, the receiver released.
+                if inst
+                    .cls_raw()
+                    .dunder(crate::types::Dunder::GetAttr)
+                    .present()
+                    && droppable(&*top)
+                {
+                    let code = &*s.code;
+                    let arg = code.instructions[s.pc as usize].arg;
+                    if let Some(v) = code
+                        .names
+                        .get(arg as usize)
+                        .and_then(|name| (*(*st).interp).leaf_getattr_hook(&*top, name, code, arg))
+                    {
+                        crate::drop_hot(std::mem::replace(&mut *top, v));
+                        (*st).stack.add(s.len as usize).write(Object::Unbound);
+                        return 0;
+                    }
+                }
                 Some(inst.clone())
             }
             _ => None,
