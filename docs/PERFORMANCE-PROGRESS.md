@@ -3041,6 +3041,16 @@ branch and pull request.
     `SomeEnum[name]` reads the member map the same way, each verdict kept
     per class and metaclass version. `Color.RED in Color` 2,730 to 870
     (CPython 1,244); `Color["RED"]` 1,333 to 514 (CPython 612).
+  - Arithmetic and comparisons over an instance of an `int` or `float`
+    subclass (`IntEnum.A + 1`, `I(2) < 3`) left compiled code at every
+    operator for the general path, about 3,500 instructions each
+    (CPython about 400). When the class takes the operator's forward
+    and reflected methods from its built-in base unchanged and defines
+    no in-place one (a verdict kept per class version), CPython runs the
+    base's own slot over the payload, so compiled code now runs the
+    operator over the payloads through the numbers' own arms: `a + 1`
+    3,528 to 497 (CPython 403), `a < 2` 3,439 to 537 (CPython 416).
+    `IntFlag`'s own `|` and any Python override still take the call.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

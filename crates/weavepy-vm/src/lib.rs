@@ -33694,6 +33694,98 @@ impl Interpreter {
         }
     }
 
+    /// The number `o` stands for under a built-in operator whose forward
+    /// and reflected methods are `fwd` and `refl` (and in-place one
+    /// `inplace`): an exact number itself, or the payload of a plain
+    /// instance of an `int` or `float` subclass (`IntEnum`'s) whose class
+    /// takes both methods from its built-in base unchanged and defines no
+    /// in-place one, so CPython's `binary_op1` (or `do_richcompare`) runs
+    /// the base's own slot, which reads only the payload and answers an
+    /// exact `int`, `float` or `bool`. The class's answer is cached under
+    /// its attribute version at `key` (one of [`vm_key::NUM_BINOP`]'s or
+    /// [`vm_key::NUM_CMP`]'s). `None` for anything else.
+    ///
+    /// [`vm_key::NUM_BINOP`]: crate::types::vm_key::NUM_BINOP
+    /// [`vm_key::NUM_CMP`]: crate::types::vm_key::NUM_CMP
+    pub(crate) fn kept_number_payload(
+        o: &Object,
+        key: u32,
+        fwd: &str,
+        refl: &str,
+        inplace: Option<&str>,
+    ) -> Option<Object> {
+        use crate::types::LeafAttrKind as K;
+        let inst = match o {
+            Object::Int(_) | Object::Bool(_) | Object::Long(_) | Object::Float(_) => {
+                return Some(o.clone());
+            }
+            Object::Instance(i) => i,
+            _ => return None,
+        };
+        let v = inst.native.get()?;
+        if !matches!(v, Object::Int(_) | Object::Long(_) | Object::Float(_)) {
+            return None;
+        }
+        let cls = inst.cls_raw();
+        if cls.native_kind.get() != 0 || cls.c_ext_ptr.get() != 0 {
+            return None;
+        }
+        let key = crate::types::AttrKey::vm(key);
+        let ver = cls.attr_version.get();
+        let kept = match cls.leaf_attrs.get(key, ver) {
+            Some(K::InstanceOnly) => true,
+            Some(_) => false,
+            None => {
+                if crate::object::exotic_str_keys_possible() {
+                    return None;
+                }
+                let base = |name: &str| {
+                    matches!(
+                        cls.lookup_with_owner(name),
+                        Some((Object::Builtin(_), owner)) if owner.flags.is_builtin
+                    )
+                };
+                let kept =
+                    base(fwd) && base(refl) && inplace.is_none_or(|n| cls.lookup(n).is_none());
+                cls.leaf_attrs
+                    .set(key, ver, if kept { K::InstanceOnly } else { K::Other });
+                kept
+            }
+        };
+        kept.then(|| v.clone())
+    }
+
+    /// [`Self::kept_number_payload`] for `BINARY_OP` of `op`.
+    pub(crate) fn binop_number_payload(o: &Object, op: BinOpKind) -> Option<Object> {
+        let (fwd, refl) = binop_dunders(op);
+        Self::kept_number_payload(
+            o,
+            crate::types::vm_key::NUM_BINOP + op as u32,
+            fwd,
+            refl,
+            Some(op.inplace_dunder()),
+        )
+    }
+
+    /// [`Self::kept_number_payload`] for `COMPARE_OP` of `op`.
+    pub(crate) fn compare_number_payload(o: &Object, op: CompareKind) -> Option<Object> {
+        let name = |op: CompareKind| match op {
+            CompareKind::Lt => "__lt__",
+            CompareKind::LtE => "__le__",
+            CompareKind::Eq => "__eq__",
+            CompareKind::NotEq => "__ne__",
+            CompareKind::Gt => "__gt__",
+            CompareKind::GtE => "__ge__",
+        };
+        Self::kept_number_payload(
+            o,
+            crate::types::vm_key::NUM_CMP + op as u32,
+            name(op),
+            name(cmp_swapped(op)),
+            None,
+        )
+    }
+
     /// CPython 3.14's `LOAD_COMMON_CONSTANT` value `arg`, from the
     /// interpreter-wide `common_consts` table (keep in sync with
     /// `opcode._common_constants`).
@@ -96042,7 +96134,17 @@ pub(crate) unsafe fn core_plain_compare(at: *mut Object, op: CompareKind) -> Opt
     {
         return None;
     }
-    let r = plain_compare(a, b, op)?;
+    let r = match plain_compare(a, b, op) {
+        Some(r) => r,
+        // An `int` or `float` subclass that keeps its base's comparison
+        // (`IntEnum.A < 2`): the payloads'.
+        None if matches!(a, Object::Instance(_)) || matches!(b, Object::Instance(_)) => {
+            let x = Interpreter::compare_number_payload(a, op)?;
+            let y = Interpreter::compare_number_payload(b, op)?;
+            plain_compare(&x, &y, op)?
+        }
+        None => return None,
+    };
     // SAFETY: the operands leave their slots, each releasing a plain count.
     unsafe {
         drop_hot_at(at.add(1));

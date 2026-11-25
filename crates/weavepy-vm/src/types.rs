@@ -854,6 +854,12 @@ pub(crate) mod vm_key {
     pub(crate) const STR_NATIVE: u32 = 120;
     /// Its native `__repr__` likewise (an exception's, `object`'s).
     pub(crate) const REPR_NATIVE: u32 = 121;
+    /// Per binary operator (sixteen), then per comparison (eight):
+    /// whether an `int` or `float` subclass takes the operator's methods
+    /// (forward and reflected, and no in-place one) from its built-in
+    /// base unchanged.
+    pub(crate) const NUM_BINOP: u32 = 128;
+    pub(crate) const NUM_CMP: u32 = 144;
 }
 
 /// A builtin type's pure constructor (see [`TypeObject::pure_new`]).

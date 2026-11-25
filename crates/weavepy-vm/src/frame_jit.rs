@@ -7076,6 +7076,11 @@ unsafe extern "C" fn h_binop(at: *mut Object, kind: u32) -> u32 {
                     _ => None,
                 }
             }
+            // An `int` or `float` subclass that keeps its base's operator
+            // (`IntEnum.A + 1`): the payloads' (an exact number).
+            (Object::Instance(_), _) | (_, Object::Instance(_)) if droppable(a) && droppable(b) => {
+                number_payload_binop(a, b, kind, inplace)
+            }
             _ => None,
         };
         let Some(r) = r else {
@@ -7086,6 +7091,35 @@ unsafe extern "C" fn h_binop(at: *mut Object, kind: u32) -> u32 {
         at.write(r);
     }
     0
+}
+
+/// [`h_binop`]'s answer for `a <op> b` where either is an `int` or `float`
+/// subclass's instance whose class keeps its base's methods for `op` (see
+/// `Interpreter::binop_number_payload`): the operator over the payloads,
+/// through the numbers' own arms (`None` where they decline, a division by
+/// zero say, for the core loop to raise).
+#[inline(never)]
+fn number_payload_binop(a: &Object, b: &Object, op: BinOpKind, inplace: bool) -> Option<Object> {
+    use std::mem::ManuallyDrop;
+    let x = Interpreter::binop_number_payload(a, op)?;
+    let y = Interpreter::binop_number_payload(b, op)?;
+    let mut kind = op as u32;
+    if inplace {
+        kind |= weavepy_compiler::BINARY_OP_INPLACE_FLAG;
+    }
+    let mut pair = [ManuallyDrop::new(x), ManuallyDrop::new(y)];
+    // SAFETY: two initialized slots; on `0` the first holds the result and
+    // the second is released, otherwise both are untouched.
+    unsafe {
+        let at = pair.as_mut_ptr().cast::<Object>();
+        if h_binop(at, kind) == 0 {
+            Some(at.read())
+        } else {
+            ManuallyDrop::drop(&mut pair[0]);
+            ManuallyDrop::drop(&mut pair[1]);
+            None
+        }
+    }
 }
 
 /// `BINARY_OP` of `kind` over the values at `a` and `b` (a local's or a
