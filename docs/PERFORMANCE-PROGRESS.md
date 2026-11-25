@@ -3014,7 +3014,12 @@ branch and pull request.
     setter that is an effect leaf now runs in place through the general
     evaluation, its stores committed at the return (`t.c = i` 3,988 to
     1,405, CPython 1,916). A method load that misses on an instance tries
-    a pure-leaf `__getattr__` in place, as an attribute read does.
+    a pure-leaf `__getattr__` in place, as an attribute read does. Such
+    a hook is usually `return getattr(self._target, name)`, and leaf
+    evaluation refused any call of `getattr`: it now admits it, since
+    its leaf body answers only what runs no code (or a pure-leaf
+    getter) and declines the rest. A wrapper's delegated `w.count(1)`
+    went from 9,598 to 3,066 (CPython 2,001).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

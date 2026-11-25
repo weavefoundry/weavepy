@@ -79399,6 +79399,10 @@ impl LeafKind {
                 | Self::StrReplace
                 | Self::StrFormat
                 | Self::Scalar
+                // (`getattr(obj, name[, default])` answers only what runs
+                // no code, or a pure leaf getter's value, and declines the
+                // rest.)
+                | Self::GetAttr
         ) || matches!(self, Self::Fast(f) if pure_fast_half(f))
     }
 }
