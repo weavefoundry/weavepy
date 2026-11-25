@@ -294,7 +294,9 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 /// computed without the body's argument conversion and result checks. A
 /// domain or range error, or a NaN (which the body re-tags), declines to
 /// the full body.
-const FAST_HALVES: [(&str, crate::leaf_builtins::Fast); 12] = [
+const FAST_HALVES: [(&str, crate::leaf_builtins::Fast); 14] = [
+    ("prod", prod_fast),
+    ("fsum", fsum_fast),
     ("floor", floor_fast),
     ("ceil", ceil_fast),
     ("sqrt", sqrt_fast),
@@ -315,6 +317,59 @@ pub(crate) fn is_fast_half(f: crate::leaf_builtins::Fast) -> bool {
 }
 
 type FastResult = Option<Result<Object, RuntimeError>>;
+
+/// A list's or tuple's items, when every one is a plain `int` or `float`
+/// (reading them runs no code), handed to `f`.
+fn plain_numbers<R>(seq: &Object, f: impl FnOnce(&[Object]) -> Option<R>) -> Option<R> {
+    let plain = |xs: &[Object]| {
+        xs.iter()
+            .all(|x| matches!(x, Object::Int(_) | Object::Float(_)))
+    };
+    match seq {
+        Object::List(l) => {
+            let xs = l.try_borrow().ok()?;
+            plain(&xs).then(|| f(&xs)).flatten()
+        }
+        Object::Tuple(t) => plain(t).then(|| f(t)).flatten(),
+        _ => None,
+    }
+}
+
+/// `math.prod(xs)` (no `start`) of a list or tuple of plain numbers: the
+/// left-to-right product, machine ints while they don't overflow, then
+/// doubles once a `float` comes, as CPython's int and float paths compute
+/// it. An overflowing int product declines to the full body.
+fn prod_fast(args: &[Object]) -> FastResult {
+    let [seq] = args else {
+        return None;
+    };
+    plain_numbers(seq, |xs| {
+        let mut int_acc: i64 = 1;
+        let mut flt: Option<f64> = None;
+        for x in xs {
+            match (flt, x) {
+                (None, Object::Int(i)) => int_acc = int_acc.checked_mul(*i)?,
+                (None, Object::Float(f)) => flt = Some(int_acc as f64 * f),
+                (Some(a), Object::Float(f)) => flt = Some(a * f),
+                (Some(a), Object::Int(i)) => flt = Some(a * *i as f64),
+                _ => return None,
+            }
+        }
+        Some(Ok(match flt {
+            Some(f) => Object::Float(f),
+            None => Object::Int(int_acc),
+        }))
+    })
+}
+
+/// `math.fsum(xs)` of a list or tuple of plain numbers: the full body,
+/// which reads such items with no code run.
+fn fsum_fast(args: &[Object]) -> FastResult {
+    let [seq] = args else {
+        return None;
+    };
+    plain_numbers(seq, |_| Some(math_fsum(args)))
+}
 
 /// A plain `float` or `int` argument's value.
 #[inline]

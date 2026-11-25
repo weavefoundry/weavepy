@@ -118,6 +118,35 @@ fn reader_keys() -> &'static ReaderKeys {
     })
 }
 
+/// A dialect's attribute keys, which every reader's dialect is built with
+/// and read by (and a reader's `dialect`): built once.
+struct DialectKeys {
+    delimiter: DictKey,
+    quotechar: DictKey,
+    escapechar: DictKey,
+    lineterminator: DictKey,
+    quoting: DictKey,
+    doublequote: DictKey,
+    skipinitialspace: DictKey,
+    strict: DictKey,
+    dialect: DictKey,
+}
+
+fn dialect_keys() -> &'static DialectKeys {
+    static KEYS: OnceLock<DialectKeys> = OnceLock::new();
+    KEYS.get_or_init(|| DialectKeys {
+        delimiter: key("delimiter"),
+        quotechar: key("quotechar"),
+        escapechar: key("escapechar"),
+        lineterminator: key("lineterminator"),
+        quoting: key("quoting"),
+        doublequote: key("doublequote"),
+        skipinitialspace: key("skipinitialspace"),
+        strict: key("strict"),
+        dialect: key("dialect"),
+    })
+}
+
 /// A module-level function taking only positional args.
 fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
@@ -426,21 +455,22 @@ fn dialect_new(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, R
 
         let inst = PyInstance::new(dialect_type());
         {
+            let k = dialect_keys();
             let mut d = inst.dict_cell().borrow_mut();
-            d.insert(key("delimiter"), Object::from_str(delim.to_string()));
+            d.insert(k.delimiter.clone(), Object::from_char(delim));
             d.insert(
-                key("quotechar"),
-                qc.map_or(Object::None, |c| Object::from_str(c.to_string())),
+                k.quotechar.clone(),
+                qc.map_or(Object::None, Object::from_char),
             );
             d.insert(
-                key("escapechar"),
-                esc.map_or(Object::None, |c| Object::from_str(c.to_string())),
+                k.escapechar.clone(),
+                esc.map_or(Object::None, Object::from_char),
             );
-            d.insert(key("lineterminator"), Object::from_str(lineterm));
-            d.insert(key("quoting"), Object::Int(quot));
-            d.insert(key("doublequote"), Object::Bool(dq));
-            d.insert(key("skipinitialspace"), Object::Bool(sis));
-            d.insert(key("strict"), Object::Bool(strict_v));
+            d.insert(k.lineterminator.clone(), Object::from_str(lineterm));
+            d.insert(k.quoting.clone(), Object::Int(quot));
+            d.insert(k.doublequote.clone(), Object::Bool(dq));
+            d.insert(k.skipinitialspace.clone(), Object::Bool(sis));
+            d.insert(k.strict.clone(), Object::Bool(strict_v));
         }
         Ok(Object::Instance(Rc::new(inst)))
     })
@@ -613,7 +643,8 @@ fn read_cfg(dialect: &Object) -> Result<DialectCfg, RuntimeError> {
         _ => return Err(type_error("invalid dialect")),
     };
     let d = inst.dict_cell().borrow();
-    let get = |n: &'static str| d.get(&DictKey(Object::from_static(n))).cloned();
+    let get = |k: &DictKey| d.get(k).cloned();
+    let k = dialect_keys();
     let as_char = |o: Option<Object>| -> Option<char> {
         match o {
             Some(Object::Str(s)) => one_char(&s),
@@ -621,20 +652,20 @@ fn read_cfg(dialect: &Object) -> Result<DialectCfg, RuntimeError> {
         }
     };
     Ok(DialectCfg {
-        delimiter: as_char(get("delimiter")).unwrap_or(','),
-        quotechar: as_char(get("quotechar")),
-        escapechar: as_char(get("escapechar")),
-        lineterminator: match get("lineterminator") {
+        delimiter: as_char(get(&k.delimiter)).unwrap_or(','),
+        quotechar: as_char(get(&k.quotechar)),
+        escapechar: as_char(get(&k.escapechar)),
+        lineterminator: match get(&k.lineterminator) {
             Some(Object::Str(s)) => s.to_string(),
             _ => "\r\n".to_owned(),
         },
-        quoting: match get("quoting") {
+        quoting: match get(&k.quoting) {
             Some(Object::Int(n)) => n,
             _ => QUOTE_MINIMAL,
         },
-        doublequote: matches!(get("doublequote"), Some(Object::Bool(true))),
-        skipinitialspace: matches!(get("skipinitialspace"), Some(Object::Bool(true))),
-        strict: matches!(get("strict"), Some(Object::Bool(true))),
+        doublequote: matches!(get(&k.doublequote), Some(Object::Bool(true))),
+        skipinitialspace: matches!(get(&k.skipinitialspace), Some(Object::Bool(true))),
+        strict: matches!(get(&k.strict), Some(Object::Bool(true))),
     })
 }
 
@@ -1050,19 +1081,46 @@ fn csv_reader(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
         let iterable = args[0].clone();
         let dialect_pos = args.get(1).cloned();
         let input_iter = interp.iter_object(iterable)?;
-        let dialect = call_dialect(interp, dialect_pos, kwargs)?;
-        let cfg = pack_reader_cfg(&read_cfg(&dialect)?);
+        // (No dialect and no overrides: the default dialect, immutable,
+        // built once with its packed view.)
+        let (dialect, cfg) = if dialect_pos.is_none() && kwargs.is_empty() {
+            default_dialect(interp)?
+        } else {
+            let dialect = call_dialect(interp, dialect_pos, kwargs)?;
+            let cfg = pack_reader_cfg(&read_cfg(&dialect)?);
+            (dialect, cfg)
+        };
         let inst = PyInstance::new(reader_type());
         {
             let keys = reader_keys();
             let mut d = inst.dict_cell().borrow_mut();
             d.insert(keys.input_iter.clone(), input_iter);
-            d.insert(key("dialect"), dialect);
+            d.insert(dialect_keys().dialect.clone(), dialect);
             d.insert(keys.cfg.clone(), cfg);
             d.insert(keys.line_num.clone(), Object::Int(0));
         }
         Ok(Object::Instance(Rc::new(inst)))
     })
+}
+
+thread_local! {
+    /// The default `Dialect()` and its packed reader view (see
+    /// [`default_dialect`]).
+    static DEFAULT_DIALECT: crate::gil::ReleaseUnderGil<RefCell<Option<(Object, Object)>>> =
+        const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
+}
+
+/// The dialect a reader made with no dialect and no format parameters
+/// reads by (CPython builds an equal one each time; a dialect never
+/// changes once built), and its packed view.
+fn default_dialect(interp: &mut Interpreter) -> Result<(Object, Object), RuntimeError> {
+    if let Some(hit) = DEFAULT_DIALECT.with(|d| d.borrow().clone()) {
+        return Ok(hit);
+    }
+    let dialect = call_dialect(interp, None, &[])?;
+    let cfg = pack_reader_cfg(&read_cfg(&dialect)?);
+    DEFAULT_DIALECT.with(|d| *d.borrow_mut() = Some((dialect.clone(), cfg.clone())));
+    Ok((dialect, cfg))
 }
 
 fn reader_iter_self(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1085,7 +1143,7 @@ fn reader_iternext(args: &[Object]) -> Result<Object, RuntimeError> {
                 Some(cfg) => cfg,
                 None => {
                     let dialect = d
-                        .get(&key("dialect"))
+                        .get(&dialect_keys().dialect)
                         .ok_or_else(|| type_error("reader is missing its dialect"))?;
                     read_cfg(dialect)?
                 }
@@ -1424,7 +1482,7 @@ fn csv_writer(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
         {
             let mut d = inst.dict_cell().borrow_mut();
             d.insert(key("write"), write);
-            d.insert(key("dialect"), dialect);
+            d.insert(dialect_keys().dialect.clone(), dialect);
         }
         Ok(Object::Instance(Rc::new(inst)))
     })
@@ -1549,7 +1607,7 @@ fn writer_parts(inst: &Rc<PyInstance>) -> Result<(Object, DialectCfg), RuntimeEr
         let d = inst.dict_cell().borrow();
         (
             d.get(&key("write")).cloned(),
-            d.get(&key("dialect")).cloned(),
+            d.get(&dialect_keys().dialect).cloned(),
         )
     };
     let write = write.ok_or_else(|| type_error("writer is missing its write method"))?;

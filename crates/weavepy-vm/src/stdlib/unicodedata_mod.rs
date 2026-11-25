@@ -124,12 +124,16 @@ fn build_inner_ucd() -> Rc<PyModule> {
 }
 
 fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
-    Object::Builtin(Rc::new(BuiltinFn {
+    let b = Rc::new(BuiltinFn {
         name,
         binds_instance: false,
         call: Box::new(body),
         call_kw: None,
-    }))
+    });
+    // Every body reads the character database and runs no Python code: a
+    // call site runs it in place.
+    crate::leaf_builtins::register(&b);
+    Object::Builtin(b)
 }
 
 /// The single code point of a one-character string argument, accepting both
@@ -139,18 +143,26 @@ fn builtin(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeErro
 /// `map(chr, range(0x21, 0x10000))`, which includes the surrogate range — so
 /// we hand back the raw `u32` code point.
 fn first_codepoint(args: &[Object], fn_name: &str) -> Result<u32, RuntimeError> {
+    // (CPython numbers the argument of the functions that also take a
+    // default.)
+    let arg = if matches!(fn_name, "name" | "decimal" | "digit" | "numeric") {
+        "argument 1"
+    } else {
+        "argument"
+    };
     match args.first() {
         Some(obj) if obj.is_str() => {
             let cps = obj.str_codepoints().unwrap_or_default();
             match cps.as_slice() {
                 [cp] => Ok(*cp),
                 _ => Err(type_error(format!(
-                    "{fn_name}() argument must be a unicode character"
+                    "{fn_name}(): {arg} must be a unicode character, not a string of length {}",
+                    cps.len()
                 ))),
             }
         }
         Some(other) => Err(type_error(format!(
-            "{fn_name}() argument 1 must be str, not '{}'",
+            "{fn_name}() {arg} must be a unicode character, not {}",
             other.type_name()
         ))),
         None => Err(type_error(format!("{fn_name}() takes at least 1 argument"))),

@@ -2965,6 +2965,18 @@ branch and pull request.
     whose metaclass `__len__` evaluates as a pure leaf runs it in place
     instead of through the builtin lane and a bound method: `len(Color)`
     3,260 to 2,127 (CPython 1,000).
+  - A seventh sweep (`target/mb/i7/i7.py`, 58 stdlib calls) found
+    native functions taking the general call. `math.prod` and
+    `math.fsum` of a list or tuple of plain numbers have fast halves
+    (`prod` of four ints 6,766 to 1,345, CPython 1,475), and the
+    `unicodedata` functions, whose bodies only read the character
+    database, are leaves (`category("a")` 3,772 to 790, CPython 755);
+    their argument errors now read as CPython's. A `csv.reader` built
+    its default dialect from fresh string keys every call: the keys are
+    built once, and a reader with no dialect or format parameters shares
+    one default dialect (15,112 to 5,665, CPython 3,631). A store into a
+    `SimpleNamespace`'s attribute left compiled code: it goes into the
+    namespace's dictionary in place (1,409 to 496, CPython 542).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

@@ -7671,6 +7671,32 @@ unsafe extern "C" fn h_store_attr(
                 name,
                 &*slot,
             )),
+            // A `SimpleNamespace`'s attribute (`ns.x = v`): its dictionary's
+            // entry, as `object.__setattr__` stores it, when the store runs
+            // no code.
+            Object::SimpleNamespace(ns) => {
+                let Some(key @ Object::Str(s)) = crate::code_name_obj(code, name) else {
+                    return 1;
+                };
+                if s.starts_with("__") {
+                    return 1;
+                }
+                let args = [
+                    Object::Dict(ns.clone()),
+                    key.clone(),
+                    crate::clone_hot(&*slot),
+                ];
+                match crate::builtins::dict_setitem_leaf(&args) {
+                    Some(Ok(_)) => {
+                        drop(args);
+                        // (The dict holds the value: the slot's reference
+                        // goes.)
+                        crate::drop_hot_at(slot);
+                        0
+                    }
+                    _ => 1,
+                }
+            }
             // A function's or a plain class's attribute (`wrapper.__wrapped__
             // = f`, `Cls.count = n`): the stack form's store, over the value
             // and a reference of the local's own.

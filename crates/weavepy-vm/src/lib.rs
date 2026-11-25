@@ -92923,7 +92923,7 @@ fn exc_family_flags_slow(cls: &crate::types::TypeObject) -> u16 {
 /// object's VM extension is populated (it is, after the first
 /// `LOAD_CONST`/attribute op of any execution).
 #[inline]
-fn code_name_obj(code: &CodeObject, name_idx: u32) -> Option<&Object> {
+pub(crate) fn code_name_obj(code: &CodeObject, name_idx: u32) -> Option<&Object> {
     code_vm_ext(code).and_then(|t| t.name_objs.get(name_idx as usize))
 }
 
