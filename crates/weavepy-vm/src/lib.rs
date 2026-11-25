@@ -16461,7 +16461,7 @@ impl Interpreter {
                             && if held & 1 == 0 {
                                 stamp[2] == 0
                             } else {
-                                !self.globals_missing_any.get()
+                                !self.globals_missing_gate()
                                     && stamp[2] == unsafe { (*bdict).mutation_stamp() }
                             } {
                             // SAFETY: the dicts are as they were when the
@@ -16479,7 +16479,7 @@ impl Interpreter {
                                     builtins_id,
                                     key_idx,
                                 } if builtins_id == specialize::rc_id(&frame.builtins)
-                                    && !self.globals_missing_any.get()
+                                    && !self.globals_missing_gate()
                                     && stamp
                                         == [gid, g_stamp, unsafe { (*bdict).mutation_stamp() }] =>
                                 {
@@ -25051,7 +25051,7 @@ impl Interpreter {
             && frame.class_namespace_obj().is_none()
             && frame.builtins_obj().is_none()
             && !frame.code.is_class_body
-            && !self.globals_missing_any.get()
+            && !self.globals_missing_gate()
     }
 
     /// A plain namespace in front of the module scope, for the core loop's
@@ -25063,7 +25063,7 @@ impl Interpreter {
         frame.class_namespace().is_some()
             && frame.class_namespace_obj().is_none()
             && frame.builtins_obj().is_none()
-            && !self.globals_missing_any.get()
+            && !self.globals_missing_gate()
     }
 
     /// The probe for `co_names[name_idx]` in a namespace frame (see
@@ -43272,18 +43272,7 @@ impl Interpreter {
     /// The dict-subclass instance registered (by `exec`/`eval`) as the
     /// owner of `globals`, if any.
     fn globals_missing_owner(&self, globals: &Rc<RefCell<DictData>>) -> Option<Object> {
-        // While the gate is up every builtin `LOAD_GLOBAL` asks here, and
-        // a program that runs no finalizers may never drain them to notice
-        // the last owner die: every so often, have the next safe point
-        // drain and prune (see `prune_globals_missing_hooks_sometimes`).
-        let n = self.globals_missing_asks.get();
-        if n >= 1024 {
-            self.globals_missing_asks.set(0);
-            self.globals_missing_prune_in.set(0);
-            gc_trace::mark_maybe_dead();
-        } else {
-            self.globals_missing_asks.set(n + 1);
-        }
+        self.globals_missing_ask();
         let hooks = self.globals_missing_hooks.borrow();
         if hooks.is_empty() {
             return None;
@@ -43293,6 +43282,38 @@ impl Interpreter {
             .iter()
             .find(|(ptr, _)| *ptr == want)
             .map(|(_, inst)| Object::Instance(inst.clone()))
+    }
+
+    /// Whether a dict subclass's `__missing__` may serve builtin lookups
+    /// (see `globals_missing_hooks`): the fast paths' gate. While it is up,
+    /// each ask counts as the full lookup's asks do (see
+    /// [`Self::globals_missing_ask`]), so a loop that only takes fast paths,
+    /// and runs no finalizers, still has the owners that died pruned
+    /// rather than keeping the gate up for good.
+    #[inline(always)]
+    pub(crate) fn globals_missing_gate(&self) -> bool {
+        if !self.globals_missing_any.get() {
+            return false;
+        }
+        self.globals_missing_ask();
+        true
+    }
+
+    /// One ask of the `__missing__` gate while it is up: a program that
+    /// runs no finalizers (a loop that releases nothing reaches no drain)
+    /// may never notice the last owner die, so every 1,024th ask prunes
+    /// the owners nothing holds. Letting one go only queues what its
+    /// release finalizes, which the next safe point drains.
+    #[inline(never)]
+    fn globals_missing_ask(&self) {
+        let n = self.globals_missing_asks.get();
+        if n >= 1024 {
+            self.globals_missing_asks.set(0);
+            self.prune_globals_missing_hooks();
+            gc_trace::mark_maybe_dead();
+        } else {
+            self.globals_missing_asks.set(n + 1);
+        }
     }
 
     /// PEP 649 (RFC 0077 WS10) — CPython's `func_get_annotation_dict`

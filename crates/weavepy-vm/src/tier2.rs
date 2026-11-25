@@ -5354,7 +5354,7 @@ fn guards_hold(
         // A rebinding in place leaves the stamps alone (see `STORE_GLOBAL`).
         crate::object::global_value_epoch(),
     );
-    if (guard_snapshot.last_ok.get() != key || interp.globals_missing_any.get())
+    if (guard_snapshot.last_ok.get() != key || interp.globals_missing_gate())
         && !global_guards_hold(interp, globals, builtins, guard_snapshot, key)
     {
         return false;

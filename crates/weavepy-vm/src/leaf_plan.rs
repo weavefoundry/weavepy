@@ -2113,7 +2113,7 @@ impl Interpreter {
                 builtins_id,
                 key_idx,
             } if builtins_id == crate::specialize::rc_id(&f.builtins)
-                && !self.globals_missing_any.get()
+                && !self.globals_missing_gate()
                 && slot.get() == [gid, g_stamp, unsafe { (*bdict).mutation_stamp() }] =>
             unsafe { (*bdict).get_index(key_idx as usize) },
             _ => return None,

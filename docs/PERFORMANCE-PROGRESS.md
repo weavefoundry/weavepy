@@ -2992,6 +2992,21 @@ branch and pull request.
     calls too (`b2a_base64(b)` 4,054 to 1,081, CPython 1,113;
     `base64.b64encode` 3,184 to 2,150 and `b64decode` 4,541 to 3,428,
     CPython 1,938 and 3,016).
+  - A function made with a dict subclass's `__missing__` as its globals
+    raises a gate under which every builtin lookup takes the slow path,
+    and `annotationlib` makes one whenever it evaluates annotations with
+    forward references (`typing.NamedTuple`, a dataclass's string
+    annotations). The gate drops when the owners die, but only the full
+    lookup counted toward pruning them, and only a finalizer drain
+    pruned: a loop that ran its builtins through the fast paths kept the
+    gate up for good, so defining one `NamedTuple` made every leaf call
+    that reads a builtin take a frame (`hash(q)` with a Python
+    `__hash__` 1,436 instructions to 2,964). The fast paths' gate now
+    counts too, and every 1,024th ask prunes the owners nothing holds
+    in place (letting one go only queues its finalizers): `hash(q)` in
+    the protocol sweep 2,930 to 1,414 (CPython 1,066), a frozen
+    dataclass's `hash(f)` 3,405 to 1,363 (CPython 1,755). An owner in a
+    reference cycle still waits for the next collection.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

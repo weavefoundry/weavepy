@@ -2982,7 +2982,7 @@ unsafe extern "C" fn h_inline_global(
                 && (c.builtins == 0
                     || (std::ptr::from_ref(&f.builtins).cast::<u64>().read() == c.builtins
                         && stamp(c.bdata) == c.bstamp
-                        && !(*(*st).interp).globals_missing_any.get()))
+                        && !(*(*st).interp).globals_missing_gate()))
             {
                 let v = &*(c.value as *const Object);
                 (*st).stack.add(c.len as usize).write(crate::clone_hot(v));
@@ -3027,7 +3027,7 @@ unsafe fn inline_global_miss(
         let b_stamp = (*bdict).mutation_stamp();
         let (v, builtin) = match g.get_full(&probe) {
             Some((_, _, v)) => (v, false),
-            None if interp.globals_missing_any.get() => return false,
+            None if interp.globals_missing_gate() => return false,
             None => match b.get_full(&probe) {
                 Some((_, _, v)) => (v, true),
                 None => return false,

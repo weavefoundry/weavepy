@@ -7840,7 +7840,7 @@ unsafe extern "C" fn h_load_global(
                 builtins_id,
                 key_idx,
             } if builtins_id == crate::specialize::rc_id(&frame.builtins)
-                && !interp.globals_missing_any.get()
+                && !interp.globals_missing_gate()
                 && slot.get() == [gid, g_stamp, b_stamp] =>
             {
                 ((*bdict).get_index(key_idx as usize), true)
@@ -8016,7 +8016,7 @@ unsafe extern "C" fn h_global(st: *mut State, c: *mut GlobalCache) -> u32 {
             && (site.builtins == 0
                 || (word(F_BUILTINS) == site.builtins
                     && stamp(site.bdata) == site.bstamp
-                    && !(*(*st).interp).globals_missing_any.get()))
+                    && !(*(*st).interp).globals_missing_gate()))
         {
             if site.len_of != 0 {
                 return global_len_of(st, c);
