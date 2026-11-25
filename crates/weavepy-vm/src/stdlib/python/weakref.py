@@ -583,5 +583,5 @@ try:
 except ImportError:
     pass
 else:
-    _install_weak_tables(WeakKeyDictionary, WeakSet)
+    _install_weak_tables(WeakKeyDictionary, WeakSet, KeyedRef)
     del _install_weak_tables

@@ -258,8 +258,18 @@ pub fn c_referent(obj: &Object) -> Option<Option<Object>> {
 /// (see [`identity_keyed`]), each falling back to the Python method it
 /// replaces for anything else.
 fn install_weak_tables(args: &[Object]) -> Result<Object, RuntimeError> {
-    let [Object::Type(wkd), Object::Type(ws)] = args else {
-        return Err(type_error("_install_weak_tables() expects two classes"));
+    let (wkd, ws) = match args {
+        [Object::Type(wkd), Object::Type(ws)] => (wkd, ws),
+        [Object::Type(wkd), Object::Type(ws), Object::Type(keyed)] => {
+            // (A `WeakValueDictionary` store builds a `KeyedRef` in place.)
+            keyed.pure_new.set(Some(keyedref_pure_new));
+            (wkd, ws)
+        }
+        _ => {
+            return Err(type_error(
+                "_install_weak_tables() expects the weak classes",
+            ))
+        }
     };
     let own = |cls: &Rc<TypeObject>, name: &str| cls.dict.borrow().get(&StrKey(name)).cloned();
     if let (Some(getitem), Some(get), Some(contains), Some(setitem)) = (
@@ -292,6 +302,44 @@ fn install_weak_tables(args: &[Object]) -> Result<Object, RuntimeError> {
         );
     }
     Ok(Object::None)
+}
+
+/// `KeyedRef(ob, callback, key)` while the class keeps `weakref`'s own
+/// `__new__` and `__init__` (a verdict kept per class version): the ref
+/// `ref.__new__(cls, ob, callback)` makes, its `key` slot set, as those
+/// methods leave it. `None` for any other call (an object that can't be
+/// weakly referenced, whose error the full call raises).
+fn keyedref_pure_new(cls: &Rc<TypeObject>, args: &[Object]) -> Option<Object> {
+    let [ob, callback, key] = args else {
+        return None;
+    };
+    let own = |name: &str| match cls.dict.borrow().get(&StrKey(name)) {
+        Some(Object::Function(f)) => f.code().qualname == format!("KeyedRef.{name}"),
+        Some(Object::StaticMethod(m)) => matches!(
+            m.func(),
+            Object::Function(f) if f.code().qualname == format!("KeyedRef.{name}")
+        ),
+        _ => false,
+    };
+    if crate::trace::any_observers_active()
+        || !cls.memo_verdict(crate::types::Verdict::KeyedRefPlainNew, "", || {
+            own("__new__") && own("__init__")
+        })
+        || !supports_weakref(ob)
+    {
+        return None;
+    }
+    let obj = make_ref_object_with_class(
+        ob.clone(),
+        extract_callback(Some(callback)),
+        kind::REF,
+        Some(cls.clone()),
+    );
+    let Object::Instance(inst) = &obj else {
+        return None;
+    };
+    inst.slots.try_borrow_mut().ok()?.insert("key", key.clone());
+    Some(obj)
 }
 
 /// Whether `key` compares and hashes by identity, so the stored weak

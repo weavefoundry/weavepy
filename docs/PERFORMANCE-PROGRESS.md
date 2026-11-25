@@ -3159,7 +3159,10 @@ branch and pull request.
     of a present item now find it natively. Other keys, and any lookup
     while a tracer or profiler watches, take the Python methods. `wkd[k]`
     went to 1,455, `weakset.add(x)` from 9,647 to 1,026, and a
-    singledispatch call to 4,184.
+    singledispatch call to 4,184. A `WeakValueDictionary` store builds a
+    `KeyedRef` (a `ref` subclass with a `key` slot), and that ran its
+    Python `__new__` and `__init__`. While the class keeps them, it is
+    now built in place (`wvd[k] = v` 10,194 to 6,847, CPython 5,995).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

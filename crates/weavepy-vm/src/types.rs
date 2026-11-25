@@ -250,6 +250,10 @@ pub(crate) enum Verdict {
     /// attribute access, and no `_core` on the class (see
     /// `stdlib::itertools_mod::core_next_fast`); `name` unused.
     CoreInDict = 23,
+    /// The class (`weakref.KeyedRef`) keeps its module's own `__new__`
+    /// and `__init__` (see `stdlib::weakref_real::keyedref_pure_new`);
+    /// `name` unused.
+    KeyedRefPlainNew = 24,
 }
 
 pub struct AttrVersion(std::sync::atomic::AtomicU64);
