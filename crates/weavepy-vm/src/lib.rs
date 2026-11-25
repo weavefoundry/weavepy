@@ -68672,8 +68672,8 @@ impl Interpreter {
     /// instance) through the VM-aware collector. `None` for an eager
     /// container of pairs, which `builtins::b_dict` builds.
     fn dict_from_one(&mut self, arg: &Object) -> Option<Result<Object, RuntimeError>> {
-        let global_dummy = Rc::new(RefCell::new(DictData::default()));
-        match self.try_dict_from_mapping(arg, &global_dummy) {
+        let globals = self.builtins_dict();
+        match self.try_dict_from_mapping(arg, &globals) {
             Ok(Some(d)) => return Some(Ok(d)),
             Ok(None) => {}
             Err(e) => return Some(Err(e)),
@@ -68690,45 +68690,17 @@ impl Interpreter {
 
     /// [`Self::dict_from_one`]'s lazy iterable of pairs.
     fn dict_from_lazy_pairs(&mut self, arg: &Object) -> Result<Object, RuntimeError> {
-        let args = std::slice::from_ref(arg);
-        let global_dummy = Rc::new(RefCell::new(DictData::default()));
-        // `dict(zip(ks, vs))`: the pairs straight from the two
-        // sources, in the order the zip would step them, with
-        // no tuple between.
-        let pairs: Vec<(Object, Object)> = match self.zip2_pairs(&args[0], &global_dummy) {
-            Some(pairs) => pairs?,
-            None => {
-                let items = self.collect_iterable(&args[0], &global_dummy)?;
-                let mut pairs = Vec::with_capacity(items.len());
-                for (i, pair) in items.into_iter().enumerate() {
-                    // A 2-tuple is its own pair.
-                    pairs.push(match &pair {
-                            Object::Tuple(t) if t.len() == 2 => {
-                                (t[0].clone(), t[1].clone())
-                            }
-                            _ => {
-                                let kv = self.collect_iterable(&pair, &global_dummy)?;
-                                if kv.len() != 2 {
-                                    return Err(value_error(format!(
-                                        "dictionary update sequence element #{i} has length {}; 2 is required",
-                                        kv.len()
-                                    )));
-                                }
-                                let mut kv = kv.into_iter();
-                                (kv.next().expect("two"), kv.next().expect("two"))
-                            }
-                        });
-                }
-                pairs
-            }
-        };
-        let mut d = DictData::default();
-        // While every key compares natively (as all so far
-        // have), an insert runs no Python comparison to catch.
-        let mut native = true;
-        for (key, value) in pairs {
+        let globals = self.builtins_dict();
+        // While every key compares natively (as all so far have), an
+        // insert runs no Python comparison to catch.
+        fn insert(
+            d: &mut DictData,
+            native: &mut bool,
+            key: Object,
+            value: Object,
+        ) -> Result<(), RuntimeError> {
             crate::builtins::ensure_dict_key(&key)?;
-            native &= matches!(
+            *native &= matches!(
                 key,
                 Object::Str(_)
                     | Object::Int(_)
@@ -68737,12 +68709,51 @@ impl Interpreter {
                     | Object::Float(_)
                     | Object::Bytes(_)
             );
-            if native {
+            if *native {
                 d.insert(DictKey(key), value);
             } else {
                 crate::object::key_cmp_scope(|| d.insert(DictKey(key), value))?;
             }
+            Ok(())
         }
+        let mut native = true;
+        // `dict(zip(ks, vs))`: the pairs straight from the two sources, in
+        // the order the zip would step them, with no tuple between.
+        let d = match self.zip2_pairs(arg, &globals) {
+            Some(pairs) => {
+                let pairs = pairs?;
+                let mut d =
+                    DictData::with_capacity_and_hasher(pairs.len(), crate::fasthash::FxBuildHasher);
+                for (key, value) in pairs {
+                    insert(&mut d, &mut native, key, value)?;
+                }
+                d
+            }
+            None => {
+                let items = self.collect_iterable(arg, &globals)?;
+                let mut d =
+                    DictData::with_capacity_and_hasher(items.len(), crate::fasthash::FxBuildHasher);
+                for (i, pair) in items.into_iter().enumerate() {
+                    // A 2-tuple is its own pair.
+                    let (key, value) = match &pair {
+                        Object::Tuple(t) if t.len() == 2 => (t[0].clone(), t[1].clone()),
+                        _ => {
+                            let kv = self.collect_iterable(&pair, &globals)?;
+                            if kv.len() != 2 {
+                                return Err(value_error(format!(
+                                    "dictionary update sequence element #{i} has length {}; 2 is required",
+                                    kv.len()
+                                )));
+                            }
+                            let mut kv = kv.into_iter();
+                            (kv.next().expect("two"), kv.next().expect("two"))
+                        }
+                    };
+                    insert(&mut d, &mut native, key, value)?;
+                }
+                d
+            }
+        };
         let out = Object::Dict(Rc::new(RefCell::new(d)));
         crate::gc_trace::track_built(&out);
         Ok(out)

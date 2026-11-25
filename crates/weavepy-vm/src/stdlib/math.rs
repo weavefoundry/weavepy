@@ -1040,10 +1040,10 @@ fn math_gcd(args: &[Object]) -> Result<Object, RuntimeError> {
         Object::Bool(b) => Some(u64::from(*b)),
         _ => None,
     };
-    if let Some(words) = args.iter().map(small).collect::<Option<Vec<u64>>>() {
-        let g = words
-            .into_iter()
-            .fold(0u64, |a, b| gcd_u128(u128::from(a), u128::from(b)) as u64);
+    // (Folded as they come, no list of them built.)
+    if let Some(g) = args.iter().try_fold(0u64, |a, o| {
+        small(o).map(|b| gcd_u128(u128::from(a), u128::from(b)) as u64)
+    }) {
         return Ok(i64::try_from(g).map_or_else(
             |_| Object::int_from_bigint(num_bigint::BigInt::from(g)),
             Object::Int,
@@ -2524,6 +2524,21 @@ fn math_lgamma(args: &[Object]) -> Result<Object, RuntimeError> {
 fn math_isqrt(args: &[Object]) -> Result<Object, RuntimeError> {
     use num_traits::Signed;
     expect_nargs(args, "isqrt", 1)?;
+    // A non-negative machine int: the float root's estimate, corrected to
+    // the exact floor (the estimate is within one of it).
+    if let Object::Int(n) = &args[0] {
+        if let Ok(n) = u64::try_from(*n) {
+            let n = u128::from(n);
+            let mut r = (n as f64).sqrt() as u128;
+            while r * r > n {
+                r -= 1;
+            }
+            while (r + 1) * (r + 1) <= n {
+                r += 1;
+            }
+            return Ok(Object::Int(r as i64));
+        }
+    }
     // Accept any integer, including big and `__index__`-able values
     // (CPython uses `_PyNumber_Index`). A float approximation overflows for
     // large inputs, so we take the exact integer square root over BigInt.

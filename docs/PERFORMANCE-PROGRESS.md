@@ -3138,6 +3138,14 @@ branch and pull request.
     3,325). `bisect` calls a key that runs no code (an `itemgetter`) in
     place (6,951 to 4,119, CPython 2,340). `OrderedDict(pairs)` and
     `OrderedDict(d)` with `str` or `int` keys build in place.
+  - `math.isqrt` of a machine int takes the float root's estimate and
+    corrects it to the exact floor, where it went through big ints, and
+    `math.gcd` folds machine words without collecting them first
+    (`gcd(84, 36)` and `isqrt(1000)` together went from 1,689 to 1,194,
+    CPython 1,160). `dict()` of a generator or iterator of pairs no longer
+    allocates two throwaway globals dicts or copies its pairs into a
+    second list, and sizes the dict once (`dict((k, v) for k, v in
+    pairs)` of ten pairs went from 15,945 to 14,508, CPython 10,769).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
