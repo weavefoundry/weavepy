@@ -12852,6 +12852,18 @@ unsafe extern "C" fn h_subscr_dunder(
         if let Some(f) = missing_dunder(&*st.stack.add(slot), &*st.stack.add(slot + 1)) {
             return dunder_call(st, pc, slot, 2, f, site, None);
         }
+        // `SomeEnum[name]`: the member, from the class's member map.
+        if let Object::Type(t) = &*st.stack.add(slot) {
+            if let Some(v) = Interpreter::enum_getitem(t, &*st.stack.add(slot + 1)) {
+                let at = st.stack.add(slot);
+                if droppable(&*at) && droppable(&*at.add(1)) {
+                    crate::drop_hot_at(at.add(1));
+                    crate::drop_hot_at(at);
+                    at.write(v);
+                    return 0;
+                }
+            }
+        }
         let Some(f) = Interpreter::getitem_dunder(&*code, pc, &*st.stack.add(slot)) else {
             return CALL_DECLINED;
         };

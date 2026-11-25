@@ -32846,6 +32846,8 @@ impl Interpreter {
             // A class's `__dict__` view (`'__dict__' in type.__dict__`, as
             // `inspect` asks) tests the class dict it wraps.
             Object::MappingProxy(d) => Self::leaf_contains(&Object::Dict(d.clone()), item),
+            // `x in SomeEnum`: `EnumType.__contains__`'s answer.
+            Object::Type(t) if !t.metaclass_is_type() => Self::enum_contains(t, item),
             // (A dict subclass's view keeps its instance alive, which the
             // full handler releases.)
             Object::DictView(view) if view.owner.is_none() => match view.kind {
@@ -49790,6 +49792,139 @@ impl Interpreter {
                 Ok(out)
             }
         }
+    }
+
+    /// `cls[name]` for an enum class whose metaclass keeps `enum`'s own
+    /// `EnumType.__getitem__` (`return cls._member_map_[name]`): the member,
+    /// read from the map with no code run. `None` for a miss (the method
+    /// raises its `KeyError`), a key that hashes in Python, or while a
+    /// tracer would see the method.
+    pub(crate) fn enum_getitem(cls: &Rc<TypeObject>, key: &Object) -> Option<Object> {
+        // The class's verdict and map, by its version and its metaclass's
+        // (a class or metaclass change moves one of them).
+        type Memo = Option<(usize, u64, u64, crate::sync::Weak<RefCell<DictData>>)>;
+        thread_local! {
+            static MEMO: std::cell::RefCell<Memo> = const { std::cell::RefCell::new(None) };
+        }
+        if crate::trace::any_observers_active() {
+            return None;
+        }
+        let probe = crate::object::LeafProbe::new(key)?;
+        let id = Rc::as_ptr(cls) as usize;
+        let ver = cls.attr_version.get();
+        let hit = MEMO.with(|m| {
+            let m = m.try_borrow().ok()?;
+            match &*m {
+                Some((i, v, mv, map)) if *i == id && *v == ver => Some((*mv, map.upgrade()?)),
+                _ => None,
+            }
+        });
+        let map = match hit {
+            Some((mv, map)) if mv == cls.metaclass_or_type().attr_version.get() => map,
+            _ => {
+                if cls.metaclass_is_type() {
+                    return None;
+                }
+                let meta = cls.metaclass_or_type();
+                let Some(Object::Function(f)) = meta.lookup("__getitem__") else {
+                    return None;
+                };
+                if !Self::stdlib_fn_is(&f, "enum", "EnumType.__getitem__") {
+                    return None;
+                }
+                let Some(Object::Dict(map)) = cls.lookup("_member_map_") else {
+                    return None;
+                };
+                let mv = meta.attr_version.get();
+                MEMO.with(|m| {
+                    if let Ok(mut m) = m.try_borrow_mut() {
+                        *m = Some((id, ver, mv, Rc::downgrade(&map)));
+                    }
+                });
+                map
+            }
+        };
+        let m = map.try_borrow().ok()?;
+        m.get(&probe).cloned()
+    }
+
+    /// `value in cls` for an enum class whose metaclass keeps `enum`'s own
+    /// `EnumType.__contains__`, answered as it answers with no code run: a
+    /// member of the class, else a scan of its unhashable and hashable
+    /// value lists. `None` for a `Flag` class (its `_missing_` runs), a
+    /// comparison that could run Python, or while a tracer would see the
+    /// method.
+    fn enum_contains(cls: &Rc<TypeObject>, item: &Object) -> Option<bool> {
+        // The class's verdict and value lists, by its version and its
+        // metaclass's (see `enum_getitem`).
+        type Lists = [crate::sync::Weak<RefCell<Vec<Object>>>; 2];
+        type Memo = Option<(usize, u64, u64, Lists)>;
+        thread_local! {
+            static MEMO: std::cell::RefCell<Memo> = const { std::cell::RefCell::new(None) };
+        }
+        if crate::trace::any_observers_active() {
+            return None;
+        }
+        let id = Rc::as_ptr(cls) as usize;
+        let ver = cls.attr_version.get();
+        let hit = MEMO.with(|m| {
+            let m = m.try_borrow().ok()?;
+            match &*m {
+                Some((i, v, mv, [a, b])) if *i == id && *v == ver => {
+                    Some((*mv, [a.upgrade()?, b.upgrade()?]))
+                }
+                _ => None,
+            }
+        });
+        let lists = match hit {
+            Some((mv, lists)) if mv == cls.metaclass_or_type().attr_version.get() => lists,
+            _ => {
+                let meta = cls.metaclass_or_type();
+                let Some(Object::Function(f)) = meta.lookup("__contains__") else {
+                    return None;
+                };
+                if !Self::stdlib_fn_is(&f, "enum", "EnumType.__contains__") {
+                    return None;
+                }
+                let flag = f
+                    .globals
+                    .try_borrow()
+                    .ok()?
+                    .get(&crate::object::StrKey("Flag"))
+                    .cloned();
+                match flag {
+                    Some(Object::Type(flag)) if !cls.is_subclass_of(&flag) => {}
+                    _ => return None,
+                }
+                let (Some(Object::List(a)), Some(Object::List(b))) = (
+                    cls.lookup("_unhashable_values_"),
+                    cls.lookup("_hashable_values_"),
+                ) else {
+                    return None;
+                };
+                let mv = meta.attr_version.get();
+                MEMO.with(|m| {
+                    if let Ok(mut m) = m.try_borrow_mut() {
+                        *m = Some((id, ver, mv, [Rc::downgrade(&a), Rc::downgrade(&b)]));
+                    }
+                });
+                [a, b]
+            }
+        };
+        match Self::core_isinstance(&[item.clone(), Object::Type(cls.clone())])? {
+            Ok(Object::Bool(true)) => return Some(true),
+            Ok(Object::Bool(false)) => {}
+            _ => return None,
+        }
+        for values in &lists {
+            let values = values.try_borrow().ok()?;
+            for v in values.iter() {
+                if Self::leaf_contains_eq(v, item)? {
+                    return Some(true);
+                }
+            }
+        }
+        Some(false)
     }
 
     /// Whether `f` is the function `qualname` of the frozen stdlib module

@@ -3033,6 +3033,14 @@ branch and pull request.
     a small int (`ChainMap`'s `self.maps[0]`), now stores into that dict
     in place when the store runs no code (1,256; `UserDict` 1,257,
     CPython 1,012; a `ChainMap` 3,527 to 1,394, CPython 1,212).
+    `x in SomeEnum` ran `EnumType.__contains__` in a frame (its `try`
+    keeps it from being a leaf); when the metaclass keeps `enum`'s own
+    method, the membership test now answers as it does, in place: a
+    member of the class, else a scan of the class's value lists (a
+    `Flag` class, whose `_missing_` runs, takes the call), and
+    `SomeEnum[name]` reads the member map the same way, each verdict kept
+    per class and metaclass version. `Color.RED in Color` 2,730 to 870
+    (CPython 1,244); `Color["RED"]` 1,333 to 514 (CPython 612).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
