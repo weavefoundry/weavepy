@@ -3019,7 +3019,11 @@ branch and pull request.
     evaluation refused any call of `getattr`: it now admits it, since
     its leaf body answers only what runs no code (or a pure-leaf
     getter) and declines the rest. A wrapper's delegated `w.count(1)`
-    went from 9,598 to 3,066 (CPython 2,001).
+    went from 9,598 to 3,066 (CPython 2,001). A `TypedDict` class's
+    metaclass sets `__call__ = dict`, and a type binds no receiver, so
+    `TD(a=1)` is `dict(a=1)`; compiled code left the loop for it each
+    call. A class whose metaclass's `__call__` is a builtin type is now
+    called as that type (5,472 to 1,882, CPython 2,230).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

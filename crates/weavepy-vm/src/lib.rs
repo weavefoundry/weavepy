@@ -33245,6 +33245,20 @@ impl Interpreter {
         // SAFETY: the caller's contract.
         let inst = match (unsafe { &*callee }, unsafe { &*callee.add(1) }) {
             (Object::Instance(inst), Object::Unbound) => inst,
+            // A class whose metaclass's `__call__` is a builtin type (a
+            // `TypedDict`'s `__call__ = dict`): a type binds no receiver,
+            // so calling the class is calling that type.
+            (Object::Type(t), Object::Unbound) if !t.metaclass_is_type() => {
+                let meta = t.metaclass_or_type();
+                if let Some(Object::Type(call)) = meta.lookup("__call__") {
+                    if call.flags.is_builtin && Rc::strong_count(t) > 1 {
+                        // SAFETY: the class leaves by a plain decrement
+                        // (something else holds it).
+                        unsafe { drop(callee.replace(Object::Type(call))) };
+                    }
+                }
+                return;
+            }
             (Object::BoundMethod(_), Object::Unbound) => {
                 // SAFETY: the caller's contract.
                 unsafe { Self::core_bound_callee(callee) };
