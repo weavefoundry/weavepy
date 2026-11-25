@@ -889,6 +889,10 @@ pub(crate) mod vm_key {
     /// base unchanged.
     pub(crate) const NUM_BINOP: u32 = 128;
     pub(crate) const NUM_CMP: u32 = 144;
+    /// Whether nothing on the MRO supplies `__length_hint__` / `__len__`
+    /// (a container built from an instance probes both).
+    pub(crate) const LENGTH_HINT_ABSENT: u32 = 152;
+    pub(crate) const LEN_ABSENT: u32 = 153;
 }
 
 /// A builtin type's pure constructor (see [`TypeObject::pure_new`]).

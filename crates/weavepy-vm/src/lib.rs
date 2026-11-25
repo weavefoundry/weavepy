@@ -50546,8 +50546,17 @@ impl Interpreter {
                 // raising `__len__` propagates unless it's a
                 // TypeError (test_iterlen.test_issue1242657's
                 // `list(BadLen())` must surface the RuntimeError).
-                let mut need_hint = cls.lookup("__length_hint__").is_some();
-                if cls.lookup("__len__").is_some() {
+                // (Each absence remembered per class version.)
+                let mut need_hint = !Self::class_lacks(
+                    &cls,
+                    crate::types::AttrKey::vm(crate::types::vm_key::LENGTH_HINT_ABSENT),
+                    "__length_hint__",
+                );
+                if !Self::class_lacks(
+                    &cls,
+                    crate::types::AttrKey::vm(crate::types::vm_key::LEN_ABSENT),
+                    "__len__",
+                ) {
                     if let Some(len_m) = instance_method(v, "__len__") {
                         match self.call(&len_m, &[], &[], globals) {
                             Ok(_) => need_hint = false,

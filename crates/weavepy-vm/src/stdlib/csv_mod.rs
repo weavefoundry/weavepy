@@ -1223,23 +1223,47 @@ fn reader_iternext(args: &[Object]) -> Result<Object, RuntimeError> {
 /// `float`, a reader in the middle of a call, and
 /// any other input decline to the full parser, which then reads the same
 /// line.
+/// A reader's state entries, by the position `csv_reader` inserts them at.
+const AT_INPUT_ITER: usize = 0;
+const AT_CFG: usize = 2;
+const AT_LINE_NUM: usize = 3;
+const AT_FIELDS_LIVE: usize = 4;
+
+/// Whether `a` is the very key `b` (the same interned name).
+fn same_key(a: &DictKey, b: &DictKey) -> bool {
+    matches!((&a.0, &b.0), (Object::Str(x), Object::Str(y)) if crate::shared_value::SharedStr::ptr_eq(x, y))
+}
+
+/// A reader's state entry `key`, read at position `at` while that still
+/// holds it (the layout `csv_reader` builds), else found by hash.
+fn state_get<'a>(d: &'a DictData, at: usize, key: &DictKey) -> Option<&'a Object> {
+    match d.get_index(at) {
+        Some((k, v)) if same_key(k, key) => Some(v),
+        _ => d.get(key),
+    }
+}
+
 fn reader_next_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let [Object::Instance(inst)] = args else {
         return None;
     };
     let keys = reader_keys();
     let mut d = inst.dict_cell().try_borrow_mut().ok()?;
-    let src = match d.get(&keys.input_iter) {
+    let src = match state_get(&d, AT_INPUT_ITER, &keys.input_iter) {
         Some(o @ Object::Iter(_)) => o.clone(),
         Some(o @ Object::File(f)) if !f.binary => o.clone(),
         _ => return None,
     };
-    if !matches!(d.get(&keys.fields_live), Some(Object::Bool(false)))
-        || !matches!(d.get(&keys.line_num), Some(Object::Int(_)))
-    {
+    if !matches!(
+        state_get(&d, AT_FIELDS_LIVE, &keys.fields_live),
+        Some(Object::Bool(false))
+    ) || !matches!(
+        state_get(&d, AT_LINE_NUM, &keys.line_num),
+        Some(Object::Int(_))
+    ) {
         return None;
     }
-    let cfg = d.get(&keys.cfg).and_then(unpack_reader_cfg)?;
+    let cfg = state_get(&d, AT_CFG, &keys.cfg).and_then(unpack_reader_cfg)?;
     if matches!(cfg.quoting, QUOTE_NONNUMERIC | QUOTE_STRINGS) {
         return None;
     }
@@ -1290,7 +1314,11 @@ fn reader_next_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
         }
         _ => return None,
     };
-    if let Some(Object::Int(n)) = d.get_mut(&keys.line_num) {
+    let line_num = match d.get_index_mut(AT_LINE_NUM) {
+        Some((k, v)) if same_key(k, &keys.line_num) => Some(v),
+        _ => d.get_mut(&keys.line_num),
+    };
+    if let Some(Object::Int(n)) = line_num {
         *n += 1;
     }
     Some(Ok(Object::new_list(fields)))

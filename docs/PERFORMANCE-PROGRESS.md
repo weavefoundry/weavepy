@@ -3103,6 +3103,13 @@ branch and pull request.
     attribute path takes the same in-place read. A function returning
     `member.name` is now 1,569 (CPython 1,556), `member.value` 1,594
     (CPython 1,561), and `d[member]` 1,216 (CPython 1,434).
+  - A csv reader keeps its state in its instance dict, and each row's
+    fast step found five entries by hash (about 90 instructions each).
+    It now reads them at the positions the constructor inserts them,
+    checking the key there, so `next(reader)` went from 2,423 to 1,838
+    (CPython 1,494). `list()` of an instance looked up `__len__` and
+    `__length_hint__` on the class each time to decide what to probe;
+    their absence is now remembered per class version.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
