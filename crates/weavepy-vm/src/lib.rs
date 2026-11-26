@@ -50264,6 +50264,25 @@ impl Interpreter {
                         }
                     }
                 }
+                // A native iterator (an `__iter__` returning `iter(range(n))`
+                // or a list's): its steps run no code, so one borrow for the
+                // whole drain, as below for other objects.
+                if let Object::Iter(cell) = &it {
+                    let mut cur = cell.borrow_mut();
+                    if let Some(n) = cur.remaining() {
+                        out.reserve(n.min(1 << 16));
+                    }
+                    // (A plain cursor's items as compiled loops step them;
+                    // its end, and any other iterator, checked.)
+                    while let Some(x) = cur.pure_peek() {
+                        cur.pure_skip();
+                        out.push(x);
+                    }
+                    while let Some(x) = cur.next_value_checked()? {
+                        out.push(x);
+                    }
+                    return Ok(out);
+                }
                 while let Some(x) = self.iter_next(&it, globals)? {
                     out.push(x);
                 }

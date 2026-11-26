@@ -1053,32 +1053,22 @@ unsafe extern "C" fn h_call<const EFFECT: bool>(
         },
         _ => return 1,
     };
-    // Scalar arguments are staged as objects (no drop glue); heap ones are
-    // borrowed in place.
-    let mut staged = [const { std::mem::MaybeUninit::<Object>::uninit() }; 8];
-    let mut ptrs = [std::ptr::null::<Object>(); 8];
-    for k in 0..n {
-        let o = match reg(first + k) {
-            V::R(p) => {
-                ptrs[k] = p;
-                continue;
-            }
-            V::I(i) => Object::Int(i),
-            V::F(x) => Object::Float(x),
-            V::B(b) => Object::Bool(b),
-            V::N => Object::None,
-            V::Fn(_) | V::Bi(_) | V::Null => return 1,
-        };
-        ptrs[k] = staged[k].write(o);
-    }
     if native.is_some() || ctor.is_some() {
-        // A read-only builtin, on borrowed copies of the arguments: never
-        // dropped, so no reference moves.
+        // A read-only builtin, on borrowed copies of the arguments (scalars
+        // made as objects, which have no drop glue): never dropped, so no
+        // reference moves.
         let mut copies = [const { std::mem::MaybeUninit::<Object>::uninit() }; 8];
-        for k in 0..n {
-            // SAFETY: each pointer names a live object; the copy is never
-            // dropped.
-            copies[k].write(unsafe { std::ptr::read(ptrs[k]) });
+        for (k, slot) in copies.iter_mut().enumerate().take(n) {
+            slot.write(match reg(first + k) {
+                // SAFETY: the register names a live object; the copy is
+                // never dropped.
+                V::R(p) => unsafe { std::ptr::read(p) },
+                V::I(i) => Object::Int(i),
+                V::F(x) => Object::Float(x),
+                V::B(b) => Object::Bool(b),
+                V::N => Object::None,
+                V::Fn(_) | V::Bi(_) | V::Null => return 1,
+            });
         }
         // SAFETY: the first `n` copies were written.
         let args = unsafe { std::slice::from_raw_parts(copies.as_ptr().cast::<Object>(), n) };
@@ -1097,6 +1087,24 @@ unsafe extern "C" fn h_call<const EFFECT: bool>(
             }
             None => 1,
         };
+    }
+    // Scalar arguments are staged as objects (no drop glue); heap ones are
+    // borrowed in place.
+    let mut staged = [const { std::mem::MaybeUninit::<Object>::uninit() }; 8];
+    let mut ptrs = [std::ptr::null::<Object>(); 8];
+    for k in 0..n {
+        let o = match reg(first + k) {
+            V::R(p) => {
+                ptrs[k] = p;
+                continue;
+            }
+            V::I(i) => Object::Int(i),
+            V::F(x) => Object::Float(x),
+            V::B(b) => Object::Bool(b),
+            V::N => Object::None,
+            V::Fn(_) | V::Bi(_) | V::Null => return 1,
+        };
+        ptrs[k] = staged[k].write(o);
     }
     // SAFETY: the class or the namespace holds the callee, and nothing
     // here runs code that could release it.
