@@ -15661,6 +15661,23 @@ pub(crate) fn dict_pop_leaf(args: &[Object]) -> Option<Result<Object, RuntimeErr
     }
 }
 
+/// `dict.popitem()`'s leaf half: the last entry of a non-empty dict as a
+/// pair (nothing is released, so nothing could finalize). An empty dict,
+/// which raises, and a dict watcher take the full path.
+pub(crate) fn dict_popitem_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [recv] = args else {
+        return None;
+    };
+    if crate::capi_watchers::dicts_active() {
+        return None;
+    }
+    let cell = leaf_dict_of(recv)?;
+    let (k, v) = cell.try_borrow_mut().ok()?.pop()?;
+    crate::object::dict_watch_bump(cell);
+    crate::object::dict_mutation_event(cell);
+    Some(Ok(Object::new_tuple_array([k.0, v])))
+}
+
 /// `dict.__setitem__`'s leaf half: a `str`/`int` key replacing an
 /// exact-key entry, or inserting one no stored key could equal. Anything
 /// that could run Python (an exotic stored key, a dict watcher) takes the

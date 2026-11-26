@@ -4528,20 +4528,22 @@ pub(crate) fn take_repr_error() -> Option<RuntimeError> {
 
 impl PartialEq for DictKey {
     fn eq(&self, other: &Self) -> bool {
+        // Two plain strings or machine ints, the common keys, are equal by
+        // value alone (a string by identity first), before the general
+        // identity test below.
+        match (&self.0, &other.0) {
+            (Object::Str(a), Object::Str(b)) => {
+                return SharedStr::ptr_eq(a, b)
+                    || crate::dictmap::key_bytes_eq(a.as_bytes(), b.as_bytes());
+            }
+            (Object::Int(a), Object::Int(b)) => return a == b,
+            _ => {}
+        }
         // CPython compares dict/set keys with `a is b or a == b`; the identity
         // half makes a stored `nan` findable by itself (`{nan}` contains its
         // own nan even though `nan != nan`).
         if self.0.is_same(&other.0) {
             return true;
-        }
-        // Two plain strings or machine ints, the common keys, are equal by
-        // value alone.
-        match (&self.0, &other.0) {
-            (Object::Str(a), Object::Str(b)) => {
-                return crate::dictmap::key_bytes_eq(a.as_bytes(), b.as_bytes());
-            }
-            (Object::Int(a), Object::Int(b)) => return a == b,
-            _ => {}
         }
         // Native fast path also covers instance *identity* (`Rc::ptr_eq`),
         // which is the `a is b` half of CPython's dict-key comparison.

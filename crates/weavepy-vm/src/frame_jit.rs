@@ -7016,6 +7016,14 @@ unsafe extern "C" fn h_binop(at: *mut Object, kind: u32) -> u32 {
             {
                 crate::set_algebra_fast(a, b, kind)
             }
+            // A set's `|=` with a set whose keys hash and compare natively:
+            // the keys it lacks added in place (none leaves, so nothing is
+            // released), the set itself the result.
+            (Object::Set(_), Object::Set(_) | Object::FrozenSet(_))
+                if inplace && kind == BinOpKind::BitOr && droppable(b) =>
+            {
+                crate::setalg::update(a, b, kind).then(|| a.clone())
+            }
             // A dict's keys view against a set (`d.keys() & s`): a set.
             (Object::DictView(_), Object::Set(_) | Object::FrozenSet(_))
                 if !inplace

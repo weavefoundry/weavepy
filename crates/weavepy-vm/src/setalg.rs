@@ -281,7 +281,15 @@ impl Plan {
     /// and unchanged since. Compares no keys: positions name what goes,
     /// and what arrives is known to be absent. Returns the keys taken
     /// out, for the caller to release once `a` is no longer borrowed.
-    pub(crate) fn apply(self, a: &mut SetMap) -> Vec<DictKey> {
+    pub(crate) fn apply(self, a: &mut SetMap) -> Gone {
+        // (A replaced table goes out whole, its keys never gathered.)
+        if let Plan::Replace(new) = self {
+            return Gone::Table(std::mem::replace(a, new));
+        }
+        Gone::Keys(self.apply_keys(a))
+    }
+
+    fn apply_keys(self, a: &mut SetMap) -> Vec<DictKey> {
         let take = |a: &mut SetMap, mut gone: Vec<usize>| -> Vec<DictKey> {
             // (From the highest position down: each removal moves the
             // last key into the freed place, never one still to go.)
@@ -314,6 +322,13 @@ impl Plan {
             Plan::Replace(new) => std::mem::replace(a, new).into_iter().collect(),
         }
     }
+}
+
+/// What [`Plan::apply`] took out of a table: its keys, or the old table
+/// itself.
+pub(crate) enum Gone {
+    Keys(#[allow(dead_code)] Vec<DictKey>),
+    Table(#[allow(dead_code)] SetMap),
 }
 
 /// `dst <op>= src` in place, for a `set` and a `set` or `frozenset` whose
