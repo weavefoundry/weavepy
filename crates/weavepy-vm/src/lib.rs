@@ -18067,6 +18067,13 @@ impl Interpreter {
                 if matches!(recv, Object::Instance(i) if i.native.get().is_some()) {
                     return Some(true);
                 }
+                // A native method of a class written in Python, on its
+                // plain instance (`deque.extend`): through the dispatch, as
+                // the full handler calls it (the dispatch takes such a
+                // receiver's argument as it comes).
+                if matches!(recv, Object::Instance(_)) && builtin_method_via_call(b.name) {
+                    return Some(true);
+                }
                 // The names below are dispatched by the interpreter, which
                 // knows them on the builtin kinds' receivers.
                 builtins::method_memo_tag(recv)?;
@@ -50399,6 +50406,13 @@ impl Interpreter {
                             Some(x) => out.push(x),
                             None => return Ok(out),
                         }
+                    }
+                }
+                // A deque's iterator: the rest of its items at once.
+                if let Object::Instance(inst) = &it {
+                    if let Some(items) = crate::stdlib::collections_native::deque_iter_rest(inst) {
+                        out.extend(items);
+                        return Ok(out);
                     }
                 }
                 // A native `__next__` with a fast half (`struct.iter_unpack`'s
@@ -88680,6 +88694,10 @@ fn lane_recv_ok(b: &crate::object::BuiltinFn, recv: &Object, via_call: bool) -> 
             // the site loaded from its class, whose body (or the shim
             // around it) unwraps the payload itself.
             || matches!(recv, Object::Instance(i) if i.native.get().is_some())
+            // A native method of a class written in Python on its plain
+            // instance (`deque.extend`), as `Interpreter::builtin_lane`
+            // settles it.
+            || (matches!(recv, Object::Instance(_)) && builtin_method_via_call(b.name))
             || exception_init_call(b, recv)
             || (matches!(b.name, ".object_reduce_ex" | ".object_reduce")
                 && matches!(recv, Object::Instance(_))))

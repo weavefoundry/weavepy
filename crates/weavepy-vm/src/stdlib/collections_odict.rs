@@ -588,6 +588,36 @@ fn od_keys_equal(args: &[Object]) -> Result<Object, RuntimeError> {
     let (a, _) = receiver(args, "__eq__")?;
     let (b, _) = receiver(args.get(1..).unwrap_or_default(), "__eq__")?;
     let (oa, ob) = (order_of(&a), order_of(&b));
+    // Both orders' keys as ints, strings or the same objects, compared in
+    // one pass through views (no comparison runs code); any other key
+    // takes the walk below.
+    // SAFETY: views that run no code, ending with the block.
+    if let (Some(da), Some(db)) = (unsafe { oa.peek() }, unsafe { ob.peek() }) {
+        let mut verdict = Some(da.len() == db.len());
+        for i in 0..da.len().min(db.len()) {
+            let (Some((ka, _)), Some((kb, _))) = (da.get_index(i), db.get_index(i)) else {
+                verdict = None;
+                break;
+            };
+            let same = match (&ka.0, &kb.0) {
+                (Object::Str(x), Object::Str(y)) => x == y,
+                (Object::Int(x), Object::Int(y)) => x == y,
+                (Object::Str(_), Object::Int(_)) | (Object::Int(_), Object::Str(_)) => false,
+                (x, y) if x.is_same(y) => true,
+                _ => {
+                    verdict = None;
+                    break;
+                }
+            };
+            if !same {
+                verdict = Some(false);
+                break;
+            }
+        }
+        if let Some(eq) = verdict {
+            return Ok(Object::Bool(eq));
+        }
+    }
     let wa = crate::object::DictWatch::new(&oa);
     let wb = crate::object::DictWatch::new(&ob);
     let (na, nb) = (oa.borrow().len(), ob.borrow().len());

@@ -3261,7 +3261,19 @@ branch and pull request.
     directly (3,074 to 2,129 and 3,286 to 2,727, CPython 1,698 and
     1,789); `dict.fromkeys(range(n))` builds in place where it left
     compiled code on every call (8,543 to 2,901, CPython 3,353); and
-    `xs.clear()` of plain items runs as a leaf.
+    `xs.clear()` of plain items runs as a leaf. `list.index(x, start)`
+    with int bounds scans natively (1,957 to 833, CPython 1,515).
+  - `collections.deque` was 7 to 8 times CPython in several everyday
+    shapes. `list(dq)` of 20 items stepped a Python-level iterator per
+    item (19,887 instructions, CPython 2,420); a deque iterator's rest is
+    now copied at once, and its `__next__` has a leaf half (7,863). A
+    bounded `dq.extend((a, b, c))` left compiled code on every call: a
+    native method of a class written in Python, with a name the call
+    dispatcher handles (`extend`), had no in-place lane on a plain
+    instance. It now takes the dispatcher's path in place (6,631 to
+    3,404, CPython 924). `OrderedDict` equality compares plain keys'
+    order natively (still 7 times CPython: its `__eq__` is a Python method
+    that isn't a leaf, so the comparison leaves compiled code).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

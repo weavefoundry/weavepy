@@ -914,6 +914,94 @@ fn deque_next_fast(iterator: &crate::types::PyInstance, reverse: bool) -> Option
     Some(v)
 }
 
+/// The deque iterators' native `__next__` builtins (their addresses), for
+/// [`deque_iter_rest`]'s check.
+static ITER_NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static RITER_NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The rest of a deque iterator's items at once (`list(dq)`), when its
+/// class keeps the native `__next__` and the deque is unchanged since the
+/// iterator was made: the items in order (reversed for `reversed(dq)`'s),
+/// the iterator moved to its end as stepping it would leave it. `None`,
+/// nothing changed, for anything else.
+pub(crate) fn deque_iter_rest(iterator: &crate::types::PyInstance) -> Option<Vec<Object>> {
+    use std::sync::atomic::Ordering;
+    let reverse = match iterator.cls_raw().lookup("__next__") {
+        Some(Object::Builtin(b)) => {
+            let p = Rc::as_ptr(&b) as usize;
+            if p == ITER_NEXT.load(Ordering::Relaxed) {
+                false
+            } else if p == RITER_NEXT.load(Ordering::Relaxed) {
+                true
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    // SAFETY: as in `deque_next_fast`: no guard is live on the cells, no
+    // Python runs before the last use, and the two objects are distinct.
+    let its = unsafe { iterator.slots.peek_mut() }?;
+    let n = names();
+    let [deque, index, it_state] =
+        its.leading_memo_mut(&ITER_LAYOUT, [&n.deq, &n.index, &n.deq_state])?;
+    let Object::Instance(deque) = deque else {
+        return None;
+    };
+    let deque: *const crate::types::PyInstance = Rc::as_ptr(deque);
+    let Object::Int(i) = index else {
+        return None;
+    };
+    // SAFETY: as above.
+    let ds = unsafe { (*deque).slots.peek() }?;
+    let [data, head, _, state] =
+        ds.leading_memo(&DEQUE_LAYOUT, [&n.data, &n.head, &n.maxlen, &n.state])?;
+    let Object::List(data) = data else {
+        return None;
+    };
+    match (state, &*it_state) {
+        (Object::Int(a), Object::Int(b)) if a == b => {}
+        _ => return None,
+    }
+    let h = match *head {
+        Object::Int(h) if h >= 0 => h as usize,
+        _ => 0,
+    };
+    // SAFETY: as above.
+    let d = unsafe { data.peek() }?;
+    let h = h.min(d.len());
+    let total = d.len() - h;
+    let at = usize::try_from(*i).ok()?;
+    if at > total {
+        return None;
+    }
+    let out = if reverse {
+        (at..total).map(|k| d[d.len() - 1 - k].clone()).collect()
+    } else {
+        d[h + at..].to_vec()
+    };
+    *i = total as i64;
+    Some(out)
+}
+
+/// A deque iterator's `__next__` leaf half: the next item read in place
+/// while the deque is unchanged (see [`deque_next_fast`]). `None` (the
+/// end, a change, or anything unusual) for the full body.
+fn deque_iterator_next_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Instance(it)] = args else {
+        return None;
+    };
+    deque_next_fast(it, false).map(Ok)
+}
+
+/// [`deque_iterator_next_leaf`] for `reversed(deque)`'s iterator.
+fn deque_reverse_iterator_next_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Instance(it)] = args else {
+        return None;
+    };
+    deque_next_fast(it, true).map(Ok)
+}
+
 fn deque_next(args: &[Object], reverse: bool) -> Result<Object, RuntimeError> {
     let [Object::Instance(iterator)] = args else {
         return Err(type_error("deque iterator __next__ requires one iterator"));
@@ -2414,6 +2502,24 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static("dd_missing"))) {
             DD_MISSING.store(Rc::as_ptr(b) as usize, std::sync::atomic::Ordering::Relaxed);
         }
+        // The deque iterators' steps, as leaves (`list(dq)`, `for x in dq`).
+        for (key, fast) in [
+            (
+                "iterator_next",
+                deque_iterator_next_leaf as crate::leaf_builtins::Fast,
+            ),
+            ("reverse_iterator_next", deque_reverse_iterator_next_leaf),
+        ] {
+            if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static(key))) {
+                crate::leaf_builtins::register_fast(b, fast);
+                let slot = if key == "iterator_next" {
+                    &ITER_NEXT
+                } else {
+                    &RITER_NEXT
+                };
+                slot.store(Rc::as_ptr(b) as usize, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         // The `OrderedDict` methods (see `collections_odict`).
         for (export, name, body, kw) in super::collections_odict::exports() {
             d.insert(
@@ -2466,8 +2572,8 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 }
             }
         }
-        // The end operations, length, truth, iterator construction, and
-        // iterator steps run no Python code. Indexing and rotation require
+        // The end operations, length, truth and iterator construction run
+        // no Python code (the iterator steps have leaf halves, above). Indexing and rotation require
         // an argument guard because index coercion can invoke Python's
         // __index__ protocol.
         for name in [
@@ -2479,8 +2585,6 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             "__bool__",
             "__iter__",
             "__reversed__",
-            "iterator_next",
-            "reverse_iterator_next",
             "tuplegetter_get",
         ] {
             if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static(name))) {
