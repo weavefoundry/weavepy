@@ -2413,6 +2413,23 @@ fn ready_next(it: &Object) -> Option<Object> {
     src_step(it)
 }
 
+/// Whether `l` is a `zip`, `map`, `filter` or `enumerate` with a generator
+/// among its sources, whose steps always run code (so its pure step,
+/// [`Interpreter::lazy_core_next`], never takes one).
+pub(crate) fn lazy_has_generator_source(l: &PyLazyIter) -> bool {
+    let is_gen = |o: &Object| matches!(o, Object::Generator(_));
+    // SAFETY: a read that runs no code, ending with the match.
+    match unsafe { l.state.peek() } {
+        Some(LazyIterKind::Zip { iters, .. } | LazyIterKind::Map { iters, .. }) => {
+            iters.iter().any(is_gen)
+        }
+        Some(LazyIterKind::Filter { source, .. } | LazyIterKind::Enumerate { source, .. }) => {
+            is_gen(source)
+        }
+        _ => false,
+    }
+}
+
 /// `zip`'s items over sources that are all list or tuple iterators (not
 /// `strict`, nothing held back), drained in one pass: as many tuples as
 /// the shortest has items left, then the end step CPython's takes, one

@@ -50444,13 +50444,25 @@ impl Interpreter {
             Object::LazyIter(l) => {
                 let mut out = Vec::new();
                 if !self.seq_drain(l, &mut out, globals)? {
+                    // (A declined pure step consumes nothing; after four in
+                    // a row, a source that never steps purely, a generator
+                    // say, the general step alone.)
+                    let mut declines = if crate::seqiter::lazy_has_generator_source(l) {
+                        4
+                    } else {
+                        0u8
+                    };
                     loop {
-                        if let Some(r) = self.lazy_core_next(l) {
-                            match r {
-                                Some(x) => out.push(x),
-                                None => break,
+                        if declines < 4 {
+                            if let Some(r) = self.lazy_core_next(l) {
+                                declines = 0;
+                                match r {
+                                    Some(x) => out.push(x),
+                                    None => break,
+                                }
+                                continue;
                             }
-                            continue;
+                            declines += 1;
                         }
                         match self.lazy_iter_next(l, globals)? {
                             Some(x) => out.push(x),
