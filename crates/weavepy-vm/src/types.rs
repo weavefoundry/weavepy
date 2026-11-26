@@ -907,6 +907,8 @@ pub(crate) mod vm_key {
     pub(crate) const LEN_ABSENT: u32 = 153;
     /// A class's Python `__getattr__` hook, for the frameless hook calls.
     pub(crate) const GETATTR_FN: u32 = 154;
+    /// Its Python `__format__`, for frameless `format(obj, spec)` calls.
+    pub(crate) const FORMAT_FN: u32 = 155;
 }
 
 /// A builtin type's pure constructor (see [`TypeObject::pure_new`]).

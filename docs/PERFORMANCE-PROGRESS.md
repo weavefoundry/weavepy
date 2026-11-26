@@ -3378,6 +3378,12 @@ branch and pull request.
     3.00 to 1.65). A frameless evaluation also raises an int to a power
     below 64 (`min(xs, key=lambda x: (x - 25) ** 2)` declined to a full
     call for every item: 2.07 to 0.62).
+  - `format(obj, spec)` and an f-string's `{obj:spec}` called a class's
+    Python `__format__` through a bound method and a frame (about 10
+    allocations a call). A warm pure-leaf `__format__` now runs frameless,
+    found once per class version, and `format()`'s own fast half counts as
+    pure, so a body that formats a field (`return format(self.v, spec)`)
+    qualifies (`f"{p:>4}"` 1.67 to 1.18 times CPython).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

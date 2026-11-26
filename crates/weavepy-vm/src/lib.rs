@@ -48459,6 +48459,39 @@ impl Interpreter {
     /// Format `value` with `spec`, dispatching to a user `__format__`
     /// when present (CPython's `PyObject_Format`). Built-in objects use
     /// the format mini-language.
+    /// `format(value, spec)` through `inst`'s class's Python `__format__`
+    /// (found once per class version) when it is a warm pure leaf of
+    /// `(self, spec)` that answers a `str`. `None` for anything else.
+    fn leaf_instance_format(
+        &self,
+        inst: &PyInstance,
+        value: &Object,
+        spec: &str,
+    ) -> Option<String> {
+        if crate::object::exotic_str_keys_possible() || crate::trace::any_observers_active() {
+            return None;
+        }
+        let f = Self::instance_dunder_function(
+            inst,
+            crate::types::AttrKey::vm(crate::types::vm_key::FORMAT_FN),
+            "__format__",
+        )?;
+        let code = f.code();
+        if code.arg_count != 2
+            || !code_is_pure_leaf(&code)
+            || !pure_leaf_warm(&code)
+            || crate::recursion::current_depth() >= crate::recursion::recursion_limit()
+        {
+            return None;
+        }
+        let spec = Object::from_str(spec);
+        let args = [std::ptr::from_ref(value), std::ptr::from_ref(&spec)];
+        match self.pure_leaf_eval::<false, false>(&code, &f, &args)? {
+            Object::Str(s) => Some(s.to_string()),
+            _ => None,
+        }
+    }
+
     fn format_obj_str(
         &mut self,
         value: &Object,
@@ -48487,6 +48520,14 @@ impl Interpreter {
                 crate::types::AttrKey::vm(crate::types::vm_key::FORMAT_LACKS),
                 "__format__",
             );
+            // A warm pure-leaf `__format__` (`return format(self.v, spec)`),
+            // evaluated in place with no bound method or frame; a result
+            // that isn't a `str` takes the full call, which raises.
+            if !lacks_format {
+                if let Some(r) = self.leaf_instance_format(inst, value, spec) {
+                    return Ok(r);
+                }
+            }
             if let Some(method) = (!lacks_format)
                 .then(|| instance_method(value, "__format__"))
                 .flatten()
@@ -80578,8 +80619,10 @@ fn leaf_issubclass(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
 /// effect (a module's may have one: `getrandbits` advances its state), so a
 /// frameless evaluation that declines after calling it did nothing.
 fn pure_fast_half(f: leaf_builtins::Fast) -> bool {
-    let pure: [leaf_builtins::Fast; 19] = [
+    let pure: [leaf_builtins::Fast; 20] = [
         leaf_issubclass,
+        // (A new string; a bad spec's error declines, the full call raises.)
+        leaf_format,
         // (A new iterator over its argument, which it leaves alone.)
         crate::seqiter::iter_fast,
         crate::seqiter::hash_fast,
