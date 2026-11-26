@@ -3190,6 +3190,47 @@ branch and pull request.
     hashes (`randint` 1,063 to 958, CPython 2,494).
     `ContextVar.get` borrows the var's class state in place instead of
     cloning it through the receiver check (817 to 588, CPython 431).
+  - `enumerate` over a `str` left compiled code once per loop: its end
+    step only knew list, tuple and range cursors. `enumerate(s, 1)` was
+    also declined by the `int(text, base)` constructor arm, which
+    returned for any `[str, int]` call. Both now run in place
+    (`for j, c in enumerate("abc", 1)` 3,511 to 2,108, CPython 2,286).
+    `set.issubset`, `issuperset`, `isdisjoint`, `union`, `intersection`,
+    `difference` and `symmetric_difference` with set arguments were
+    dispatched by name through the interpreter (about 600 instructions a
+    call). They now have leaf halves, and a union of several sets folds
+    over their tables (`a.issubset(S)` 1,271 to 713, CPython 597;
+    `S1.union(S2, {99})` 7,847 to 4,513, CPython 4,940). `set(s)` copies
+    another set's table, and `dict.popitem`, `bytes.join`, `hex`, `oct`
+    and `bin` run as leaves. An in-place `s |= t` of sets runs in compiled
+    code (2,460 to 1,256, CPython 1,588), and `s &= t` hands back the
+    replaced table whole instead of collecting its keys.
+  - `list(map(max, a, b))` resolved its callback on every step; a map
+    over two plain cursors now resolves it once (6,517 to 4,816, CPython
+    3,978), and `max`/`min` of two ints or floats skip gathering a list
+    (`max(x, y)` 389, CPython 635). A map over an instance with a native
+    `__call__` (`map(itemgetter(0), pairs)`) runs its fast half per item.
+    `itertools.product("ab", repeat=2)` left compiled code on every call
+    because a `str` couldn't be a pure pool (11,091 to 5,929, CPython
+    5,990).
+  - `heapq`'s sifts took a guarded borrow of the list for every
+    comparison and swap, each running the biased-guard protocol. Two
+    native scalars are now compared and swapped under one view of the
+    list (a push and a pop 2,120 to 1,860, CPython 1,863). `Counter(list)`
+    counts a run of plain keys under one view of its dict with one change
+    notice (13,061 to 11,699, CPython 11,090). `zip`'s bulk drain reads
+    its cursors through views (`list(zip(*m))` 5,464 to 4,656, CPython
+    4,118), and `zip_longest` builds rows of up to four sources in
+    arrays.
+  - `list(obj)` of an instance whose `__iter__` returns a native iterator
+    stepped it through the general loop; it now drains under one borrow
+    (`list(It(5))` 6,331 to 5,762, CPython 2,890, most of the rest being
+    the `__iter__` frame). Pure `bytes` and `bytearray` methods (`upper`,
+    `split`, `replace` and about thirty more) run as leaves when every
+    operand is plain data (three calls 4,164 to 3,900). `BytesIO`'s
+    `getvalue` and in-place writes read the buffer through views (on
+    Linux 3,231 to 3,014 for a create, two writes and a `getvalue`).
+    The leaf JIT's builtin calls copy their arguments once.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
