@@ -3312,6 +3312,18 @@ branch and pull request.
     test, `in`, a loop, `len`, `get`, `pop`) also skips registration.
     Thirty spread calls fell from 72,635 to 64,227 instructions (CPython
     58,488), thirty keyword calls from 74,482 to 70,957 (CPython 62,013).
+  - `getattr`, `hasattr` and `attrgetter` declined their fast half for
+    any attribute the class supplies through a descriptor, so a
+    `__slots__` member went through the full lookup, about four layers
+    and five class lookups deep (`getattr(obj, "a", None)` 4,191
+    instructions, CPython 515; `list(map(attrgetter("a"), objs))` over 50
+    slotted objects 204,564, CPython 20,214). The fast half now reads a
+    slot member directly, giving the default for an unset one when no
+    `__getattr__` could answer, and remembers per class version and name
+    that the class supplies nothing or a slot, which skips the class
+    lookup on later reads of any instance (`getattr` of a slot 719,
+    `hasattr` 757, CPython 610 and 590; the 50-object map 40,941, CPython
+    20,485; over plain objects 40,315 to 37,547).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

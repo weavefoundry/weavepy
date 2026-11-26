@@ -36098,15 +36098,53 @@ impl Interpreter {
             }
             return None;
         }
-        if cls.native_kind.get() != 0
-            || inst.native.get().is_some()
-            || !Self::default_getattribute(cls)
-        {
+        if cls.native_kind.get() != 0 || inst.native.get().is_some() {
+            return None;
+        }
+        // The class's part, remembered for its version (see
+        // `instance_getattr_memo`): nothing on the class, or a slot.
+        let memo = instance_getattr_memo(cls, name_obj);
+        if memo.is_none() && !Self::default_getattribute(cls) {
             return None;
         }
         // Only class values without `__get__` (or a function, which binds)
         // leave the instance dictionary in charge.
-        let on_class = cls.lookup(name);
+        let on_class = match memo {
+            Some(InstGetattrClass::Nothing) => None,
+            Some(InstGetattrClass::Slot) => Some(Object::Unbound),
+            None => {
+                let on_class = cls.lookup(name);
+                match &on_class {
+                    None => note_instance_getattr(cls, name_obj, InstGetattrClass::Nothing),
+                    Some(Object::SlotDescriptor(s)) if s.name == name && s.default.is_none() => {
+                        note_instance_getattr(cls, name_obj, InstGetattrClass::Slot)
+                    }
+                    _ => {}
+                }
+                on_class
+            }
+        };
+        // A `__slots__` member (a data descriptor, ahead of any instance
+        // dictionary): its stored value, as `obj.name` reads it; unset, the
+        // default when no `__getattr__` could supply one (the full path
+        // raises the `AttributeError` otherwise). (`Unbound`: the memo's
+        // slot.)
+        if let Some(Object::SlotDescriptor(_) | Object::Unbound) = &on_class {
+            if let Some(Object::SlotDescriptor(s)) = &on_class {
+                if s.name != name || s.default.is_some() {
+                    return None;
+                }
+            }
+            if let Some(v) = inst
+                .slot_get(name)
+                .filter(|v| !matches!(v, Object::Unbound))
+            {
+                return Some(v);
+            }
+            return default
+                .filter(|_| !cls.dunder(crate::types::Dunder::GetAttr).present())
+                .cloned();
+        }
         if !matches!(
             on_class,
             None | Some(
@@ -83633,6 +83671,76 @@ pub(crate) fn certain_miss_error_obj(
         }
         _ => crate::error::attribute_error_named_obj(obj, name, name_obj),
     }
+}
+
+/// What [`Interpreter::leaf_getattr_parts`] found on an instance's class
+/// for a name, under the default `__getattribute__`.
+#[derive(Clone, Copy)]
+enum InstGetattrClass {
+    /// Nothing: the instance's own value decides.
+    Nothing,
+    /// A `__slots__` member without a default.
+    Slot,
+}
+
+/// Entries of [`INST_GETATTR_MEMO`].
+const INST_GETATTR_SLOTS: usize = 64;
+
+thread_local! {
+    /// [`InstGetattrClass`] answers by class attribute version (unique in
+    /// the process, and moved by any change to the class, a base, or the
+    /// MRO) and name object (held, so its address can't be reused).
+    /// `getattr(obj, name, default)`, `hasattr` and `attrgetter` ask the
+    /// same question of each instance of a class, and the class lookup
+    /// cost more than the rest of the read.
+    static INST_GETATTR_MEMO: crate::gil::ReleaseUnderGil<
+        RefCell<Vec<(u64, Option<SharedStr>, InstGetattrClass)>>,
+    > = const { crate::gil::ReleaseUnderGil::new(RefCell::new(Vec::new())) };
+}
+
+#[inline]
+fn inst_getattr_slot(ver: u64, name: &SharedStr) -> usize {
+    let word = SharedStr::addr(name) >> 4;
+    ((ver as usize) ^ word).wrapping_mul(0x9E37_79B9_7F4A_7C15_u64 as usize)
+        >> (usize::BITS - INST_GETATTR_SLOTS.trailing_zeros())
+}
+
+/// The remembered [`InstGetattrClass`] of `name` on `cls`, if any (none
+/// for a class without a version, or while types are watched).
+#[inline]
+fn instance_getattr_memo(cls: &TypeObject, name: &SharedStr) -> Option<InstGetattrClass> {
+    let ver = cls.attr_version.get();
+    if ver == 0 || crate::capi_watchers::types_active() {
+        return None;
+    }
+    let slot = inst_getattr_slot(ver, name);
+    INST_GETATTR_MEMO
+        .try_with(|m| {
+            let m = m.try_borrow().ok()?;
+            let (v, n, kind) = m.get(slot)?;
+            (*v == ver && n.as_ref().is_some_and(|n| SharedStr::ptr_eq(n, name))).then_some(*kind)
+        })
+        .ok()
+        .flatten()
+}
+
+/// Remember `kind` for `name` on `cls` (see [`instance_getattr_memo`]).
+fn note_instance_getattr(cls: &TypeObject, name: &SharedStr, kind: InstGetattrClass) {
+    let ver = cls.attr_version.get();
+    if ver == 0 || crate::capi_watchers::types_active() {
+        return;
+    }
+    let slot = inst_getattr_slot(ver, name);
+    let _ = INST_GETATTR_MEMO.try_with(|m| {
+        let Ok(mut m) = m.try_borrow_mut() else {
+            return;
+        };
+        if m.is_empty() {
+            m.resize(INST_GETATTR_SLOTS, (0, None, InstGetattrClass::Nothing));
+        }
+        // (The evicted name is only a string: releasing it runs nothing.)
+        m[slot] = (ver, Some(name.clone()), kind);
+    });
 }
 
 /// Whether `inst.name` is a `__slots__` member of its class (the data
