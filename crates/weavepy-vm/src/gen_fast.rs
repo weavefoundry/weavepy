@@ -1145,7 +1145,7 @@ impl Interpreter {
                                 return ForNext::Bail;
                             }
                             if !unique {
-                                *items = Rc::new(crate::sync::RefCell::new(Vec::new()));
+                                *items = crate::object::detached_store();
                             }
                             return ForNext::Exhausted;
                         };

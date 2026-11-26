@@ -11770,6 +11770,20 @@ pub enum PyIterator {
     },
 }
 
+/// The empty store an exhausted list or reverse iterator detaches to:
+/// one per thread, shared, so a loop's end allocates nothing (CPython
+/// clears `it_seq`). Nothing writes to a detached iterator's store, and
+/// `__reduce__` reports a fresh list for an empty one, so no one sees it
+/// shared. (Never dropped: its thread's exit runs no destructor.)
+#[inline]
+pub(crate) fn detached_store() -> Rc<RefCell<Vec<Object>>> {
+    thread_local! {
+        static EMPTY: std::mem::ManuallyDrop<Rc<RefCell<Vec<Object>>>> =
+            std::mem::ManuallyDrop::new(Rc::new(RefCell::new(Vec::new())));
+    }
+    EMPTY.with(|e| Rc::clone(e))
+}
+
 impl PyIterator {
     /// Pull the next value out of the iterator, or `None` if exhausted.
     pub fn next_value(&mut self) -> Option<Object> {
@@ -11793,7 +11807,7 @@ impl PyIterator {
                         // subclass keepalive drops with it, running its
                         // `__del__` here like CPython freeing the list
                         // (test_free_after_iterating).
-                        *items = Rc::new(RefCell::new(Vec::new()));
+                        *items = crate::object::detached_store();
                         *owner = None;
                         None
                     }
@@ -12039,7 +12053,7 @@ impl PyIterator {
                 owner,
             } => {
                 if *index < 0 {
-                    *items = Rc::new(RefCell::new(Vec::new()));
+                    *items = crate::object::detached_store();
                     *owner = None;
                     return None;
                 }
@@ -12051,7 +12065,7 @@ impl PyIterator {
                     }
                     None => {
                         // Index out of range (list shrank): exhaust + detach.
-                        *items = Rc::new(RefCell::new(Vec::new()));
+                        *items = crate::object::detached_store();
                         *index = -1;
                         *owner = None;
                         None

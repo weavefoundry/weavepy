@@ -15087,7 +15087,7 @@ impl Interpreter {
                                         // list, as `next_value` does, so a later
                                         // append can't resurrect it.
                                         if !unique {
-                                            *items = Rc::new(RefCell::new(Vec::new()));
+                                            *items = crate::object::detached_store();
                                         }
                                         retire = true;
                                         Object::None
@@ -15301,7 +15301,7 @@ impl Interpreter {
                                             // finalizer its release queues runs
                                             // before the next instruction).
                                             None if owner.is_none() => {
-                                                *items = Rc::new(RefCell::new(Vec::new()));
+                                                *items = crate::object::detached_store();
                                                 retire = true;
                                                 Object::None
                                             }
@@ -50330,7 +50330,7 @@ impl Interpreter {
                         }
                     };
                     let detached = (
-                        std::mem::replace(items, Rc::new(RefCell::new(Vec::new()))),
+                        std::mem::replace(items, crate::object::detached_store()),
                         owner.take(),
                     );
                     *index = -1;
@@ -53967,6 +53967,11 @@ impl Interpreter {
     ) -> Result<Object, RuntimeError> {
         match v {
             Object::Generator(_) | Object::Iter(_) | Object::LazyIter(_) => Ok(v.clone()),
+            // A list's or tuple's cursor, without the default arm's checks.
+            Object::List(_) | Object::Tuple(_) => {
+                let it = v.make_iter()?;
+                Ok(Object::Iter(Rc::new(RefCell::new(it))))
+            }
             // An object-backed `mappingproxy` iterates as the wrapped
             // mapping does — overridden `__iter__` included (CPython's
             // `mappingproxy_getiter`; test_types.MappingProxyTests).
@@ -60682,7 +60687,7 @@ impl Interpreter {
                         // generic path detaches but this fast path leaks a
                         // live cursor (test_list.test_exhausted_iterator,
                         // test_tier2_invalidates_iterator).
-                        *items = Rc::new(RefCell::new(Vec::new()));
+                        *items = crate::object::detached_store();
                         drop(it);
                         frame.pop()?;
                         frame.pc += jump_arg;

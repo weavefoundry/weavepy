@@ -2594,7 +2594,7 @@ fn chain_drain(l: &PyLazyIter, out: &mut Vec<Object>) -> bool {
                 }
                 // Exhausted: detached from the list, as its own last step
                 // leaves it (see `PyIterator::next_value`).
-                let old = std::mem::replace(items, Rc::new(RefCell::new(Vec::new())));
+                let old = std::mem::replace(items, crate::object::detached_store());
                 *index = 0;
                 drop(old);
             }

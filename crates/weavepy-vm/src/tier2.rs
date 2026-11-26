@@ -14430,6 +14430,28 @@ unsafe extern "C" fn wpjit_iter_new(frame: *mut JitFrame, pin: i64) -> i64 {
     if ctx.pins.len() >= RUNTIME_PIN_CAP {
         return -1;
     }
+    // A list's or tuple's cursor (an opaque loop's commonest iterable)
+    // directly, without the general dispatch.
+    let direct = match ctx.pins.get(pin as usize) {
+        Some(Pin::Obj(Object::List(l)) | Pin::List(l, _)) => Some(PyIterator::List {
+            items: l.clone(),
+            index: 0,
+            owner: None,
+        }),
+        Some(Pin::Obj(Object::Tuple(t))) => Some(PyIterator::Tuple {
+            items: t.clone(),
+            index: 0,
+        }),
+        _ => None,
+    };
+    if let Some(it) = direct {
+        let idx = ctx.pins.len() as i64;
+        ctx.pins
+            .push(Pin::Obj(Object::Iter(Rc::new(crate::sync::RefCell::new(
+                it,
+            )))));
+        return idx;
+    }
     let recv = match ctx.pins.get(pin as usize) {
         Some(Pin::Obj(o)) => o.clone(),
         Some(Pin::List(l, _)) => Object::List(l.clone()),

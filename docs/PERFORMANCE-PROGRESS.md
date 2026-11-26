@@ -3286,6 +3286,14 @@ branch and pull request.
     `__name__` and `__qualname__`, and a generator's names, are interned
     through the per-code-name memo instead of hashing the text each
     time.
+  - A list iterator that ran out swapped in a freshly allocated empty
+    list to detach from its source, and freed it when the iterator died,
+    so every loop over a list paid an allocation at its end. Exhausted
+    list and reverse iterators now share one empty store per thread.
+    The frame JIT's step retires a loop's own exhausted list cursor
+    without its general helper, and tier 2 builds list and tuple cursors
+    directly (a loop over an empty list 870 to 557 instructions, CPython
+    438; over a two-item tuple 818 to 693, CPython 591).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

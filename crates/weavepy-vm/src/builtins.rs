@@ -12446,7 +12446,7 @@ fn str_join(args: &[Object]) -> Result<Object, RuntimeError> {
                         }
                     }) {
                         let detached = (
-                            std::mem::replace(items, Rc::new(RefCell::new(Vec::new()))),
+                            std::mem::replace(items, crate::object::detached_store()),
                             owner.take(),
                         );
                         *index = -1;

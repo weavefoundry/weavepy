@@ -2814,15 +2814,28 @@ unsafe extern "C" fn h_for_iter(st: *mut State, it: *mut Object, out: *mut Objec
                         *current = current.wrapping_add(*step);
                         return 0;
                     }
-                    PyIterator::List { items, index, .. } => {
-                        match items.peek().and_then(|xs| xs.get(*index)) {
-                            Some(v) => {
-                                *index += 1;
-                                v
-                            }
-                            None => return h_for_iter_rest(st, it, out, pc),
+                    PyIterator::List {
+                        items,
+                        index,
+                        owner,
+                    } => match items.peek().and_then(|xs| xs.get(*index)) {
+                        Some(v) => {
+                            *index += 1;
+                            v
                         }
-                    }
+                        // The end of a loop's own cursor (no generator
+                        // expression's `.0` sharing it): it leaves the stack
+                        // here, as `h_for_iter_rest` retires it, without
+                        // that helper's dispatch.
+                        None if owner.is_none()
+                            && items.peek().is_some()
+                            && Rc::strong_count(rc) == 1 =>
+                        {
+                            drop(it.read());
+                            return 2;
+                        }
+                        None => return h_for_iter_rest(st, it, out, pc),
+                    },
                     PyIterator::Tuple { items, index } => match items.get(*index) {
                         Some(v) => {
                             *index += 1;
@@ -4757,7 +4770,7 @@ unsafe extern "C" fn h_for_iter_rest(
                         || xs.iter().all(plain_scalar)) =>
                 {
                     if !unique {
-                        *items = crate::sync::Rc::new(crate::sync::RefCell::new(Vec::new()));
+                        *items = crate::object::detached_store();
                     }
                     // SAFETY: as above.
                     drop(unsafe { it.read() });
@@ -4837,7 +4850,7 @@ unsafe extern "C" fn h_for_iter_rest(
                                     || v.iter().all(plain_scalar))
                         });
                         if ok && !unique {
-                            *items = crate::sync::Rc::new(crate::sync::RefCell::new(Vec::new()));
+                            *items = crate::object::detached_store();
                         }
                         ok
                     }
