@@ -34891,6 +34891,83 @@ impl Interpreter {
                         ("decode", LeafKind::Fast(crate::builtins::bytes_decode_leaf)),
                         ("find", LeafKind::Fast(crate::builtins::bytes_find_leaf)),
                         ("hex", LeafKind::Fast(crate::builtins::bytes_hex_leaf)),
+                        // (Pure bodies over plain operands.)
+                        ("upper", LeafKind::Fast(crate::builtins::bytes_upper_fast)),
+                        ("lower", LeafKind::Fast(crate::builtins::bytes_lower_fast)),
+                        ("strip", LeafKind::Fast(crate::builtins::bytes_strip_fast)),
+                        ("lstrip", LeafKind::Fast(crate::builtins::bytes_lstrip_fast)),
+                        ("rstrip", LeafKind::Fast(crate::builtins::bytes_rstrip_fast)),
+                        ("count", LeafKind::Fast(crate::builtins::bytes_count_fast)),
+                        ("rfind", LeafKind::Fast(crate::builtins::bytes_rfind_fast)),
+                        ("index", LeafKind::Fast(crate::builtins::bytes_index_fast)),
+                        ("rindex", LeafKind::Fast(crate::builtins::bytes_rindex_fast)),
+                        (
+                            "partition",
+                            LeafKind::Fast(crate::builtins::bytes_partition_fast),
+                        ),
+                        (
+                            "rpartition",
+                            LeafKind::Fast(crate::builtins::bytes_rpartition_fast),
+                        ),
+                        (
+                            "removeprefix",
+                            LeafKind::Fast(crate::builtins::bytes_removeprefix_fast),
+                        ),
+                        (
+                            "removesuffix",
+                            LeafKind::Fast(crate::builtins::bytes_removesuffix_fast),
+                        ),
+                        ("center", LeafKind::Fast(crate::builtins::bytes_center_fast)),
+                        ("ljust", LeafKind::Fast(crate::builtins::bytes_ljust_fast)),
+                        ("rjust", LeafKind::Fast(crate::builtins::bytes_rjust_fast)),
+                        ("zfill", LeafKind::Fast(crate::builtins::bytes_zfill_fast)),
+                        (
+                            "capitalize",
+                            LeafKind::Fast(crate::builtins::bytes_capitalize_fast),
+                        ),
+                        ("title", LeafKind::Fast(crate::builtins::bytes_title_fast)),
+                        (
+                            "swapcase",
+                            LeafKind::Fast(crate::builtins::bytes_swapcase_fast),
+                        ),
+                        (
+                            "isalnum",
+                            LeafKind::Fast(crate::builtins::bytes_isalnum_fast),
+                        ),
+                        (
+                            "isalpha",
+                            LeafKind::Fast(crate::builtins::bytes_isalpha_fast),
+                        ),
+                        (
+                            "isdigit",
+                            LeafKind::Fast(crate::builtins::bytes_isdigit_fast),
+                        ),
+                        (
+                            "isspace",
+                            LeafKind::Fast(crate::builtins::bytes_isspace_fast),
+                        ),
+                        (
+                            "islower",
+                            LeafKind::Fast(crate::builtins::bytes_islower_fast),
+                        ),
+                        (
+                            "isupper",
+                            LeafKind::Fast(crate::builtins::bytes_isupper_fast),
+                        ),
+                        ("split", LeafKind::Fast(crate::builtins::bytes_split_fast)),
+                        ("rsplit", LeafKind::Fast(crate::builtins::bytes_rsplit_fast)),
+                        (
+                            "replace",
+                            LeafKind::Fast(crate::builtins::bytes_replace_fast),
+                        ),
+                        (
+                            "splitlines",
+                            LeafKind::Fast(crate::builtins::bytes_splitlines_fast),
+                        ),
+                        (
+                            "expandtabs",
+                            LeafKind::Fast(crate::builtins::bytes_expandtabs_fast),
+                        ),
                     ],
                 ),
                 // A buffer built a byte or a chunk at a time, and read back.
@@ -34908,6 +34985,82 @@ impl Interpreter {
                         ),
                         ("pop", LeafKind::Fast(crate::builtins::bytearray_pop_leaf)),
                         ("decode", LeafKind::Fast(crate::builtins::bytes_decode_leaf)),
+                        ("upper", LeafKind::Fast(crate::builtins::bytes_upper_fast)),
+                        ("lower", LeafKind::Fast(crate::builtins::bytes_lower_fast)),
+                        ("strip", LeafKind::Fast(crate::builtins::bytes_strip_fast)),
+                        ("lstrip", LeafKind::Fast(crate::builtins::bytes_lstrip_fast)),
+                        ("rstrip", LeafKind::Fast(crate::builtins::bytes_rstrip_fast)),
+                        ("count", LeafKind::Fast(crate::builtins::bytes_count_fast)),
+                        ("rfind", LeafKind::Fast(crate::builtins::bytes_rfind_fast)),
+                        ("index", LeafKind::Fast(crate::builtins::bytes_index_fast)),
+                        ("rindex", LeafKind::Fast(crate::builtins::bytes_rindex_fast)),
+                        (
+                            "partition",
+                            LeafKind::Fast(crate::builtins::bytes_partition_fast),
+                        ),
+                        (
+                            "rpartition",
+                            LeafKind::Fast(crate::builtins::bytes_rpartition_fast),
+                        ),
+                        (
+                            "removeprefix",
+                            LeafKind::Fast(crate::builtins::bytes_removeprefix_fast),
+                        ),
+                        (
+                            "removesuffix",
+                            LeafKind::Fast(crate::builtins::bytes_removesuffix_fast),
+                        ),
+                        ("center", LeafKind::Fast(crate::builtins::bytes_center_fast)),
+                        ("ljust", LeafKind::Fast(crate::builtins::bytes_ljust_fast)),
+                        ("rjust", LeafKind::Fast(crate::builtins::bytes_rjust_fast)),
+                        ("zfill", LeafKind::Fast(crate::builtins::bytes_zfill_fast)),
+                        (
+                            "capitalize",
+                            LeafKind::Fast(crate::builtins::bytes_capitalize_fast),
+                        ),
+                        ("title", LeafKind::Fast(crate::builtins::bytes_title_fast)),
+                        (
+                            "swapcase",
+                            LeafKind::Fast(crate::builtins::bytes_swapcase_fast),
+                        ),
+                        (
+                            "isalnum",
+                            LeafKind::Fast(crate::builtins::bytes_isalnum_fast),
+                        ),
+                        (
+                            "isalpha",
+                            LeafKind::Fast(crate::builtins::bytes_isalpha_fast),
+                        ),
+                        (
+                            "isdigit",
+                            LeafKind::Fast(crate::builtins::bytes_isdigit_fast),
+                        ),
+                        (
+                            "isspace",
+                            LeafKind::Fast(crate::builtins::bytes_isspace_fast),
+                        ),
+                        (
+                            "islower",
+                            LeafKind::Fast(crate::builtins::bytes_islower_fast),
+                        ),
+                        (
+                            "isupper",
+                            LeafKind::Fast(crate::builtins::bytes_isupper_fast),
+                        ),
+                        ("split", LeafKind::Fast(crate::builtins::bytes_split_fast)),
+                        ("rsplit", LeafKind::Fast(crate::builtins::bytes_rsplit_fast)),
+                        (
+                            "replace",
+                            LeafKind::Fast(crate::builtins::bytes_replace_fast),
+                        ),
+                        (
+                            "splitlines",
+                            LeafKind::Fast(crate::builtins::bytes_splitlines_fast),
+                        ),
+                        (
+                            "expandtabs",
+                            LeafKind::Fast(crate::builtins::bytes_expandtabs_fast),
+                        ),
                     ],
                 ),
             ];

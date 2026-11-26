@@ -17860,6 +17860,84 @@ fn bytes_lower(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(bytes_like_result(args, out))
 }
 
+/// Whether a bytes or bytearray method's operands are plain data: the
+/// receiver, then bytes, bytearrays, ints, bools and `None`. Its body then
+/// reads them in place and runs no code (a buffer exporter's `__buffer__`,
+/// or an `__index__`, could), so a call site may run it as a leaf.
+fn bytes_plain_args(args: &[Object]) -> bool {
+    match args.split_first() {
+        Some((Object::Bytes(_) | Object::ByteArray(_), rest)) => rest.iter().all(|a| {
+            matches!(
+                a,
+                Object::Bytes(_)
+                    | Object::ByteArray(_)
+                    | Object::Int(_)
+                    | Object::Bool(_)
+                    | Object::None
+            )
+        }),
+        _ => false,
+    }
+}
+
+/// Leaf halves of the pure bytes and bytearray methods (see
+/// [`bytes_plain_args`]): the full body over plain operands, `None` for
+/// any other (the full call).
+macro_rules! bytes_leaf_halves {
+    ($($fast:ident => $body:ident),* $(,)?) => {$(
+        pub(crate) fn $fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+            bytes_plain_args(args).then(|| $body(args))
+        }
+    )*};
+}
+
+/// [`bytes_leaf_halves`] for a method that also takes keywords, called
+/// with positional operands only.
+macro_rules! bytes_leaf_halves_kw {
+    ($($fast:ident => $body:ident),* $(,)?) => {$(
+        pub(crate) fn $fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+            bytes_plain_args(args).then(|| $body(args, &[]))
+        }
+    )*};
+}
+
+bytes_leaf_halves! {
+    bytes_upper_fast => bytes_upper,
+    bytes_lower_fast => bytes_lower,
+    bytes_strip_fast => bytes_strip,
+    bytes_lstrip_fast => bytes_lstrip,
+    bytes_rstrip_fast => bytes_rstrip,
+    bytes_count_fast => bytes_count,
+    bytes_rfind_fast => bytes_rfind,
+    bytes_index_fast => bytes_index,
+    bytes_rindex_fast => bytes_rindex,
+    bytes_partition_fast => bytes_partition,
+    bytes_rpartition_fast => bytes_rpartition,
+    bytes_removeprefix_fast => bytes_removeprefix,
+    bytes_removesuffix_fast => bytes_removesuffix,
+    bytes_center_fast => bytes_center,
+    bytes_ljust_fast => bytes_ljust,
+    bytes_rjust_fast => bytes_rjust,
+    bytes_zfill_fast => bytes_zfill,
+    bytes_capitalize_fast => bytes_capitalize,
+    bytes_title_fast => bytes_title,
+    bytes_swapcase_fast => bytes_swapcase,
+    bytes_isalnum_fast => bytes_isalnum,
+    bytes_isalpha_fast => bytes_isalpha,
+    bytes_isdigit_fast => bytes_isdigit,
+    bytes_isspace_fast => bytes_isspace,
+    bytes_islower_fast => bytes_islower,
+    bytes_isupper_fast => bytes_isupper,
+}
+
+bytes_leaf_halves_kw! {
+    bytes_split_fast => bytes_split_kw,
+    bytes_rsplit_fast => bytes_rsplit_kw,
+    bytes_replace_fast => bytes_replace_kw,
+    bytes_splitlines_fast => bytes_splitlines_kw,
+    bytes_expandtabs_fast => bytes_expandtabs,
+}
+
 fn bytes_upper(args: &[Object]) -> Result<Object, RuntimeError> {
     bytes_no_args("upper", args)?;
     let out: Vec<u8> = bytes_data(args)?
