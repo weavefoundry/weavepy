@@ -3331,6 +3331,15 @@ branch and pull request.
     `attrgetter`'s fast half also reads its name without cloning the
     getter's tuple (the 50-object map over plain objects 37,072 to
     32,872 instructions under callgrind).
+  - Iterating an object that defines only `__getitem__` (the legacy
+    sequence protocol) goes through the frozen `_seqtools._SeqIter`,
+    whose `__next__` catches `IndexError`, so every item ran two full
+    Python frames (3,917 instructions an item, CPython 801). The
+    frameless iterator step now recognizes that class, unchanged since
+    it was made, and evaluates the sequence's `__getitem__` as a pure
+    leaf with the index, ending the loop at its bare `raise IndexError`
+    or `raise StopIteration` and dropping the sequence as CPython's
+    iterator does (1,311 an item).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

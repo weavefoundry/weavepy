@@ -1092,6 +1092,9 @@ pub struct Interpreter {
     /// ahead of the raise may land (not when the caller then runs the
     /// full call to raise the exception, which would repeat them).
     pub(crate) leaf_stop: std::cell::Cell<(usize, usize, bool)>,
+    /// Whether that step also ends at a bare `raise IndexError` (a
+    /// legacy `__getitem__` sequence's step, see `seqiter_step`).
+    pub(crate) leaf_stop_index: std::cell::Cell<bool>,
     /// The last builtin [`Interpreter::leaf_call_kind`] found a leaf kind
     /// for, the registry generation it looked under, and the kind. The weak
     /// handle keeps the address from being reused while it is remembered.
@@ -1361,6 +1364,7 @@ impl Default for Interpreter {
             )),
             leaf_miss: std::cell::Cell::new((0, 0)),
             leaf_stop: std::cell::Cell::new((0, 0, false)),
+            leaf_stop_index: std::cell::Cell::new(false),
             leaf_hit: std::cell::RefCell::new(None),
             core_next: ThreadCell::new(None),
             core_truth: ThreadCell::new(None),
@@ -1524,6 +1528,7 @@ impl Interpreter {
             )),
             leaf_miss: std::cell::Cell::new((0, 0)),
             leaf_stop: std::cell::Cell::new((0, 0, false)),
+            leaf_stop_index: std::cell::Cell::new(false),
             leaf_hit: std::cell::RefCell::new(None),
             core_next: ThreadCell::new(None),
             core_truth: ThreadCell::new(None),
@@ -35560,6 +35565,11 @@ impl Interpreter {
         ends_land: bool,
     ) -> Option<Option<Object>> {
         use crate::types::{vm_key, AttrKey};
+        // The legacy sequence protocol's iterator (`iter(seq)` of a class
+        // with only `__getitem__`): its sequence's `__getitem__`, frameless.
+        if is_plain_seqiter(inst) {
+            return self.seqiter_step(inst);
+        }
         let f = Self::instance_dunder_function(inst, AttrKey::vm(vm_key::NEXT_FN), "__next__")?;
         let code = f.code();
         if code.arg_count != 1 || !pure_leaf_warm(&code) {
@@ -35584,13 +35594,82 @@ impl Interpreter {
                 ends_land,
             )
         };
-        let saved = self.leaf_stop.replace(stop);
+        let saved = (
+            self.leaf_stop.replace(stop),
+            self.leaf_stop_index.replace(false),
+        );
         let r = self.pure_leaf_call(&code, &f, &[std::ptr::from_ref(it)], !pure, depth);
-        self.leaf_stop.set(saved);
+        self.leaf_stop.set(saved.0);
+        self.leaf_stop_index.set(saved.1);
         match r {
             Some(Object::Unbound) => Some(None),
             r => r.map(Some),
         }
+    }
+
+    /// One step of `_seqtools._SeqIter` (`inst`), as its `__next__` takes
+    /// it, when its sequence is an instance whose class's `__getitem__` is
+    /// a warm pure leaf: the item at the iterator's index (the index
+    /// advanced), or the end at the body's bare `raise IndexError` or
+    /// `raise StopIteration` (the sequence then dropped, as CPython's
+    /// `seqiterobject` clears it). `None`, nothing done, for anything else.
+    fn seqiter_step(&self, inst: &PyInstance) -> Option<Option<Object>> {
+        use crate::types::{vm_key, AttrKey};
+        // SAFETY: a view that ends before anything runs.
+        let (seq, index) = {
+            let slots = unsafe { inst.slots.peek() }?;
+            let seq = slots.get_hinted(0, "_seq")?.clone();
+            let Object::Int(i) = *slots.get_hinted(1, "_index")? else {
+                return None;
+            };
+            (seq, i)
+        };
+        let Object::Instance(sinst) = &seq else {
+            return None;
+        };
+        if index == i64::MAX || sinst.native.get().is_some() {
+            return None;
+        }
+        let f =
+            Self::instance_dunder_function(sinst, AttrKey::vm(vm_key::GETITEM_FN), "__getitem__")?;
+        let code = f.code();
+        if code.arg_count != 2 || !pure_leaf_warm(&code) || !code_is_pure_leaf(&code) {
+            return None;
+        }
+        let depth = crate::recursion::current_depth();
+        if depth >= crate::recursion::recursion_limit() || crate::trace::any_observers_active() {
+            return None;
+        }
+        let at = Object::Int(index);
+        let stop = (
+            Rc::as_ptr(&code) as usize,
+            std::ptr::from_ref(&seq) as usize,
+            true,
+        );
+        let saved = (
+            self.leaf_stop.replace(stop),
+            self.leaf_stop_index.replace(true),
+        );
+        let r = self.pure_leaf_call(
+            &code,
+            &f,
+            &[std::ptr::from_ref(&seq), std::ptr::from_ref(&at)],
+            false,
+            depth,
+        );
+        self.leaf_stop.set(saved.0);
+        self.leaf_stop_index.set(saved.1);
+        let r = r?;
+        // SAFETY: as above (the pure body ran no code).
+        let slots = unsafe { inst.slots.peek_mut() }?;
+        if matches!(r, Object::Unbound) {
+            let s = slots.get_hinted_mut(0, "_seq")?;
+            drop(std::mem::replace(s, Object::None));
+            drop(seq);
+            return Some(None);
+        }
+        *slots.get_hinted_mut(1, "_index")? = Object::Int(index + 1);
+        Some(Some(r))
     }
 
     /// `next(it)` or `next(it, default)` (the builtin's leaf operands) of
@@ -53987,6 +54066,9 @@ impl Interpreter {
                 .cloned(),
             _ => None,
         };
+        if let Some(Object::Type(t)) = &cls {
+            note_seqiter_class(t);
+        }
         match cls {
             Some(cls) => Ok(Some(self.call(
                 &cls,
@@ -83796,6 +83878,32 @@ fn note_instance_getattr(cls: &TypeObject, name: &str, kind: InstGetattrClass) {
             kind,
         });
     });
+}
+
+/// `_seqtools._SeqIter` as [`Interpreter::make_seq_iterator`] last found
+/// it: the class's address and its attribute version then (unique in the
+/// process, so a patched or a different class at the address never
+/// matches).
+static SEQITER_CLASS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static SEQITER_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_seqiter_class(t: &Rc<TypeObject>) {
+    use std::sync::atomic::Ordering;
+    let ver = t.attr_version.get();
+    if ver != 0 {
+        SEQITER_VERSION.store(ver, Ordering::Relaxed);
+        SEQITER_CLASS.store(Rc::as_ptr(t) as usize, Ordering::Relaxed);
+    }
+}
+
+/// Whether `inst` is a `_SeqIter` of the class [`note_seqiter_class`]
+/// noted, unchanged since.
+#[inline]
+fn is_plain_seqiter(inst: &PyInstance) -> bool {
+    use std::sync::atomic::Ordering;
+    let cls = inst.cls_raw();
+    std::ptr::from_ref(cls) as usize == SEQITER_CLASS.load(Ordering::Relaxed)
+        && cls.attr_version.get() == SEQITER_VERSION.load(Ordering::Relaxed)
 }
 
 /// Whether `inst.name` is a `__slots__` member of its class (the data

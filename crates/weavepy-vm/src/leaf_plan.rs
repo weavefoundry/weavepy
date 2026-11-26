@@ -1255,8 +1255,10 @@ pub(super) fn stop_ends_step(
         return false;
     };
     // SAFETY: as `norm`.
+    // (A legacy sequence's `__getitem__` ends at `IndexError` too.)
     matches!(unsafe { &*p }, Object::Type(t)
-        if t.flags.is_builtin && t.name.as_str() == "StopIteration")
+        if t.flags.is_builtin && (t.name.as_str() == "StopIteration"
+            || (interp.leaf_stop_index.get() && t.name.as_str() == "IndexError")))
 }
 
 /// The value of `f`'s closure cell `idx`, borrowed: nothing an evaluation
