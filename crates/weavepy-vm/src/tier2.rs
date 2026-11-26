@@ -10339,6 +10339,24 @@ fn seq_scalar_step(cell: &Rc<GilRefCell<PyIterator>>, elem_tag: i64) -> Option<u
     // runs (reading an element and packing its bits run no code).
     let it = unsafe { cell.peek_mut()? };
     match it {
+        // A range's next int either way (a counted loop the compiler left
+        // opaque: `range(n, -1, -1)`, `reversed(range(n))`); its end is the
+        // general step's.
+        PyIterator::Range {
+            current,
+            stop,
+            step,
+        } if lane == JitType::Int
+            && (if *step > 0 {
+                *current < *stop
+            } else {
+                *step < 0 && *current > *stop
+            }) =>
+        {
+            let v = *current;
+            *current = current.wrapping_add(*step);
+            pack(&Object::Int(v), lane)
+        }
         PyIterator::Tuple { items, index } => {
             let bits = pack(items.get(*index)?, lane)?;
             *index += 1;

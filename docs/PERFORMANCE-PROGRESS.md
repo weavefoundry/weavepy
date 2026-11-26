@@ -3370,6 +3370,14 @@ branch and pull request.
     the groupby's current value, as the item-by-item steps leave it
     (`[(k, len(list(g))) for k, g in groupby(xs)]` over 50 items 1.99 to
     1.68 times CPython).
+  - A loop over a descending range stepped through the general helpers:
+    the frame JIT's in-place step took only positive steps, and tier 2's
+    opaque-iterator step had no range case. Both now step a range either
+    way (`for i in reversed(range(50))` 1.61 to 0.96 times CPython;
+    `for i in range(49, -1, -1)`, which tier 2 doesn't count natively,
+    3.00 to 1.65). A frameless evaluation also raises an int to a power
+    below 64 (`min(xs, key=lambda x: (x - 25) ** 2)` declined to a full
+    call for every item: 2.07 to 0.62).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

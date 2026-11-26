@@ -1918,6 +1918,8 @@ pub(crate) fn binary(a: V, b: V, kind: u8) -> Option<V> {
             }
             k if k == BinOpKind::FloorDiv as u8 && b > 0 && a >= 0 => a / b,
             k if k == BinOpKind::Mod as u8 && b > 0 && a >= 0 => a % b,
+            // (A negative exponent gives a float: the full arm's.)
+            k if k == BinOpKind::Pow as u8 && (0..64).contains(&b) => a.checked_pow(b as u32)?,
             _ => return None,
         }),
         (x, y) => {

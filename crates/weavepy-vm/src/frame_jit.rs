@@ -2809,7 +2809,7 @@ unsafe extern "C" fn h_for_iter(st: *mut State, it: *mut Object, out: *mut Objec
                         current,
                         stop,
                         step,
-                    } if *step > 0 && *current < *stop => {
+                    } if (*step > 0 && *current < *stop) || (*step < 0 && *current > *stop) => {
                         (*st).out = *current as u64;
                         *current = current.wrapping_add(*step);
                         return 0;
