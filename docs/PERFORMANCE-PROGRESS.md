@@ -3231,6 +3231,20 @@ branch and pull request.
     `getvalue` and in-place writes read the buffer through views (on
     Linux 3,231 to 3,014 for a create, two writes and a `getvalue`).
     The leaf JIT's builtin calls copy their arguments once.
+  - A class attribute read through an instance (`self.LIMIT`) went to
+    the compiled code's slow attribute helper before the class memo
+    answered it (1.38 times CPython for an int), and a module value was
+    never memoized at all (`pathlib`'s `self.parser`, read several times
+    in every path operation, 2.2 times). Modules, ranges, complex
+    numbers and bytearrays are now memoized as plain values, and the
+    fast helpers consult the memo once the field caches miss: both reads
+    are about level with CPython (265 to 311 instructions, CPython about
+    280). `list(enumerate(gen))` collects the generator as `list(gen)`
+    does and numbers the items (8,264 against CPython's 5,893, from
+    12,081). `sum`, `min`, `max`, `any`, `all`, `list` and `tuple` of an
+    iterable the interpreter steps skip about fifty name comparisons in
+    the call dispatcher, and a drain of an adapter over a generator no
+    longer tries a pure step that can't succeed.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

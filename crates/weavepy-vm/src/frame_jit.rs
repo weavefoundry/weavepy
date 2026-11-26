@@ -10369,12 +10369,15 @@ unsafe extern "C" fn h_attr_local(st: *mut State, site: *const AttrSite) -> u32 
         let s = &*site;
         let at = (*st).locals.add(s.local as usize);
         let v = match &*at {
-            Object::Instance(inst) => field_hit(s, inst),
-            Object::Module(_) => attr_hit(s, &*at),
+            // (Or a class attribute the site memoized, as `h_attr_stack`.)
+            Object::Instance(inst) => field_hit(s, inst)
+                .map(crate::clone_hot)
+                .or_else(|| class_poly_hit(s, inst)),
+            Object::Module(_) => attr_hit(s, &*at).map(crate::clone_hot),
             _ => None,
         };
         if let Some(v) = v {
-            (*st).stack.add(s.slot as usize).write(crate::clone_hot(v));
+            (*st).stack.add(s.slot as usize).write(v);
             return 0;
         }
         attr_local_slow(st, site)
@@ -10554,9 +10557,12 @@ unsafe extern "C" fn h_attr_stack(st: *mut State, site: *const AttrSite) -> u32 
         let s = &*site;
         let at = (*st).stack.add(s.slot as usize);
         let v = match &*at {
+            // (Or a class attribute the site memoized for the class, which
+            // the instance doesn't shadow: `self.LIMIT`.)
             Object::Instance(inst) => field_hit(s, inst)
                 .or_else(|| slot_field_hit(s, inst))
-                .map(crate::clone_hot),
+                .map(crate::clone_hot)
+                .or_else(|| class_poly_hit(s, inst)),
             // A class's constant the site memoized (`Direction.FORWARD`).
             Object::Type(cls) => type_attr_memo(s, cls),
             // A module's value the site noted (`os.path`).
@@ -10773,8 +10779,9 @@ fn class_poly_prove(site: &AttrSite, inst: &crate::types::PyInstance, code: &Cod
 /// `site`'s code is live.
 unsafe fn class_poly_note(site: &AttrSite, inst: &crate::types::PyInstance, v: &Object) {
     // (Values a read through an instance gives back as they are: plain
-    // data, or an object or class whose type has no `__get__`, such as a
-    // compiled pattern a class keeps.)
+    // data, a module (`pathlib`'s `self.parser`), or an object or class
+    // whose type has no `__get__`, such as a compiled pattern a class
+    // keeps.)
     let plain = match v {
         Object::Str(_)
         | Object::Int(_)
@@ -10782,6 +10789,10 @@ unsafe fn class_poly_note(site: &AttrSite, inst: &crate::types::PyInstance, v: &
         | Object::Bool(_)
         | Object::None
         | Object::Bytes(_)
+        | Object::ByteArray(_)
+        | Object::Complex(_)
+        | Object::Range(_)
+        | Object::Module(_)
         | Object::Tuple(_)
         | Object::FrozenSet(_)
         | Object::List(_)
