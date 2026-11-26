@@ -239,6 +239,49 @@ impl Interpreter {
         out: &mut Vec<Object>,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<bool, RuntimeError> {
+        // `enumerate` over a generator (`list(enumerate(gen))`): the
+        // generator's items taken as `list(gen)` takes them (its yields
+        // folded straight into a vector rather than a resume each), then
+        // numbered. The count moves past every item taken, a raise
+        // included, as stepping it item by item moves it.
+        // SAFETY: a read that runs no code, ending with the match.
+        let gen_source = match unsafe { l.state.peek() } {
+            Some(LazyIterKind::Enumerate {
+                source: Object::Generator(g),
+                count,
+                count_big: None,
+            }) if *count <= i64::MAX >> 1 => Some((g.clone(), *count)),
+            _ => None,
+        };
+        if let Some((g, start)) = gen_source {
+            let mut items = Vec::new();
+            let r = match self.gen_fast_collect(&g, &mut items) {
+                Some(v) => {
+                    drop(v);
+                    Ok(())
+                }
+                None => loop {
+                    let sink = crate::FoldSink::Collect(std::ptr::from_mut(&mut items));
+                    match self.gen_drain_next(&g, Some(sink), false) {
+                        Ok(Some(x)) => items.push(x),
+                        Ok(None) => break Ok(()),
+                        Err(e) => break Err(e),
+                    }
+                },
+            };
+            // (A vector's length is below `i64::MAX >> 1`, so the count
+            // stays a machine int.)
+            let end = start + items.len() as i64;
+            // SAFETY: as above; nothing runs code while the count moves.
+            if let Some(LazyIterKind::Enumerate { count, .. }) = unsafe { l.state.peek_mut() } {
+                *count = end;
+            }
+            out.reserve(items.len());
+            for (i, x) in (start..).zip(items) {
+                out.push(Object::new_tuple_array([Object::Int(i), x]));
+            }
+            return r.map(|()| true);
+        }
         // (The adapter's kind read once, each bulk path tried only for its
         // own.)
         // SAFETY: a read that runs no code, ending with the match.
