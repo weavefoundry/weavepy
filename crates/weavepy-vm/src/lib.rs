@@ -34758,6 +34758,7 @@ impl Interpreter {
                         ("copy", LeafKind::ListCopy),
                         ("remove", LeafKind::ListRemove),
                         ("sort", LeafKind::Fast(crate::seqiter::list_sort_fast)),
+                        ("clear", LeafKind::Fast(crate::builtins::list_clear_leaf)),
                     ],
                 ),
                 (
@@ -50241,6 +50242,11 @@ impl Interpreter {
     ) -> Result<Vec<Object>, RuntimeError> {
         if let Some(items) = crate::object::collect_small_int_range(v) {
             return items;
+        }
+        // A `str`'s characters (`list("abc")`, `set(word)`), each made as
+        // its iterator makes it, with no iterator stepped.
+        if let Object::Str(s) = v {
+            return Ok(s.chars().map(Object::from_char).collect());
         }
         if let Some(items) = crate::stdlib::struct_mod::array_items(v) {
             return Ok(items);
@@ -66005,14 +66011,19 @@ impl Interpreter {
         if !ty.flags.is_builtin {
             return None;
         }
+        let bt = builtin_types();
         // A struct sequence from a tuple or list (`os.terminal_size((80,
-        // 24))`), filled directly.
-        if matches!(arg, Object::Tuple(_) | Object::List(_)) {
+        // 24))`), filled directly. (The core containers aren't: their
+        // calls skip the registry scan.)
+        if matches!(arg, Object::Tuple(_) | Object::List(_))
+            && ![&bt.list_, &bt.tuple_, &bt.dict_, &bt.set_, &bt.frozenset_]
+                .iter()
+                .any(|c| Rc::ptr_eq(ty, c))
+        {
             if let Some(v) = crate::stdlib::os::struct_seq_from_sequence(ty, arg) {
                 return Some(Ok(v));
             }
         }
-        let bt = builtin_types();
         // `str(x)`: `x`'s `__str__` (see `type_call_default`).
         if Rc::ptr_eq(ty, &bt.str_) {
             let globals = self.builtins.clone();

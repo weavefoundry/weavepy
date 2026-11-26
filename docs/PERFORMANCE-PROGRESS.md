@@ -3253,6 +3253,15 @@ branch and pull request.
     memo now keeps the class's own entry for these too and binds or
     unwraps it on each read: 717, 325, and a plain method read 1,280 to
     590 (CPython 642).
+  - Every `list(xs)`, `tuple(xs)`, `dict(pairs)` or `set(xs)` of a list
+    or tuple first scanned the registry of struct sequence types (about
+    150 instructions); the core containers now skip it. `bool(x)` found
+    its constructor arm after a dozen other classes' and now finds it
+    first; `list("hello")` and `set("hello")` collect the characters
+    directly (3,074 to 2,129 and 3,286 to 2,727, CPython 1,698 and
+    1,789); `dict.fromkeys(range(n))` builds in place where it left
+    compiled code on every call (8,543 to 2,901, CPython 3,353); and
+    `xs.clear()` of plain items runs as a leaf.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

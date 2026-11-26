@@ -3049,6 +3049,26 @@ fn int_subclass_value(
 /// registers it on.
 pub(crate) fn builtin_ctor_arms(cls: &Rc<TypeObject>, args: &[Object]) -> Option<Object> {
     let bt = builtin_types();
+    // `bool(x)` of a plain value or exact container, ahead of the other
+    // classes' arms.
+    if let ([x], true) = (args, Rc::ptr_eq(cls, &bt.bool_)) {
+        return match x {
+            Object::Int(i) => Some(Object::Bool(*i != 0)),
+            Object::Float(f) => Some(Object::Bool(*f != 0.0)),
+            Object::Bool(b) => Some(Object::Bool(*b)),
+            Object::None => Some(Object::Bool(false)),
+            Object::Str(s) => Some(Object::Bool(!s.is_empty())),
+            // An exact container is true when it holds anything
+            // (`bool(items)`, as `if items:` reads it).
+            Object::Bytes(b) => Some(Object::Bool(!b.is_empty())),
+            Object::Tuple(t) => Some(Object::Bool(!t.is_empty())),
+            Object::List(l) => Some(Object::Bool(!l.try_borrow().ok()?.is_empty())),
+            Object::Dict(d) => Some(Object::Bool(!d.try_borrow().ok()?.is_empty())),
+            Object::Set(s) => Some(Object::Bool(!s.try_borrow().ok()?.is_empty())),
+            Object::FrozenSet(s) => Some(Object::Bool(s.iter().next().is_some())),
+            _ => None,
+        };
+    }
     // `float(x)` and `int(x)` of a plain number or a well-formed `str`
     // (a malformed one raises through the full constructor).
     if Rc::ptr_eq(cls, &bt.float_) {
@@ -3259,24 +3279,6 @@ pub(crate) fn builtin_ctor_arms(cls: &Rc<TypeObject>, args: &[Object]) -> Option
                 _ => None,
             };
         }
-        if Rc::ptr_eq(cls, &bt.bool_) {
-            return match x {
-                Object::Int(i) => Some(Object::Bool(*i != 0)),
-                Object::Float(f) => Some(Object::Bool(*f != 0.0)),
-                Object::Bool(b) => Some(Object::Bool(*b)),
-                Object::None => Some(Object::Bool(false)),
-                Object::Str(s) => Some(Object::Bool(!s.is_empty())),
-                // An exact container is true when it holds anything
-                // (`bool(items)`, as `if items:` reads it).
-                Object::Bytes(b) => Some(Object::Bool(!b.is_empty())),
-                Object::Tuple(t) => Some(Object::Bool(!t.is_empty())),
-                Object::List(l) => Some(Object::Bool(!l.try_borrow().ok()?.is_empty())),
-                Object::Dict(d) => Some(Object::Bool(!d.try_borrow().ok()?.is_empty())),
-                Object::Set(s) => Some(Object::Bool(!s.try_borrow().ok()?.is_empty())),
-                Object::FrozenSet(s) => Some(Object::Bool(s.iter().next().is_some())),
-                _ => None,
-            };
-        }
         if Rc::ptr_eq(cls, &bt.str_) {
             return match x {
                 Object::Int(i) => Some(Object::from_str(i.to_string())),
@@ -3332,7 +3334,7 @@ pub(crate) fn builtin_ctor_arms(cls: &Rc<TypeObject>, args: &[Object]) -> Option
     }
     // `set(xs)` and `frozenset(xs)` of an exact list or tuple of plain
     // hashable values: no element's hash or comparison runs any code.
-    if let [src @ (Object::List(_) | Object::Tuple(_))] = args {
+    if let [src @ (Object::List(_) | Object::Tuple(_) | Object::Str(_))] = args {
         let frozen = Rc::ptr_eq(cls, &bt.frozenset_);
         if frozen || Rc::ptr_eq(cls, &bt.set_) {
             if crate::stdlib::tracemalloc_real::is_tracking() || crate::gc_trace::auto_collect_due()
@@ -3340,11 +3342,17 @@ pub(crate) fn builtin_ctor_arms(cls: &Rc<TypeObject>, args: &[Object]) -> Option
                 return None;
             }
             let borrowed;
+            let chars: Vec<Object>;
             let items: &[Object] = match src {
                 Object::Tuple(t) => t,
                 Object::List(l) => {
                     borrowed = l.try_borrow().ok()?;
                     &borrowed
+                }
+                // (A short `str`'s characters: `set(word)`.)
+                Object::Str(t) if t.len() <= 64 => {
+                    chars = t.chars().map(Object::from_char).collect();
+                    &chars
                 }
                 _ => return None,
             };

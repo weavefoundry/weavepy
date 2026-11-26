@@ -8064,6 +8064,10 @@ fn simple_key_set(src: &Object) -> Option<crate::object::SetData> {
     match src {
         Object::List(l) => build(&l.try_borrow().ok()?),
         Object::Tuple(t) => build(t),
+        // A short `str`'s characters (`set(word)`).
+        Object::Str(s) if s.len() <= 256 => {
+            build(&s.chars().map(Object::from_char).collect::<Vec<_>>())
+        }
         // A set's or frozenset's own table, hashes and all; a dict's keys
         // with their stored hashes (each differs from the rest, so none is
         // hashed or compared).
@@ -14991,6 +14995,32 @@ fn list_reverse(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::None)
 }
 
+/// `xs.clear()`'s leaf half: an exact list whose items are all plain
+/// scalars, strings or bytes (their release runs no code). `None` for
+/// anything else, which the full call clears.
+pub(crate) fn list_clear_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::List(l)] = args else {
+        return None;
+    };
+    let mut items = l.try_borrow_mut().ok()?;
+    let plain = items.iter().all(|x| {
+        matches!(
+            x,
+            Object::Int(_)
+                | Object::Float(_)
+                | Object::Bool(_)
+                | Object::None
+                | Object::Str(_)
+                | Object::Bytes(_)
+        )
+    });
+    if !plain {
+        return None;
+    }
+    items.clear();
+    Some(Ok(Object::None))
+}
+
 fn list_clear(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() != 1 {
         return Err(type_error("clear() takes no arguments (1 given)"));
@@ -15571,6 +15601,27 @@ pub(crate) fn dict_fromkeys_leaf(args: &[Object]) -> Option<Result<Object, Runti
             m.try_borrow().ok()?.iter().map(|k| k.0.clone()).collect()
         }
         Object::FrozenSet(m) if m.len() <= 64 => m.iter().map(|k| k.0.clone()).collect(),
+        // A short range of machine ints (`dict.fromkeys(range(n))`).
+        Object::Range(r) if r.big.is_none() => {
+            let (start, stop, step) = (
+                i128::from(i64::try_from(r.start).ok()?),
+                i128::from(i64::try_from(r.stop).ok()?),
+                i128::from(i64::try_from(r.step).ok()?),
+            );
+            let n = if step > 0 && start < stop {
+                (stop - start + step - 1) / step
+            } else if step < 0 && start > stop {
+                (start - stop - step - 1) / -step
+            } else {
+                0
+            };
+            if n > 64 {
+                return None;
+            }
+            (0..n)
+                .map(|k| Object::Int((start + k * step) as i64))
+                .collect()
+        }
         _ => return None,
     };
     let mut d = DictData::default();
