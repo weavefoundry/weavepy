@@ -3274,6 +3274,11 @@ branch and pull request.
     3,404, CPython 924). `OrderedDict` equality compares plain keys'
     order natively (still 7 times CPython: its `__eq__` is a Python method
     that isn't a leaf, so the comparison leaves compiled code).
+    `key in chainmap` left compiled code at every test, though
+    `ChainMap.__contains__` is native; over exact dicts it is now decided
+    in place (3,887 to 983, CPython 1,550). `itertools.chain`'s bulk drain
+    takes `str` sources (`list(chain([1], (2,), "ab"))` 7,749 to 4,611,
+    CPython 4,125).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

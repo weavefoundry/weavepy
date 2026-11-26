@@ -1480,6 +1480,50 @@ fn chainmap_maps_of(inst: &crate::types::PyInstance) -> Option<Rc<RefCell<Vec<Ob
     }
 }
 
+/// The native `ChainMap.__contains__` builtin's address, for
+/// [`chainmap_contains_fast`]'s check.
+static CHAINMAP_CONTAINS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `key in chainmap` when the class keeps the native `__contains__`, its
+/// `maps` is the instance's own list of exact dicts, and the key settles by
+/// native equality (see `LeafProbe`): found in any map. `None` (nothing
+/// decided) for anything else, which the full path answers.
+pub(crate) fn chainmap_contains_fast(
+    inst: &crate::types::PyInstance,
+    key: &Object,
+) -> Option<bool> {
+    let want = CHAINMAP_CONTAINS.load(std::sync::atomic::Ordering::Relaxed);
+    if want == 0 {
+        return None;
+    }
+    let cls = inst.cls_raw();
+    match cls.lookup("__contains__") {
+        Some(Object::Builtin(b)) if Rc::as_ptr(&b) as usize == want => {}
+        _ => return None,
+    }
+    if cls.lookup("maps").is_some() {
+        return None;
+    }
+    let maps = chainmap_maps_of(inst)?;
+    let probe = crate::object::LeafProbe::new(key)?;
+    // SAFETY: views that run no code (native probes), ending with this call.
+    let ms = unsafe { maps.peek() }?;
+    for m in ms.iter() {
+        let Object::Dict(d) = m else {
+            return None;
+        };
+        // SAFETY: as above.
+        let dd = unsafe { d.peek() }?;
+        if dd.get_index_of(&probe).is_some() {
+            return Some(true);
+        }
+        if !probe.miss_is_exact() {
+            return None;
+        }
+    }
+    Some(false)
+}
+
 /// [`chainmap_getitem`]'s leaf half (see `leaf_builtins::Fast`): a plain
 /// key found by exact native equality in a list of exact dicts held in
 /// the instance's own `maps` attribute. A key no map holds (the
@@ -2501,6 +2545,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         );
         if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static("dd_missing"))) {
             DD_MISSING.store(Rc::as_ptr(b) as usize, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static("chainmap_contains")))
+        {
+            CHAINMAP_CONTAINS.store(Rc::as_ptr(b) as usize, std::sync::atomic::Ordering::Relaxed);
         }
         // The deque iterators' steps, as leaves (`list(dq)`, `for x in dq`).
         for (key, fast) in [

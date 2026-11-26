@@ -2536,6 +2536,8 @@ fn chain_drain(l: &PyLazyIter, out: &mut Vec<Object>) -> bool {
                 out.extend_from_slice(items.get(from..).unwrap_or(&[]));
             }
             Object::Tuple(items) => out.extend_from_slice(items.get(from..).unwrap_or(&[])),
+            // A `str`'s characters (`chain(xs, "ab")`), from the start.
+            Object::Str(t) if from == 0 => out.extend(t.chars().map(Object::from_char)),
             // A `range` of machine ints (`chain(range(a), range(b))`).
             Object::Range(r) if from == 0 && r.big.is_none() => {
                 let (start, stop, step) = (

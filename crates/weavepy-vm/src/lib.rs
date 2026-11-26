@@ -32982,6 +32982,12 @@ impl Interpreter {
                 ) {
                     return Self::leaf_contains(native, item);
                 }
+                // A `ChainMap` over exact dicts (its native `__contains__`).
+                if let Some(found) =
+                    crate::stdlib::collections_native::chainmap_contains_fast(inst, item)
+                {
+                    return Some(found);
+                }
                 let f = Self::instance_dunder_function(
                     inst,
                     crate::types::AttrKey::vm(crate::types::vm_key::CONTAINS),
