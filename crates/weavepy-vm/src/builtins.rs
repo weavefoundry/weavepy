@@ -14709,13 +14709,33 @@ fn list_remove(args: &[Object]) -> Result<Object, RuntimeError> {
 pub(crate) fn list_scan_native(
     list: &Object,
     needle: &Object,
+    f: impl FnMut(usize) -> bool,
+) -> Option<()> {
+    list_scan_native_in(list, needle, None, f)
+}
+
+/// [`list_scan_native`] over the items from `bounds`' start (inclusive)
+/// to its stop (exclusive), as `list.index(x, start, stop)` adjusts them
+/// (negative counts from the end, both clamped to the list): ints only.
+fn list_scan_native_in(
+    list: &Object,
+    needle: &Object,
+    bounds: Option<(&Object, Option<&Object>)>,
     mut f: impl FnMut(usize) -> bool,
 ) -> Option<()> {
     let Object::List(l) = list else {
         return None;
     };
     let items = l.try_borrow().ok()?;
-    for (i, x) in items.iter().enumerate() {
+    let len = items.len() as i64;
+    let adjust = |v: i64| if v < 0 { (v + len).max(0) } else { v.min(len) };
+    let (start, stop) = match bounds {
+        None => (0, items.len()),
+        Some((Object::Int(a), None)) => (adjust(*a) as usize, items.len()),
+        Some((Object::Int(a), Some(Object::Int(b)))) => (adjust(*a) as usize, adjust(*b) as usize),
+        Some(_) => return None,
+    };
+    for (i, x) in items.iter().enumerate().take(stop).skip(start) {
         let eq = match (x, needle) {
             (Object::Int(a), Object::Int(b)) => a == b,
             (Object::Str(a), Object::Str(b)) => a == b,
@@ -14732,9 +14752,21 @@ fn list_index(args: &[Object]) -> Result<Object, RuntimeError> {
     if args.len() < 2 {
         return Err(type_error("list.index() expected at least 1 argument"));
     }
-    if let [list, needle] = args {
+    if args.len() > 4 {
+        return Err(type_error(format!(
+            "index expected at most 3 arguments, got {}",
+            args.len() - 1
+        )));
+    }
+    let native = match args {
+        [list, needle] => Some((list, needle, None)),
+        [list, needle, a] => Some((list, needle, Some((a, None)))),
+        [list, needle, a, b] => Some((list, needle, Some((a, Some(b))))),
+        _ => None,
+    };
+    if let Some((list, needle, bounds)) = native {
         let mut found = None;
-        if list_scan_native(list, needle, |i| {
+        if list_scan_native_in(list, needle, bounds, |i| {
             found = Some(i);
             false
         })
