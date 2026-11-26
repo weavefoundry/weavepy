@@ -93,10 +93,46 @@ pub(crate) fn compare(a: V, b: V, kind: CompareKind) -> Option<bool> {
         // the evaluator's scratch; no Python runs.
         (V::R(p), V::R(q)) => match (unsafe { &*p }, unsafe { &*q }) {
             (Object::Str(s), Object::Str(t)) => (**s).cmp(&**t),
+            (Object::Tuple(s), Object::Tuple(t)) => return tuple_compare(s, t, kind),
             _ => return None,
         },
         _ => return None,
     };
+    Some(match kind {
+        CompareKind::Lt => ord.is_lt(),
+        CompareKind::LtE => ord.is_le(),
+        CompareKind::Eq => ord.is_eq(),
+        CompareKind::NotEq => ord.is_ne(),
+        CompareKind::Gt => ord.is_gt(),
+        CompareKind::GtE => ord.is_ge(),
+    })
+}
+
+/// `s <op> t` for two tuples, as CPython's tuple comparison takes it: the
+/// first pair of items that differ (identity first, then `==`) decides,
+/// else the lengths do. Only items [`compare`] settles take part (scalars
+/// and strings, a nested tuple declining), so nothing runs.
+fn tuple_compare(s: &[Object], t: &[Object], kind: CompareKind) -> Option<bool> {
+    for (x, y) in s.iter().zip(t) {
+        if std::ptr::eq(x, y) {
+            continue;
+        }
+        let (vx, vy) = (norm(x), norm(y));
+        if let (V::R(px), V::R(py)) = (vx, vy) {
+            // SAFETY: items of live tuples, with nothing running.
+            if !matches!(unsafe { (&*px, &*py) }, (Object::Str(_), Object::Str(_))) {
+                return None;
+            }
+        }
+        if !compare(vx, vy, CompareKind::Eq)? {
+            return match kind {
+                CompareKind::Eq => Some(false),
+                CompareKind::NotEq => Some(true),
+                _ => compare(vx, vy, kind),
+            };
+        }
+    }
+    let ord = s.len().cmp(&t.len());
     Some(match kind {
         CompareKind::Lt => ord.is_lt(),
         CompareKind::LtE => ord.is_le(),

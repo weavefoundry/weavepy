@@ -37373,6 +37373,21 @@ impl Interpreter {
         {
             return Some(Object::Type(inst.cls()));
         }
+        // A `__slots__` member (a data descriptor no instance dictionary
+        // shadows) whose site the interpreter never specialized (a body
+        // the frame JIT runs): its stored value; unset, the full path's
+        // `AttributeError`.
+        if let Some(name) = code.names.get(name_idx as usize) {
+            // (A class key's `__eq__` could run during the lookup.)
+            if inst.native.get().is_none()
+                && !crate::object::exotic_str_keys_possible()
+                && slot_member_class(inst.cls_raw(), name)
+            {
+                return inst
+                    .slot_get(name)
+                    .filter(|v| !matches!(v, Object::Unbound));
+            }
+        }
         // A scalar class attribute read through an instance that doesn't
         // shadow it (the stamp was filled below, at this class version),
         // or a named tuple field.

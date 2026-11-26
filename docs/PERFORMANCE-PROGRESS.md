@@ -3340,6 +3340,16 @@ branch and pull request.
     leaf with the index, ending the loop at its bare `raise IndexError`
     or `raise StopIteration` and dropping the sequence as CPython's
     iterator does (1,311 an item).
+  - Sorting objects by a Python `__lt__` ran each comparison as a full
+    call (about 3,000 instructions, twice CPython's), because the
+    frameless evaluation declined: it read `__slots__` members only
+    through the interpreter's specialized cache, which a body the frame
+    JIT runs never fills, and it couldn't compare tuples (`return
+    (self.x, self.y) < (o.x, o.y)`). Its attribute fallback now reads a
+    slot member directly, and its comparison takes two tuples of scalars
+    and strings item by item as CPython does, declining for anything else
+    (sorting 40 slotted objects 2.31 to 1.11 times CPython; by a tuple
+    key 2.01 to 1.06; `min` 2.01 to 1.40).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
