@@ -10372,7 +10372,7 @@ unsafe extern "C" fn h_attr_local(st: *mut State, site: *const AttrSite) -> u32 
             // (Or a class attribute the site memoized, as `h_attr_stack`.)
             Object::Instance(inst) => field_hit(s, inst)
                 .map(crate::clone_hot)
-                .or_else(|| class_poly_hit(s, inst)),
+                .or_else(|| class_poly_hit(s, inst, &*at)),
             Object::Module(_) => attr_hit(s, &*at).map(crate::clone_hot),
             _ => None,
         };
@@ -10501,7 +10501,7 @@ unsafe extern "C" fn attr_local_slow(st: *mut State, site: *const AttrSite) -> u
                     return 0;
                 }
                 if let Some(v) =
-                    class_poly_hit(site, inst).or_else(|| instance_class_read(site, inst))
+                    class_poly_hit(site, inst, &*at).or_else(|| instance_class_read(site, inst))
                 {
                     (*st).stack.add(slot).write(v);
                     return 0;
@@ -10562,7 +10562,7 @@ unsafe extern "C" fn h_attr_stack(st: *mut State, site: *const AttrSite) -> u32 
             Object::Instance(inst) => field_hit(s, inst)
                 .or_else(|| slot_field_hit(s, inst))
                 .map(crate::clone_hot)
-                .or_else(|| class_poly_hit(s, inst)),
+                .or_else(|| class_poly_hit(s, inst, &*at)),
             // A class's constant the site memoized (`Direction.FORWARD`).
             Object::Type(cls) => type_attr_memo(s, cls),
             // A module's value the site noted (`os.path`).
@@ -10718,7 +10718,11 @@ pub(crate) struct ClassPolyEntry {
 /// # Safety
 ///
 /// `site`'s code is live.
-unsafe fn class_poly_hit(site: &AttrSite, inst: &crate::types::PyInstance) -> Option<Object> {
+unsafe fn class_poly_hit(
+    site: &AttrSite,
+    inst: &crate::types::PyInstance,
+    recv: &Object,
+) -> Option<Object> {
     let ver = inst.cls_raw().attr_version.get();
     if ver == 0 {
         return None;
@@ -10745,7 +10749,19 @@ unsafe fn class_poly_hit(site: &AttrSite, inst: &crate::types::PyInstance) -> Op
     // version stands; the view is never dropped.
     let v =
         std::mem::ManuallyDrop::new(unsafe { std::ptr::from_ref(&e.val).cast::<Object>().read() });
-    Some(crate::clone_hot(&v))
+    // (A function, staticmethod or classmethod entry gives what its
+    // `__get__` gives through an instance: see `class_poly_note`.)
+    Some(match &*v {
+        Object::Function(_) => Object::BoundMethod(Rc::new(crate::object::BoundMethod::new(
+            recv.clone(),
+            crate::clone_hot(&v),
+        ))),
+        Object::StaticMethod(w) => w.func(),
+        Object::ClassMethod(w) => Object::BoundMethod(Rc::new(
+            crate::object::BoundMethod::py_method(Object::Type(inst.cls()), w.func()),
+        )),
+        _ => crate::clone_hot(&v),
+    })
 }
 
 /// Remember what proves, at `site`, that an instance of `inst`'s class
@@ -10803,7 +10819,15 @@ unsafe fn class_poly_note(site: &AttrSite, inst: &crate::types::PyInstance, v: &
         }
         _ => false,
     };
-    if !plain {
+    // (Or a read a function, staticmethod or classmethod in the class gave:
+    // the entry itself is memoized, and a hit gives what its `__get__`
+    // gives, see `class_poly_hit`.)
+    let bound = !plain
+        && matches!(
+            v,
+            Object::Function(_) | Object::Builtin(_) | Object::BoundMethod(_)
+        );
+    if !plain && !bound {
         return;
     }
     let cls = inst.cls_raw();
@@ -10825,6 +10849,24 @@ unsafe fn class_poly_note(site: &AttrSite, inst: &crate::types::PyInstance, v: &
         return;
     };
     if crate::inst_may_shadow(inst, code, arg) {
+        return;
+    }
+    if bound {
+        let found = cls.lookup(name);
+        let entry = match (&found, v) {
+            (Some(f @ Object::Function(fun)), Object::BoundMethod(bm))
+                if !bm.redispatch_descriptor
+                    && matches!(&bm.function, Object::Function(g) if Rc::ptr_eq(fun, g)) =>
+            {
+                f
+            }
+            (Some(w @ Object::StaticMethod(sm)), _) if sm.func().is_same(v) => w,
+            (Some(w @ Object::ClassMethod(_)), Object::BoundMethod(_)) => w,
+            _ => return,
+        };
+        // SAFETY: as below.
+        let val = unsafe { std::ptr::from_ref(entry).cast::<[u64; 2]>().read() };
+        class_poly_put(site, ver, val);
         return;
     }
     // The class's own entry, the very value the read gave (else the read
@@ -11390,7 +11432,7 @@ unsafe extern "C" fn attr_stack_slow(st: *mut State, site: *const AttrSite) -> u
                 // descriptor or native method shares its version), or a
                 // named tuple's field, as the local read's path finds them
                 // first.
-                if let Some(v) = class_poly_hit(site, inst).or_else(|| {
+                if let Some(v) = class_poly_hit(site, inst, &*at).or_else(|| {
                     (*site.ext)
                         .stamp_slot(site.pc as usize)
                         .and_then(|s| crate::tuple_field_hit(s, inst))
@@ -11409,7 +11451,7 @@ unsafe extern "C" fn attr_stack_slow(st: *mut State, site: *const AttrSite) -> u
                 if site_property_leaf(&mut *st, site, at, false) {
                     return 0;
                 }
-                let v = class_poly_hit(site, inst)
+                let v = class_poly_hit(site, inst, &*at)
                     .or_else(|| instance_class_read(site, inst))
                     .or_else(|| {
                         site.class_attr.get().then(|| {

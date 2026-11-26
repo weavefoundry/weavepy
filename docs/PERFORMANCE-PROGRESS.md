@@ -3245,6 +3245,14 @@ branch and pull request.
     iterable the interpreter steps skip about fifty name comparisons in
     the call dispatcher, and a drain of an adapter over a generator no
     longer tries a pure step that can't succeed.
+  - A method, staticmethod or classmethod read as a value through an
+    instance (`cb = self.handle`) was never memoized, and the two
+    wrappers' reads re-resolved the name each time, scanning the
+    instance's attributes: a classmethod read cost 6,169 instructions
+    (CPython 638) and a staticmethod's 2,432 (CPython 442). The class
+    memo now keeps the class's own entry for these too and binds or
+    unwraps it on each read: 717, 325, and a plain method read 1,280 to
+    590 (CPython 642).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
