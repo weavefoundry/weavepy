@@ -5878,11 +5878,11 @@ impl PyFunction {
         }
         map.insert(
             DictKey(name_key.clone()),
-            crate::stdlib::sys::intern_name(&code.name),
+            crate::stdlib::sys::intern_code_name(&code.name),
         );
         map.insert(
             DictKey(qualname_key.clone()),
-            crate::stdlib::sys::intern_name(&code.qualname),
+            crate::stdlib::sys::intern_code_name(&code.qualname),
         );
         let mut slots = self.slots_cell().borrow_mut();
         // Every store goes through `slots()`, which plants the seed
@@ -5898,8 +5898,8 @@ impl PyFunction {
         if self.names_seeded() {
             let code = self.code();
             return (
-                Some(crate::stdlib::sys::intern_name(&code.name)),
-                Some(crate::stdlib::sys::intern_name(&code.qualname)),
+                Some(crate::stdlib::sys::intern_code_name(&code.name)),
+                Some(crate::stdlib::sys::intern_code_name(&code.qualname)),
             );
         }
         let Some(slots) = self.slots_raw.get() else {

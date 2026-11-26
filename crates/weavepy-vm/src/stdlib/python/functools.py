@@ -32,6 +32,11 @@ from _thread import RLock
 WRAPPER_ASSIGNMENTS = ('__module__', '__name__', '__qualname__', '__doc__',
                        '__annotate__', '__type_params__')
 WRAPPER_UPDATES = ('__dict__',)
+try:
+    from _functools import _update_wrapper_plain
+except ImportError:
+    def _update_wrapper_plain(wrapper, wrapped):
+        return None
 def update_wrapper(wrapper,
                    wrapped,
                    assigned = WRAPPER_ASSIGNMENTS,
@@ -47,6 +52,11 @@ def update_wrapper(wrapper,
        are updated with the corresponding attribute from the wrapped
        function (defaults to functools.WRAPPER_UPDATES)
     """
+    # (Two plain functions and the default lists: the same steps, native.)
+    if assigned is WRAPPER_ASSIGNMENTS and updated is WRAPPER_UPDATES:
+        done = _update_wrapper_plain(wrapper, wrapped)
+        if done is not None:
+            return done
     for attr in assigned:
         try:
             value = getattr(wrapped, attr)

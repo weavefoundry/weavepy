@@ -46,6 +46,15 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             })),
         );
         d.insert(
+            DictKey(Object::from_static("_update_wrapper_plain")),
+            Object::Builtin(Rc::new(BuiltinFn {
+                name: "_update_wrapper_plain",
+                binds_instance: false,
+                call: Box::new(update_wrapper_plain),
+                call_kw: None,
+            })),
+        );
+        d.insert(
             DictKey(Object::from_static("cmp_to_key")),
             Object::Builtin(Rc::new(BuiltinFn {
                 name: "cmp_to_key",
@@ -2118,6 +2127,63 @@ fn reduce(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Runtim
         acc = step(interp, acc, x)?;
     }
     Ok(acc)
+}
+
+/// `_update_wrapper_plain(wrapper, wrapped)`: `functools.update_wrapper`
+/// with the default attribute lists, for two plain Python functions, done
+/// natively in the same steps (each of `WRAPPER_ASSIGNMENTS` read from
+/// `wrapped` and stored on `wrapper`, an `AttributeError` skipping it;
+/// `wrapper.__dict__` updated from `wrapped.__dict__`; `__wrapped__` set
+/// last): `wrapper`. `None` for any other pair, which the Python body
+/// handles.
+fn update_wrapper_plain(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [wrapper @ Object::Function(_), wrapped @ Object::Function(_)] = args else {
+        return Ok(Object::None);
+    };
+    let interp = crate::builtins::reentrant_interp()?;
+    let attribute_error = &crate::builtin_types::builtin_types().attribute_error;
+    for attr in [
+        "__module__",
+        "__name__",
+        "__qualname__",
+        "__doc__",
+        "__annotate__",
+        "__type_params__",
+    ] {
+        match interp.load_attr_public(wrapped, attr) {
+            Ok(v) => interp.store_attr(wrapper, attr, v)?,
+            Err(RuntimeError::PyException(pe)) if matches!(&pe.instance, Object::Instance(i) if i.cls().is_subclass_of(attribute_error)) =>
+                {}
+            Err(e) => return Err(e),
+        }
+    }
+    let target = interp.load_attr_public(wrapper, "__dict__")?;
+    let source = match interp.load_attr_public(wrapped, "__dict__") {
+        Ok(v) => v,
+        Err(RuntimeError::PyException(pe)) if matches!(&pe.instance, Object::Instance(i) if i.cls().is_subclass_of(attribute_error)) => {
+            Object::new_dict()
+        }
+        Err(e) => return Err(e),
+    };
+    match (&target, &source) {
+        (Object::Dict(t), Object::Dict(s)) => {
+            let pairs: Vec<(Object, Object)> = s
+                .borrow()
+                .iter()
+                .map(|(k, v)| (k.0.clone(), v.clone()))
+                .collect();
+            for (k, v) in pairs {
+                crate::builtins::dict_insert(t, k, v)?;
+            }
+        }
+        _ => {
+            let update = interp.load_attr_public(&target, "update")?;
+            let globals = interp.builtins_dict();
+            interp.call(&update, std::slice::from_ref(&source), &[], &globals)?;
+        }
+    }
+    interp.store_attr(wrapper, "__wrapped__", wrapped.clone())?;
+    Ok(wrapper.clone())
 }
 
 #[cfg(test)]

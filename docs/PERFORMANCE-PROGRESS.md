@@ -3279,6 +3279,13 @@ branch and pull request.
     in place (3,887 to 983, CPython 1,550). `itertools.chain`'s bulk drain
     takes `str` sources (`list(chain([1], (2,), "ab"))` 7,749 to 4,611,
     CPython 4,125).
+  - `functools.wraps` ran `update_wrapper`'s Python loop of `getattr`
+    and `setattr` calls on function objects (44,019 instructions, CPython
+    14,595). For two plain functions and the default attribute lists the
+    same steps now run natively (30,254). A function's lazily planted
+    `__name__` and `__qualname__`, and a generator's names, are interned
+    through the per-code-name memo instead of hashing the text each
+    time.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

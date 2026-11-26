@@ -93675,8 +93675,8 @@ struct BinderLayout {
 pub(crate) fn code_gen_names(code: &CodeObject) -> (Object, Object) {
     let intern = || {
         (
-            crate::stdlib::sys::intern_name(&code.name),
-            crate::stdlib::sys::intern_name(&code.qualname),
+            crate::stdlib::sys::intern_code_name(&code.name),
+            crate::stdlib::sys::intern_code_name(&code.qualname),
         )
     };
     match code_vm_ext(code) {
