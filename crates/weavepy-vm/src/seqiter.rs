@@ -285,12 +285,16 @@ impl Interpreter {
         // (The adapter's kind read once, each bulk path tried only for its
         // own.)
         // SAFETY: a read that runs no code, ending with the match.
-        let (chain, accumulate, zip) = match unsafe { l.state.peek() } {
-            Some(LazyIterKind::Chain { .. }) => (true, false, false),
-            Some(LazyIterKind::Accumulate { .. }) => (false, true, false),
-            Some(LazyIterKind::Zip { .. }) => (false, false, true),
-            _ => (false, false, false),
+        let (chain, accumulate, zip, grouper) = match unsafe { l.state.peek() } {
+            Some(LazyIterKind::Chain { .. }) => (true, false, false, false),
+            Some(LazyIterKind::Accumulate { .. }) => (false, true, false, false),
+            Some(LazyIterKind::Zip { .. }) => (false, false, true, false),
+            Some(LazyIterKind::Grouper { .. }) => (false, false, false, true),
+            _ => (false, false, false, false),
         };
+        if grouper && grouper_drain(l, out) {
+            return Ok(true);
+        }
         if chain && chain_drain(l, out) {
             return Ok(true);
         }
@@ -2427,6 +2431,66 @@ pub(crate) fn lazy_has_generator_source(l: &PyLazyIter) -> bool {
             is_gen(source)
         }
         _ => false,
+    }
+}
+
+/// `list(g)` of a `groupby` group `l` whose groupby has no key function
+/// and steps a plain list or tuple cursor: the group's items in one loop,
+/// as `_grouper_next` takes them one at a time (the next group's first
+/// item left as the groupby's current value and key). `false` once a step
+/// needs the general loop (the source's end, a key that compares only by
+/// running code), the items taken so far in `out` and the state as those
+/// steps left it.
+fn grouper_drain(l: &Rc<PyLazyIter>, out: &mut Vec<Object>) -> bool {
+    // SAFETY: nothing below runs code (keys compare natively, and the
+    // values released are held in `out`); each view ends before return.
+    let Some(LazyIterKind::Grouper { parent, tgtkey }) = (unsafe { l.state.peek() }) else {
+        return false;
+    };
+    let (parent, tgtkey) = (parent.clone(), tgtkey.clone());
+    // SAFETY: as above (the parent's distinct cell).
+    let Some(LazyIterKind::GroupBy {
+        source: Object::Iter(c),
+        keyfunc: Object::None,
+        currkey,
+        currvalue,
+        currgrouper,
+        ..
+    }) = (unsafe { parent.state.peek_mut() })
+    else {
+        return false;
+    };
+    if !currgrouper
+        .as_ref()
+        .is_some_and(|w| std::ptr::eq(w.as_ptr(), Rc::as_ptr(l)))
+    {
+        return false;
+    }
+    loop {
+        if currvalue.is_none() {
+            let Some(v) = cursor_peek(c) else {
+                return false;
+            };
+            if cursor_advance(c).is_none() {
+                return false;
+            }
+            let old = (currkey.replace(v.clone()), currvalue.replace(v));
+            drop(old);
+        }
+        let Some(curr) = currkey.as_ref() else {
+            return false;
+        };
+        match native_key_eq(&tgtkey, curr) {
+            Some(true) => {
+                let v = currvalue.take().expect("a current value");
+                let old = currkey.take();
+                drop(old);
+                out.push(v);
+            }
+            // The group's end: the next group's first item stays current.
+            Some(false) => return true,
+            None => return false,
+        }
     }
 }
 

@@ -3363,6 +3363,13 @@ branch and pull request.
     hashes natively now computes the hash in place, in both the plan's
     interpreter and its compiled form (`set()` of 50 such objects 2.12 to
     1.77 times CPython; a dict comprehension keyed by them 1.51 to 1.30).
+  - `list(g)` of an `itertools.groupby` group stepped the grouper one
+    item at a time through the adapter dispatch (about 250 instructions an
+    item). A group of a key-function-free `groupby` over a plain list or
+    tuple now drains in one loop, leaving the next group's first item as
+    the groupby's current value, as the item-by-item steps leave it
+    (`[(k, len(list(g))) for k, g in groupby(xs)]` over 50 items 1.99 to
+    1.68 times CPython).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
