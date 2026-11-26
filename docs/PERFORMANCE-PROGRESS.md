@@ -3184,7 +3184,12 @@ branch and pull request.
     instance's `_fmt` by scanning its names on every call. They now use
     the name's hash and remembered position (`Struct("<ihd").unpack(b)`
     from about 2,300 to about 1,700 instructions, CPython about 1,050;
-    these runs are noisy).
+    these runs are noisy). `random`'s native methods check that the
+    instance holds no `_randbelow` or `getrandbits` of its own, which
+    scanned all its names for each miss. The check now goes by the names'
+    hashes (`randint` 1,063 to 958, CPython 2,494).
+    `ContextVar.get` borrows the var's class state in place instead of
+    cloning it through the receiver check (817 to 588, CPython 431).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

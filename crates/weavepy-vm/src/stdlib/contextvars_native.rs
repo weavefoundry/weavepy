@@ -474,8 +474,27 @@ fn not_applicable(method: &str, cls: &str, obj: &Object) -> RuntimeError {
 
 /// `ContextVar.get([default])`.
 fn var_get(args: &[Object]) -> Result<Object, RuntimeError> {
-    let (var, ext) = var_receiver(args, "get")?;
-    let st = st(&ext);
+    // (An exact `ContextVar`'s class state borrowed in place, as
+    // `var_receiver` checks it but with no clone of the state; anything
+    // else, and the error, through it.)
+    let lean = match args.first() {
+        Some(Object::Instance(i)) => i
+            .cls_raw()
+            .native_ext
+            .get()
+            .and_then(|e| e.downcast_ref::<State>())
+            .filter(|st| std::ptr::eq(i.cls_raw(), Rc::as_ptr(&st.var_cls)))
+            .map(|st| (i, st)),
+        _ => None,
+    };
+    let owned;
+    let (var, st) = match lean {
+        Some(found) => found,
+        None => {
+            owned = var_receiver(args, "get")?;
+            (owned.0, st(&owned.1))
+        }
+    };
     if args.len() > 2 {
         return Err(type_error(format!(
             "get expected at most 1 argument, got {}",

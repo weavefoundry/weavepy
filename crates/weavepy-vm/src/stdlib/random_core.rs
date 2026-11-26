@@ -541,12 +541,47 @@ fn plain_random(recv: &Object) -> Option<&Rc<PyInstance>> {
         || std::ptr::from_ref(cls) as usize
             != PY_RANDOM_CLASS.load(std::sync::atomic::Ordering::Relaxed)
         || cls.attr_version.get() != PY_RANDOM_VERSION.load(std::sync::atomic::Ordering::Relaxed)
-        || inst.attr_get_str("_randbelow").is_some()
-        || inst.attr_get_str("getrandbits").is_some()
+        || shadowed(inst)
     {
         return None;
     }
     Some(inst)
+}
+
+/// Whether the instance holds its own `_randbelow` or `getrandbits` (which
+/// the methods would call): the names' hashes computed once, so a miss is
+/// settled from the layout's filter.
+fn shadowed(inst: &PyInstance) -> bool {
+    struct Name {
+        name: &'static str,
+        hash: i64,
+        memo: crate::inst_dict::PosMemo,
+    }
+    static NAMES: std::sync::OnceLock<[Name; 2]> = std::sync::OnceLock::new();
+    NAMES
+        .get_or_init(|| {
+            ["_randbelow", "getrandbits"].map(|name| Name {
+                name,
+                hash: crate::object::py_str_hash(name),
+                memo: crate::inst_dict::PosMemo::new(),
+            })
+        })
+        .iter()
+        .any(|n| match inst.dict.published() {
+            // (A dict it can't read counts as holding the name.)
+            Some(d) => d.try_borrow().map_or(true, |d| {
+                d.get(&crate::object::StrKeyHashed {
+                    s: n.name,
+                    hash: n.hash,
+                })
+                .is_some()
+            }),
+            None => inst
+                .dict
+                .split_cell()
+                .try_borrow()
+                .map_or(true, |s| s.get_memo(n.name, n.hash, &n.memo).is_some()),
+        })
 }
 
 /// `_randbelow_with_getrandbits(n)` for `0 < n < 2**63`: draws of
