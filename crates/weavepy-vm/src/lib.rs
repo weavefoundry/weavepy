@@ -36103,7 +36103,7 @@ impl Interpreter {
         }
         // The class's part, remembered for its version (see
         // `instance_getattr_memo`): nothing on the class, or a slot.
-        let memo = instance_getattr_memo(cls, name_obj);
+        let memo = instance_getattr_memo(cls, name);
         if memo.is_none() && !Self::default_getattribute(cls) {
             return None;
         }
@@ -36115,9 +36115,9 @@ impl Interpreter {
             None => {
                 let on_class = cls.lookup(name);
                 match &on_class {
-                    None => note_instance_getattr(cls, name_obj, InstGetattrClass::Nothing),
+                    None => note_instance_getattr(cls, name, InstGetattrClass::Nothing),
                     Some(Object::SlotDescriptor(s)) if s.name == name && s.default.is_none() => {
-                        note_instance_getattr(cls, name_obj, InstGetattrClass::Slot)
+                        note_instance_getattr(cls, name, InstGetattrClass::Slot)
                     }
                     _ => {}
                 }
@@ -83686,60 +83686,115 @@ enum InstGetattrClass {
 /// Entries of [`INST_GETATTR_MEMO`].
 const INST_GETATTR_SLOTS: usize = 64;
 
+/// One [`INST_GETATTR_MEMO`] answer: the class attribute version (unique
+/// in the process, and moved by any change to the class, a base, or the
+/// MRO), the name as two words and its length (see [`inst_getattr_key`]),
+/// and the answer (`0` none).
+#[derive(Clone, Copy)]
+struct InstGetattrEntry {
+    ver: u64,
+    words: [u64; 2],
+    len: u8,
+    kind: u8,
+}
+
 thread_local! {
-    /// [`InstGetattrClass`] answers by class attribute version (unique in
-    /// the process, and moved by any change to the class, a base, or the
-    /// MRO) and name object (held, so its address can't be reused).
+    /// [`InstGetattrClass`] answers by class version and name.
     /// `getattr(obj, name, default)`, `hasattr` and `attrgetter` ask the
     /// same question of each instance of a class, and the class lookup
-    /// cost more than the rest of the read.
-    static INST_GETATTR_MEMO: crate::gil::ReleaseUnderGil<
-        RefCell<Vec<(u64, Option<SharedStr>, InstGetattrClass)>>,
-    > = const { crate::gil::ReleaseUnderGil::new(RefCell::new(Vec::new())) };
+    /// cost more than the rest of the read. (Plain entries in the thread's
+    /// static block: a probe is a few loads, with no destructor to
+    /// register and no name to keep alive.)
+    static INST_GETATTR_MEMO: [std::cell::Cell<InstGetattrEntry>; INST_GETATTR_SLOTS] = const {
+        [const {
+            std::cell::Cell::new(InstGetattrEntry {
+                ver: 0,
+                words: [0; 2],
+                len: 0,
+                kind: 0,
+            })
+        }; INST_GETATTR_SLOTS]
+    };
+}
+
+/// `name` as [`InstGetattrEntry`] words, for a name of at most 16 bytes:
+/// its first and last eight bytes (overlapping, so with the length they
+/// determine the name), or for a shorter one its first and last four,
+/// two or one (likewise).
+#[inline]
+fn inst_getattr_key(name: &str) -> Option<([u64; 2], u8)> {
+    let b = name.as_bytes();
+    let n = b.len();
+    let w8 = |at: usize| u64::from_le_bytes(b[at..at + 8].try_into().expect("8 bytes"));
+    let w4 = |at: usize| {
+        u64::from(u32::from_le_bytes(
+            b[at..at + 4].try_into().expect("4 bytes"),
+        ))
+    };
+    let w2 = |at: usize| {
+        u64::from(u16::from_le_bytes(
+            b[at..at + 2].try_into().expect("2 bytes"),
+        ))
+    };
+    let words = match n {
+        17.. => return None,
+        8.. => [w8(0), w8(n - 8)],
+        4.. => [w4(0), w4(n - 4)],
+        2.. => [w2(0), w2(n - 2)],
+        1 => [u64::from(b[0]), 0],
+        0 => [0, 0],
+    };
+    Some((words, n as u8))
 }
 
 #[inline]
-fn inst_getattr_slot(ver: u64, name: &SharedStr) -> usize {
-    let word = SharedStr::addr(name) >> 4;
-    ((ver as usize) ^ word).wrapping_mul(0x9E37_79B9_7F4A_7C15_u64 as usize)
-        >> (usize::BITS - INST_GETATTR_SLOTS.trailing_zeros())
+fn inst_getattr_slot(ver: u64, words: &[u64; 2]) -> usize {
+    let x = (ver ^ words[0] ^ words[1].rotate_left(17)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    (x >> (u64::BITS - INST_GETATTR_SLOTS.trailing_zeros())) as usize
 }
 
 /// The remembered [`InstGetattrClass`] of `name` on `cls`, if any (none
 /// for a class without a version, or while types are watched).
 #[inline]
-fn instance_getattr_memo(cls: &TypeObject, name: &SharedStr) -> Option<InstGetattrClass> {
+fn instance_getattr_memo(cls: &TypeObject, name: &str) -> Option<InstGetattrClass> {
     let ver = cls.attr_version.get();
     if ver == 0 || crate::capi_watchers::types_active() {
         return None;
     }
-    let slot = inst_getattr_slot(ver, name);
-    INST_GETATTR_MEMO
-        .try_with(|m| {
-            let m = m.try_borrow().ok()?;
-            let (v, n, kind) = m.get(slot)?;
-            (*v == ver && n.as_ref().is_some_and(|n| SharedStr::ptr_eq(n, name))).then_some(*kind)
-        })
-        .ok()
-        .flatten()
+    let (words, len) = inst_getattr_key(name)?;
+    let e = INST_GETATTR_MEMO
+        .try_with(|m| m[inst_getattr_slot(ver, &words)].get())
+        .ok()?;
+    if e.ver != ver || e.len != len || e.words != words {
+        return None;
+    }
+    match e.kind {
+        1 => Some(InstGetattrClass::Nothing),
+        2 => Some(InstGetattrClass::Slot),
+        _ => None,
+    }
 }
 
 /// Remember `kind` for `name` on `cls` (see [`instance_getattr_memo`]).
-fn note_instance_getattr(cls: &TypeObject, name: &SharedStr, kind: InstGetattrClass) {
+fn note_instance_getattr(cls: &TypeObject, name: &str, kind: InstGetattrClass) {
     let ver = cls.attr_version.get();
     if ver == 0 || crate::capi_watchers::types_active() {
         return;
     }
-    let slot = inst_getattr_slot(ver, name);
+    let Some((words, len)) = inst_getattr_key(name) else {
+        return;
+    };
+    let kind = match kind {
+        InstGetattrClass::Nothing => 1,
+        InstGetattrClass::Slot => 2,
+    };
     let _ = INST_GETATTR_MEMO.try_with(|m| {
-        let Ok(mut m) = m.try_borrow_mut() else {
-            return;
-        };
-        if m.is_empty() {
-            m.resize(INST_GETATTR_SLOTS, (0, None, InstGetattrClass::Nothing));
-        }
-        // (The evicted name is only a string: releasing it runs nothing.)
-        m[slot] = (ver, Some(name.clone()), kind);
+        m[inst_getattr_slot(ver, &words)].set(InstGetattrEntry {
+            ver,
+            words,
+            len,
+            kind,
+        });
     });
 }
 

@@ -541,17 +541,15 @@ fn attrgetter_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let [Object::Instance(inst), obj] = args else {
         return None;
     };
-    // SAFETY: a read that runs no code.
-    let Object::Tuple(attrs) = unsafe { inst.slots.peek() }?
-        .get_hinted(0, "_attrs")?
-        .clone()
-    else {
+    // SAFETY: a view that ends with the read, which runs no code (so
+    // nothing can rebind the getter's names meanwhile).
+    let Object::Tuple(attrs) = unsafe { inst.slots.peek() }?.get_hinted(0, "_attrs")? else {
         return None;
     };
     let [name @ Object::Str(s)] = &attrs[..] else {
         return None;
     };
-    if s.contains('.') {
+    if memchr::memchr(b'.', s.as_bytes()).is_some() {
         return None;
     }
     crate::Interpreter::leaf_getattr_value(obj, name).map(Ok)

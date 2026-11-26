@@ -3324,6 +3324,13 @@ branch and pull request.
     lookup on later reads of any instance (`getattr` of a slot 719,
     `hasattr` 757, CPython 610 and 590; the 50-object map 40,941, CPython
     20,485; over plain objects 40,315 to 37,547).
+  - That memo kept a reference to each name in a `RefCell`ed vector, so
+    a probe cost about 70 instructions. Its entries are now plain words
+    in the thread's static block, keyed by the class version and the
+    name's bytes (names of up to 16 bytes), and a probe costs about 50;
+    `attrgetter`'s fast half also reads its name without cloning the
+    getter's tuple (the 50-object map over plain objects 37,072 to
+    32,872 instructions under callgrind).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
