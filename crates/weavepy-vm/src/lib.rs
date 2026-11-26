@@ -64118,6 +64118,16 @@ impl Interpreter {
                 // chain takes.
                 match (b.name, args.len()) {
                     ("len", 1) => return self.do_len_call(&args[0], outer_globals),
+                    // (The consumers of an iterable the interpreter steps,
+                    // `sum(gen)` and its kin: the chain's arms for them.)
+                    ("sum", _) => return self.do_sum_call(args, kwargs, outer_globals),
+                    ("list" | "tuple", 1) => {
+                        return self.do_list_or_tuple_call(b.name, &args[0], outer_globals)
+                    }
+                    ("min" | "max", _) if !b.binds_instance => {
+                        return self.do_min_max_call(b.name, args, kwargs, outer_globals)
+                    }
+                    ("any" | "all", _) => return self.do_any_all_call(b.name, args, outer_globals),
                     ("hash", 1) => return self.do_hash_call(&args[0], outer_globals),
                     ("isinstance", 2) => {
                         return self.do_isinstance_call(&args[0], &args[1], outer_globals)
