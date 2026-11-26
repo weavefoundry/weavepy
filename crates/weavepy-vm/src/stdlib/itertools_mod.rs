@@ -1086,6 +1086,10 @@ fn pure_pool(o: &Object) -> Option<Result<Object, RuntimeError>> {
     match o {
         Object::Tuple(_) => Some(Ok(o.clone())),
         Object::List(l) => Some(Ok(Object::new_tuple(l.try_borrow().ok()?.clone()))),
+        // A short str's characters (`product("ab", repeat=2)`).
+        Object::Str(t) if t.len() <= 256 => Some(Ok(Object::new_tuple(
+            t.chars().map(Object::from_char).collect(),
+        ))),
         _ => None,
     }
 }

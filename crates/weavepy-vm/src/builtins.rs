@@ -10879,6 +10879,31 @@ fn radix_str(i: i64, letter: u8, shift: u32) -> Object {
     Object::Str(SharedStr::from_ascii(text))
 }
 
+/// `hex(i)`, `oct(i)` and `bin(i)`'s leaf halves: an exact int, big int
+/// or bool, formatted in place. Anything else (`__index__` may run code)
+/// takes the full path.
+fn radix_fast(
+    args: &[Object],
+    f: fn(&[Object]) -> Result<Object, RuntimeError>,
+) -> Option<Result<Object, RuntimeError>> {
+    match args {
+        [Object::Int(_) | Object::Bool(_) | Object::Long(_)] => Some(f(args)),
+        _ => None,
+    }
+}
+
+pub(crate) fn hex_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    radix_fast(args, b_hex)
+}
+
+pub(crate) fn oct_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    radix_fast(args, b_oct)
+}
+
+pub(crate) fn bin_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    radix_fast(args, b_bin)
+}
+
 fn b_hex(args: &[Object]) -> Result<Object, RuntimeError> {
     match one(args, "hex")? {
         Object::Int(i) => Ok(radix_str(*i, b'x', 4)),

@@ -104,14 +104,38 @@ fn heap_arg(args: &[Object]) -> Result<Rc<RefCell<Vec<Object>>>, RuntimeError> {
 /// copies through the full comparison.
 #[inline]
 fn heap_lt(heap: &Rc<RefCell<Vec<Object>>>, i: usize, j: usize) -> Result<bool, RuntimeError> {
+    // SAFETY: a view that runs no code, ending with the statement.
+    let native = unsafe { heap.peek() }
+        .and_then(|h| crate::native_scalar_compare(h.get(i)?, h.get(j)?, CompareKind::Lt));
+    if let Some(lt) = native {
+        return Ok(lt);
+    }
     let (a, b) = {
         let h = heap.borrow();
-        if let Some(lt) = crate::native_scalar_compare(&h[i], &h[j], CompareKind::Lt) {
-            return Ok(lt);
-        }
         (h[i].clone(), h[j].clone())
     };
     interp()?.op_compare(&a, &b, CompareKind::Lt)
+}
+
+/// `heap[i] < heap[j]` for two native scalars (see
+/// [`crate::native_scalar_compare`]), and when it holds, `heap[a]` and
+/// `heap[b]` swapped, under one view of the list: no code runs, so nothing
+/// can change it meanwhile. `None`, touching nothing, for any other pair.
+#[inline]
+fn native_lt_swap(
+    heap: &Rc<RefCell<Vec<Object>>>,
+    i: usize,
+    j: usize,
+    a: usize,
+    b: usize,
+) -> Option<bool> {
+    // SAFETY: a view that runs no code, ending with this call.
+    let h = unsafe { heap.peek_mut() }?;
+    let lt = crate::native_scalar_compare(h.get(i)?, h.get(j)?, CompareKind::Lt)?;
+    if lt {
+        h.swap(a, b);
+    }
+    Some(lt)
 }
 
 /// `siftdown` (CPython's confusingly named "move toward the root"): the item
@@ -129,6 +153,21 @@ fn siftdown(
     }
     while pos > startpos {
         let parentpos = (pos - 1) >> 1;
+        // (Two native scalars: compared, and swapped when out of order,
+        // under one view of the list.)
+        let (x, y) = if max_heap {
+            (parentpos, pos)
+        } else {
+            (pos, parentpos)
+        };
+        match native_lt_swap(heap, x, y, pos, parentpos) {
+            Some(true) => {
+                pos = parentpos;
+                continue;
+            }
+            Some(false) => break,
+            None => {}
+        }
         // min-heap: `cur < parent`; max-heap: `parent < cur`.
         let cmp = if max_heap {
             heap_lt(heap, parentpos, pos)?
@@ -165,6 +204,25 @@ fn siftup(
         if childpos + 1 < endpos {
             // Pick the smaller child (min) / larger child (max); ties go right,
             // matching CPython's `childpos += (cmp ^ 1)`.
+            let (x, y) = if max_heap {
+                (childpos + 1, childpos)
+            } else {
+                (childpos, childpos + 1)
+            };
+            // (Two native scalars: compared in place, nothing swapped.)
+            // SAFETY: a view that runs no code, ending with the statement.
+            let native = unsafe { heap.peek() }
+                .and_then(|h| crate::native_scalar_compare(h.get(x)?, h.get(y)?, CompareKind::Lt));
+            if let Some(cmp) = native {
+                childpos += usize::from(!cmp);
+                // SAFETY: as above; both positions are in the list.
+                if let Some(h) = unsafe { heap.peek_mut() } {
+                    h.swap(pos, childpos);
+                    pos = childpos;
+                    continue;
+                }
+                childpos -= usize::from(!cmp);
+            }
             let cmp = if max_heap {
                 heap_lt(heap, childpos + 1, childpos)?
             } else {
