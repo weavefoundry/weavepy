@@ -1766,6 +1766,46 @@ fn tally_dict(mapping: &Object) -> Option<Rc<RefCell<DictData>>> {
     }
 }
 
+/// Count the leading run of `items` whose keys probe natively and whose
+/// counts are machine ints into `d`, under one view of it (nothing runs
+/// code, so one change notice covers the run): how many were counted.
+/// The first item it can't take, and the rest, are the caller's.
+fn tally_run(d: &Rc<RefCell<DictData>>, items: &[Object]) -> usize {
+    if crate::capi_watchers::dicts_active() {
+        return 0;
+    }
+    // SAFETY: native probes and int counts run no code; the view ends
+    // before the notices below.
+    let Some(m) = (unsafe { d.peek_mut() }) else {
+        return 0;
+    };
+    let (mut done, mut added) = (0, false);
+    for key in items {
+        let Some(probe) = crate::object::LeafProbe::new(key) else {
+            break;
+        };
+        match m.probe_entry(&probe) {
+            crate::dictmap::ProbeEntry::Occupied(e) => match e.into_mut() {
+                Object::Int(n) if *n < i64::MAX => *n += 1,
+                _ => break,
+            },
+            crate::dictmap::ProbeEntry::Vacant(e) if probe.miss_is_exact() => {
+                e.insert(DictKey(key.clone()), Object::Int(1));
+                added = true;
+            }
+            crate::dictmap::ProbeEntry::Vacant(_) => break,
+        }
+        done += 1;
+    }
+    if done > 0 {
+        if added {
+            crate::object::dict_watch_bump(d);
+        }
+        crate::object::dict_mutation_event(d);
+    }
+    done
+}
+
 /// Count one element into `d` (`d[key] = d.get(key, 0) + 1`).
 fn tally_one(
     interp: &mut crate::Interpreter,
@@ -1831,8 +1871,10 @@ fn count_elements(args: &[Object]) -> Result<Object, RuntimeError> {
             }
         }
         Object::List(items) => {
+            // (The leading plain keys under one view: see `tally_run`.)
+            // SAFETY: a view that runs no code, ending with the statement.
+            let mut i = unsafe { items.peek() }.map_or(0, |xs| tally_run(&d, xs));
             // Snapshot-free: the list may change under a key's `__eq__`.
-            let mut i = 0;
             loop {
                 let item = items.borrow().get(i).cloned();
                 let Some(item) = item else { break };
@@ -1841,7 +1883,8 @@ fn count_elements(args: &[Object]) -> Result<Object, RuntimeError> {
             }
         }
         Object::Tuple(items) => {
-            for item in items.iter() {
+            let done = tally_run(&d, items);
+            for item in items.iter().skip(done) {
                 tally_one(interp, &d, item)?;
             }
         }

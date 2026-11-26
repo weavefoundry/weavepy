@@ -2338,15 +2338,14 @@ fn ready_next(it: &Object) -> Option<Object> {
 fn zip_seq_bulk(l: &Rc<PyLazyIter>, out: &mut Vec<Object>) -> bool {
     use crate::object::PyIterator;
     const WIDTH: usize = 8;
-    let Ok(st) = l.state.try_borrow() else {
-        return false;
-    };
-    let LazyIterKind::Zip {
+    // SAFETY: nothing runs code until the end step, which steps clones of
+    // the cells after every view below has ended.
+    let Some(LazyIterKind::Zip {
         iters,
         strict: false,
         held,
         ..
-    } = &*st
+    }) = (unsafe { l.state.peek() })
     else {
         return false;
     };
@@ -2355,6 +2354,9 @@ fn zip_seq_bulk(l: &Rc<PyLazyIter>, out: &mut Vec<Object>) -> bool {
         return false;
     }
     let mut cells: [Option<Rc<RefCell<PyIterator>>>; WIDTH] = Default::default();
+    // Every source's items and position, read in place.
+    let mut views: [(&[Object], usize); WIDTH] = [(&[], 0); WIDTH];
+    let mut n = usize::MAX;
     for (k, src) in iters.iter().enumerate() {
         let Object::Iter(c) = src else {
             return false;
@@ -2363,42 +2365,21 @@ fn zip_seq_bulk(l: &Rc<PyLazyIter>, out: &mut Vec<Object>) -> bool {
         if cells[..k].iter().flatten().any(|d| Rc::ptr_eq(c, d)) {
             return false;
         }
-        cells[k] = Some(c.clone());
-    }
-    drop(st);
-    let cells = &cells[..width];
-    // Every source's items and position, read in place (no code runs
-    // while the views live).
-    let mut views: [(&[Object], usize); WIDTH] = [(&[], 0); WIDTH];
-    let mut guards = Vec::with_capacity(width);
-    for c in cells.iter().flatten() {
-        let Ok(cur) = c.try_borrow() else {
-            return false;
-        };
-        guards.push(cur);
-    }
-    let mut list_guards = Vec::with_capacity(width);
-    for g in &guards {
-        match &**g {
-            PyIterator::List { items, .. } => match items.try_borrow() {
-                Ok(v) => list_guards.push(Some(v)),
-                Err(_) => return false,
+        // SAFETY: as above.
+        let (items, index): (&[Object], usize) = match unsafe { c.peek() } {
+            Some(PyIterator::List { items, index, .. }) => match unsafe { items.peek() } {
+                Some(v) => (v.as_slice(), *index),
+                None => return false,
             },
-            PyIterator::Tuple { .. } => list_guards.push(None),
-            _ => return false,
-        }
-    }
-    let mut n = usize::MAX;
-    for (k, g) in guards.iter().enumerate() {
-        let (items, index): (&[Object], usize) = match (&**g, &list_guards[k]) {
-            (PyIterator::List { index, .. }, Some(v)) => (v, *index),
-            (PyIterator::Tuple { items, index }, None) => (items, *index),
+            Some(PyIterator::Tuple { items, index }) => (&items[..], *index),
             _ => return false,
         };
         let index = index.min(items.len());
         views[k] = (items, index);
         n = n.min(items.len() - index);
+        cells[k] = Some(c.clone());
     }
+    let cells = &cells[..width];
     out.reserve(n);
     for row in 0..n {
         let item = |k: usize| views[k].0[views[k].1 + row].clone();
@@ -2412,11 +2393,10 @@ fn zip_seq_bulk(l: &Rc<PyLazyIter>, out: &mut Vec<Object>) -> bool {
     // more item, which the step drops.
     let ends: [bool; WIDTH] =
         std::array::from_fn(|k| k < width && views[k].1 + n >= views[k].0.len());
-    drop(list_guards);
-    drop(guards);
     for c in cells.iter().flatten() {
-        match &mut *c.borrow_mut() {
-            PyIterator::List { index, .. } | PyIterator::Tuple { index, .. } => *index += n,
+        // SAFETY: the views above have ended; this runs no code.
+        match unsafe { c.peek_mut() } {
+            Some(PyIterator::List { index, .. } | PyIterator::Tuple { index, .. }) => *index += n,
             _ => unreachable!("checked above"),
         }
     }
