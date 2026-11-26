@@ -5035,6 +5035,31 @@ impl Interpreter {
         Some(item)
     }
 
+    /// [`Self::lazy_core_next`] of an `enumerate` over a native adapter
+    /// whose pair is unpacked at once (`for i, (x, y) in enumerate(zip(xs,
+    /// ys))`): the index and the source's item, with no pair built. `None`
+    /// for any other adapter, and at the source's end (which the general
+    /// step finds as this one left it).
+    pub(crate) fn lazy_enumerate_pair(&self, l: &Rc<PyLazyIter>) -> Option<(Object, Object)> {
+        // SAFETY: as `lazy_core_next`'s; the source is another adapter.
+        let st = unsafe { l.state.peek_mut() }?;
+        let LazyIterKind::Enumerate {
+            source: Object::LazyIter(src),
+            count,
+            count_big: None,
+        } = st
+        else {
+            return None;
+        };
+        if *count == i64::MAX {
+            return None;
+        }
+        let v = self.lazy_core_next(src)??;
+        let i = *count;
+        *count += 1;
+        Some((Object::Int(i), v))
+    }
+
     /// One step of a native adapter that runs no Python code, for every
     /// `FOR_ITER` (the core loop's, the frame JIT's, tier 2's) and ahead of
     /// the interpreter's general step: [`lazy_pure_next`]'s state machines,

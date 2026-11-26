@@ -3294,6 +3294,24 @@ branch and pull request.
     without its general helper, and tier 2 builds list and tuple cursors
     directly (a loop over an empty list 870 to 557 instructions, CPython
     438; over a two-item tuple 818 to 693, CPython 591).
+  - `for i, (x, y) in enumerate(zip(xs, ys))` built an `(i, pair)`
+    tuple per item and unpacked it twice, because the fused pair step
+    only knew `enumerate` over a sequence. It now steps `enumerate` over
+    any native adapter, handing over the index and the adapter's item,
+    and unpacking a `zip` result the adapter still holds skips the tuple
+    recycler (a 100-item loop 123,095 to 76,757 instructions, CPython
+    98,531). `str.split` by a separator of two to sixteen bytes scans
+    for its first byte with `memchr` instead of setting up the two-way
+    searcher (`s.split(", ")` 3,310 to 2,519, CPython 2,527).
+  - A call that spreads arguments, `f(a, *rest)`, compiles to
+    `BUILD_LIST`, `LIST_EXTEND` and `LIST_TO_TUPLE`. The frame JIT now
+    fuses the last two into one helper that builds the tuple from the
+    list's items and an exact tuple or list in a single allocation, and
+    such a list is no longer registered with the collector, since only
+    the stack holds it. A `**kwargs` dict that is only read (a truth
+    test, `in`, a loop, `len`, `get`, `pop`) also skips registration.
+    Thirty spread calls fell from 72,635 to 64,227 instructions (CPython
+    58,488), thirty keyword calls from 74,482 to 70,957 (CPython 62,013).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

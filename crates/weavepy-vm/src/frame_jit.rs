@@ -5015,7 +5015,11 @@ unsafe extern "C" fn h_for_iter_pair(st: *mut State, it: *mut Object, out: *mut 
                     },
                 }
             }
-            Object::LazyIter(l) => match crate::seqiter::lazy_pure_pair(l) {
+            Object::LazyIter(l) => match crate::seqiter::lazy_pure_pair(l)
+                // `enumerate` over a native adapter (`enumerate(zip(xs,
+                // ys))`): the index and the adapter's item.
+                .or_else(|| (*(*st).interp).lazy_enumerate_pair(l))
+            {
                 Some(pair) => pair,
                 // `enumerate(gen)`, or a `zip` with a generator among its
                 // two sources: each generator stepped by its native code.
@@ -6566,9 +6570,10 @@ unsafe fn unpack_fast(
             }
             _ => unreachable!("checked above"),
         }
-        // (A dead tuple's allocation is recycled, as `release` does it.)
+        // (A dead tuple's allocation is recycled, as `release` does it; a
+        // shared one, a `zip`'s result it reuses, is only released.)
         match seq {
-            Some(seq @ Object::Tuple(_)) => interp.maybe_donate_tuple(seq),
+            Some(seq @ Object::Tuple(_)) if unique => interp.maybe_donate_tuple(seq),
             Some(seq) => crate::drop_hot(seq),
             None => {}
         }
@@ -12016,8 +12021,11 @@ unsafe extern "C" fn h_build(st: *mut State, at: *mut Object, n: u64, list: u32)
             let items: Vec<Object> = (0..n).map(|j| at.add(j).read()).collect();
             let obj = Object::new_list(items);
             // (Deferred as a built list is, a collection promoting it once
-            // it can anchor a cycle.)
-            crate::gc_trace::track_built(&obj);
+            // it can anchor a cycle; a call's spread arguments, which only
+            // the stack holds until they become a tuple, aren't.)
+            if list == 1 {
+                crate::gc_trace::track_built(&obj);
+            }
             at.write(obj);
             return 0;
         }
@@ -18261,6 +18269,70 @@ unsafe extern "C" fn h_list_to_tuple(at: *mut Object) -> u32 {
     }
 }
 
+/// `LIST_EXTEND 1` fused with the `LIST_TO_TUPLE` after it (a call's
+/// spread arguments, `f(a, *rest)`): the list at stack slot `at`, which
+/// only the stack holds, and the exact tuple or list above it become one
+/// tuple of both's items in the list's slot, the source released. `0`
+/// done, anything else declined untouched (the unfused steps take it).
+unsafe extern "C" fn h_extend_to_tuple(at: *mut Object) -> u32 {
+    // SAFETY: the code passes two initialized slots.
+    unsafe {
+        let Object::List(l) = &*at else {
+            return 1;
+        };
+        if Rc::strong_count(l) != 1 {
+            return 1;
+        }
+        let Some(head) = l.peek_mut() else {
+            return 1;
+        };
+        let tail: &[Object] = match &*at.add(1) {
+            Object::Tuple(t) => t,
+            Object::List(src) if !Rc::ptr_eq(src, l) => match src.peek() {
+                Some(xs) => xs,
+                None => return 1,
+            },
+            _ => return 1,
+        };
+        // (One allocation, the tuple's own.)
+        let t = crate::object::TupleStorage::from_cloned_pair(head, tail);
+        // (Both runs' items live on in the tuple, so releasing the list's
+        // and the source frees at most their storage.)
+        head.clear();
+        crate::drop_hot(at.add(1).read());
+        crate::drop_hot(std::mem::replace(&mut *at, Object::Tuple(t)));
+        0
+    }
+}
+
+/// Whether the `LIST_EXTEND` at `pc` of `code` spreads one source into a
+/// list the `LIST_TO_TUPLE` after it converts, which [`h_extend_to_tuple`]
+/// fuses.
+fn fused_extend_tuple_at(code: &CodeObject, pc: usize) -> bool {
+    let op = |pc: usize| code.instructions.get(pc).map(|i| (i.op, i.arg));
+    matches!(op(pc), Some((OpCode::ListExtend, 1)))
+        && matches!(op(pc + 1), Some((OpCode::ListToTuple, _)))
+        && pc + 2 < code.instructions.len()
+}
+
+/// Whether the `BUILD_LIST` at `pc` of `code` only collects a call's
+/// spread arguments: one load, then a [`fused_extend_tuple_at`] pair, so
+/// that only the stack holds the list until it becomes a tuple.
+fn spread_list_at(code: &CodeObject, pc: usize) -> bool {
+    matches!(
+        code.instructions.get(pc + 1).map(|i| i.op),
+        Some(
+            OpCode::LoadConst
+                | OpCode::LoadFast
+                | OpCode::LoadFastBorrow
+                | OpCode::LoadFastCheck
+                | OpCode::LoadDeref
+                | OpCode::LoadGlobal
+                | OpCode::LoadName
+        )
+    ) && fused_extend_tuple_at(code, pc + 2)
+}
+
 /// `GET_ITER` of the value at stack slot `at`, as the core loop's arm
 /// runs it: `0` the iterator in its place, anything else declined
 /// untouched.
@@ -19329,6 +19401,10 @@ fn block_starts(code: &CodeObject, depths: &[i64]) -> Vec<bool> {
         }
         if next < n && (target.is_some() || !native_at(code, pc)) {
             starts[next] = true;
+        }
+        // A fused spread continues after its `LIST_TO_TUPLE`.
+        if fused_extend_tuple_at(code, pc) {
+            starts[pc + 2] = true;
         }
         // A fused attribute store continues after its `STORE_ATTR`.
         if ins.op == OpCode::LoadFast
@@ -21174,6 +21250,9 @@ impl<'a> Lower<'a> {
             }
             OpCode::SetAdd if ins.arg != 0 && (ins.arg as usize) < self.depth => {
                 return self.set_add(pc, ins.arg as usize)
+            }
+            OpCode::ListExtend if fused_extend_tuple_at(self.code, pc) => {
+                return self.extend_to_tuple(pc)
             }
             OpCode::ListAppend
             | OpCode::ListExtend
@@ -26006,6 +26085,31 @@ impl<'a> Lower<'a> {
     }
 
     /// `BUILD_TUPLE n` / `BUILD_LIST n` through [`h_build`].
+    /// `LIST_EXTEND 1` and the `LIST_TO_TUPLE` after it through
+    /// [`h_extend_to_tuple`], continuing past both; the unfused
+    /// `LIST_EXTEND` when it declines.
+    fn extend_to_tuple(&mut self, pc: usize) -> bool {
+        if self.depth < 2 {
+            return self.container(pc);
+        }
+        self.flush();
+        let at = self.slot_addr(self.depth - 2);
+        let r = self
+            .call(h_extend_to_tuple as *const () as usize, &[at], true)
+            .expect("returns");
+        let fused = self.b.create_block();
+        let unfused = self.b.create_block();
+        self.b.ins().brif(r, unfused, &[], fused, &[]);
+        self.b.switch_to_block(fused);
+        let depth = self.depth;
+        self.depth -= 1;
+        self.set_last(pc + 1);
+        self.goto(pc + 2);
+        self.depth = depth;
+        self.b.switch_to_block(unfused);
+        self.container(pc)
+    }
+
     fn build(&mut self, pc: usize, n: usize, list: bool) -> bool {
         if n > self.depth {
             self.exit(INTERP, pc);
@@ -26014,7 +26118,13 @@ impl<'a> Lower<'a> {
         self.flush();
         let at = self.slot_addr(self.depth - n);
         let nv = self.b.ins().iconst(types::I64, n as i64);
-        let lv = self.b.ins().iconst(types::I32, i64::from(list));
+        // (`2`: a call's spread arguments, a list left untracked.)
+        let kind = match list {
+            true if spread_list_at(self.code, pc) => 2,
+            true => 1,
+            false => 0,
+        };
+        let lv = self.b.ins().iconst(types::I32, kind);
         let r = self
             .call(h_build as *const () as usize, &[self.st, at, nv, lv], true)
             .expect("returns");

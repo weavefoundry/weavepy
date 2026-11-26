@@ -81788,7 +81788,7 @@ fn varkw_stays_local(code: &CodeObject) -> bool {
             OpCode::LoadFast | OpCode::LoadFastBorrow | OpCode::LoadFastCheck
                 if i.arg as usize == slot =>
             {
-                ins.get(pc + 1).is_some_and(|n| n.op == OpCode::DictUpdate)
+                varkw_use_reads(code, pc)
             }
             OpCode::LoadFastAndClear | OpCode::StoreFast | OpCode::DeleteFast => {
                 i.arg as usize != slot
@@ -81804,6 +81804,49 @@ fn varkw_stays_local(code: &CodeObject) -> bool {
     ext.varkw_local
         .store(if local { 1 } else { 2 }, Ordering::Relaxed);
     local
+}
+
+/// Whether the load of a `**kwargs` dict at `pc` of `code` only reads it
+/// (see [`varkw_stays_local`]): a `DICT_UPDATE` that copies it, a truth
+/// test, `in`, a `for` over its keys, `len(kw)`, or a call of one of the
+/// dict's own methods that return neither it nor a view of it
+/// (`kw.get(k)`, `kw.pop(k, d)`).
+fn varkw_use_reads(code: &CodeObject, pc: usize) -> bool {
+    let ins = &code.instructions;
+    let op = |k: usize| ins.get(k).map(|i| i.op);
+    match op(pc + 1) {
+        Some(
+            OpCode::DictUpdate
+            | OpCode::ToBool
+            | OpCode::PopJumpIfFalse
+            | OpCode::PopJumpIfTrue
+            | OpCode::ContainsOp,
+        ) => true,
+        // (The iterator only lives on the stack through its loop.)
+        Some(OpCode::GetIter) => op(pc + 2) == Some(OpCode::ForIter),
+        // (A method-call site: the bound method goes to its call.)
+        Some(OpCode::LoadMethodAttr) => {
+            let name = code.names.get(ins[pc + 1].arg as usize);
+            name.is_some_and(|n| {
+                matches!(
+                    n.as_str(),
+                    "get" | "pop" | "setdefault" | "__contains__" | "__getitem__" | "__len__"
+                )
+            })
+        }
+        // (`LOAD_GLOBAL len`, `PUSH_NULL`, the dict, `CALL 1`.)
+        Some(OpCode::Call) => {
+            ins[pc + 1].arg == 1
+                && pc >= 2
+                && ins[pc - 1].op == OpCode::PushNull
+                && ins[pc - 2].op == OpCode::LoadGlobal
+                && code
+                    .names
+                    .get(ins[pc - 2].arg as usize)
+                    .is_some_and(|n| n == "len")
+        }
+        _ => false,
+    }
 }
 
 fn spare_kw_dict(n: usize) -> Rc<RefCell<DictData>> {

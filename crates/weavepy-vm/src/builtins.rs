@@ -12397,6 +12397,35 @@ fn str_split_sep(s: &str, ascii: bool, sep: &str, maxsplit: i64) -> Vec<Object> 
         out.push(piece(&s[start..]));
         return out;
     }
+    // A short separator (`", "`, `"\r\n"`) by a `memchr` scan for its
+    // first byte, as `str.replace` finds a short needle: the two-way
+    // searcher's setup cost more than a short line's whole split. (The
+    // first byte starts a character, so every hit is a boundary.)
+    if (2..=16).contains(&sep.len()) {
+        let (h, n) = (s.as_bytes(), sep.as_bytes());
+        let mut out = Vec::new();
+        let (mut start, mut i) = (0, 0);
+        if let Some(last_start) = h.len().checked_sub(n.len()) {
+            while i <= last_start {
+                let Some(off) = memchr::memchr(n[0], &h[i..=last_start]) else {
+                    break;
+                };
+                let at = i + off;
+                if short_bytes_eq(&h[at + 1..at + n.len()], &n[1..]) {
+                    if out.len() == limit {
+                        break;
+                    }
+                    out.push(piece(&s[start..at]));
+                    start = at + n.len();
+                    i = start;
+                } else {
+                    i = at + 1;
+                }
+            }
+        }
+        out.push(piece(&s[start..]));
+        return out;
+    }
     s.splitn(limit.saturating_add(1), sep).map(piece).collect()
 }
 
