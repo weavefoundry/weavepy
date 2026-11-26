@@ -1053,6 +1053,16 @@ unsafe extern "C" fn h_call<const EFFECT: bool>(
         },
         _ => return 1,
     };
+    // `hash(x)` of a value that hashes natively: its hash, with no call
+    // (as the plan's interpreter takes it).
+    if let Some((b, _)) = native {
+        if n == 1 && c.interp.is_builtin_hash_fn(b) {
+            if let Some(h) = super::hash_item(reg(first)) {
+                c.put(V::I(h));
+                return 0;
+            }
+        }
+    }
     if native.is_some() || ctor.is_some() {
         // A read-only builtin, on borrowed copies of the arguments (scalars
         // made as objects, which have no drop glue): never dropped, so no

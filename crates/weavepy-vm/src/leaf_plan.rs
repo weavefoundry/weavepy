@@ -387,7 +387,7 @@ pub(super) fn hash_items(items: [V; 3], n: u8) -> Option<i64> {
 /// tuple of such ([`crate::seqiter::plain_hashable`]), or an instance
 /// hashed by identity.
 #[inline]
-fn hash_item(v: V) -> Option<i64> {
+pub(super) fn hash_item(v: V) -> Option<i64> {
     match v {
         V::I(i) => Some(crate::object::py_hash_long_i64(i)),
         V::B(b) => Some(i64::from(b)),
@@ -1624,6 +1624,17 @@ impl Interpreter {
                     let n = usize::from(at + 2 + argc - first);
                     if n > 8 {
                         return None;
+                    }
+                    // `hash(x)` of a value that hashes natively (a
+                    // `__hash__`'s `return hash(self.a)`): its hash, with no
+                    // call.
+                    if let Callee::Native(b, _) = callee {
+                        if n == 1 && self.is_builtin_hash_fn(b) {
+                            if let Some(h) = hash_item(get!(first)) {
+                                set!(at, V::I(h));
+                                continue;
+                            }
+                        }
                     }
                     let fp = match callee {
                         Callee::Py(fp) => fp,

@@ -35295,6 +35295,12 @@ impl Interpreter {
         })
     }
 
+    /// Whether `b` is the builtin `hash`.
+    #[inline]
+    pub(crate) fn is_builtin_hash_fn(&self, b: *const crate::object::BuiltinFn) -> bool {
+        b as usize == self.leaf_fns().hash_ptr
+    }
+
     /// Whether a leaf plan register holds the builtin `hash`.
     #[inline]
     pub(crate) fn is_builtin_hash_obj(&self, o: &Object) -> bool {

@@ -3357,6 +3357,12 @@ branch and pull request.
     found once per class version, and a site the hook answered marks the
     class version so its next miss tries the hook first, which still
     checks that the default lookup misses (2.09 to 1.50 times CPython).
+  - A frameless `__hash__` returning `hash(self.a)` called the builtin
+    through the general native-call path. A leaf plan already fused
+    `hash((a, b))`; its call of the builtin `hash` with one argument that
+    hashes natively now computes the hash in place, in both the plan's
+    interpreter and its compiled form (`set()` of 50 such objects 2.12 to
+    1.77 times CPython; a dict comprehension keyed by them 1.51 to 1.30).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
