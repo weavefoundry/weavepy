@@ -3350,6 +3350,13 @@ branch and pull request.
     and strings item by item as CPython does, declining for anything else
     (sorting 40 slotted objects 2.31 to 1.11 times CPython; by a tuple
     key 2.01 to 1.06; `min` 2.01 to 1.40).
+  - A read that a class's pure `__getattr__` answers (`return
+    self.d.get(k, 0)`) walked the slow path's whole chain of site memos
+    before reaching the hook, then looked `__getattr__` up along the MRO
+    (about 2,100 instructions a read, twice CPython's). The hook is now
+    found once per class version, and a site the hook answered marks the
+    class version so its next miss tries the hook first, which still
+    checks that the default lookup misses (2.09 to 1.50 times CPython).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

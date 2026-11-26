@@ -9419,6 +9419,10 @@ pub(crate) struct AttrSite {
     /// The class version under which the site's read last turned out not
     /// to be such a descriptor's.
     no_descr: Cell<u64>,
+    /// The class version under which a receiver's Python `__getattr__`
+    /// last answered the site's read in place (see `attr_miss`): the slow
+    /// path tries that hook first.
+    py_hook: Cell<u64>,
     /// A receiver's class's native `__getattribute__` hook, for the
     /// class's version (see [`native_hook`]).
     hook: std::cell::RefCell<Option<(u64, Rc<crate::object::BuiltinFn>)>>,
@@ -9804,6 +9808,7 @@ unsafe fn attr_miss(st: *mut State, site: &AttrSite, at: *mut Object, local: boo
                     .get(arg as usize)
                     .and_then(|name| (*(*st).interp).leaf_getattr_hook(&*at, name, code, arg))
                 {
+                    site.py_hook.set(inst.cls_raw().attr_version.get());
                     if local {
                         (*st).stack.add(site.slot as usize).write(v);
                     } else {
@@ -10472,6 +10477,23 @@ unsafe extern "C" fn attr_local_slow(st: *mut State, site: *const AttrSite) -> u
             }
             // (A class attribute the site has read before.)
             Object::Instance(inst) => {
+                // A read the class's Python `__getattr__` answered before,
+                // for this class version: the hook first (it checks the
+                // default lookup still misses), ahead of the memos that
+                // can't answer it.
+                let ver = inst.cls_raw().attr_version.get();
+                if ver != 0 && site.py_hook.get() == ver {
+                    let code = &*site.code;
+                    let arg = code.instructions[site.pc as usize].arg;
+                    if let Some(v) = code
+                        .names
+                        .get(arg as usize)
+                        .and_then(|name| (*(*st).interp).leaf_getattr_hook(&*at, name, code, arg))
+                    {
+                        (*st).stack.add(slot).write(v);
+                        return 0;
+                    }
+                }
                 // An exception's pseudo-slot (`e.args`), as the site found
                 // it for the class's version.
                 if let Some(v) = exc_slot_known(site, inst) {
@@ -24607,6 +24629,7 @@ impl<'a> Lower<'a> {
             class_attr: Cell::new(false),
             descr: Cell::new(false),
             no_descr: Cell::new(0),
+            py_hook: Cell::new(0),
             hook: std::cell::RefCell::new(None),
             type_attr: std::cell::RefCell::new(None),
             class_poly: Default::default(),

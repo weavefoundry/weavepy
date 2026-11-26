@@ -905,6 +905,8 @@ pub(crate) mod vm_key {
     /// (a container built from an instance probes both).
     pub(crate) const LENGTH_HINT_ABSENT: u32 = 152;
     pub(crate) const LEN_ABSENT: u32 = 153;
+    /// A class's Python `__getattr__` hook, for the frameless hook calls.
+    pub(crate) const GETATTR_FN: u32 = 154;
 }
 
 /// A builtin type's pure constructor (see [`TypeObject::pure_new`]).

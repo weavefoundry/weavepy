@@ -11363,9 +11363,12 @@ impl Interpreter {
         {
             return None;
         }
-        let Some(Object::Function(hook)) = cls.lookup("__getattr__") else {
-            return None;
-        };
+        // (The hook found once per class version.)
+        let hook = Self::instance_dunder_function(
+            inst,
+            crate::types::AttrKey::vm(crate::types::vm_key::GETATTR_FN),
+            "__getattr__",
+        )?;
         let hcode = hook.code();
         if hcode.arg_count != 2
             || !code_is_pure_leaf(&hcode)
