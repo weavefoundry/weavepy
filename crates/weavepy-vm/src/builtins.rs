@@ -570,6 +570,9 @@ fn lookup_method_memo(obj: &Object, name: &str, tag: u8) -> Option<Object> {
         match name {
             "startswith" => crate::leaf_builtins::register_fast(b, bytes_startswith_fast),
             "endswith" => crate::leaf_builtins::register_fast(b, bytes_endswith_fast),
+            "join" if matches!(obj, Object::Bytes(_)) => {
+                crate::leaf_builtins::register_fast(b, bytes_join_fast)
+            }
             _ => {}
         }
     }
@@ -18248,7 +18251,23 @@ fn bytes_dunder_rmod(args: &[Object]) -> Result<Object, RuntimeError> {
     }
 }
 
+/// `bytes.join(parts)`'s leaf half: a list or tuple of `bytes` and
+/// `bytearray` parts (see [`bytes_join`]); `None` for anything else.
+fn bytes_join_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    match args {
+        [Object::Bytes(_), Object::List(_) | Object::Tuple(_)] => bytes_join_parts(args).map(Ok),
+        _ => None,
+    }
+}
+
 fn bytes_join(args: &[Object]) -> Result<Object, RuntimeError> {
+    if let Some(r) = bytes_join_parts(args) {
+        return Ok(r);
+    }
+    bytes_join_general(args)
+}
+
+fn bytes_join_parts(args: &[Object]) -> Option<Object> {
     // `bytes` joining a list or tuple of `bytes`: one allocation of the
     // exact size, the parts read in place (reading them runs no code).
     if let Some(Object::Bytes(sep)) = args.first() {
@@ -18277,15 +18296,16 @@ fn bytes_join(args: &[Object]) -> Result<Object, RuntimeError> {
             // (No part changed size: nothing ran between the passes.)
             (out.len() == total).then(|| Object::new_bytes(out))
         };
-        let joined = match args.get(1) {
+        return match args.get(1) {
             Some(Object::List(l)) => l.try_borrow().ok().and_then(|l| join(&l)),
             Some(Object::Tuple(t)) => join(t),
             _ => None,
         };
-        if let Some(r) = joined {
-            return Ok(r);
-        }
     }
+    None
+}
+
+fn bytes_join_general(args: &[Object]) -> Result<Object, RuntimeError> {
     let sep = bytes_data(args)?;
     let it = args
         .get(1)

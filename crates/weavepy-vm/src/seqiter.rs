@@ -239,14 +239,25 @@ impl Interpreter {
         out: &mut Vec<Object>,
         globals: &Rc<RefCell<DictData>>,
     ) -> Result<bool, RuntimeError> {
-        if chain_drain(l, out) {
+        // (The adapter's kind read once, each bulk path tried only for its
+        // own.)
+        // SAFETY: a read that runs no code, ending with the match.
+        let (chain, accumulate, zip) = match unsafe { l.state.peek() } {
+            Some(LazyIterKind::Chain { .. }) => (true, false, false),
+            Some(LazyIterKind::Accumulate { .. }) => (false, true, false),
+            Some(LazyIterKind::Zip { .. }) => (false, false, true),
+            _ => (false, false, false),
+        };
+        if chain && chain_drain(l, out) {
             return Ok(true);
         }
-        if let Some(items) = accumulate_collect(l) {
-            out.extend(items);
-            return Ok(true);
+        if accumulate {
+            if let Some(items) = accumulate_collect(l) {
+                out.extend(items);
+                return Ok(true);
+            }
         }
-        if zip_seq_bulk(l, out) {
+        if zip && zip_seq_bulk(l, out) {
             return Ok(true);
         }
         // `map(f, xs, ys)` of a leaf builtin over two plain cursors
