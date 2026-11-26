@@ -8314,19 +8314,24 @@ impl PyFile {
         if unsafe { self.closed.peek() }.is_none_or(|c| *c) {
             return false;
         }
-        let Ok(mut backend) = self.backend.try_borrow_mut() else {
-            return false;
-        };
-        let FileBackend::MemBytes { data: buf, pos } = &mut *backend else {
+        // SAFETY: as above (the cache's release only frees bytes).
+        let Some(FileBackend::MemBytes { data: buf, pos }) = (unsafe { self.backend.peek_mut() })
+        else {
             return false;
         };
         if bytearray_is_exported(buf) {
             return false;
         }
-        let Ok(mut b) = buf.try_borrow_mut() else {
+        // SAFETY: as above.
+        let Some(b) = (unsafe { buf.peek_mut() }) else {
             return false;
         };
-        self.mem_changed();
+        // SAFETY: as above.
+        if let Some(m) = unsafe { self.mem_value.peek_mut() } {
+            *m = None;
+        } else {
+            return false;
+        }
         // (At the end: appended. Inside the buffer, after a seek: written
         // over what is there, the buffer growing if the data runs past its
         // end. Past the end is the full method's, which fills the gap.)
@@ -10969,6 +10974,30 @@ impl PyFile {
     }
 
     pub fn getvalue(&self) -> Option<Object> {
+        // (A `BytesIO`'s value read through views: nothing here runs code.)
+        // SAFETY: the views end with this block; the cache store only
+        // releases bytes.
+        unsafe {
+            if let Some(FileBackend::MemBytes { data, .. }) = self.backend.peek() {
+                if let Some(d) = data.peek() {
+                    let exported = bytearray_is_exported(data);
+                    if !exported {
+                        if let Some(Some(v)) = self.mem_value.peek() {
+                            if v.len() == d.len() {
+                                return Some(Object::Bytes(v.clone()));
+                            }
+                        }
+                    }
+                    let v = SharedSlice::from(d.as_slice());
+                    if !exported {
+                        if let Some(m) = self.mem_value.peek_mut() {
+                            *m = Some(v.clone());
+                        }
+                    }
+                    return Some(Object::Bytes(v));
+                }
+            }
+        }
         match &*self.backend.borrow() {
             FileBackend::MemBytes { data, .. } => {
                 let d = data.borrow();
