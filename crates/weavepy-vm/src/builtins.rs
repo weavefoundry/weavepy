@@ -549,6 +549,22 @@ fn lookup_method_memo(obj: &Object, name: &str, tag: u8) -> Option<Object> {
             _ => {}
         }
     }
+    // A set's or frozenset's tests and algebra with other sets.
+    if let (Object::Set(_) | Object::FrozenSet(_), Some(Object::Builtin(b))) = (obj, &found) {
+        let fast: Option<crate::leaf_builtins::Fast> = match name {
+            "issubset" => Some(set_issubset_fast),
+            "issuperset" => Some(set_issuperset_fast),
+            "isdisjoint" => Some(set_isdisjoint_fast),
+            "union" => Some(set_union_fast),
+            "intersection" => Some(set_intersection_fast),
+            "difference" => Some(set_difference_fast),
+            "symmetric_difference" => Some(set_symmetric_difference_fast),
+            _ => None,
+        };
+        if let Some(fast) = fast {
+            crate::leaf_builtins::register_fast(b, fast);
+        }
+    }
     // `startswith`/`endswith` of one `bytes` or `bytearray` affix.
     if let (Object::Bytes(_) | Object::ByteArray(_), Some(Object::Builtin(b))) = (obj, &found) {
         match name {
@@ -16540,6 +16556,79 @@ pub(crate) fn set_ops_pending() -> bool {
     SET_DEFERRED_OPS.with(|q| q.try_borrow().map_or(true, |q| !q.is_empty()))
 }
 
+/// Whether every operand is an exact set or frozenset (a set method's
+/// leaf half reads their tables in place).
+fn all_sets(args: &[Object]) -> bool {
+    args.iter()
+        .all(|a| matches!(a, Object::Set(_) | Object::FrozenSet(_)))
+}
+
+/// `a.issubset(b)`, `a.issuperset(b)` and `a.isdisjoint(b)`'s leaf half:
+/// two sets or frozensets whose keys compare natively. `None` for anything
+/// else, which the full call answers.
+fn set_test_fast(
+    args: &[Object],
+    f: fn(&crate::object::SetData, &crate::object::SetData) -> bool,
+    flip: bool,
+) -> Option<Result<Object, RuntimeError>> {
+    let [a, b] = args else {
+        return None;
+    };
+    if !all_sets(args) || set_ops_pending() {
+        return None;
+    }
+    let (a, b) = if flip { (b, a) } else { (a, b) };
+    set_pair_test(a, b, f).map(|r| Ok(Object::Bool(r)))
+}
+
+fn set_issubset_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    set_test_fast(args, crate::setalg::subset, false)
+}
+
+fn set_issuperset_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    set_test_fast(args, crate::setalg::subset, true)
+}
+
+fn set_isdisjoint_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    set_test_fast(args, crate::setalg::disjoint, false)
+}
+
+/// `a.union(*others)`, `a.intersection(b)`, `a.difference(b)` and
+/// `a.symmetric_difference(b)`'s leaf half: sets and frozensets whose keys
+/// compare natively, the result's kind the receiver's. `None` for anything
+/// else.
+fn set_algebra_fast(
+    args: &[Object],
+    f: fn(&crate::object::SetData, &crate::object::SetData) -> crate::object::SetData,
+    many: bool,
+) -> Option<Result<Object, RuntimeError>> {
+    if !all_sets(args) || set_ops_pending() {
+        return None;
+    }
+    let out = match args {
+        [_, _] => set_pair_pure(args, f)?,
+        [_, _, _, ..] if many => crate::setalg::pure(|| crate::setalg::union_many(args))??,
+        _ => return None,
+    };
+    Some(Ok(set_result_like(args.first(), out)))
+}
+
+fn set_union_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    set_algebra_fast(args, crate::setalg::union, true)
+}
+
+fn set_intersection_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    set_algebra_fast(args, crate::setalg::intersection, false)
+}
+
+fn set_difference_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    set_algebra_fast(args, crate::setalg::difference, false)
+}
+
+fn set_symmetric_difference_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    set_algebra_fast(args, crate::setalg::symmetric_difference, false)
+}
+
 /// `s.add(x)`'s leaf half: a plain set, a value that hashes and compares
 /// natively. `None` for anything else.
 fn set_add_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
@@ -16683,6 +16772,13 @@ fn set_native_items(o: &Object) -> Option<Vec<Object>> {
 fn set_union(args: &[Object]) -> Result<Object, RuntimeError> {
     if let Some(out) = set_pair_pure(args, crate::setalg::union) {
         return Ok(set_result_like(args.first(), out));
+    }
+    // (`a.union(b, c)` of sets: folded over their tables, each key's hash
+    // read where it's stored.)
+    if args.len() > 2 {
+        if let Some(Some(out)) = crate::setalg::pure(|| crate::setalg::union_many(args)) {
+            return Ok(set_result_like(args.first(), out));
+        }
     }
     let mut out = crate::object::SetData::default();
     if let Some(first) = args.first() {

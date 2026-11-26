@@ -98,6 +98,25 @@ pub(crate) fn union(a: &SetMap, b: &SetMap) -> SetMap {
     out
 }
 
+/// `a | b | c ...` of exact sets and frozensets: the first's keys, then
+/// each other's that the result still lacks, in turn. `None` when one
+/// isn't a set or frozenset, or is being changed.
+pub(crate) fn union_many(sets: &[crate::object::Object]) -> Option<SetMap> {
+    let (first, rest) = sets.split_first()?;
+    let mut out = with_set(first, SetMap::clone)?;
+    for o in rest {
+        with_set(o, |b| {
+            if !b.is_empty() {
+                out.reserve(b.len().div_ceil(2));
+                for e in b.as_entries() {
+                    out.insert_hashed(e.hash, e.key.clone());
+                }
+            }
+        })?;
+    }
+    Some(out)
+}
+
 /// `a & b`: the smaller operand's keys that the other holds (`b`'s on a
 /// tie), in the smaller one's order.
 pub(crate) fn intersection(a: &SetMap, b: &SetMap) -> SetMap {

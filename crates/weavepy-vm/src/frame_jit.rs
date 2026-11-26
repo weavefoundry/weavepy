@@ -4848,6 +4848,10 @@ unsafe extern "C" fn h_for_iter_rest(
                                 || items.iter().all(|x| plain_scalar(x) || held_elsewhere(x)))
                     }
                     PyIterator::Range { .. } => unique,
+                    // A str's or bytes' cursor: immutable data whose release
+                    // runs nothing (`for i, c in enumerate(s)`).
+                    PyIterator::Str { s, index } => *index >= s.len(),
+                    PyIterator::Bytes { data, index } => *index >= data.len(),
                     _ => false,
                 };
                 if !frees_nothing {

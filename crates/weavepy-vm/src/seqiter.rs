@@ -249,6 +249,51 @@ impl Interpreter {
         if zip_seq_bulk(l, out) {
             return Ok(true);
         }
+        // `map(f, xs, ys)` of a leaf builtin over two plain cursors
+        // (`map(max, a, b)`): its kind resolved once, each pair through its
+        // body in place while both cursors hold an item. The end (which
+        // may consume the first source's item), and a pair the body
+        // declines or raises on, go on through the general loop.
+        let pair_leaf = match &*l.state.borrow() {
+            LazyIterKind::Map {
+                func: Object::Builtin(b),
+                iters,
+                strict,
+                ..
+            } => match iters.as_slice() {
+                [first @ Object::Iter(x), Object::Iter(y)] if !Rc::ptr_eq(x, y) => self
+                    .leaf_call_kind(b)
+                    .map(|k| (b.clone(), k, x.clone(), y.clone(), first.clone(), *strict)),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some((b, kind, x, y, first, strict)) = pair_leaf {
+            while let (Some(a), Some(c)) = (cursor_peek(&x), cursor_peek(&y)) {
+                if cursor_advance(&x).is_none() || cursor_advance(&y).is_none() {
+                    break;
+                }
+                let args = [a, c];
+                let r = match self.leaf_builtin_call(kind, &b, &args) {
+                    Some(Ok(r)) => {
+                        let [a, c] = args;
+                        self.release(a);
+                        self.release(c);
+                        Ok(r)
+                    }
+                    // (Both items are taken: the full call answers them.)
+                    _ => self.call(&Object::Builtin(b.clone()), &args, &[], globals),
+                };
+                match r {
+                    Ok(r) => out.push(r),
+                    Err(e) if is_stop_iteration(&e) => return Ok(true),
+                    Err(e) => return Err(e),
+                }
+            }
+            // (The first source's end, a plain cursor's, ends a map that
+            // isn't strict, as `zip`'s does: see `lazy_stops_quietly`.)
+            return Ok(!strict && cursor_at_end(&first));
+        }
         let (func, source, filter) = match &*l.state.borrow() {
             LazyIterKind::Map { func, iters, .. } if iters.len() == 1 => {
                 (func.clone(), iters[0].clone(), false)
@@ -3116,6 +3161,31 @@ pub(crate) fn builtin_ctor_arms(cls: &Rc<TypeObject>, args: &[Object]) -> Option
             step,
         })));
     }
+    // `set(s)` and `frozenset(s)` of an exact set or frozenset: its table
+    // copied, hashes and all (no key is hashed or compared); an exact
+    // frozenset's `frozenset(f)` is `f` itself, as CPython's.
+    if let [src @ (Object::Set(_) | Object::FrozenSet(_))] = args {
+        let frozen = Rc::ptr_eq(cls, &bt.frozenset_);
+        if frozen || Rc::ptr_eq(cls, &bt.set_) {
+            if frozen && matches!(src, Object::FrozenSet(_)) {
+                return Some(src.clone());
+            }
+            if crate::stdlib::tracemalloc_real::is_tracking() || crate::gc_trace::auto_collect_due()
+            {
+                return None;
+            }
+            let data = crate::setalg::with_set(src, crate::object::SetData::clone)?;
+            let obj = if !frozen {
+                Object::Set(Rc::new(crate::sync::RefCell::new(data)))
+            } else if data.is_empty() {
+                Object::new_frozenset_from(std::iter::empty())
+            } else {
+                Object::FrozenSet(Rc::new(crate::object::FrozenSetObj::new(data)))
+            };
+            crate::gc_trace::track(&obj);
+            return Some(obj);
+        }
+    }
     // `set(xs)` and `frozenset(xs)` of an exact list or tuple of plain
     // hashable values: no element's hash or comparison runs any code.
     if let [src @ (Object::List(_) | Object::Tuple(_))] = args {
@@ -3188,10 +3258,8 @@ pub(crate) fn builtin_ctor_arms(cls: &Rc<TypeObject>, args: &[Object]) -> Option
     // names for base 0 (where a decimal literal can't have a leading
     // zero). Underscores, spaces, and anything that would raise or not fit
     // a machine word take the full path.
-    if let [Object::Str(text), Object::Int(base)] = args {
-        if !Rc::ptr_eq(cls, &bt.int_) {
-            return None;
-        }
+    // (Another class's pair, `enumerate(text, 1)` say, goes on below.)
+    if let ([Object::Str(text), Object::Int(base)], true) = (args, Rc::ptr_eq(cls, &bt.int_)) {
         let t: &str = text.as_ref();
         let (neg, body) = match t.as_bytes().first() {
             Some(b'-') => (true, &t[1..]),
@@ -3311,12 +3379,14 @@ pub(crate) fn iter_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>>
 
 /// The items `min`/`max`/`sum`/`any`/`all` scan: the positional
 /// arguments, or a single list or tuple argument's items.
-fn scan_items(args: &[Object], multi: bool) -> Option<Vec<Object>> {
+fn scan_items(args: &[Object], multi: bool) -> Option<std::borrow::Cow<'_, [Object]>> {
+    use std::borrow::Cow;
     match args {
-        [Object::Tuple(t)] => Some(crate::object::cloned_vec(t)),
-        [Object::List(l)] => Some(crate::object::cloned_vec(&l.try_borrow().ok()?)),
+        [Object::Tuple(t)] => Some(Cow::Owned(crate::object::cloned_vec(t))),
+        [Object::List(l)] => Some(Cow::Owned(crate::object::cloned_vec(&l.try_borrow().ok()?))),
         [_] => None,
-        _ if multi && args.len() > 1 => Some(args.to_vec()),
+        // (The arguments themselves, read where they are.)
+        _ if multi && args.len() > 1 => Some(Cow::Borrowed(args)),
         _ => None,
     }
 }
@@ -3336,6 +3406,17 @@ fn min_max_fast(args: &[Object], want_max: bool) -> Option<Result<Object, Runtim
         x.map(|&x| Ok(Object::Int(i64::from(x))))
     };
     match args {
+        // `max(a, b)` of two ints or two floats (NaNs ordered as the scan
+        // below orders them: the first wins unless the second compares
+        // greater), with no list of items gathered.
+        [x @ Object::Int(a), y @ Object::Int(b)] => {
+            let second = if want_max { b > a } else { b < a };
+            return Some(Ok(if second { y.clone() } else { x.clone() }));
+        }
+        [x @ Object::Float(a), y @ Object::Float(b)] => {
+            let second = if want_max { b > a } else { b < a };
+            return Some(Ok(if second { y.clone() } else { x.clone() }));
+        }
         [Object::Bytes(b)] => return extreme(b),
         [Object::ByteArray(b)] => return extreme(&b.try_borrow().ok()?),
         _ => {}
