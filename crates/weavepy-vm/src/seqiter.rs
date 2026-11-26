@@ -449,6 +449,47 @@ impl Interpreter {
                 }
             }
         }
+        // An instance whose class's native `__call__` has a fast half
+        // (`map(itemgetter(0), pairs)`), resolved once: each item through
+        // it with the instance first, on views; one it declines takes the
+        // full call.
+        let inst_fast = match &func {
+            Object::Instance(inst) => {
+                Self::instance_call_native(inst).and_then(|b| match self.leaf_call_kind(&b) {
+                    Some(LeafKind::Fast(f)) => Some(f),
+                    _ => None,
+                })
+            }
+            _ => None,
+        };
+        if let Some(fast) = inst_fast {
+            loop {
+                let v = match self.seq_step_source(&source, globals) {
+                    Ok(Some(v)) => v,
+                    Ok(None) => return Ok(true),
+                    Err(e) => return stop(e),
+                };
+                // SAFETY: bitwise views of the live instance and item, never
+                // dropped (the fast half clones what it keeps).
+                let views = std::mem::ManuallyDrop::new(unsafe {
+                    [
+                        std::ptr::read(&raw const func),
+                        std::ptr::read(&raw const v),
+                    ]
+                });
+                let r = match fast(&views[..]) {
+                    Some(Ok(r)) => {
+                        self.release(v);
+                        Ok(r)
+                    }
+                    _ => self.seq_call1(&func, v, globals),
+                };
+                match r {
+                    Ok(r) => out.push(r),
+                    Err(e) => return stop(e),
+                }
+            }
+        }
         loop {
             let v = match self.seq_step_source(&source, globals) {
                 Ok(Some(v)) => v,
@@ -2802,6 +2843,58 @@ pub(crate) fn itertools_pure_next(l: &PyLazyIter) -> Option<Option<Object>> {
                         return None;
                     }
                 }
+            }
+            // (Up to four sources in arrays, the row built in place.)
+            if iters.len() <= 4 {
+                let n = iters.len();
+                let mut items: [Option<Object>; 4] = [None, None, None, None];
+                let mut ending = 0usize;
+                for (k, slot) in iters.iter().enumerate() {
+                    items[k] = match slot {
+                        None => None,
+                        Some(src) if cursor_at_end(src) => {
+                            if !quiet_source(src) {
+                                return None;
+                            }
+                            exhaust_cursor(src);
+                            ending += 1;
+                            None
+                        }
+                        Some(Object::Iter(c)) => Some(cursor_peek(c)?),
+                        Some(_) => return None,
+                    };
+                }
+                if ending >= *numactive {
+                    *numactive = 0;
+                    return Some(None);
+                }
+                let mut row = [Object::None, Object::None, Object::None, Object::None];
+                let mut done: [Option<Object>; 4] = [None, None, None, None];
+                for (k, (slot, item)) in iters.iter_mut().zip(items).enumerate() {
+                    row[k] = match item {
+                        Some(v) => {
+                            if let Some(Object::Iter(c)) = slot {
+                                cursor_advance(c)?;
+                            }
+                            v
+                        }
+                        None => {
+                            if let Some(src) = slot.take() {
+                                done[k] = Some(src);
+                                *numactive -= 1;
+                            }
+                            fillvalue.clone()
+                        }
+                    };
+                }
+                drop(done);
+                let [a, b, c, d] = row;
+                return Some(Some(match n {
+                    1 => Object::new_tuple_array([a]),
+                    2 => Object::new_tuple_array([a, b]),
+                    3 => Object::new_tuple_array([a, b, c]),
+                    _ => Object::new_tuple_array([a, b, c, d]),
+                }));
             }
             let mut items: Vec<Option<Object>> = Vec::with_capacity(iters.len());
             let mut ending = 0usize;
