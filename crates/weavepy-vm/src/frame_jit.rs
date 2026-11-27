@@ -4663,6 +4663,19 @@ unsafe extern "C" fn h_for_iter_rest(
             // SAFETY: the code passes its live state, whose interpreter
             // is dormant while the helper runs.
             let interp = unsafe { &*st.interp };
+            // A `chain`, `filter` or `islice` over a generator: its own
+            // step, past the ones that can't take it.
+            if !st.sw.is_null() && crate::seqiter::lazy_steps_generator(l) {
+                // SAFETY: as above.
+                let interp = unsafe { &mut *st.interp.cast_mut() };
+                if let Some(v) = interp.lazy_gen_one(l, st.snap_gen, st.maybe_dead, st.depth_cell) {
+                    // SAFETY: the slot above the iterator is free.
+                    unsafe { out.write(v) };
+                    return 1;
+                }
+                // SAFETY: as above.
+                return unsafe { for_iter_lane(st, it, pc) };
+            }
             if let Some(Some(v)) = interp.lazy_core_next(l) {
                 // SAFETY: the slot above the iterator is free.
                 unsafe { out.write(v) };

@@ -2228,6 +2228,31 @@ pub(crate) fn islice_collect(l: &PyLazyIter) -> Option<Vec<Object>> {
 /// whose first source, a tuple or list cursor, is at its end, and an
 /// `accumulate` without a function over one (its end changes no state,
 /// as CPython's doesn't).
+/// Whether `l` is a `chain` at a generator, or a `filter` or `islice` over
+/// one: the adapters whose step only
+/// [`Interpreter::lazy_gen_one`] takes in place (the steps that run no
+/// code can't resume a generator).
+#[cfg(feature = "jit")]
+#[inline]
+pub(crate) fn lazy_steps_generator(l: &Rc<PyLazyIter>) -> bool {
+    // SAFETY: a read that runs no code, ending with this call.
+    matches!(
+        unsafe { l.state.peek() },
+        Some(
+            LazyIterKind::Chain {
+                active: Some(Object::Generator(_)),
+                ..
+            } | LazyIterKind::Filter {
+                source: Object::Generator(_),
+                ..
+            } | LazyIterKind::Islice {
+                source: Object::Generator(_),
+                ..
+            }
+        )
+    )
+}
+
 pub(crate) fn lazy_stops_quietly(l: &Rc<PyLazyIter>) -> bool {
     // SAFETY: reads that run no code, ending with this call.
     let Some(st) = (unsafe { l.state.peek() }) else {
@@ -5220,6 +5245,18 @@ impl Interpreter {
                 active: Some(g @ Object::Generator(_)),
                 ..
             } => (g.clone(), None),
+            LazyIterKind::Filter {
+                func,
+                source: Object::Generator(g),
+            } if match func {
+                Object::None => true,
+                Object::Type(t) => Rc::ptr_eq(t, &builtin_types().bool_),
+                _ => false,
+            } =>
+            {
+                let g = g.clone();
+                return self.lazy_gen_filter(l, &g, snap_gen, dead, depth_cell);
+            }
             LazyIterKind::Islice {
                 source: g @ Object::Generator(_),
                 next_idx,
@@ -5258,6 +5295,73 @@ impl Interpreter {
             }
         }
         Some(item)
+    }
+
+    /// One step of `filter(None, gen)` (or `filter(bool, gen)`) from a
+    /// running activation (see [`Self::lazy_gen_one`]): the generator's
+    /// items stepped by its native code where it stands until one tests
+    /// true. An item whose truth would run code (a `__bool__` that doesn't
+    /// evaluate frameless, a foreign object's) is put back ahead of the
+    /// generator, the adapter's source becoming a `chain` of the two, for
+    /// the general step to test. `None` when the generator doesn't yield:
+    /// the general step finds it as it stands.
+    #[cfg(feature = "jit")]
+    fn lazy_gen_filter(
+        &mut self,
+        l: &Rc<PyLazyIter>,
+        g: &Rc<crate::object::PyGenerator>,
+        snap_gen: u64,
+        dead: *const std::cell::Cell<bool>,
+        depth_cell: *const std::cell::Cell<usize>,
+    ) -> Option<Object> {
+        loop {
+            let v = match self.gen_native_next(g, snap_gen, dead, depth_cell, 0) {
+                crate::gen_fast::GenNext::Yielded(v) => v,
+                _ => return None,
+            };
+            let truth = match &v {
+                Object::Instance(_) if !v.is_same(&crate::vm_singletons::not_implemented()) => {
+                    self.leaf_instance_truth(&v)
+                }
+                Object::Instance(_) | Object::Foreign(_) | Object::MappingProxyObj(_) => None,
+                o if o.truth_dispatches() => None,
+                o => Some(o.is_truthy()),
+            };
+            match truth {
+                Some(true) => return Some(v),
+                Some(false) => drop(v),
+                None => {
+                    Self::filter_put_back(l, v);
+                    return None;
+                }
+            }
+        }
+    }
+
+    /// Put `item`, taken from a `filter`'s generator source, back ahead of
+    /// it (see [`Self::lazy_gen_filter`]).
+    #[cfg(feature = "jit")]
+    #[cold]
+    fn filter_put_back(l: &Rc<PyLazyIter>, item: Object) {
+        let one = |o: Object| -> Object {
+            let Object::Tuple(items) = Object::new_tuple_array([o]) else {
+                unreachable!("a tuple")
+            };
+            Object::Iter(Rc::new(RefCell::new(PyIterator::Tuple { items, index: 0 })))
+        };
+        let mut st = l.state.borrow_mut();
+        let LazyIterKind::Filter { source, .. } = &mut *st else {
+            // (The generator's body replaced the adapter's state: the
+            // item goes where a general step's would, nowhere.)
+            drop(st);
+            drop(item);
+            return;
+        };
+        let rest = std::mem::replace(source, Object::None);
+        *source = lazy(LazyIterKind::Chain {
+            source: Some(one(rest)),
+            active: Some(one(item)),
+        });
     }
 
     /// [`Self::lazy_core_next`] of an `enumerate` over a native adapter

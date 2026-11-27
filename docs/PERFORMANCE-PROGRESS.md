@@ -3446,6 +3446,18 @@ branch and pull request.
     next spine shells and inline activations take them (a raise through
     six frames caught and dropped: 30 allocations to 12, 21,970 to 20,284
     instructions).
+  - A compiled loop over `filter(None, gen)` (or `filter(bool, gen)`)
+    stepped the generator through the core loop's lane and four layers of
+    general steps, about 1,640 instructions an item. The frame JIT's
+    adapter step now resumes the generator by its native code where it
+    stands and tests each item's truth natively (a class instance's
+    through its frameless `__bool__` or `__len__`); an item whose truth
+    would run code goes back ahead of the generator, the adapter's source
+    becoming a `chain` of the two, for the general step to test. `chain`,
+    `filter` and `islice` over a generator also skip the three adapter
+    steps that can't take them (50 items: `filter` 3.40 to 1.73 times
+    CPython, `chain` of two generators 2.37 to 2.11, `islice` 2.50 to
+    2.01).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
