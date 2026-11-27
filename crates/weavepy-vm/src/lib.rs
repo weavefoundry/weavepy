@@ -9438,6 +9438,7 @@ impl Interpreter {
             (Some(MethodOp::Truth(from_len)), Ok(v)) => truth_result(v, from_len).map(Object::Bool),
             (Some(MethodOp::Len), Ok(v)) => coerce_len_result(v).map(Object::Int),
             (Some(MethodOp::Format), Ok(v)) => format_result(v),
+            (Some(MethodOp::Str), Ok(v)) => str_result(v),
             (Some(MethodOp::Inplace(op, a, b)), Ok(v))
                 if v.is_same(&crate::vm_singletons::not_implemented()) =>
             {
@@ -81056,6 +81057,20 @@ pub(crate) enum MethodOp {
     /// A `FORMAT_VALUE`'s Python `__format__`: its result must be a string
     /// (see [`format_result`]).
     Format,
+    /// `str(obj)`'s Python `__str__`: its result must be a string.
+    Str,
+}
+
+/// A `__str__` result `r` as `str(obj)` takes it: a string (a `str`
+/// subclass's instance as it is), or the protocol's `TypeError`.
+pub(crate) fn str_result(r: Object) -> Result<Object, RuntimeError> {
+    if str_like_object(&r) {
+        return Ok(r);
+    }
+    Err(type_error(format!(
+        "__str__ returned non-string (type {})",
+        r.type_name()
+    )))
 }
 
 /// A `__format__` result `r` as `PyObject_Format` takes it: a string (a

@@ -73,6 +73,8 @@ pub(super) enum MethodOp<'a> {
     Inplace(weavepy_compiler::BinOpKind, &'a Object, &'a Object),
     /// A `FORMAT_VALUE`'s `__format__`: its result must be a string.
     Format,
+    /// `str(obj)`'s `__str__`: its result must be a string.
+    Str,
 }
 
 impl MethodOp<'_> {
@@ -90,6 +92,7 @@ impl MethodOp<'_> {
             MethodOp::Len => crate::MethodOp::Len,
             MethodOp::Inplace(op, a, b) => crate::MethodOp::Inplace(op, a.clone(), b.clone()),
             MethodOp::Format => crate::MethodOp::Format,
+            MethodOp::Str => crate::MethodOp::Str,
         }
     }
 }

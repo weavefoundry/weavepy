@@ -3538,6 +3538,12 @@ branch and pull request.
     through a `__format__` that calls a method 1.63 to 0.73 times
     CPython). The general path rendered a `str` subclass result as its
     repr (`"'subz'"`); it now takes the text.
+  - `str(obj)` of an instance whose class's Python `__str__` doesn't
+    evaluate frameless went through the general constructor call. The
+    call site now calls the method directly, the type's slot taking it,
+    and takes the result as `str()` does (the new `MethodOp::Str`); a
+    warm pure-leaf `__str__` keeps its frameless path (`str(k)` through a
+    `__str__` that calls a method 1.34 to 0.73 times CPython).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

@@ -2734,6 +2734,7 @@ unsafe fn op_after_reload(st: &mut State, op: records::MethodOp<'_>) {
             }
             records::MethodOp::Inplace(..) => Ok(v),
             records::MethodOp::Format => crate::format_result(v),
+            records::MethodOp::Str => crate::str_result(v),
             records::MethodOp::Contains(invert) => {
                 let globals = frame.globals.clone();
                 interp
@@ -14807,6 +14808,17 @@ unsafe extern "C" fn h_call_site(
             }
             site.retry -= 1;
         } else if matches!(callee, Object::Type(_)) {
+            // `str(obj)` through a Python `__str__` (see `str_call`).
+            if argc == 1
+                && matches!(callee, Object::Type(t) if Rc::ptr_eq(t, &crate::builtin_types::builtin_types().str_))
+                && matches!(&*at.add(2), Object::Instance(_))
+            {
+                let lenu = len as usize;
+                let pc = (pc_argc & u64::from(u32::MAX)) as usize;
+                if let Some(r) = str_call(&mut *st, site, pc, lenu - 3, lenu) {
+                    return r;
+                }
+            }
             return h_call_ctor(st, code, ext, pc_argc, len);
         } else if crate::stdlib::functools_mod::is_lru_wrapper(callee) {
             return h_call_instance(st, code, ext, pc_argc, len, site);
@@ -16979,6 +16991,10 @@ unsafe fn len_call(
 pub(crate) struct TypeSite {
     cls: Rc<crate::types::TypeObject>,
     argc: usize,
+    /// The address of the site's direct-call cache, for `str(obj)` of an
+    /// instance whose class's `__str__` is a Python function (see
+    /// [`str_call`]); `0` none.
+    direct: usize,
 }
 
 /// [`h_call`] at a site settled on a builtin type `site` names: the callee
@@ -17023,6 +17039,14 @@ unsafe extern "C" fn h_call_type(
                 }
                 return 0;
             }
+            // `str(obj)` through a Python `__str__` (see `str_call`).
+            if site.direct != 0 {
+                if let Some(r) =
+                    str_call(s, site.direct as *mut DirectSite, pc as usize, start, lenu)
+                {
+                    return r;
+                }
+            }
             // `list(it)`, `tuple(it)`, `set(it)` ... of anything else
             // (`list(map(f, xs))`): straight to the core loop's lane.
             if site.argc == 1 && Interpreter::core_type_lane_class(&site.cls) {
@@ -17032,6 +17056,105 @@ unsafe extern "C" fn h_call_type(
             }
         }
         h_call(st, code, ext, pc, len)
+    }
+}
+
+/// [`h_call_type`]'s `str(obj)` (the `CALL` at `pc`, `str` at `start` on a
+/// `lenu`-deep stack) of an instance whose class's `__str__` is a Python
+/// function: the method called directly ([`direct_call`]) on the instance,
+/// the type's slot taking the method, and its result taken as `str()`
+/// takes it ([`crate::str_result`]). `Some(0)` the string in place,
+/// `Some(RAISED)` or `Some(RELOAD)` as [`h_call`]'s (the core loop settles
+/// a result it finishes: see `records::MethodOp::Str`), `None` declined
+/// untouched.
+///
+/// # Safety
+///
+/// As [`h_call_type`]'s, with the site's direct-call cache.
+#[inline(never)]
+unsafe fn str_call(
+    s: &mut State,
+    dsite: *mut DirectSite,
+    pc: usize,
+    start: usize,
+    lenu: usize,
+) -> Option<u32> {
+    // SAFETY: the caller's contract.
+    unsafe {
+        if s.sw.is_null() {
+            return None;
+        }
+        let at = s.stack.add(start);
+        if lenu != start + 3 || !matches!(&*at.add(1), Object::Unbound) {
+            return None;
+        }
+        let Object::Instance(inst) = &*at.add(2) else {
+            return None;
+        };
+        let f = Interpreter::instance_dunder_function(
+            inst,
+            crate::types::AttrKey::vm(crate::types::vm_key::STR_FN),
+            "__str__",
+        )?;
+        {
+            // SAFETY: GIL-serialized raw read of the function's code cell.
+            let fc = &*f.code.as_ptr();
+            // (A warm pure leaf evaluates frameless on the type call's own
+            // path.)
+            if (crate::code_is_pure_leaf(fc) && crate::pure_leaf_warm(fc))
+                || fc.arg_count != 1
+                || fc.kwonly_count != 0
+                || fc.has_varargs
+                || fc.has_varkeywords
+                || fc.is_generator
+                || fc.is_coroutine
+                || fc.is_async_generator
+            {
+                return None;
+            }
+        }
+        // `[str, NULL, obj]` becomes the method call `[f, obj]`.
+        let ty = at.read();
+        at.write(Object::Function(f));
+        at.add(1).write(at.add(2).read());
+        let dsite = &mut *dsite;
+        match direct_call_out(s, pc, start, start + 2, dsite, Some(records::MethodOp::Str)) {
+            None => {
+                let f = at.read();
+                at.add(2).write(at.add(1).read());
+                at.add(1).write(Object::Unbound);
+                at.write(ty);
+                if let Object::Function(f) = &f {
+                    let fc = f.code();
+                    if let Some(ext) = crate::code_vm_ext(&fc) {
+                        ext.frame_jit
+                            .warm_switched(&fc, ext, fc.varnames.len().max(1));
+                    }
+                }
+                drop(f);
+                None
+            }
+            Some(0) => {
+                drop(ty);
+                match crate::str_result(at.read()) {
+                    Ok(v) => {
+                        at.write(v);
+                        s.len = start + 1;
+                        Some(0)
+                    }
+                    Err(e) => {
+                        s.len = start;
+                        s.pc = pc + 1;
+                        s.err = Some(e);
+                        Some(RAISED)
+                    }
+                }
+            }
+            Some(r) => {
+                drop(ty);
+                Some(r)
+            }
+        }
     }
 }
 
@@ -26872,7 +26995,17 @@ impl<'a> Lower<'a> {
         use crate::LeafKind;
         let Some((f, kind, via_call)) = crate::call_site_builtin(self.ext, pc) else {
             let cls = crate::call_site_type(self.ext, pc)?;
-            let site = Box::new(TypeSite { cls, argc });
+            // `str(obj)` calls a Python `__str__` directly (see `str_call`).
+            let direct =
+                if argc == 1 && Rc::ptr_eq(&cls, &crate::builtin_types::builtin_types().str_) {
+                    let d: Box<DirectSite> = Box::default();
+                    let at = std::ptr::from_ref::<DirectSite>(&d) as usize;
+                    self.direct_sites.push(d);
+                    at
+                } else {
+                    0
+                };
+            let site = Box::new(TypeSite { cls, argc, direct });
             let at = std::ptr::from_ref::<TypeSite>(&site).cast_mut().cast();
             self.type_sites.push(site);
             return Some((h_site_type as *const () as usize, at));
