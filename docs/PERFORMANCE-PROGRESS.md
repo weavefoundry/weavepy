@@ -3384,6 +3384,14 @@ branch and pull request.
     found once per class version, and `format()`'s own fast half counts as
     pure, so a body that formats a field (`return format(self.v, spec)`)
     qualifies (`f"{p:>4}"` 1.67 to 1.18 times CPython).
+  - The fast halves of `round`, `pow`, `repr`, `hex`, `oct` and `bin`,
+    which take only native numbers or strings, now count as pure, and a
+    frameless evaluation adds two strings (a new string it holds), so
+    callbacks using them no longer decline to a full call per item
+    (`sorted(xs, key=lambda x: round(x, 1))` 1.04 to 0.77 times CPython;
+    `min(xs, key=lambda x: pow(x - 25, 2))` 1.69 to 1.00; `map(lambda x:
+    hex(x)[2:], xs)` 1.88 to 1.32; `map(lambda x: repr(x) + "!", xs)`
+    1.61 to 1.14).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

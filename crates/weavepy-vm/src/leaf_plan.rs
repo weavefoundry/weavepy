@@ -1544,7 +1544,13 @@ impl Interpreter {
                 }
                 Op::Truth { dst, src } => set!(dst, V::B(truth(get!(src))?)),
                 Op::Unary { dst, src, kind } => set!(dst, unary(get!(src), kind)?),
-                Op::Binary { dst, a, b, kind } => set!(dst, binary(get!(a), get!(b), kind)?),
+                Op::Binary { dst, a, b, kind } => {
+                    let (x, y) = (get!(a), get!(b));
+                    match binary(x, y, kind) {
+                        Some(v) => set!(dst, v),
+                        None => set!(dst, str_add(&mut owned, x, y, kind)?),
+                    }
+                }
                 Op::Contains {
                     dst,
                     item,
@@ -1893,6 +1899,22 @@ pub(crate) fn unary(v: V, kind: u8) -> Option<V> {
 /// result the interpreter must produce (an overflow, a negative operand
 /// of a floor division).
 #[inline(always)]
+/// `a + b` of two strings (what [`binary`] leaves): a new string, held
+/// by `owned`. `None` for anything else.
+fn str_add(owned: &mut Owned, a: V, b: V, kind: u8) -> Option<V> {
+    if kind != BinOpKind::Add as u8 {
+        return None;
+    }
+    let (V::R(p), V::R(q)) = (a, b) else {
+        return None;
+    };
+    // SAFETY: as `norm`.
+    let (Object::Str(x), Object::Str(y)) = (unsafe { &*p }, unsafe { &*q }) else {
+        return None;
+    };
+    owned.own(Object::Str(crate::shared_value::SharedStr::concat(&[x, y])))
+}
+
 pub(crate) fn binary(a: V, b: V, kind: u8) -> Option<V> {
     Some(match (a, b) {
         // `int / int` of operands a double holds exactly (at most `2**53`

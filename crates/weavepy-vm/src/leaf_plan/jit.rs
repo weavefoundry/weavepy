@@ -798,7 +798,9 @@ unsafe extern "C" fn h_binary(
 ) -> u32 {
     // SAFETY: called by native code with its context.
     let c = unsafe { cx(ctx) };
-    match binary(value(ta, pa), value(tb, pb), kind as u8) {
+    let (a, b) = (value(ta, pa), value(tb, pb));
+    // (Two strings' sum is a new string, held by the evaluation.)
+    match binary(a, b, kind as u8).or_else(|| super::str_add(&mut c.owned, a, b, kind as u8)) {
         Some(v) => {
             c.put(v);
             0

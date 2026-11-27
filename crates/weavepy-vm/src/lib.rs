@@ -80619,10 +80619,17 @@ fn leaf_issubclass(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
 /// effect (a module's may have one: `getrandbits` advances its state), so a
 /// frameless evaluation that declines after calling it did nothing.
 fn pure_fast_half(f: leaf_builtins::Fast) -> bool {
-    let pure: [leaf_builtins::Fast; 20] = [
+    let pure: [leaf_builtins::Fast; 26] = [
         leaf_issubclass,
         // (A new string; a bad spec's error declines, the full call raises.)
         leaf_format,
+        // (Of native numbers or strings only: a new value each.)
+        crate::seqiter::round_fast,
+        crate::seqiter::pow_fast,
+        crate::seqiter::repr_fast,
+        crate::builtins::hex_fast,
+        crate::builtins::oct_fast,
+        crate::builtins::bin_fast,
         // (A new iterator over its argument, which it leaves alone.)
         crate::seqiter::iter_fast,
         crate::seqiter::hash_fast,
