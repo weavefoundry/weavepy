@@ -7531,6 +7531,16 @@ impl Interpreter {
         if !self.specialized_binary_op(frame, cache_pc, kind)? {
             let b = frame.pop()?;
             let a = frame.pop()?;
+            // (Compiled code keeps an instance operator's operands on the
+            // stack, where its method's direct call leaves them, at a site
+            // known to see instances: see `instance_site`.)
+            if matches!(a, Object::Instance(_)) || matches!(b, Object::Instance(_)) {
+                if let Some(ext) = code_vm_ext_existing(&frame.code) {
+                    if !instance_site(ext, cache_pc as usize) {
+                        instance_site_note(ext, frame.code.instructions.len(), cache_pc as usize);
+                    }
+                }
+            }
             let r_res = if inplace {
                 self.dispatch_inplace_op(&a, &b, kind, &frame.globals)
             } else {
@@ -9427,6 +9437,12 @@ impl Interpreter {
             (Some(MethodOp::Iter), Ok(v)) => iter_result(v),
             (Some(MethodOp::Truth(from_len)), Ok(v)) => truth_result(v, from_len).map(Object::Bool),
             (Some(MethodOp::Len), Ok(v)) => coerce_len_result(v).map(Object::Int),
+            (Some(MethodOp::Inplace(op, a, b)), Ok(v))
+                if v.is_same(&crate::vm_singletons::not_implemented()) =>
+            {
+                let globals = frame.globals.clone();
+                self.inplace_binop_fallback(&a, &b, op, &globals)
+            }
             (Some(MethodOp::Contains(invert)), Ok(v)) => {
                 let globals = frame.globals.clone();
                 self.obj_truthy(&v, &globals)
@@ -10998,6 +11014,41 @@ impl Interpreter {
     /// `CONTAINS_OP` (`key` `vm_key::CONTAINS`, `name` `__contains__`) or
     /// `DELETE_SUBSCR` (`DELITEM_FN`, `__delitem__`) through. `None` for
     /// anything else.
+    /// The Python in-place method (`__iadd__`, …) of `a`'s class that
+    /// `a <op>= b` calls first, for an instance without a native payload
+    /// (whose in-place result CPython's slot remaps). `None` for anything
+    /// else.
+    pub(crate) fn inplace_instance_dunder(
+        a: &Object,
+        op: BinOpKind,
+    ) -> Option<Rc<crate::object::PyFunction>> {
+        let Object::Instance(ai) = a else {
+            return None;
+        };
+        if ai.native.get().is_some() {
+            return None;
+        }
+        let k = op as usize;
+        let f = Self::instance_dunder_function(
+            ai,
+            crate::types::AttrKey::vm(crate::types::vm_key::IBINOP_FN + k as u32),
+            op.inplace_dunder(),
+        )?;
+        // SAFETY: GIL-serialized raw read of the function's code cell.
+        let fc = unsafe { &*f.code.as_ptr() };
+        if fc.arg_count != 2
+            || fc.kwonly_count != 0
+            || fc.has_varargs
+            || fc.has_varkeywords
+            || fc.is_generator
+            || fc.is_coroutine
+            || fc.is_async_generator
+        {
+            return None;
+        }
+        Some(f)
+    }
+
     pub(crate) fn binary_dunder_function(
         inst: &PyInstance,
         key: u32,
@@ -58057,6 +58108,19 @@ impl Interpreter {
             }
             _ => {}
         }
+        self.inplace_binop_fallback(a, b, op, globals)
+    }
+
+    /// `a <op>= b` past the in-place method (none, or its `NotImplemented`)
+    /// for an `a` the built-in containers' in-place arms don't take: the
+    /// regular operator, its failure naming the augmented one.
+    pub(crate) fn inplace_binop_fallback(
+        &mut self,
+        a: &Object,
+        b: &Object,
+        op: BinOpKind,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Result<Object, RuntimeError> {
         // CPython's `binary_iop1` reports the *augmented* operator in the
         // failure message ("unsupported operand type(s) for **=: …").
         match self.dispatch_binary_op(a, b, op, globals) {
@@ -80983,6 +81047,10 @@ pub(crate) enum MethodOp {
     /// `len(obj)`'s Python `__len__`: its result becomes the length (see
     /// [`coerce_len_result`]).
     Len,
+    /// An augmented assignment's Python in-place method (`__iadd__`, …) on
+    /// these operands: its `NotImplemented` goes on to the regular
+    /// operator ([`Interpreter::inplace_binop_fallback`]).
+    Inplace(BinOpKind, Object, Object),
 }
 
 /// How a compiled `STORE_ATTR`'s Python function takes the store (see

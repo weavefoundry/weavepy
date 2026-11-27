@@ -916,6 +916,10 @@ pub(crate) mod vm_key {
     /// A data descriptor's Python `__set__`, for compiled stores' direct
     /// calls.
     pub(crate) const SET_FN: u32 = 158;
+    /// A class's Python in-place operator methods (`__iadd__`, …), one per
+    /// `BinOpKind` from here, for compiled augmented assignments' direct
+    /// calls (`IBINOP`'s keys cache whether the class lacks one).
+    pub(crate) const IBINOP_FN: u32 = 160;
 }
 
 /// A builtin type's pure constructor (see [`TypeObject::pure_new`]).

@@ -2726,6 +2726,13 @@ unsafe fn op_after_reload(st: &mut State, op: records::MethodOp<'_>) {
                 crate::truth_result(v, from_len).map(Object::Bool)
             }
             records::MethodOp::Len => crate::coerce_len_result(v).map(Object::Int),
+            records::MethodOp::Inplace(op, a, b)
+                if v.is_same(&crate::vm_singletons::not_implemented()) =>
+            {
+                let globals = frame.globals.clone();
+                interp.inplace_binop_fallback(a, b, op, &globals)
+            }
+            records::MethodOp::Inplace(..) => Ok(v),
             records::MethodOp::Contains(invert) => {
                 let globals = frame.globals.clone();
                 interp
@@ -13186,6 +13193,11 @@ unsafe extern "C" fn h_binop_dunder(
         let op: BinOpKind = std::mem::transmute(arg as u8);
         let inplace = arg & weavepy_compiler::BINARY_OP_INPLACE_FLAG != 0;
         let at = st.stack.add(slot);
+        if inplace {
+            if let Some(f) = Interpreter::inplace_instance_dunder(&*at, op) {
+                return inplace_call(st, pc, slot, op, f, site);
+            }
+        }
         let Some(f) = Interpreter::binop_instance_dunder(&*at, &*at.add(1), op, inplace) else {
             return binop_leaf(st, pc, slot, op, inplace);
         };
@@ -13211,6 +13223,106 @@ unsafe extern "C" fn h_binop_dunder(
             site,
             Some(records::MethodOp::Binary(op, inplace, &cls, &right)),
         )
+    }
+}
+
+/// [`h_binop_dunder`]'s `a <op>= b` of an instance whose class's in-place
+/// method `f` is a Python function: the method called directly
+/// ([`dunder_call`]) on the operands at `slot`, its result there; a
+/// `NotImplemented` goes on to the regular operator
+/// ([`inplace_rest`]). Returns as `h_binop_dunder` does.
+///
+/// # Safety
+///
+/// As [`h_binop_dunder`]'s.
+#[inline(never)]
+unsafe fn inplace_call(
+    st: &mut State,
+    pc: usize,
+    slot: usize,
+    op: BinOpKind,
+    f: Rc<crate::object::PyFunction>,
+    site: *mut DirectSite,
+) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let at = st.stack.add(slot);
+        // The operands, kept for a fallback past `NotImplemented`.
+        let (a, b) = (crate::clone_hot(&*at), crate::clone_hot(&*at.add(1)));
+        let r = dunder_call(
+            st,
+            pc,
+            slot,
+            2,
+            f,
+            site,
+            Some(records::MethodOp::Inplace(op, &a, &b)),
+        );
+        if r == 0 && (*at).is_same(&crate::vm_singletons::not_implemented()) {
+            crate::drop_hot_at(at);
+            return inplace_rest(st, pc, slot, op, &a, &b);
+        }
+        r
+    }
+}
+
+/// [`inplace_call`] whose method answered `NotImplemented`: the regular
+/// operator (`Interpreter::inplace_binop_fallback`), which may run Python
+/// code, so the caller's frame is synced and its shell built first, as
+/// [`compare_rest`] syncs it. `0` the result at `slot`; `RAISED`, or
+/// `RELOAD` with the result on the frame's stack.
+#[cold]
+#[inline(never)]
+unsafe fn inplace_rest(
+    st: &mut State,
+    pc: usize,
+    slot: usize,
+    op: BinOpKind,
+    a: &Object,
+    b: &Object,
+) -> u32 {
+    // SAFETY: as `inplace_call`'s, the slot at `slot` free.
+    unsafe {
+        let interp = &mut *st.interp.cast_mut();
+        let frame = &mut *st.frame;
+        frame.stack.set_len(slot);
+        frame.pc = pc as u32 + 1;
+        settle(st);
+        let sw = &mut *st.sw;
+        let mut tmp = None;
+        let (cf, _, cshell) = sw.activation((*sw.inl).len(), &mut tmp);
+        interp.flush_lean(&mut *cf, &mut *cshell.cast::<crate::QuietShell<'_>>());
+        let globals = frame.globals.clone();
+        let r = interp.inplace_binop_fallback(a, b, op, &globals);
+        *sw.last = pc;
+        let in_place = |sw: &crate::CoreSwitch| {
+            sw.pending.is_none()
+                && std::ptr::eq(sw.cur, st.frame)
+                && crate::hot_gates::loop_gen() == st.snap_gen
+        };
+        let v = match r {
+            Ok(v) => v,
+            Err(e) if in_place(sw) => {
+                st.len = slot;
+                st.pc = pc + 1;
+                st.err = Some(e);
+                return RAISED;
+            }
+            Err(e) => {
+                sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Raised(e)));
+                return RELOAD;
+            }
+        };
+        if interp.drain_if_maybe_dead() && crate::hot_gates::loop_gen() != st.snap_gen {
+            sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Breaker));
+        }
+        if !in_place(sw) {
+            frame.stack.push(v);
+            return RELOAD;
+        }
+        st.stack.add(slot).write(v);
+        st.len = slot + 1;
+        0
     }
 }
 

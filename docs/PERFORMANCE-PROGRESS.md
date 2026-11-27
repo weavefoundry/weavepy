@@ -3509,6 +3509,16 @@ branch and pull request.
     and calls its `__set__(descriptor, obj, value)` directly on the
     store's slots, as it calls a setter (a `__set__` that checks
     `isinstance` and stores with `setattr` 4.59 to 1.93 times CPython).
+  - An augmented assignment on an instance whose class has a Python
+    in-place method (`x += v` through `__iadd__`) left compiled code at
+    every run: the operator lane took only classes lacking one, and the
+    full handler never marked the site as one that sees instances, so it
+    compiled as a numeric site. The full handler now marks such sites,
+    and the operator lane calls the in-place method directly; a
+    `NotImplemented` goes on to the regular operator with the frame
+    synced (the new `MethodOp::Inplace` carries the operands for a call
+    the core loop finishes) (`x += 1` through an `__iadd__` that counts
+    4.41 to 1.32 times CPython).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

@@ -68,6 +68,9 @@ pub(super) enum MethodOp<'a> {
     Contains(bool),
     /// `len(obj)`'s `__len__`: its result becomes the length.
     Len,
+    /// An augmented assignment's in-place method, on these operands: its
+    /// `NotImplemented` goes on to the regular operator.
+    Inplace(weavepy_compiler::BinOpKind, &'a Object, &'a Object),
 }
 
 impl MethodOp<'_> {
@@ -83,6 +86,7 @@ impl MethodOp<'_> {
             MethodOp::Truth(from_len) => crate::MethodOp::Truth(from_len),
             MethodOp::Contains(invert) => crate::MethodOp::Contains(invert),
             MethodOp::Len => crate::MethodOp::Len,
+            MethodOp::Inplace(op, a, b) => crate::MethodOp::Inplace(op, a.clone(), b.clone()),
         }
     }
 }
