@@ -35919,7 +35919,17 @@ impl Interpreter {
             Some(k) => k,
             None => self.leaf_pure_builtin_kind(slot, b, rc)?,
         };
-        if !kind.is_pure_read() {
+        // (An opaque `str` method, `s.zfill(5)` or `s.count("a")`, or a
+        // `bytes` method's fast half, reads its immutable receiver and runs
+        // no code: its result is its only effect.)
+        // SAFETY: the plan's holder keeps the builtin alive.
+        let str_method = unsafe { (*b).binds_instance }
+            && matches!(
+                (kind, args.first()),
+                (LeafKind::Opaque, Some(Object::Str(_)))
+                    | (LeafKind::Opaque | LeafKind::Fast(_), Some(Object::Bytes(_)))
+            );
+        if !kind.is_pure_read() && !str_method {
             return None;
         }
         // SAFETY: the plan's holder (a namespace, or the leaf method

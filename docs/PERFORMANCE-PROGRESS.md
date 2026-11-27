@@ -3392,6 +3392,19 @@ branch and pull request.
     `min(xs, key=lambda x: pow(x - 25, 2))` 1.69 to 1.00; `map(lambda x:
     hex(x)[2:], xs)` 1.88 to 1.32; `map(lambda x: repr(x) + "!", xs)`
     1.61 to 1.14).
+  - The `str` methods the leaf table registers as opaque (`count`,
+    `zfill`, `title`, `rjust`, `partition`, `index`, the `is...` tests and
+    the rest) read their immutable receiver and run no code, but the
+    frameless evaluator's purity test rejected the kind, so a callback
+    calling one declined to a full call per item. On an exact `str`
+    receiver they now count as pure, as do the fast halves of the `bytes`
+    methods (`map(lambda s: s.zfill(8), ws)` 2.05 to 1.38 times CPython;
+    `sorted(ws, key=lambda w: w.count("a"))` 2.11 to 1.37).
+  - Widening that exposed an older fault: a frameless evaluation's
+    subscript returned a pointer into a container the evaluation had
+    built itself, so `return s.split(".")[0]` read the item after the
+    list was freed (a wrong result after warm-up, then a crash). An item
+    of a container the evaluation holds is now held too.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
