@@ -3476,6 +3476,15 @@ branch and pull request.
     (`c[k] = v` through a Python `__setitem__` that stores into a dict
     attribute 3.20 to 1.86 times CPython, a `dict` subclass's
     `super().__setitem__` 1.82 to 1.03, `ChainMap` 1.28 to 1.08).
+  - A truth test (`if obj:`, `while`, `and`/`or`) of an instance whose
+    class decides its truth with a Python `__bool__` or `__len__` that
+    doesn't evaluate frameless left compiled code for the general call.
+    The truth helpers now call the method directly where nothing below
+    the value is virtual, taking the result as the protocol does (an
+    exact `bool` from `__bool__`, a length from `__len__`, with CPython's
+    errors otherwise; the new `MethodOp::Truth` settles a result the core
+    loop finishes) (`if obj:` through a `__bool__` that counts its calls
+    4.70 to 0.71 times CPython).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

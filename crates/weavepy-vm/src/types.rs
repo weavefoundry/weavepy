@@ -909,6 +909,8 @@ pub(crate) mod vm_key {
     pub(crate) const GETATTR_FN: u32 = 154;
     /// Its Python `__format__`, for frameless `format(obj, spec)` calls.
     pub(crate) const FORMAT_FN: u32 = 155;
+    /// Its Python `__bool__`, for compiled truth tests' direct calls.
+    pub(crate) const BOOL_FN: u32 = 156;
 }
 
 /// A builtin type's pure constructor (see [`TypeObject::pure_new`]).

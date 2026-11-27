@@ -61,6 +61,9 @@ pub(super) enum MethodOp<'a> {
     /// A `STORE_ATTR`'s setter or a `STORE_SUBSCR`'s `__setitem__`: its
     /// result is dropped.
     Store,
+    /// A `TO_BOOL`'s `__bool__` (`true`: its `__len__`): its result becomes
+    /// the truth.
+    Truth(bool),
 }
 
 impl MethodOp<'_> {
@@ -73,6 +76,7 @@ impl MethodOp<'_> {
             MethodOp::Compare(arg) => crate::MethodOp::Compare(arg),
             MethodOp::Iter => crate::MethodOp::Iter,
             MethodOp::Store => crate::MethodOp::Store,
+            MethodOp::Truth(from_len) => crate::MethodOp::Truth(from_len),
         }
     }
 }

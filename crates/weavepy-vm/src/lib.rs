@@ -9425,6 +9425,7 @@ impl Interpreter {
             }
             (Some(MethodOp::Compare(arg)), Ok(v)) => self.compare_finish(frame, arg, v),
             (Some(MethodOp::Iter), Ok(v)) => iter_result(v),
+            (Some(MethodOp::Truth(from_len)), Ok(v)) => truth_result(v, from_len).map(Object::Bool),
             (_, result) => result,
         };
         // A `functools.lru_cache` miss's function returned: its result is
@@ -10946,6 +10947,45 @@ impl Interpreter {
         let mut act = self.inline_bind(frame, shell, pc, act, code, Object::Function(f), guard);
         act.discard = true;
         Some(act)
+    }
+
+    /// The Python method that decides `inst`'s truth, as
+    /// [`Self::obj_truthy`] finds it: the class's `__bool__` of `(self)`
+    /// (`false`), or, the class defining no `__bool__`, its `__len__`
+    /// (`true`). `None` when neither is a plain Python function of one
+    /// parameter (a `__bool__` of `None` blocks the protocol).
+    pub(crate) fn truth_function(
+        inst: &PyInstance,
+    ) -> Option<(Rc<crate::object::PyFunction>, bool)> {
+        use crate::types::{vm_key, AttrKey};
+        let (f, from_len) =
+            match Self::instance_dunder_function(inst, AttrKey::vm(vm_key::BOOL_FN), "__bool__") {
+                Some(f) => (f, false),
+                None => {
+                    if inst.cls_raw().lookup("__bool__").is_some() {
+                        return None;
+                    }
+                    let f = Self::instance_dunder_function(
+                        inst,
+                        AttrKey::vm(vm_key::LEN_FN),
+                        "__len__",
+                    )?;
+                    (f, true)
+                }
+            };
+        // SAFETY: GIL-serialized raw read of the function's code cell.
+        let fc = unsafe { &*f.code.as_ptr() };
+        if fc.arg_count != 1
+            || fc.kwonly_count != 0
+            || fc.has_varargs
+            || fc.has_varkeywords
+            || fc.is_generator
+            || fc.is_coroutine
+            || fc.is_async_generator
+        {
+            return None;
+        }
+        Some((f, from_len))
     }
 
     /// The Python function a `STORE_ATTR` of `co_names[name_idx]` on
@@ -80878,6 +80918,26 @@ pub(crate) enum MethodOp {
     /// `frame_jit::setter_call` and `frame_jit::h_setitem_dunder`): its
     /// result is dropped, the store leaving nothing on the stack.
     Store,
+    /// A `TO_BOOL`'s Python `__bool__` (or, `true`, `__len__`, for a class
+    /// without `__bool__`): its result becomes the truth (see
+    /// [`truth_result`]).
+    Truth(bool),
+}
+
+/// The truth a `__bool__` (or, `from_len`, a `__len__`) result `r` gives, as
+/// `Interpreter::obj_truthy` takes one: an exact `bool` from `__bool__`, a
+/// length from `__len__`.
+pub(crate) fn truth_result(r: Object, from_len: bool) -> Result<bool, RuntimeError> {
+    if from_len {
+        return coerce_len_result(r).map(|n| n != 0);
+    }
+    match r {
+        Object::Bool(b) => Ok(b),
+        other => Err(type_error(format!(
+            "__bool__ should return bool, returned {}",
+            other.type_name()
+        ))),
+    }
 }
 
 /// `__iter__`'s result `v` as `GET_ITER` takes it: an instance without

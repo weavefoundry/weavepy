@@ -2722,6 +2722,9 @@ unsafe fn op_after_reload(st: &mut State, op: records::MethodOp<'_>) {
                 interp.release(v);
                 return;
             }
+            records::MethodOp::Truth(from_len) => {
+                crate::truth_result(v, from_len).map(Object::Bool)
+            }
         };
         match r {
             Ok(v) => frame.stack.push(v),
@@ -7413,6 +7416,10 @@ pub(crate) struct TruthSite {
     slot: u32,
     local: u32,
     last: u32,
+    /// The address of the site's direct-call cache, for an instance's
+    /// Python `__bool__` or `__len__` (see [`truth_call`]); `0` where the
+    /// code can't call (an inlined body, a value virtual below the slot).
+    direct: usize,
 }
 
 /// The truth of `v` for [`h_truth_local`] and [`h_truth_stack`], the tests
@@ -7514,6 +7521,11 @@ unsafe extern "C" fn h_truth_local(st: *mut State, site: *const TruthSite) -> u3
                     .stack
                     .add(s.slot as usize)
                     .write(crate::clone_hot(&*at));
+                if s.direct != 0 {
+                    if let Some(r) = truth_call(st, s) {
+                        return r;
+                    }
+                }
                 left(st, s.pc, s.last, s.slot as usize + 1)
             }
         }
@@ -7530,12 +7542,66 @@ unsafe extern "C" fn h_truth_stack(st: *mut State, site: *const TruthSite) -> u3
         let s = &*site;
         let at = (*st).stack.add(s.slot as usize);
         let Some(b) = truth_at(st, &*at, s) else {
+            if s.direct != 0 {
+                if let Some(r) = truth_call(st, s) {
+                    return r;
+                }
+            }
             return left(st, s.pc, s.last, s.slot as usize + 1);
         };
         if plain_release(&*at) {
             return u32::from(b);
         }
         truth_release(st, s, at, b)
+    }
+}
+
+/// [`h_truth_local`]'s and [`h_truth_stack`]'s test of an instance whose
+/// class decides its truth with a Python `__bool__` (or `__len__`), the
+/// value at the site's slot: the method called directly ([`dunder_call`]),
+/// its result taken as `TO_BOOL` takes it ([`crate::truth_result`]). The
+/// truth, a status (`RAISED` for a result the protocol refuses), or `None`
+/// declined with the value still in its slot.
+///
+/// # Safety
+///
+/// As [`h_truth_stack`]'s, the site's slot holding the value with room for
+/// one more above it, and nothing virtual below it (`s.direct` says so).
+#[inline(never)]
+unsafe fn truth_call(st: *mut State, s: &TruthSite) -> Option<u32> {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let st = &mut *st;
+        if st.sw.is_null() {
+            return None;
+        }
+        let slot = s.slot as usize;
+        let at = st.stack.add(slot);
+        let Object::Instance(inst) = &*at else {
+            return None;
+        };
+        let (f, from_len) = Interpreter::truth_function(inst)?;
+        let site = s.direct as *mut DirectSite;
+        let op = Some(records::MethodOp::Truth(from_len));
+        match dunder_call(st, s.pc as usize, slot, 1, f, site, op) {
+            CALL_DECLINED => None,
+            0 => match crate::truth_result(at.read(), from_len) {
+                Ok(b) => {
+                    if (*st.maybe_dead).get() {
+                        at.write(Object::Bool(b));
+                        return Some(left_marked(st, s.pc, slot + 1));
+                    }
+                    Some(u32::from(b))
+                }
+                Err(e) => {
+                    st.len = slot;
+                    st.pc = s.pc as usize + 1;
+                    st.err = Some(e);
+                    Some(RAISED)
+                }
+            },
+            r => Some(r),
+        }
     }
 }
 
@@ -25797,6 +25863,16 @@ impl<'a> Lower<'a> {
             Item::Mem(s) => (h_truth_stack as *const () as usize, 0, s),
             _ => unreachable!("a local or a stack value"),
         };
+        // An instance's Python `__bool__` is called directly where nothing
+        // below the value is virtual (see `truth_call`).
+        let direct = if !self.inlining() && self.vs.iter().all(|i| matches!(i, Item::Mem(_))) {
+            let d: Box<DirectSite> = Box::default();
+            let at = std::ptr::from_ref::<DirectSite>(&d) as usize;
+            self.direct_sites.push(d);
+            at
+        } else {
+            0
+        };
         let site = Box::new(TruthSite {
             ver: std::cell::Cell::new(0),
             native: std::cell::Cell::new((0, crate::NativeTruthPlan::NONE)),
@@ -25804,6 +25880,7 @@ impl<'a> Lower<'a> {
             slot: slot as u32,
             local,
             last: self.last_pc.map_or(NO_LAST, |l| l as u32),
+            direct,
         });
         let c = self
             .b
