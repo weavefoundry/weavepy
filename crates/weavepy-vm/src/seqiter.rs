@@ -2551,7 +2551,10 @@ fn zip_seq_bulk(l: &Rc<PyLazyIter>, out: &mut Vec<Object>) -> bool {
         out.push(match width {
             2 => Object::new_tuple_array([item(0), item(1)]),
             3 => Object::new_tuple_array([item(0), item(1), item(2)]),
-            _ => Object::new_tuple((0..width).map(item).collect()),
+            // (Straight into the tuple's own allocation.)
+            _ => Object::Tuple(crate::object::TupleStorage::from_exact_iter(
+                (0..width).map(item),
+            )),
         });
     }
     // The end step: each source before the first exhausted one gives one

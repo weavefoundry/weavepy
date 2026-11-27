@@ -3405,6 +3405,10 @@ branch and pull request.
     built itself, so `return s.split(".")[0]` read the item after the
     list was freed (a wrong result after warm-up, then a crash). An item
     of a container the evaluation holds is now held too.
+  - `list(zip(*rows))` over four to eight lists built each tuple through
+    an intermediate vector; it now fills the tuple's own allocation
+    directly (`list(zip(*m))` of an 8x8 matrix 1.64 to 1.19 times
+    CPython).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
