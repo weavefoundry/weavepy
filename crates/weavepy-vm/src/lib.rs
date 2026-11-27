@@ -9439,6 +9439,7 @@ impl Interpreter {
             (Some(MethodOp::Len), Ok(v)) => coerce_len_result(v).map(Object::Int),
             (Some(MethodOp::Format), Ok(v)) => format_result(v),
             (Some(MethodOp::Str), Ok(v)) => str_result(v),
+            (Some(MethodOp::Repr), Ok(v)) => repr_result(v),
             (Some(MethodOp::Inplace(op, a, b)), Ok(v))
                 if v.is_same(&crate::vm_singletons::not_implemented()) =>
             {
@@ -47958,6 +47959,25 @@ impl Interpreter {
         Ok(Object::None)
     }
 
+    /// The text the general `str(inst)` (`repr(inst)` when `repr`) finds
+    /// natively ahead of the class's Python method: an exact
+    /// `decimal.Decimal`'s, a number subclass's rendered as its base, an
+    /// enum member's `Enum.__str__`. The compiled code's direct calls of a
+    /// `__str__` or `__repr__` take these first.
+    pub(crate) fn native_text(inst: &crate::types::PyInstance, repr: bool) -> Option<Object> {
+        if crate::stdlib::decimal_native::is_decimal_instance(inst) {
+            return if repr {
+                crate::stdlib::decimal_native::leaf_repr(inst)
+            } else {
+                crate::stdlib::decimal_native::leaf_str(inst)
+            };
+        }
+        if repr {
+            return None;
+        }
+        Self::num_str_payload(inst).or_else(|| Self::enum_str(inst))
+    }
+
     /// `str(inst)` of a `str` subclass's instance whose class keeps
     /// `str`'s own `__str__` (no Python override, remembered per class
     /// version): its payload, as [`Self::do_str_call`]'s last resort for
@@ -81059,6 +81079,9 @@ pub(crate) enum MethodOp {
     Format,
     /// `str(obj)`'s Python `__str__`: its result must be a string.
     Str,
+    /// `repr(obj)`'s Python `__repr__`: its result must be a string (see
+    /// [`repr_result`]).
+    Repr,
 }
 
 /// A `__str__` result `r` as `str(obj)` takes it: a string (a `str`
@@ -81069,6 +81092,18 @@ pub(crate) fn str_result(r: Object) -> Result<Object, RuntimeError> {
     }
     Err(type_error(format!(
         "__str__ returned non-string (type {})",
+        r.type_name()
+    )))
+}
+
+/// A `__repr__` result `r` as `repr(obj)` takes it: a string (a `str`
+/// subclass's instance as it is), or the protocol's `TypeError`.
+pub(crate) fn repr_result(r: Object) -> Result<Object, RuntimeError> {
+    if str_like_object(&r) {
+        return Ok(r);
+    }
+    Err(type_error(format!(
+        "__repr__ returned non-string (type {})",
         r.type_name()
     )))
 }

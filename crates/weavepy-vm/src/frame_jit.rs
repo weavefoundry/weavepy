@@ -2735,6 +2735,7 @@ unsafe fn op_after_reload(st: &mut State, op: records::MethodOp<'_>) {
             records::MethodOp::Inplace(..) => Ok(v),
             records::MethodOp::Format => crate::format_result(v),
             records::MethodOp::Str => crate::str_result(v),
+            records::MethodOp::Repr => crate::repr_result(v),
             records::MethodOp::Contains(invert) => {
                 let globals = frame.globals.clone();
                 interp
@@ -13485,6 +13486,88 @@ unsafe extern "C" fn h_format_dunder(
     }
 }
 
+/// `CONVERT_VALUE` (the `pc`th instruction) of the instance at stack slot
+/// `slot`, which [`h_fstring`] declined, whose class's `__str__` (`!s`,
+/// `conv` 1) or `__repr__` (`!r`, `conv` 2) is a Python function: the
+/// method called directly ([`dunder_call`]), its result at `slot` as
+/// `str()` or `repr()` takes it ([`crate::str_result`],
+/// [`crate::repr_result`]). `0` done, `CALL_DECLINED` declined untouched,
+/// `RAISED` or `RELOAD` as [`h_call`]'s (the core loop settles a result it
+/// finishes: see `records::MethodOp::Str` and `records::MethodOp::Repr`).
+unsafe extern "C" fn h_convert_dunder(
+    st: *mut State,
+    _code: *const CodeObject,
+    pc: u64,
+    slot: u64,
+    site: *mut DirectSite,
+    conv: u64,
+) -> u32 {
+    // SAFETY: the code passes its live state, one of its `CONVERT_VALUE`s,
+    // the value's slot (with one free above it, and nothing virtual
+    // below), and the site's cache.
+    unsafe {
+        let st = &mut *st;
+        if st.sw.is_null() || crate::trace::any_observers_active() {
+            return CALL_DECLINED;
+        }
+        let (pc, slot, repr) = (pc as usize, slot as usize, conv == 2);
+        let at = st.stack.add(slot);
+        let Object::Instance(inst) = &*at else {
+            return CALL_DECLINED;
+        };
+        if let Some(v) = Interpreter::native_text(inst, repr) {
+            crate::release_operands(&*st.interp, at, 1);
+            at.write(v);
+            if (*st.maybe_dead).get() {
+                return left_marked(st, pc as u32, slot + 1);
+            }
+            return 0;
+        }
+        let (key, name, op) = if repr {
+            (
+                crate::types::vm_key::REPR_FN,
+                "__repr__",
+                records::MethodOp::Repr,
+            )
+        } else {
+            (
+                crate::types::vm_key::STR_FN,
+                "__str__",
+                records::MethodOp::Str,
+            )
+        };
+        let Some(f) =
+            Interpreter::instance_dunder_function(inst, crate::types::AttrKey::vm(key), name)
+        else {
+            return CALL_DECLINED;
+        };
+        match dunder_call(st, pc, slot, 1, f, site, Some(op)) {
+            0 => {
+                let v = at.read();
+                let r = if repr {
+                    crate::repr_result(v)
+                } else {
+                    crate::str_result(v)
+                };
+                match r {
+                    Ok(v) => {
+                        at.write(v);
+                        st.len = slot + 1;
+                        0
+                    }
+                    Err(e) => {
+                        st.len = slot;
+                        st.pc = pc + 1;
+                        st.err = Some(e);
+                        RAISED
+                    }
+                }
+            }
+            r => r,
+        }
+    }
+}
+
 /// `GET_ITER` (the `pc`th instruction of `code`) of the plain instance at
 /// stack slot `slot`, which [`h_get_iter`] declined, whose class's
 /// `__iter__` is a plain Python function: the method called directly
@@ -16619,9 +16702,9 @@ pub(crate) struct BuiltinSite {
     /// then run through the core loop's lane, as an unregistered builtin's
     /// would (`Some(via_call)`), instead of the full handler.
     lane: Option<bool>,
-    /// The address of the site's direct-call cache, for `len(obj)` of an
-    /// instance whose class's `__len__` is a Python function (see
-    /// [`len_call`]); `0` none.
+    /// The address of the site's direct-call cache, for `len(obj)` or
+    /// `repr(obj)` of an instance whose class's `__len__` or `__repr__` is a
+    /// Python function (see [`len_call`]); `0` none.
     direct: usize,
 }
 
@@ -16879,13 +16962,9 @@ unsafe fn call_leaf_in_place(
                 Some(k) => (*s.interp).leaf_builtin_call(k, b, args),
                 None => None,
             };
-            if r.is_none()
-                && site.direct != 0
-                && hit
-                && bound_args.is_none()
-                && matches!(site.kind, Some(LeafKind::Len))
-            {
-                return len_call(s, site, pc as usize, start, lenu);
+            if r.is_none() && site.direct != 0 && hit && bound_args.is_none() {
+                let repr = !matches!(site.kind, Some(LeafKind::Len));
+                return len_call(s, site, pc as usize, start, lenu, repr);
             }
             match r {
                 None => {}
@@ -16909,13 +16988,15 @@ unsafe fn call_leaf_in_place(
     }
 }
 
-/// [`call_leaf_in_place`]'s `len(obj)` (the `CALL` at `pc`, the builtin at
-/// `start` on a `lenu`-deep stack) of an instance whose class's `__len__` is
-/// a Python function: the method called directly ([`direct_call`]) on the
-/// instance, the builtin's slot taking the method, and its result taken as
-/// `len()` takes it ([`crate::coerce_len_result`]). As
+/// [`call_leaf_in_place`]'s `len(obj)` (`repr(obj)` when `repr`; the
+/// `CALL` at `pc`, the builtin at `start` on a `lenu`-deep stack) of an
+/// instance whose class's `__len__` (`__repr__`) is a Python function: the
+/// method called directly ([`direct_call`]) on the instance, the builtin's
+/// slot taking the method, and its result taken as the builtin takes it
+/// ([`crate::coerce_len_result`], [`crate::repr_result`]). As
 /// [`call_leaf_in_place`]'s, `Some(RELOAD)` too (the core loop takes a
-/// result it settles as `len()` does: see `records::MethodOp::Len`).
+/// result it settles as the builtin does: see `records::MethodOp::Len`
+/// and `records::MethodOp::Repr`).
 ///
 /// # Safety
 ///
@@ -16928,6 +17009,7 @@ unsafe fn len_call(
     pc: usize,
     start: usize,
     lenu: usize,
+    repr: bool,
 ) -> Option<u32> {
     // SAFETY: the caller's contract.
     unsafe {
@@ -16938,11 +17020,17 @@ unsafe fn len_call(
         let Object::Instance(inst) = &*at.add(2) else {
             return None;
         };
-        let f = Interpreter::instance_dunder_function(
-            inst,
-            crate::types::AttrKey::vm(crate::types::vm_key::LEN_FN),
-            "__len__",
-        )?;
+        if repr {
+            if let Some(v) = Interpreter::native_text(inst, true) {
+                return Some(text_in_place(s, pc, start, v));
+            }
+        }
+        let (key, name) = if repr {
+            (crate::types::vm_key::REPR_FN, "__repr__")
+        } else {
+            (crate::types::vm_key::LEN_FN, "__len__")
+        };
+        let f = Interpreter::instance_dunder_function(inst, crate::types::AttrKey::vm(key), name)?;
         {
             // SAFETY: GIL-serialized raw read of the function's code cell.
             let fc = &*f.code.as_ptr();
@@ -16958,11 +17046,16 @@ unsafe fn len_call(
             }
         }
         // `[len, NULL, obj]` becomes the method call `[f, obj]`.
+        let op = if repr {
+            records::MethodOp::Repr
+        } else {
+            records::MethodOp::Len
+        };
         let builtin = at.read();
         at.write(Object::Function(f));
         at.add(1).write(at.add(2).read());
         let dsite = &mut *(site.direct as *mut DirectSite);
-        match direct_call_out(s, pc, start, start + 2, dsite, Some(records::MethodOp::Len)) {
+        match direct_call_out(s, pc, start, start + 2, dsite, Some(op)) {
             None => {
                 let f = at.read();
                 at.add(2).write(at.add(1).read());
@@ -16980,9 +17073,14 @@ unsafe fn len_call(
             }
             Some(0) => {
                 drop(builtin);
-                match crate::coerce_len_result(at.read()) {
-                    Ok(n) => {
-                        at.write(Object::Int(n));
+                let r = if repr {
+                    crate::repr_result(at.read())
+                } else {
+                    crate::coerce_len_result(at.read()).map(Object::Int)
+                };
+                match r {
+                    Ok(v) => {
+                        at.write(v);
                         s.len = start + 1;
                         Some(0)
                     }
@@ -16999,6 +17097,28 @@ unsafe fn len_call(
                 Some(r)
             }
         }
+    }
+}
+
+/// [`len_call`]'s and [`str_call`]'s text `v` the builtin finds natively
+/// (see [`Interpreter::native_text`]): the call's three operands from
+/// `start` released and `v` in their place.
+///
+/// # Safety
+///
+/// As [`len_call`]'s.
+unsafe fn text_in_place(s: &mut State, pc: usize, start: usize, v: Object) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let at = s.stack.add(start);
+        crate::release_operands(&*s.interp, at, 3);
+        at.write(v);
+        s.len = start + 1;
+        // A dying argument's finalizer runs before the next instruction.
+        if (*s.maybe_dead).get() {
+            return left_marked(s, pc as u32, start + 1);
+        }
+        0
     }
 }
 
@@ -17107,6 +17227,9 @@ unsafe fn str_call(
         let Object::Instance(inst) = &*at.add(2) else {
             return None;
         };
+        if let Some(v) = Interpreter::native_text(inst, false) {
+            return Some(text_in_place(s, pc, start, v));
+        }
         let f = Interpreter::instance_dunder_function(
             inst,
             crate::types::AttrKey::vm(crate::types::vm_key::STR_FN),
@@ -27066,8 +27189,14 @@ impl<'a> Lower<'a> {
             }
             _ => None,
         };
-        // `len(obj)` calls a Python `__len__` directly (see `len_call`).
-        let direct = if matches!(kind, Some(LeafKind::Len)) && argc == 1 {
+        // `len(obj)` and `repr(obj)` call a Python `__len__` or `__repr__`
+        // directly (see `len_call`).
+        let direct = if argc == 1
+            && (matches!(kind, Some(LeafKind::Len))
+                || (matches!(kind, Some(LeafKind::Fast(_)))
+                    && !f.binds_instance
+                    && f.name == "repr"))
+        {
             let d: Box<DirectSite> = Box::default();
             let at = std::ptr::from_ref::<DirectSite>(&d) as usize;
             self.direct_sites.push(d);
@@ -27326,9 +27455,9 @@ impl<'a> Lower<'a> {
             .call(h_fstring as *const () as usize, &[at, kv], true)
             .expect("returns");
         let out = self.exit_with(pc, &[], INTERP);
-        if op == OpCode::FormatValue && !self.inlining() {
-            // An instance's Python `__format__`, called directly (see
-            // `h_format_dunder`).
+        if matches!(op, OpCode::FormatValue | OpCode::ConvertValue) && !self.inlining() {
+            // An instance's Python `__format__`, `__str__` or `__repr__`,
+            // called directly (see `h_format_dunder`, `h_convert_dunder`).
             let dunder = self.b.create_block();
             let done = self.b.create_block();
             self.b.ins().brif(r, dunder, &[], done, &[]);
@@ -27343,13 +27472,14 @@ impl<'a> Lower<'a> {
             let code = self.code_ptr();
             let pcv = self.b.ins().iconst(types::I64, pc as i64);
             let slotv = self.b.ins().iconst(types::I64, (self.depth - n) as i64);
-            let spec = self.b.ins().iconst(types::I64, i64::from(n == 2));
+            let (helper, last) = if op == OpCode::ConvertValue {
+                (h_convert_dunder as *const () as usize, i64::from(arg & 3))
+            } else {
+                (h_format_dunder as *const () as usize, i64::from(n == 2))
+            };
+            let last = self.b.ins().iconst(types::I64, last);
             let d = self
-                .call(
-                    h_format_dunder as *const () as usize,
-                    &[self.st, code, pcv, slotv, site_at, spec],
-                    true,
-                )
+                .call(helper, &[self.st, code, pcv, slotv, site_at, last], true)
                 .expect("returns");
             let other = self.b.create_block();
             self.b.ins().brif(d, other, &[], done, &[]);

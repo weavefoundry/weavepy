@@ -75,6 +75,8 @@ pub(super) enum MethodOp<'a> {
     Format,
     /// `str(obj)`'s `__str__`: its result must be a string.
     Str,
+    /// `repr(obj)`'s `__repr__`: its result must be a string.
+    Repr,
 }
 
 impl MethodOp<'_> {
@@ -93,6 +95,7 @@ impl MethodOp<'_> {
             MethodOp::Inplace(op, a, b) => crate::MethodOp::Inplace(op, a.clone(), b.clone()),
             MethodOp::Format => crate::MethodOp::Format,
             MethodOp::Str => crate::MethodOp::Str,
+            MethodOp::Repr => crate::MethodOp::Repr,
         }
     }
 }

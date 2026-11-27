@@ -3561,6 +3561,16 @@ branch and pull request.
     callback now calls the class's function over the instance and the
     item, frameless when it is a pure leaf (`list(map(adder, range(20)))`
     2.30 to 1.31 times CPython, an `__call__` that counts 3.10 to 2.50).
+  - Compiled `repr(obj)` and f-string `!r` and `!s` conversions of an
+    instance whose class's `__repr__` or `__str__` is a Python function
+    took the general call, as `str(obj)` did. They now call the method
+    directly, as the `len(obj)` and `str(obj)` lanes do (`repr(k)` 1.16 to
+    0.75 times CPython, a frameless `__repr__` 1.76 to 1.14, `f"{a!r}"`
+    1.66 to 0.78). The `str(obj)` lane had sent an enum member to its
+    `Enum.__str__` (0.87 to 1.24); these lanes now take the text the
+    general call finds natively first, an enum member's, a number
+    subclass's, or a `Decimal`'s (`str(Color.RED)` 0.62, `repr(Decimal)`
+    1.10 to 0.92, `f"{d!r}"` 2.05 to 0.86).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
