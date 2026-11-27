@@ -2725,6 +2725,7 @@ unsafe fn op_after_reload(st: &mut State, op: records::MethodOp<'_>) {
             records::MethodOp::Truth(from_len) => {
                 crate::truth_result(v, from_len).map(Object::Bool)
             }
+            records::MethodOp::Len => crate::coerce_len_result(v).map(Object::Int),
             records::MethodOp::Contains(invert) => {
                 let globals = frame.globals.clone();
                 interp
@@ -16326,6 +16327,10 @@ pub(crate) struct BuiltinSite {
     /// then run through the core loop's lane, as an unregistered builtin's
     /// would (`Some(via_call)`), instead of the full handler.
     lane: Option<bool>,
+    /// The address of the site's direct-call cache, for `len(obj)` of an
+    /// instance whose class's `__len__` is a Python function (see
+    /// [`len_call`]); `0` none.
+    direct: usize,
 }
 
 /// [`h_call`] at a site settled on a container's or string's leaf method
@@ -16446,6 +16451,7 @@ unsafe extern "C" fn h_call_leaf(
                 recv_tag: 0,
                 via_call,
                 lane: None,
+                direct: 0,
             };
             return h_call_native(st, code, ext, pc, len, &raw const whole);
         }
@@ -16561,6 +16567,14 @@ unsafe fn call_leaf_in_place(
                 Some(k) => (*s.interp).leaf_builtin_call(k, b, args),
                 None => None,
             };
+            if r.is_none()
+                && site.direct != 0
+                && hit
+                && bound_args.is_none()
+                && matches!(site.kind, Some(LeafKind::Len))
+            {
+                return len_call(s, site, pc as usize, start, lenu);
+            }
             match r {
                 None => {}
                 Some(Ok(v)) => {
@@ -16580,6 +16594,99 @@ unsafe fn call_leaf_in_place(
             }
         }
         None
+    }
+}
+
+/// [`call_leaf_in_place`]'s `len(obj)` (the `CALL` at `pc`, the builtin at
+/// `start` on a `lenu`-deep stack) of an instance whose class's `__len__` is
+/// a Python function: the method called directly ([`direct_call`]) on the
+/// instance, the builtin's slot taking the method, and its result taken as
+/// `len()` takes it ([`crate::coerce_len_result`]). As
+/// [`call_leaf_in_place`]'s, `Some(RELOAD)` too (the core loop takes a
+/// result it settles as `len()` does: see `records::MethodOp::Len`).
+///
+/// # Safety
+///
+/// As [`call_leaf_in_place`]'s, with a non-null switch and the site's
+/// direct-call cache.
+#[inline(never)]
+unsafe fn len_call(
+    s: &mut State,
+    site: &BuiltinSite,
+    pc: usize,
+    start: usize,
+    lenu: usize,
+) -> Option<u32> {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let at = s.stack.add(start);
+        if lenu != start + 3 || !matches!(&*at.add(1), Object::Unbound) {
+            return None;
+        }
+        let Object::Instance(inst) = &*at.add(2) else {
+            return None;
+        };
+        let f = Interpreter::instance_dunder_function(
+            inst,
+            crate::types::AttrKey::vm(crate::types::vm_key::LEN_FN),
+            "__len__",
+        )?;
+        {
+            // SAFETY: GIL-serialized raw read of the function's code cell.
+            let fc = &*f.code.as_ptr();
+            if fc.arg_count != 1
+                || fc.kwonly_count != 0
+                || fc.has_varargs
+                || fc.has_varkeywords
+                || fc.is_generator
+                || fc.is_coroutine
+                || fc.is_async_generator
+            {
+                return None;
+            }
+        }
+        // `[len, NULL, obj]` becomes the method call `[f, obj]`.
+        let builtin = at.read();
+        at.write(Object::Function(f));
+        at.add(1).write(at.add(2).read());
+        let dsite = &mut *(site.direct as *mut DirectSite);
+        match direct_call_out(s, pc, start, start + 2, dsite, Some(records::MethodOp::Len)) {
+            None => {
+                let f = at.read();
+                at.add(2).write(at.add(1).read());
+                at.add(1).write(Object::Unbound);
+                at.write(builtin);
+                if let Object::Function(f) = &f {
+                    let fc = f.code();
+                    if let Some(ext) = crate::code_vm_ext(&fc) {
+                        ext.frame_jit
+                            .warm_switched(&fc, ext, fc.varnames.len().max(1));
+                    }
+                }
+                drop(f);
+                None
+            }
+            Some(0) => {
+                drop(builtin);
+                match crate::coerce_len_result(at.read()) {
+                    Ok(n) => {
+                        at.write(Object::Int(n));
+                        s.len = start + 1;
+                        Some(0)
+                    }
+                    Err(e) => {
+                        s.len = start;
+                        s.pc = pc + 1;
+                        s.err = Some(e);
+                        Some(RAISED)
+                    }
+                }
+            }
+            Some(r) => {
+                drop(builtin);
+                Some(r)
+            }
+        }
     }
 }
 
@@ -26526,6 +26633,15 @@ impl<'a> Lower<'a> {
             }
             _ => None,
         };
+        // `len(obj)` calls a Python `__len__` directly (see `len_call`).
+        let direct = if matches!(kind, Some(LeafKind::Len)) && argc == 1 {
+            let d: Box<DirectSite> = Box::default();
+            let at = std::ptr::from_ref::<DirectSite>(&d) as usize;
+            self.direct_sites.push(d);
+            at
+        } else {
+            0
+        };
         let site = Box::new(BuiltinSite {
             f: Rc::as_ptr(&f),
             argc,
@@ -26534,6 +26650,7 @@ impl<'a> Lower<'a> {
             recv_tag,
             via_call,
             lane,
+            direct,
         });
         self.held.push(f);
         let at = std::ptr::from_ref::<BuiltinSite>(&site).cast_mut().cast();

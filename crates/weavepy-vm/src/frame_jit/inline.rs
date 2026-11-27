@@ -2510,6 +2510,7 @@ impl<'a> Lower<'a> {
             // (An inlined body's declined call leaves through its caller's
             // paths.)
             lane: None,
+            direct: 0,
         });
         self.held.push(f);
         let at = self

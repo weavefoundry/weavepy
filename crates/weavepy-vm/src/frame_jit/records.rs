@@ -66,6 +66,8 @@ pub(super) enum MethodOp<'a> {
     Truth(bool),
     /// A `CONTAINS_OP`'s `__contains__` (`true`: `not in`).
     Contains(bool),
+    /// `len(obj)`'s `__len__`: its result becomes the length.
+    Len,
 }
 
 impl MethodOp<'_> {
@@ -80,6 +82,7 @@ impl MethodOp<'_> {
             MethodOp::Store => crate::MethodOp::Store,
             MethodOp::Truth(from_len) => crate::MethodOp::Truth(from_len),
             MethodOp::Contains(invert) => crate::MethodOp::Contains(invert),
+            MethodOp::Len => crate::MethodOp::Len,
         }
     }
 }

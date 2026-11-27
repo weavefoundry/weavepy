@@ -9426,6 +9426,7 @@ impl Interpreter {
             (Some(MethodOp::Compare(arg)), Ok(v)) => self.compare_finish(frame, arg, v),
             (Some(MethodOp::Iter), Ok(v)) => iter_result(v),
             (Some(MethodOp::Truth(from_len)), Ok(v)) => truth_result(v, from_len).map(Object::Bool),
+            (Some(MethodOp::Len), Ok(v)) => coerce_len_result(v).map(Object::Int),
             (Some(MethodOp::Contains(invert)), Ok(v)) => {
                 let globals = frame.globals.clone();
                 self.obj_truthy(&v, &globals)
@@ -80956,6 +80957,9 @@ pub(crate) enum MethodOp {
     /// A `CONTAINS_OP`'s Python `__contains__` (`true` for `not in`): the
     /// result's truth, inverted for `not in`.
     Contains(bool),
+    /// `len(obj)`'s Python `__len__`: its result becomes the length (see
+    /// [`coerce_len_result`]).
+    Len,
 }
 
 /// The truth a `__bool__` (or, `from_len`, a `__len__`) result `r` gives, as
@@ -97405,9 +97409,20 @@ pub(crate) fn coerce_len_result(r: Object) -> Result<i64, RuntimeError> {
                 ))
             }
         }
+        // An `int` subclass's value (CPython takes any index; a class's
+        // own `__index__` stays unsupported here).
+        Object::Instance(inst) => match inst.native.get() {
+            Some(n @ (Object::Int(_) | Object::Long(_) | Object::Bool(_))) => {
+                coerce_len_result(n.clone())
+            }
+            _ => Err(type_error(format!(
+                "'{}' object cannot be interpreted as an integer",
+                r.type_name_owned()
+            ))),
+        },
         other => Err(type_error(format!(
             "'{}' object cannot be interpreted as an integer",
-            other.type_name()
+            other.type_name_owned()
         ))),
     }
 }

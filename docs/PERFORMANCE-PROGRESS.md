@@ -3496,6 +3496,13 @@ branch and pull request.
     its `__bool__` (`x in obj` was true for an answer whose `__bool__`
     says false); it now uses `obj_truthy`, as CPython's
     `PyObject_IsTrue`.
+  - `len(obj)` of an instance whose class's `__len__` is a Python
+    function that doesn't evaluate frameless went through the general
+    call. The builtin's call site now calls the method directly, its
+    slot taking the method, and takes the result as `len()` does (the
+    new `MethodOp::Len` settles one the core loop finishes) (2.79 to
+    1.18 times CPython). `len()` also accepts an `int` subclass from
+    `__len__`, as CPython does, and names the class in its error.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
