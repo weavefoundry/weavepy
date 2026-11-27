@@ -34893,6 +34893,11 @@ impl Interpreter {
                         ),
                         // (A machine int's popcount, or a big one's.)
                         ("bit_count", LeafKind::Opaque),
+                        // (Each reads the int and runs no code: `statistics`'
+                        // `_exact_ratio` calls the first.)
+                        ("as_integer_ratio", LeafKind::Opaque),
+                        ("conjugate", LeafKind::Opaque),
+                        ("is_integer", LeafKind::Opaque),
                     ],
                 ),
                 // (Each reads the float's bits and runs no code.)
@@ -35920,14 +35925,18 @@ impl Interpreter {
             None => self.leaf_pure_builtin_kind(slot, b, rc)?,
         };
         // (An opaque `str` method, `s.zfill(5)` or `s.count("a")`, or a
-        // `bytes` method's fast half, reads its immutable receiver and runs
-        // no code: its result is its only effect.)
+        // `bytes`, `int` or `float` method's opaque or fast half, reads its
+        // immutable receiver and runs no code: its result is its only
+        // effect.)
         // SAFETY: the plan's holder keeps the builtin alive.
         let str_method = unsafe { (*b).binds_instance }
             && matches!(
                 (kind, args.first()),
                 (LeafKind::Opaque, Some(Object::Str(_)))
-                    | (LeafKind::Opaque | LeafKind::Fast(_), Some(Object::Bytes(_)))
+                    | (
+                        LeafKind::Opaque | LeafKind::Fast(_),
+                        Some(Object::Bytes(_) | Object::Int(_) | Object::Float(_))
+                    )
             );
         if !kind.is_pure_read() && !str_method {
             return None;

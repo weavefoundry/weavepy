@@ -3431,6 +3431,11 @@ branch and pull request.
     interpreter to raise. An exact list's, tuple's or ASCII string's
     `IndexError` is now raised in place too, with CPython's message
     (`try: L[0] except IndexError: pass` 2.27 to 1.44 times CPython).
+  - `int.as_integer_ratio`, `conjugate` and `is_integer` join the leaf
+    method table, and the opaque and fast-half methods of exact `int` and
+    `float` receivers count as pure, so `statistics`' `_exact_ratio`
+    (`try: return x.as_integer_ratio()`) runs frameless for each item
+    (`statistics.mean` of 20 ints 2.15 to 1.84 times CPython).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
