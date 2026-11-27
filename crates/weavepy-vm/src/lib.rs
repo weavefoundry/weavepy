@@ -9415,7 +9415,9 @@ impl Interpreter {
                 Err(e) => Err(e),
             },
         };
-        let result = match (done.op.take(), result) {
+        let op = done.op.take();
+        let stored = matches!(op, Some(MethodOp::Store));
+        let result = match (op, result) {
             (Some(MethodOp::Binary(op, inplace, l, r)), Ok(v))
                 if v.is_same(&crate::vm_singletons::not_implemented()) =>
             {
@@ -9433,7 +9435,7 @@ impl Interpreter {
             }
         }
         let call_pc = done.call_pc;
-        let discard = done.discard;
+        let discard = done.discard || stored;
         self.lean_pending_exit(done.caller_pending);
         // SAFETY: the callable is moved out exactly once; the parked slot
         // treats the field as stale until `inline_bind` rewrites it.
@@ -10944,6 +10946,50 @@ impl Interpreter {
         let mut act = self.inline_bind(frame, shell, pc, act, code, Object::Function(f), guard);
         act.discard = true;
         Some(act)
+    }
+
+    /// The Python function a `STORE_ATTR` of `co_names[name_idx]` on
+    /// `inst` calls, as [`Self::try_inline_setter`] finds it: the class's
+    /// own `__setattr__` of `(self, name, value)` (`true`: the call takes
+    /// the name), or else the setter of `(self, value)` of the class's
+    /// `property` of that name. `None` for any other store.
+    pub(crate) fn store_attr_function(
+        code: &CodeObject,
+        inst: &PyInstance,
+        name_idx: u32,
+    ) -> Option<(Rc<crate::object::PyFunction>, bool)> {
+        let hook = !Self::default_setattr(inst.cls_raw());
+        let f = if hook {
+            Self::instance_dunder_function(
+                inst,
+                crate::types::AttrKey::vm(crate::types::vm_key::SETATTR_FN),
+                "__setattr__",
+            )?
+        } else {
+            let LeafAttr::Property(prop) = Self::leaf_resolve_instance_attr(code, inst, name_idx)?
+            else {
+                return None;
+            };
+            // SAFETY: GIL-serialized raw read of the setter cell; the clone
+            // is taken before anything else runs.
+            let Object::Function(f) = (unsafe { &*prop.fset.as_ptr() }) else {
+                return None;
+            };
+            f.clone()
+        };
+        // SAFETY: GIL-serialized raw read of the function's code cell.
+        let fc = unsafe { &*f.code.as_ptr() };
+        if fc.arg_count != 2 + u32::from(hook)
+            || fc.is_generator
+            || fc.is_coroutine
+            || fc.is_async_generator
+            || fc.has_varargs
+            || fc.has_varkeywords
+            || fc.kwonly_count != 0
+        {
+            return None;
+        }
+        Some((f, hook))
     }
 
     /// `recv.<co_names[name_idx]> = value` on a `threading.local` whose
@@ -80785,6 +80831,10 @@ pub(crate) enum MethodOp {
     /// A `GET_ITER`'s `__iter__` (see `Interpreter::iter_dunder`): its
     /// result goes through [`iter_result`].
     Iter,
+    /// A `STORE_ATTR`'s Python `__setattr__` or property setter, called on
+    /// the store's operands (see `frame_jit::setter_call`): its result is
+    /// dropped, the store leaving nothing on the stack.
+    Store,
 }
 
 /// `__iter__`'s result `v` as `GET_ITER` takes it: an instance without

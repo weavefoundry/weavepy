@@ -2717,6 +2717,11 @@ unsafe fn op_after_reload(st: &mut State, op: records::MethodOp<'_>) {
             records::MethodOp::Binary(..) => Ok(v),
             records::MethodOp::Compare(arg) => interp.compare_finish(frame, arg, v),
             records::MethodOp::Iter => crate::iter_result(v),
+            // The store leaves nothing.
+            records::MethodOp::Store => {
+                interp.release(v);
+                return;
+            }
         };
         match r {
             Ok(v) => frame.stack.push(v),
@@ -7860,9 +7865,13 @@ unsafe extern "C" fn h_setter_store(
     recv: *mut Object,
     value: *mut Object,
     release_recv: u64,
+    site: *mut DirectSite,
 ) -> u32 {
     // SAFETY: the code passes its live state, its own code and the
-    // operands' initialized slots (the receiver's a local's or the stack's).
+    // operands' initialized slots (the receiver's a local's or the stack's,
+    // just above the value's), with four free slots from the value's up and
+    // nothing virtual below, and the store's direct-call cache (null in an
+    // inlined body: no direct call there).
     unsafe {
         let (r, v) = (&*recv, &*value);
         if !matches!(r, Object::Instance(_)) || !droppable(v) || !droppable(r) {
@@ -7870,13 +7879,128 @@ unsafe extern "C" fn h_setter_store(
         }
         let interp = &mut *(*st).interp.cast_mut();
         if !interp.leaf_setter_at(&*code, pc as usize, r, v) {
-            return 1;
+            if site.is_null() {
+                return 1;
+            }
+            return setter_call(
+                &mut *st,
+                &*code,
+                pc as usize,
+                recv,
+                value,
+                release_recv != 0,
+                site,
+            );
         }
         crate::drop_hot_at(value);
         if release_recv != 0 {
             crate::drop_hot_at(recv);
         }
         0
+    }
+}
+
+/// [`h_setter_store`]'s store through the receiver's class's Python
+/// `__setattr__`, or a property's Python setter, called directly
+/// ([`direct_call`]) as `f(recv, name, value)` or `f(recv, value)`, the
+/// call taking the operands' slots from the value's up (the receiver's
+/// moved or copied in) and its result dropped: `0` stored, the operands
+/// gone, `1` declined untouched (a function without native code, which
+/// warms as a compiled caller's switched call warms its callee), `RAISED`
+/// or `RELOAD` as [`h_call`]'s (the core loop drops a result it settles:
+/// see `records::MethodOp::Store`).
+///
+/// # Safety
+///
+/// As [`h_setter_store`]'s, both operands droppable.
+#[inline(never)]
+unsafe fn setter_call(
+    st: &mut State,
+    code: &CodeObject,
+    pc: usize,
+    recv: *mut Object,
+    value: *mut Object,
+    stack_recv: bool,
+    site: *mut DirectSite,
+) -> u32 {
+    // SAFETY: the caller's contract.
+    unsafe {
+        if st.sw.is_null() {
+            return 1;
+        }
+        let Object::Instance(inst) = &*recv else {
+            return 1;
+        };
+        let name_idx = code.instructions[pc].arg;
+        let Some((f, hook)) = Interpreter::store_attr_function(code, inst, name_idx) else {
+            return 1;
+        };
+        let name = if hook {
+            match crate::code_name_obj(code, name_idx) {
+                Some(n) => Some(n.clone()),
+                None => return 1,
+            }
+        } else {
+            None
+        };
+        let slot = value.offset_from(st.stack) as usize;
+        let at = value;
+        // `[value, recv]` (or `[value]`, the receiver a local's) becomes the
+        // call `[f, recv, name, value]` (`[f, recv, value]` for a setter).
+        let v = at.read();
+        let r = if stack_recv {
+            at.add(1).read()
+        } else {
+            crate::clone_hot(&*recv)
+        };
+        let n = 2 + usize::from(hook);
+        at.write(Object::Function(f));
+        at.add(1).write(r);
+        if let Some(name) = name {
+            at.add(2).write(name);
+        }
+        at.add(n).write(v);
+        match direct_call_out(
+            st,
+            pc,
+            slot,
+            slot + n + 1,
+            &mut *site,
+            Some(records::MethodOp::Store),
+        ) {
+            None => {
+                // Back as they were.
+                let f = at.read();
+                at.write(at.add(n).read());
+                if hook {
+                    crate::drop_hot_at(at.add(2));
+                }
+                if !stack_recv {
+                    crate::drop_hot_at(at.add(1));
+                }
+                if let Object::Function(f) = &f {
+                    let fc = f.code();
+                    if let Some(ext) = crate::code_vm_ext(&fc) {
+                        ext.frame_jit
+                            .warm_switched(&fc, ext, fc.varnames.len().max(n));
+                    }
+                }
+                drop(f);
+                1
+            }
+            Some(0) => {
+                // The setter's result (`None`, as a rule) goes.
+                let res = at.read();
+                if !plain_release(&res) {
+                    (*st.interp.cast_mut()).release(res);
+                } else {
+                    std::mem::forget(res);
+                }
+                st.len = slot;
+                0
+            }
+            Some(r) => r,
+        }
     }
 }
 
@@ -25529,13 +25653,32 @@ impl<'a> Lower<'a> {
         self.b.switch_to_block(tried);
         let code = self.code_ptr();
         let rel = self.b.ins().iconst(types::I64, i64::from(release_recv));
+        // The store's direct-call cache (see `setter_call`), but in a body
+        // inlined into its caller's code, whose leaving takes the exit.
+        let inlined = self.inlining();
+        let site_at = if inlined {
+            self.b.ins().iconst(self.ptr, 0)
+        } else {
+            let site: Box<DirectSite> = Box::default();
+            let at = self
+                .b
+                .ins()
+                .iconst(self.ptr, std::ptr::from_ref::<DirectSite>(&site) as i64);
+            self.direct_sites.push(site);
+            at
+        };
         let r = self
             .call(
                 h_setter_store as *const () as usize,
-                &[self.st, code, store_pc, recv, value, rel],
+                &[self.st, code, store_pc, recv, value, rel, site_at],
                 true,
             )
             .expect("returns");
+        if !inlined {
+            // A direct call that raised or left the rest to the core loop.
+            let left = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThan, r, 1);
+            self.after_helper_if(left, r);
+        }
         self.b.ins().brif(r, out, &[], done, &[]);
         self.b.switch_to_block(done);
     }

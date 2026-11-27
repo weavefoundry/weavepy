@@ -58,6 +58,8 @@ pub(super) enum MethodOp<'a> {
     Compare(u32),
     /// A `GET_ITER`'s `__iter__`: its result must be an iterator.
     Iter,
+    /// A `STORE_ATTR`'s setter: its result is dropped.
+    Store,
 }
 
 impl MethodOp<'_> {
@@ -69,6 +71,7 @@ impl MethodOp<'_> {
             }
             MethodOp::Compare(arg) => crate::MethodOp::Compare(arg),
             MethodOp::Iter => crate::MethodOp::Iter,
+            MethodOp::Store => crate::MethodOp::Store,
         }
     }
 }

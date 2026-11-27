@@ -3458,6 +3458,17 @@ branch and pull request.
     steps that can't take them (50 items: `filter` 3.40 to 1.73 times
     CPython, `chain` of two generators 2.37 to 2.11, `islice` 2.50 to
     2.01).
+  - An attribute store on an instance whose class has a Python
+    `__setattr__` (or a `property` whose Python setter doesn't evaluate
+    frameless) left compiled code for the core loop, which ran the hook's
+    body interpreted as an inline activation. The frame JIT's setter
+    helper now calls the function directly, as the property getter and
+    operator lanes do, on the store's own slots (`f(recv, name, value)`),
+    and drops its result; the core loop drops a result it settles (the
+    new `MethodOp::Store`). A store in a body inlined into its caller's
+    code keeps the exit. (`o.x = v` through `object.__setattr__` 2.25 to
+    0.99 times CPython, `super().__setattr__` 1.93 to 1.22,
+    `self.__dict__[k] = v` 2.99 to 1.56.)
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
