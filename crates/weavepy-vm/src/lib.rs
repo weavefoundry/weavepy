@@ -11675,6 +11675,48 @@ impl Interpreter {
     /// function of `(self, key, value)`, as an inline activation of it
     /// (CPython calls it from `STORE_SUBSCR` alike): the three operands
     /// leave the stack as its arguments, and its result is discarded.
+    /// The Python `__setitem__` of `(self, key, value)` a `STORE_SUBSCR` (the
+    /// `pc`th instruction of `code`) into `inst` calls, as
+    /// [`Self::try_inline_setitem`] finds it (the site remembering it by the
+    /// class's attribute version). `None` for any other store.
+    pub(crate) fn setitem_function(
+        code: &CodeObject,
+        pc: usize,
+        inst: &PyInstance,
+    ) -> Option<Rc<crate::object::PyFunction>> {
+        let cls = inst.cls_raw();
+        let ver = cls.attr_version.get();
+        let slot = code_method_slot(code, pc as u32);
+        let f = match slot.and_then(|s| s.get_held(ver)) {
+            Some(f) => f,
+            None => {
+                if crate::object::exotic_str_keys_possible() {
+                    return None;
+                }
+                let Some(Object::Function(f)) = cls.lookup("__setitem__") else {
+                    return None;
+                };
+                if let Some(s) = slot {
+                    s.set(ver, &f);
+                }
+                f
+            }
+        };
+        // SAFETY: GIL-serialized raw read of the function's code cell.
+        let fc = unsafe { &*f.code.as_ptr() };
+        if fc.arg_count != 3
+            || fc.kwonly_count != 0
+            || fc.has_varargs
+            || fc.has_varkeywords
+            || fc.is_generator
+            || fc.is_coroutine
+            || fc.is_async_generator
+        {
+            return None;
+        }
+        Some(f)
+    }
+
     fn try_inline_setitem(
         &mut self,
         frame: &mut Frame,
@@ -80831,9 +80873,10 @@ pub(crate) enum MethodOp {
     /// A `GET_ITER`'s `__iter__` (see `Interpreter::iter_dunder`): its
     /// result goes through [`iter_result`].
     Iter,
-    /// A `STORE_ATTR`'s Python `__setattr__` or property setter, called on
-    /// the store's operands (see `frame_jit::setter_call`): its result is
-    /// dropped, the store leaving nothing on the stack.
+    /// A `STORE_ATTR`'s Python `__setattr__` or property setter, or a
+    /// `STORE_SUBSCR`'s `__setitem__`, called on the store's operands (see
+    /// `frame_jit::setter_call` and `frame_jit::h_setitem_dunder`): its
+    /// result is dropped, the store leaving nothing on the stack.
     Store,
 }
 

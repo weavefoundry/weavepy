@@ -3469,6 +3469,13 @@ branch and pull request.
     code keeps the exit. (`o.x = v` through `object.__setattr__` 2.25 to
     0.99 times CPython, `super().__setattr__` 1.93 to 1.22,
     `self.__dict__[k] = v` 2.99 to 1.56.)
+  - An item store into an instance whose class's `__setitem__` is a
+    Python function took the same exit; a declined `STORE_SUBSCR` now
+    calls the method directly too, on the store's slots
+    (`f(cont, key, value)`), its result dropped as the setter's is
+    (`c[k] = v` through a Python `__setitem__` that stores into a dict
+    attribute 3.20 to 1.86 times CPython, a `dict` subclass's
+    `super().__setitem__` 1.82 to 1.03, `ChainMap` 1.28 to 1.08).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

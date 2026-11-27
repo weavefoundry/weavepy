@@ -58,7 +58,8 @@ pub(super) enum MethodOp<'a> {
     Compare(u32),
     /// A `GET_ITER`'s `__iter__`: its result must be an iterator.
     Iter,
-    /// A `STORE_ATTR`'s setter: its result is dropped.
+    /// A `STORE_ATTR`'s setter or a `STORE_SUBSCR`'s `__setitem__`: its
+    /// result is dropped.
     Store,
 }
 

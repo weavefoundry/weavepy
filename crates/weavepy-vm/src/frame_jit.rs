@@ -13215,6 +13215,78 @@ unsafe extern "C" fn h_subscr_dunder(
     }
 }
 
+/// `STORE_SUBSCR` (the `pc`th instruction of `code`) of the value, container
+/// and key in the three stack slots from `slot` up, the faster stores
+/// declined: a container whose class's `__setitem__` is a Python function,
+/// called directly ([`direct_call`]) as `f(cont, key, value)` on those
+/// slots and its result dropped. `0` stored, the operands gone,
+/// `CALL_DECLINED` declined untouched (a function without native code,
+/// which warms as a compiled caller's switched call warms its callee),
+/// `RAISED` or `RELOAD` as [`h_call`]'s (the core loop drops a result it
+/// settles: see `records::MethodOp::Store`).
+unsafe extern "C" fn h_setitem_dunder(
+    st: *mut State,
+    code: *const CodeObject,
+    pc: u64,
+    slot: u64,
+    site: *mut DirectSite,
+) -> u32 {
+    // SAFETY: the code passes its live state, its own code and one of its
+    // `STORE_SUBSCR`s, the operands' slot (with room for one more above
+    // them, and nothing virtual below), and the site's cache.
+    unsafe {
+        let st = &mut *st;
+        if st.sw.is_null() {
+            return CALL_DECLINED;
+        }
+        let (pc, slot) = (pc as usize, slot as usize);
+        let at = st.stack.add(slot);
+        let Object::Instance(inst) = &*at.add(1) else {
+            return CALL_DECLINED;
+        };
+        let Some(f) = Interpreter::setitem_function(&*code, pc, inst) else {
+            return CALL_DECLINED;
+        };
+        // `[value, cont, key]` becomes the call `[f, cont, key, value]`.
+        at.add(3).write(at.read());
+        at.write(Object::Function(f));
+        match direct_call_out(
+            st,
+            pc,
+            slot,
+            slot + 4,
+            &mut *site,
+            Some(records::MethodOp::Store),
+        ) {
+            None => {
+                let f = at.read();
+                at.write(at.add(3).read());
+                if let Object::Function(f) = &f {
+                    let fc = f.code();
+                    if let Some(ext) = crate::code_vm_ext(&fc) {
+                        ext.frame_jit
+                            .warm_switched(&fc, ext, fc.varnames.len().max(3));
+                    }
+                }
+                drop(f);
+                CALL_DECLINED
+            }
+            Some(0) => {
+                // The method's result (`None`, as a rule) goes.
+                let res = at.read();
+                if !plain_release(&res) {
+                    (*st.interp.cast_mut()).release(res);
+                } else {
+                    std::mem::forget(res);
+                }
+                st.len = slot;
+                0
+            }
+            Some(r) => r,
+        }
+    }
+}
+
 /// [`h_binop_dunder`]'s lane for `a + b` of two instances of one plain
 /// class whose `__add__` is a native method with a leaf half (an
 /// `array`'s): the half's answer at `slot` (see [`pair_leaf_call`]). Only
@@ -23269,6 +23341,40 @@ impl<'a> Lower<'a> {
             let d = self
                 .call(
                     h_subscr_dunder as *const () as usize,
+                    &[self.st, code, pcv, slotv, site_at],
+                    true,
+                )
+                .expect("returns");
+            let other = self.b.create_block();
+            self.b.ins().brif(d, other, &[], ok, &[]);
+            self.b.switch_to_block(other);
+            let declined = self
+                .b
+                .ins()
+                .icmp_imm(IntCC::Equal, d, i64::from(CALL_DECLINED));
+            let leave = self.b.create_block();
+            self.b.ins().brif(declined, out, &[], leave, &[]);
+            self.b.switch_to_block(leave);
+            self.leave(d);
+            self.b.switch_to_block(ok);
+        } else if raisable && self.code.instructions[pc].op == OpCode::StoreSubscr {
+            // A store into an instance whose class's `__setitem__` is a
+            // Python function: the method, called directly, as above.
+            let dunder = self.b.create_block();
+            let ok = self.b.create_block();
+            self.b.ins().brif(declined, dunder, &[], ok, &[]);
+            self.b.set_cold_block(dunder);
+            self.b.switch_to_block(dunder);
+            let site: Box<DirectSite> = Box::default();
+            let site_at = self
+                .b
+                .ins()
+                .iconst(self.ptr, std::ptr::from_ref::<DirectSite>(&site) as i64);
+            self.direct_sites.push(site);
+            let slotv = self.b.ins().iconst(types::I64, slot as i64);
+            let d = self
+                .call(
+                    h_setitem_dunder as *const () as usize,
                     &[self.st, code, pcv, slotv, site_at],
                     true,
                 )
