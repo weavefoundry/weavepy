@@ -913,6 +913,9 @@ pub(crate) mod vm_key {
     pub(crate) const BOOL_FN: u32 = 156;
     /// Its Python `__delitem__`, for compiled deletions' direct calls.
     pub(crate) const DELITEM_FN: u32 = 157;
+    /// A data descriptor's Python `__set__`, for compiled stores' direct
+    /// calls.
+    pub(crate) const SET_FN: u32 = 158;
 }
 
 /// A builtin type's pure constructor (see [`TypeObject::pure_new`]).

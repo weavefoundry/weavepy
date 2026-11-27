@@ -11020,37 +11020,60 @@ impl Interpreter {
     }
 
     /// The Python function a `STORE_ATTR` of `co_names[name_idx]` on
-    /// `inst` calls, as [`Self::try_inline_setter`] finds it: the class's
-    /// own `__setattr__` of `(self, name, value)` (`true`: the call takes
-    /// the name), or else the setter of `(self, value)` of the class's
-    /// `property` of that name. `None` for any other store.
+    /// `inst` calls, and how (see [`StoreCall`]): the class's own
+    /// `__setattr__` of `(self, name, value)`, as
+    /// [`Self::try_inline_setter`] finds it, or else the setter of
+    /// `(self, value)` of the class's `property` of that name, or the
+    /// `__set__` of `(self, obj, value)` of another data descriptor there.
+    /// `None` for any other store.
     pub(crate) fn store_attr_function(
         code: &CodeObject,
         inst: &PyInstance,
         name_idx: u32,
-    ) -> Option<(Rc<crate::object::PyFunction>, bool)> {
-        let hook = !Self::default_setattr(inst.cls_raw());
-        let f = if hook {
-            Self::instance_dunder_function(
+    ) -> Option<(Rc<crate::object::PyFunction>, StoreCall)> {
+        let (f, how) = if !Self::default_setattr(inst.cls_raw()) {
+            let f = Self::instance_dunder_function(
                 inst,
                 crate::types::AttrKey::vm(crate::types::vm_key::SETATTR_FN),
                 "__setattr__",
-            )?
+            )?;
+            (f, StoreCall::Hook)
         } else {
-            let LeafAttr::Property(prop) = Self::leaf_resolve_instance_attr(code, inst, name_idx)?
-            else {
-                return None;
-            };
-            // SAFETY: GIL-serialized raw read of the setter cell; the clone
-            // is taken before anything else runs.
-            let Object::Function(f) = (unsafe { &*prop.fset.as_ptr() }) else {
-                return None;
-            };
-            f.clone()
+            match Self::leaf_resolve_instance_attr(code, inst, name_idx) {
+                Some(LeafAttr::Property(prop)) => {
+                    // SAFETY: GIL-serialized raw read of the setter cell;
+                    // the clone is taken before anything else runs.
+                    let Object::Function(f) = (unsafe { &*prop.fset.as_ptr() }) else {
+                        return None;
+                    };
+                    (f.clone(), StoreCall::Setter)
+                }
+                _ => {
+                    if crate::object::exotic_str_keys_possible() {
+                        return None;
+                    }
+                    let name = code.names.get(name_idx as usize)?;
+                    let desc = inst.cls_raw().lookup(name)?;
+                    let Object::Instance(d) = &desc else {
+                        return None;
+                    };
+                    let f = Self::instance_dunder_function(
+                        d,
+                        crate::types::AttrKey::vm(crate::types::vm_key::SET_FN),
+                        "__set__",
+                    )?;
+                    (f, StoreCall::Descriptor(desc))
+                }
+            }
         };
         // SAFETY: GIL-serialized raw read of the function's code cell.
         let fc = unsafe { &*f.code.as_ptr() };
-        if fc.arg_count != 2 + u32::from(hook)
+        let arity = if matches!(how, StoreCall::Setter) {
+            2
+        } else {
+            3
+        };
+        if fc.arg_count != arity
             || fc.is_generator
             || fc.is_coroutine
             || fc.is_async_generator
@@ -11060,7 +11083,7 @@ impl Interpreter {
         {
             return None;
         }
-        Some((f, hook))
+        Some((f, how))
     }
 
     /// `recv.<co_names[name_idx]> = value` on a `threading.local` whose
@@ -80960,6 +80983,17 @@ pub(crate) enum MethodOp {
     /// `len(obj)`'s Python `__len__`: its result becomes the length (see
     /// [`coerce_len_result`]).
     Len,
+}
+
+/// How a compiled `STORE_ATTR`'s Python function takes the store (see
+/// `Interpreter::store_attr_function`).
+pub(crate) enum StoreCall {
+    /// The class's `__setattr__`: `f(obj, name, value)`.
+    Hook,
+    /// A `property`'s setter: `f(obj, value)`.
+    Setter,
+    /// This data descriptor's `__set__`: `f(descriptor, obj, value)`.
+    Descriptor(Object),
 }
 
 /// The truth a `__bool__` (or, `from_len`, a `__len__`) result `r` gives, as

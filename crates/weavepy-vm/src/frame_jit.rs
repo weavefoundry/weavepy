@@ -8005,31 +8005,39 @@ unsafe fn setter_call(
             return 1;
         };
         let name_idx = code.instructions[pc].arg;
-        let Some((f, hook)) = Interpreter::store_attr_function(code, inst, name_idx) else {
+        let Some((f, how)) = Interpreter::store_attr_function(code, inst, name_idx) else {
             return 1;
         };
-        let name = if hook {
-            match crate::code_name_obj(code, name_idx) {
-                Some(n) => Some(n.clone()),
+        // The call's argument before the receiver (a descriptor) or after
+        // it (the hook's name).
+        let (before, after) = match how {
+            crate::StoreCall::Hook => match crate::code_name_obj(code, name_idx) {
+                Some(n) => (None, Some(n.clone())),
                 None => return 1,
-            }
-        } else {
-            None
+            },
+            crate::StoreCall::Setter => (None, None),
+            crate::StoreCall::Descriptor(d) => (Some(d), None),
         };
         let slot = value.offset_from(st.stack) as usize;
         let at = value;
         // `[value, recv]` (or `[value]`, the receiver a local's) becomes the
-        // call `[f, recv, name, value]` (`[f, recv, value]` for a setter).
+        // call `[f, recv, name, value]` (a setter's `[f, recv, value]`, a
+        // descriptor's `[f, descriptor, recv, value]`).
         let v = at.read();
         let r = if stack_recv {
             at.add(1).read()
         } else {
             crate::clone_hot(&*recv)
         };
-        let n = 2 + usize::from(hook);
+        let n = 2 + usize::from(before.is_some() || after.is_some());
+        // (Where the receiver goes.)
+        let ri = 1 + usize::from(before.is_some());
         at.write(Object::Function(f));
-        at.add(1).write(r);
-        if let Some(name) = name {
+        if let Some(d) = before {
+            at.add(1).write(d);
+        }
+        at.add(ri).write(r);
+        if let Some(name) = after {
             at.add(2).write(name);
         }
         at.add(n).write(v);
@@ -8044,13 +8052,15 @@ unsafe fn setter_call(
             None => {
                 // Back as they were.
                 let f = at.read();
+                let r = at.add(ri).read();
+                let extra = (n == 3).then(|| at.add(if ri == 1 { 2 } else { 1 }).read());
                 at.write(at.add(n).read());
-                if hook {
-                    crate::drop_hot_at(at.add(2));
+                if stack_recv {
+                    at.add(1).write(r);
+                } else {
+                    drop(r);
                 }
-                if !stack_recv {
-                    crate::drop_hot_at(at.add(1));
-                }
+                drop(extra);
                 if let Object::Function(f) = &f {
                     let fc = f.code();
                     if let Some(ext) = crate::code_vm_ext(&fc) {

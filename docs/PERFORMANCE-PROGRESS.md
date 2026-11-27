@@ -3503,6 +3503,12 @@ branch and pull request.
     new `MethodOp::Len` settles one the core loop finishes) (2.79 to
     1.18 times CPython). `len()` also accepts an `int` subclass from
     `__len__`, as CPython does, and names the class in its error.
+  - An attribute store through a data descriptor other than a `property`
+    (a validating field descriptor's Python `__set__`) took the store's
+    exit too. The setter helper now finds such a descriptor on the class
+    and calls its `__set__(descriptor, obj, value)` directly on the
+    store's slots, as it calls a setter (a `__set__` that checks
+    `isinstance` and stores with `setattr` 4.59 to 1.93 times CPython).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
