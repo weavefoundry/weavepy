@@ -213,6 +213,26 @@ impl Interpreter {
                     return self.call(&f, &all, &[], globals);
                 }
             }
+            // An instance whose class's `__call__` is a plain Python
+            // function (`map(adder, xs)`): that function over the instance
+            // and `v`, as a bound method's is called, with no bound
+            // `__call__` made for the general call.
+            Object::Instance(inst) => {
+                if let Some(f) = Self::instance_call_function(inst) {
+                    // (A pure leaf `__call__` evaluates frameless.)
+                    let fo = Object::Function(f.clone());
+                    let pair = [func.clone(), v];
+                    if let Some(r) = self.pure_callback(&fo, &pair, true) {
+                        let [recv, v] = pair;
+                        self.release(v);
+                        drop(recv);
+                        return Ok(r);
+                    }
+                    let mut args = self.pooled_scratch();
+                    args.extend(pair);
+                    return self.call_python_owned(&f, args, Vec::new());
+                }
+            }
             _ => {}
         }
         let r = self.call(func, std::slice::from_ref(&v), &[], globals);

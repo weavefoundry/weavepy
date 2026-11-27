@@ -3555,6 +3555,12 @@ branch and pull request.
     iteration guard included; it now takes the plain cursors' in-place
     step, as its `pure_ready` already promised (`urllib.parse.quote`,
     whose drain is `map(quoter, bs)`, 3.6% fewer instructions).
+  - A callable instance (its class's Python `__call__`) as a native
+    adapter's callback (`map(adder, xs)`, a `filter` predicate) took the
+    general call for each item, which built a bound `__call__`. The
+    callback now calls the class's function over the instance and the
+    item, frameless when it is a pure leaf (`list(map(adder, range(20)))`
+    2.30 to 1.31 times CPython, an `__call__` that counts 3.10 to 2.50).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
