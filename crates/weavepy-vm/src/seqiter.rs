@@ -295,8 +295,59 @@ impl Interpreter {
         if grouper && grouper_drain(l, out) {
             return Ok(true);
         }
-        if chain && chain_drain(l, out) {
-            return Ok(true);
+        if chain {
+            // `chain(gen, ...)`: a generator source drained whole, its
+            // yields folded straight into `out` as `list(gen)` drains one,
+            // then the chain moved on as a source's end moves it; plain
+            // sources in bulk; anything else one general step at a time
+            // while a generator follows. A raise leaves the generator
+            // active, as stepping it would.
+            loop {
+                // SAFETY: a read that runs no code, ending with the match.
+                let g = match unsafe { l.state.peek() } {
+                    Some(LazyIterKind::Chain {
+                        active: Some(Object::Generator(g)),
+                        ..
+                    }) => g.clone(),
+                    _ => {
+                        if chain_drain(l, out) {
+                            return Ok(true);
+                        }
+                        // The next source made active by one step.
+                        match self.lazy_iter_step(l, globals)? {
+                            Some(v) => out.push(v),
+                            None => return Ok(true),
+                        }
+                        // SAFETY: as above.
+                        match unsafe { l.state.peek() } {
+                            Some(LazyIterKind::Chain {
+                                active: Some(Object::Generator(_)),
+                                ..
+                            }) => continue,
+                            _ => return Ok(false),
+                        }
+                    }
+                };
+                match self.gen_fast_collect(&g, out) {
+                    Some(v) => drop(v),
+                    None => loop {
+                        let sink = crate::FoldSink::Collect(std::ptr::from_mut(out));
+                        match self.gen_drain_next(&g, Some(sink), false)? {
+                            Some(x) => out.push(x),
+                            None => break,
+                        }
+                    },
+                }
+                // SAFETY: a step that runs no code; the view ends with it.
+                if let Some(LazyIterKind::Chain { active, .. }) = unsafe { l.state.peek_mut() } {
+                    if matches!(active, Some(Object::Generator(a)) if Rc::ptr_eq(a, &g)) {
+                        let old = active.take();
+                        drop(old);
+                        continue;
+                    }
+                }
+                return Ok(false);
+            }
         }
         if accumulate {
             if let Some(items) = accumulate_collect(l) {

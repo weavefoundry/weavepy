@@ -3409,6 +3409,13 @@ branch and pull request.
     an intermediate vector; it now fills the tuple's own allocation
     directly (`list(zip(*m))` of an 8x8 matrix 1.64 to 1.19 times
     CPython).
+  - `list(chain(gen, gen))` resumed each generator once an item through
+    the adapter's general step (about 1,500 instructions an item, 3.5
+    times CPython), while `list(gen)` folds a generator's yields straight
+    into the list. A chain being drained now drains a generator source
+    the same way, whole, then moves on as a source's end moves it (0.90
+    times CPython); a raise leaves the generator active, as stepping it
+    would.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
