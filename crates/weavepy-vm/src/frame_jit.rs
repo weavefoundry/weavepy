@@ -5671,6 +5671,41 @@ unsafe extern "C" fn k_set_add(
     }
 }
 
+/// [`k_set_add`] of an instance key whose class's Python `__hash__`
+/// evaluates frameless ([`Interpreter::leaf_instance_hash`]): found by
+/// identity, or added when no stored key could equal it (one with an equal
+/// hash that isn't the same object would need `__eq__`: declined). `false`
+/// touches nothing.
+///
+/// # Safety
+///
+/// As `Kernel`'s.
+#[inline(never)]
+unsafe fn set_add_leaf_hashed(interp: &Interpreter, recv: *const Object, a: *const Object) -> bool {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let (Object::Set(s), k @ Object::Instance(_)) = (&*recv, &*a) else {
+            return false;
+        };
+        let Some(h) = interp.leaf_instance_hash(k) else {
+            return false;
+        };
+        let probe = crate::object::LeafProbe::with_hash(k, h);
+        let Some(m) = s.peek_mut() else {
+            return false;
+        };
+        if m.get_index_of(&probe).is_none() {
+            if !probe.miss_is_exact() {
+                return false;
+            }
+            // (Absent, as the probe found: the hash goes in as computed,
+            // the key's own never run under the set's borrow.)
+            m.insert_unique_hashed(h, crate::object::DictKey(crate::clone_hot(k)));
+        }
+        true
+    }
+}
+
 /// `set.discard` (`remove`: a miss declines, for the full call's
 /// `KeyError`) of a key that compares natively (see `LeafProbe`): the
 /// removed key is the same object, or an equal `str`, `int` or tuple of
@@ -16533,6 +16568,17 @@ unsafe fn call_kernel_in_place(s: &mut State, site: &BuiltinSite, lenu: usize) -
                 if kernel(out.as_mut_ptr(), recv, arg(1), arg(2), site.f) == 0 {
                     crate::release_operands(&*s.interp, base.add(start), lenu - start);
                     base.add(start).write(out.assume_init());
+                    s.len = start + 1;
+                    return true;
+                }
+                // `set.add` of an instance whose class's `__hash__` evaluates
+                // frameless (see `set_add_leaf_hashed`).
+                if site.kind == Some(K::SetAdd)
+                    && site.argc == 1
+                    && set_add_leaf_hashed(&*s.interp, recv, arg(1))
+                {
+                    crate::release_operands(&*s.interp, base.add(start), lenu - start);
+                    base.add(start).write(Object::None);
                     s.len = start + 1;
                     return true;
                 }

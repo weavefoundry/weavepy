@@ -3519,6 +3519,14 @@ branch and pull request.
     synced (the new `MethodOp::Inplace` carries the operands for a call
     the core loop finishes) (`x += 1` through an `__iadd__` that counts
     4.41 to 1.32 times CPython).
+  - `set.add` of an instance whose class's Python `__hash__` evaluates
+    frameless declined the method's kernel and went through the general
+    call, which hashed it the same way several layers down. The kernel's
+    site now hashes it with the frameless evaluation and adds it on an
+    exact miss (a stored key of equal hash that isn't the same object
+    would need `__eq__`: declined), the computed hash going in with it
+    (`s.add(k)` for a `__hash__` returning `hash(self.key())` 1.94 to
+    1.00 times CPython).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
