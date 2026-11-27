@@ -3422,6 +3422,10 @@ branch and pull request.
     read and written back once (the skipped items first, then the stop
     bound, as before), 3.32 to 1.84 times CPython; the rest is the
     generator's resume per item.
+  - `list(zip(gen_a, gen_b))` likewise steps each row's sources in order,
+    stopping at the first source's end with that row's earlier items
+    dropped as CPython drops them, instead of the adapter's general step
+    per row (2.74 to 2.02 times CPython).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

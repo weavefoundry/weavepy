@@ -295,6 +295,40 @@ impl Interpreter {
         if grouper && grouper_drain(l, out) {
             return Ok(true);
         }
+        // `zip` over generators (`list(zip(gen_a, gen_b))`): each row's
+        // items stepped from the sources in order, as the general step
+        // takes them, until the first source's end (the row's earlier items
+        // dropped, as CPython drops them). The adapter's own state stays as
+        // the general steps leave it: nothing is held between rows.
+        // SAFETY: a read that runs no code, ending with the match.
+        let zip_gens = match unsafe { l.state.peek() } {
+            Some(LazyIterKind::Zip {
+                iters,
+                strict: false,
+                held,
+                ..
+            }) if held.is_empty()
+                && (2..=8).contains(&iters.len())
+                && iters.iter().any(|s| matches!(s, Object::Generator(_))) =>
+            {
+                Some(iters.clone())
+            }
+            _ => None,
+        };
+        if let Some(srcs) = zip_gens {
+            loop {
+                let mut row = Vec::with_capacity(srcs.len());
+                for src in &srcs {
+                    match self.iter_step(src, globals) {
+                        Ok(Some(v)) => row.push(v),
+                        Ok(None) => return Ok(true),
+                        Err(e) if is_stop_iteration(&e) => return Ok(true),
+                        Err(e) => return Err(e),
+                    }
+                }
+                out.push(Object::Tuple(crate::object::TupleStorage::from_vec(row)));
+            }
+        }
         // `islice(gen, ...)`: the generator stepped item after item as the
         // general step takes them (the skipped items first, then the stop
         // bound, then the item), with the adapter's state read once and
