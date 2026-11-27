@@ -295,6 +295,79 @@ impl Interpreter {
         if grouper && grouper_drain(l, out) {
             return Ok(true);
         }
+        // `islice(gen, ...)`: the generator stepped item after item as the
+        // general step takes them (the skipped items first, then the stop
+        // bound, then the item), with the adapter's state read once and
+        // written back once (released source and all) at the end or a raise.
+        // SAFETY: a read that runs no code, ending with the match.
+        let islice_gen = match unsafe { l.state.peek() } {
+            Some(LazyIterKind::Islice {
+                source: Object::Generator(g),
+                next_idx,
+                pos,
+                stop,
+                step,
+                done: false,
+            }) => Some((g.clone(), *next_idx, *pos, *stop, *step)),
+            _ => None,
+        };
+        if let Some((g, mut next_idx, mut pos, stop, step)) = islice_gen {
+            // (The loop ends only once the slice is done.)
+            let mut err = None;
+            'items: loop {
+                while pos < next_idx {
+                    match self.gen_step(&g) {
+                        Ok(Some(skipped)) => {
+                            drop(skipped);
+                            pos += 1;
+                        }
+                        Ok(None) => break 'items,
+                        Err(e) => {
+                            err = Some(e);
+                            break 'items;
+                        }
+                    }
+                }
+                if stop.is_some_and(|s| pos >= s) {
+                    break;
+                }
+                match self.gen_step(&g) {
+                    Ok(Some(item)) => {
+                        out.push(item);
+                        pos += 1;
+                        next_idx = next_idx.saturating_add(step);
+                        if let Some(s) = stop {
+                            next_idx = next_idx.min(s);
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        err = Some(e);
+                        break;
+                    }
+                }
+            }
+            let released = if let LazyIterKind::Islice {
+                next_idx: ni,
+                pos: p,
+                done: d,
+                source,
+                ..
+            } = &mut *l.state.borrow_mut()
+            {
+                (*ni, *p, *d) = (next_idx, pos, true);
+                // (A finished slice releases its source, as CPython clears
+                // `lz->it`.)
+                Some(std::mem::replace(source, Object::None))
+            } else {
+                None
+            };
+            drop(released);
+            return match err {
+                Some(e) if !is_stop_iteration(&e) => Err(e),
+                _ => Ok(true),
+            };
+        }
         if chain {
             // `chain(gen, ...)`: a generator source drained whole, its
             // yields folded straight into `out` as `list(gen)` drains one,

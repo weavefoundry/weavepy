@@ -3416,6 +3416,12 @@ branch and pull request.
     the same way, whole, then moves on as a source's end moves it (0.90
     times CPython); a raise leaves the generator active, as stepping it
     would.
+  - `list(islice(gen, n))` took each item through the adapter's general
+    step, which snapshots and writes back its state every item. Draining
+    one over a generator now steps the generator in a row with the state
+    read and written back once (the skipped items first, then the stop
+    bound, as before), 3.32 to 1.84 times CPython; the rest is the
+    generator's resume per item.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
