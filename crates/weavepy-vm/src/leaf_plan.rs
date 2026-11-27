@@ -2003,6 +2003,19 @@ fn subscr(owned: &mut Owned, a: V, b: V) -> Option<V> {
     let V::R(c) = a else {
         return None;
     };
+    // An item of a container the evaluation holds itself (the list
+    // `s.split(".")` made): held too, since the container goes with the
+    // scratch and a pointer into it would outlive it (a borrowed result
+    // read after the evaluation, `return s.split(".")[0]`).
+    let held = owned.holds(c);
+    let item = |owned: &mut Owned, p: *const Object| {
+        if held {
+            // SAFETY: an item of a live held container.
+            owned.own(crate::clone_hot(unsafe { &*p }))
+        } else {
+            Some(norm(p))
+        }
+    };
     let index = |i: i64, n: usize| {
         let n = n as i64;
         let i = if i < 0 { i + n } else { i };
@@ -2013,9 +2026,13 @@ fn subscr(owned: &mut Owned, a: V, b: V) -> Option<V> {
     match (unsafe { &*c }, b) {
         (Object::List(l), V::I(i)) => {
             let xs = unsafe { l.peek() }?;
-            Some(norm(&raw const xs[index(i, xs.len())?]))
+            let p = &raw const xs[index(i, xs.len())?];
+            item(owned, p)
         }
-        (Object::Tuple(t), V::I(i)) => Some(norm(&raw const t[index(i, t.len())?])),
+        (Object::Tuple(t), V::I(i)) => {
+            let p = &raw const t[index(i, t.len())?];
+            item(owned, p)
+        }
         (Object::Str(s), V::I(i)) => {
             if crate::object::str_char_len(s) != s.len() {
                 return None;
@@ -2051,8 +2068,8 @@ fn subscr(owned: &mut Owned, a: V, b: V) -> Option<V> {
                 _ => return None,
             };
             let probe = crate::object::LeafProbe::new(key)?;
-            let v = unsafe { d.peek() }?.get(&probe)?;
-            Some(norm(v))
+            let v: *const Object = unsafe { d.peek() }?.get(&probe)?;
+            item(owned, v)
         }
         _ => None,
     }

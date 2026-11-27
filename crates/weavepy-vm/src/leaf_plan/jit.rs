@@ -924,8 +924,9 @@ unsafe extern "C" fn h_subscr(ctx: *mut Ctx<'static>, ta: u64, pa: u64, tb: u64,
     // SAFETY: called by native code with its context.
     let c = unsafe { cx(ctx) };
     // A dict read by a `str` key (`env[name]`), the commonest shape, as
-    // `subscr` reads it.
-    if ta == T_R && tb == T_R {
+    // `subscr` reads it (a dict the evaluation holds itself is `subscr`'s,
+    // which holds the value too).
+    if ta == T_R && tb == T_R && !c.owned.holds(pa as *const Object) {
         // SAFETY: as `norm`; the borrows end before anything could change
         // the dict (no Python runs during an evaluation).
         let (a, k) = unsafe { (&*(pa as *const Object), &*(pb as *const Object)) };
