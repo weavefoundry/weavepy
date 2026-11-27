@@ -5706,6 +5706,43 @@ unsafe fn set_add_leaf_hashed(interp: &Interpreter, recv: *const Object, a: *con
     }
 }
 
+/// [`k_dict_get`] of an instance key whose class's Python `__hash__`
+/// evaluates frameless (as [`set_add_leaf_hashed`] hashes one): the value
+/// of the entry that is the same object, or the default (`b`, or `None`)
+/// when no stored key could equal it. `None` touches nothing.
+///
+/// # Safety
+///
+/// As `Kernel`'s.
+#[inline(never)]
+unsafe fn dict_get_leaf_hashed(
+    interp: &Interpreter,
+    recv: *const Object,
+    a: *const Object,
+    b: *const Object,
+) -> Option<Object> {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let (Object::Dict(d), k @ Object::Instance(_)) = (&*recv, &*a) else {
+            return None;
+        };
+        let h = interp.leaf_instance_hash(k)?;
+        let probe = crate::object::LeafProbe::with_hash(k, h);
+        let m = d.peek()?;
+        Some(match m.get_hot(&probe) {
+            Some(v) => crate::clone_hot(v),
+            None if probe.miss_is_exact() => {
+                if b.is_null() {
+                    Object::None
+                } else {
+                    crate::clone_hot(&*b)
+                }
+            }
+            None => return None,
+        })
+    }
+}
+
 /// `set.discard` (`remove`: a miss declines, for the full call's
 /// `KeyError`) of a key that compares natively (see `LeafProbe`): the
 /// removed key is the same object, or an equal `str`, `int` or tuple of
@@ -16581,6 +16618,15 @@ unsafe fn call_kernel_in_place(s: &mut State, site: &BuiltinSite, lenu: usize) -
                     base.add(start).write(Object::None);
                     s.len = start + 1;
                     return true;
+                }
+                // `dict.get` likewise (see `dict_get_leaf_hashed`).
+                if site.kind == Some(K::DictGet) {
+                    if let Some(v) = dict_get_leaf_hashed(&*s.interp, recv, arg(1), arg(2)) {
+                        crate::release_operands(&*s.interp, base.add(start), lenu - start);
+                        base.add(start).write(v);
+                        s.len = start + 1;
+                        return true;
+                    }
                 }
             }
         }

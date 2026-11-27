@@ -3527,6 +3527,9 @@ branch and pull request.
     would need `__eq__`: declined), the computed hash going in with it
     (`s.add(k)` for a `__hash__` returning `hash(self.key())` 1.94 to
     1.00 times CPython).
+  - `dict.get` of such a key takes the same path: the entry that is the
+    same object, or the default when no stored key could equal it
+    (`d.get(k)` 1.86 to 0.89 times CPython).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

@@ -1,5 +1,5 @@
-"""Compiled `set.add` of an object whose Python `__hash__` evaluates
-frameless hashes it in place; the members, equal-but-distinct objects
+"""Compiled `set.add` and `dict.get` of an object whose Python `__hash__`
+evaluates frameless hash it in place; the members, equal-but-distinct objects
 (their `__eq__` decides), hash collisions, `__hash__` returning big or
 negative values, and lookups through the general paths afterwards match
 the general call."""
@@ -106,6 +106,41 @@ class SetAddLeafHash(unittest.TestCase):
             t.add(K(i % 4, 2))
         self.assertEqual(len(t), 4)
         self.assertEqual(frozenset(t), frozenset(K(i, 2) for i in range(4)))
+
+
+class DictGetLeafHash(unittest.TestCase):
+    def test_get(self):
+        ks = [K(i, 0) for i in range(20)]
+        d = {k: k.a for k in ks}
+        for _ in range(200):
+            for k in ks:
+                self.assertEqual(d.get(k), k.a)
+                self.assertEqual(d.get(k, -1), k.a)
+        missing = K(99, 0)
+        for _ in range(500):
+            self.assertIsNone(d.get(missing))
+            self.assertEqual(d.get(missing, "dflt"), "dflt")
+        # An equal but distinct key: its `__eq__` decides.
+        for _ in range(500):
+            self.assertEqual(d.get(K(3, 0)), 3)
+
+    def test_collisions_and_mixed(self):
+        d = {Collide(i): i for i in range(5)}
+        d[7] = "seven"
+        for _ in range(500):
+            self.assertEqual(d.get(Collide(2)), 2)
+            self.assertIsNone(d.get(Collide(9)))
+            self.assertEqual(d.get(7), "seven")
+
+    def test_dict_subclass(self):
+        class D(dict):
+            pass
+
+        k = K(1, 1)
+        d = D({k: "v"})
+        for _ in range(500):
+            self.assertEqual(d.get(k), "v")
+            self.assertIsNone(d.get(K(2, 2)))
 
 
 if __name__ == "__main__":
