@@ -6194,6 +6194,29 @@ unsafe fn subscr_raise_missing(st: &mut State, pc: u64, len: usize) -> Option<u6
     // SAFETY: per the caller.
     unsafe {
         let (c, k) = (&*st.stack.add(len - 2), &*st.stack.add(len - 1));
+        // An exact list's, tuple's or ASCII string's index out of range
+        // (`xs[0]` of an empty list): its `IndexError`, as the core loop's
+        // arm words it.
+        if let Object::Int(i) = *k {
+            let (n, what) = match c {
+                Object::List(l) => (l.peek()?.len(), "list index out of range"),
+                Object::Tuple(t) => (t.len(), "tuple index out of range"),
+                Object::Str(s) if crate::object::str_char_len(s) == s.len() => {
+                    (s.len(), "string index out of range")
+                }
+                _ => return None,
+            };
+            let n = i64::try_from(n).ok()?;
+            if (-n..n).contains(&i) || !droppable(c) {
+                return None;
+            }
+            crate::drop_hot_at(st.stack.add(len - 1));
+            crate::drop_hot_at(st.stack.add(len - 2));
+            st.len = len - 2;
+            st.pc = pc as usize + 1;
+            st.err = Some(crate::error::index_error(what));
+            return Some(CONTAINER_RAISED);
+        }
         let (
             Object::Dict(d),
             Object::Str(_) | Object::Int(_) | Object::Tuple(_) | Object::Bytes(_),
@@ -6830,8 +6853,14 @@ unsafe extern "C" fn h_subscr_ref(
             return len - 1;
         }
         own_operands(at, &[cont, key], owned);
-        // A dict's missing key raises without the generic subscript.
-        if flags >> 8 != 0 && matches!(&*at, Object::Dict(_)) {
+        // A dict's missing key, and a sequence's index out of range, raise
+        // without the generic subscript.
+        if flags >> 8 != 0
+            && matches!(
+                &*at,
+                Object::Dict(_) | Object::List(_) | Object::Tuple(_) | Object::Str(_)
+            )
+        {
             if let Some(n) = subscr_raise_missing(&mut *st, pc, len as usize) {
                 return n;
             }

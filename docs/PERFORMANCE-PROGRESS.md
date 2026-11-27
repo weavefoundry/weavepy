@@ -3426,6 +3426,11 @@ branch and pull request.
     stopping at the first source's end with that row's earlier items
     dropped as CPython drops them, instead of the adapter's general step
     per row (2.74 to 2.02 times CPython).
+  - Compiled code raised a dict's missing-key `KeyError` in place, but an
+    index out of range (`xs[0]` of an empty list) left for the
+    interpreter to raise. An exact list's, tuple's or ASCII string's
+    `IndexError` is now raised in place too, with CPython's message
+    (`try: L[0] except IndexError: pass` 2.27 to 1.44 times CPython).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
