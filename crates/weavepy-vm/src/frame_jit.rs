@@ -5711,8 +5711,9 @@ unsafe fn set_add_leaf_hashed(interp: &Interpreter, recv: *const Object, a: *con
 
 /// [`k_dict_get`] of an instance key whose class's Python `__hash__`
 /// evaluates frameless (as [`set_add_leaf_hashed`] hashes one): the value
-/// of the entry that is the same object, or the default (`b`, or `None`)
-/// when no stored key could equal it. `None` touches nothing.
+/// of the entry that is the same object or equal by a frameless `__eq__`
+/// (see [`Interpreter::leaf_eq_match`]), or the default (`b`, or `None`)
+/// when no stored key equals it. `None` touches nothing.
 ///
 /// # Safety
 ///
@@ -5732,16 +5733,23 @@ unsafe fn dict_get_leaf_hashed(
         let h = interp.leaf_instance_hash(k)?;
         let probe = crate::object::LeafProbe::with_hash(k, h);
         let m = d.peek()?;
-        Some(match m.get_hot(&probe) {
-            Some(v) => crate::clone_hot(v),
-            None if probe.miss_is_exact() => {
-                if b.is_null() {
-                    Object::None
-                } else {
-                    crate::clone_hot(&*b)
+        let found = match m.get_hot(&probe) {
+            Some(v) => Some(v),
+            None if probe.miss_is_exact() => None,
+            // (A stored key of its hash that a pure `__eq__` settles.)
+            None => {
+                let declined = std::cell::Cell::new(false);
+                let i = m.find_by_hash(h, interp.leaf_eq_match(k, &declined));
+                if declined.get() {
+                    return None;
                 }
+                i.and_then(|i| m.get_index(i)).map(|(_, v)| v)
             }
-            None => return None,
+        };
+        Some(match found {
+            Some(v) => crate::clone_hot(v),
+            None if b.is_null() => Object::None,
+            None => crate::clone_hot(&*b),
         })
     }
 }

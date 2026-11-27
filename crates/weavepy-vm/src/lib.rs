@@ -33125,24 +33125,40 @@ impl Interpreter {
                 _ => None,
             },
             // A key whose Python `__hash__` evaluates as a pure leaf, found
-            // only as itself (any other key with its hash declines).
+            // as itself or, for a stored key of the same hash, by a
+            // `__eq__` that evaluates as a pure leaf too (stored key first,
+            // as CPython compares; see `object::leaf_instance_probe`). Any
+            // other comparison declines.
             Object::Dict(_) | Object::Set(_) | Object::FrozenSet(_)
                 if matches!(item, Object::Instance(_)) && !Self::leaf_hash_native(item) =>
             {
                 // SAFETY: the running thread's interpreter, under the GIL;
-                // the evaluation runs no Python and takes no frame.
+                // the evaluations run no Python and take no frame.
                 let interp = unsafe { &*crate::vm_singletons::current_interpreter_ptr()? };
-                let probe =
-                    crate::object::LeafProbe::with_hash(item, interp.leaf_instance_hash(item)?);
+                let hash = interp.leaf_instance_hash(item)?;
+                let probe = crate::object::LeafProbe::with_hash(item, hash);
+                let declined = std::cell::Cell::new(false);
+                let eq = interp.leaf_eq_match(item, &declined);
+                // SAFETY: (each) a read between two instructions; the probe
+                // and the pure comparisons run no code.
                 let found = match container {
-                    // SAFETY: as below (the probe runs no code).
-                    Object::Dict(d) => unsafe { d.peek() }?.get_index_of(&probe).is_some(),
-                    // SAFETY: as below.
-                    Object::Set(st) => unsafe { st.peek() }?.get_index_of(&probe).is_some(),
-                    Object::FrozenSet(fs) => fs.get_index_of(&probe).is_some(),
+                    Object::Dict(d) => {
+                        let m = unsafe { d.peek() }?;
+                        m.get_index_of(&probe).is_some()
+                            || (!probe.miss_is_exact() && m.find_by_hash(hash, eq).is_some())
+                    }
+                    Object::Set(st) => {
+                        let m = unsafe { st.peek() }?;
+                        m.get_index_of(&probe).is_some()
+                            || (!probe.miss_is_exact() && m.find_by_hash(hash, eq).is_some())
+                    }
+                    Object::FrozenSet(fs) => {
+                        fs.get_index_of(&probe).is_some()
+                            || (!probe.miss_is_exact() && fs.find_by_hash(hash, eq).is_some())
+                    }
                     _ => return None,
                 };
-                (found || probe.miss_is_exact()).then_some(found)
+                (!declined.get()).then_some(found)
             }
             Object::Dict(_) | Object::Set(_) | Object::FrozenSet(_)
                 if Self::leaf_hash_native(item) =>
@@ -34428,6 +34444,30 @@ impl Interpreter {
             Object::Int(r) => Some(r),
             Object::Bool(b) => Some(i64::from(b)),
             _ => None,
+        }
+    }
+
+    /// A `find_by_hash` test of the stored keys of `item`'s hash (an
+    /// instance's, a [`crate::object::LeafProbe::with_hash`] probe's
+    /// inexact miss): the same object, or equal by a `__eq__` that
+    /// evaluates as a pure leaf ([`Self::leaf_instance_eq`], the stored
+    /// key first, as CPython compares). Any other comparison sets
+    /// `declined` (and matches nothing after it), for the full path. (A
+    /// pure `__eq__` reads, and never writes, what the table holds.)
+    pub(crate) fn leaf_eq_match<'a>(
+        &'a self,
+        item: &'a Object,
+        declined: &'a std::cell::Cell<bool>,
+    ) -> impl FnMut(&DictKey) -> bool + 'a {
+        move |k: &DictKey| {
+            if declined.get() {
+                return false;
+            }
+            k.0.is_same(item)
+                || self.leaf_instance_eq(&k.0, item).unwrap_or_else(|| {
+                    declined.set(true);
+                    false
+                })
         }
     }
 

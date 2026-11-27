@@ -3571,6 +3571,14 @@ branch and pull request.
     general call finds natively first, an enum member's, a number
     subclass's, or a `Decimal`'s (`str(Color.RED)` 0.62, `repr(Decimal)`
     1.10 to 0.92, `f"{d!r}"` 2.05 to 0.86).
+  - `k in d` and `k in s` of an instance whose class's `__hash__` and
+    `__eq__` both evaluate frameless settled in place only when the
+    stored key was the same object. An equal but distinct key made each
+    of three in-place tests hash it and decline before the general path
+    hashed it a fourth time. The in-place test now compares a stored key
+    of the same hash with the frameless `__eq__` too, as the subscript's
+    probe does, and so does compiled `d.get(k)` (`k in d` 2.81 to 1.12
+    times CPython, `k in s` 2.99 to 1.14, `d.get(k)` 1.90 to 1.08).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
