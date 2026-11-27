@@ -9437,6 +9437,7 @@ impl Interpreter {
             (Some(MethodOp::Iter), Ok(v)) => iter_result(v),
             (Some(MethodOp::Truth(from_len)), Ok(v)) => truth_result(v, from_len).map(Object::Bool),
             (Some(MethodOp::Len), Ok(v)) => coerce_len_result(v).map(Object::Int),
+            (Some(MethodOp::Format), Ok(v)) => format_result(v),
             (Some(MethodOp::Inplace(op, a, b)), Ok(v))
                 if v.is_same(&crate::vm_singletons::not_implemented()) =>
             {
@@ -48793,10 +48794,11 @@ impl Interpreter {
                 return match &r {
                     Object::Str(s) => Ok(s.to_string()),
                     Object::WStr(_) => Ok(r.to_str()),
+                    // A `str` subclass's instance: its text (not its repr).
                     Object::Instance(i)
                         if matches!(i.native.get(), Some(Object::Str(_) | Object::WStr(_))) =>
                     {
-                        Ok(r.to_str())
+                        Ok(i.native.get().expect("checked").to_str())
                     }
                     other => Err(type_error(format!(
                         "__format__ must return a str, not {}",
@@ -81051,6 +81053,26 @@ pub(crate) enum MethodOp {
     /// these operands: its `NotImplemented` goes on to the regular
     /// operator ([`Interpreter::inplace_binop_fallback`]).
     Inplace(BinOpKind, Object, Object),
+    /// A `FORMAT_VALUE`'s Python `__format__`: its result must be a string
+    /// (see [`format_result`]).
+    Format,
+}
+
+/// A `__format__` result `r` as `PyObject_Format` takes it: a string (a
+/// `str` subclass's instance as its text), or the protocol's `TypeError`.
+pub(crate) fn format_result(r: Object) -> Result<Object, RuntimeError> {
+    match r {
+        r @ (Object::Str(_) | Object::WStr(_)) => Ok(r),
+        Object::Instance(ref i)
+            if matches!(i.native.get(), Some(Object::Str(_) | Object::WStr(_))) =>
+        {
+            Ok(i.native.get().cloned().expect("checked"))
+        }
+        other => Err(type_error(format!(
+            "__format__ must return a str, not {}",
+            other.type_name()
+        ))),
+    }
 }
 
 /// How a compiled `STORE_ATTR`'s Python function takes the store (see

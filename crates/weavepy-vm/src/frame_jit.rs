@@ -2733,6 +2733,7 @@ unsafe fn op_after_reload(st: &mut State, op: records::MethodOp<'_>) {
                 interp.inplace_binop_fallback(a, b, op, &globals)
             }
             records::MethodOp::Inplace(..) => Ok(v),
+            records::MethodOp::Format => crate::format_result(v),
             records::MethodOp::Contains(invert) => {
                 let globals = frame.globals.clone();
                 interp
@@ -13395,6 +13396,75 @@ unsafe fn inplace_rest(
         st.stack.add(slot).write(v);
         st.len = slot + 1;
         0
+    }
+}
+
+/// `FORMAT_VALUE` (the `pc`th instruction of `code`) of the value at stack
+/// slot `slot` (its spec above it when `spec`), which [`h_fstring`]
+/// declined: an instance whose class's `__format__` is a plain Python
+/// function, called directly ([`dunder_call`]) as `f(value, spec)` (an
+/// empty spec when there is none), its result at `slot` as
+/// `PyObject_Format` takes it ([`crate::format_result`]). `0` done,
+/// `CALL_DECLINED` declined untouched, `RAISED` or `RELOAD` as [`h_call`]'s
+/// (the core loop settles a result it finishes: see
+/// `records::MethodOp::Format`).
+unsafe extern "C" fn h_format_dunder(
+    st: *mut State,
+    _code: *const CodeObject,
+    pc: u64,
+    slot: u64,
+    site: *mut DirectSite,
+    spec: u64,
+) -> u32 {
+    // SAFETY: the code passes its live state, one of its `FORMAT_VALUE`s,
+    // the operands' slot (with two free above the value, and nothing
+    // virtual below), and the site's cache.
+    unsafe {
+        let st = &mut *st;
+        if st.sw.is_null() || crate::trace::any_observers_active() {
+            return CALL_DECLINED;
+        }
+        let (pc, slot) = (pc as usize, slot as usize);
+        let at = st.stack.add(slot);
+        let Object::Instance(inst) = &*at else {
+            return CALL_DECLINED;
+        };
+        if spec != 0 && !matches!(&*at.add(1), Object::Str(_)) {
+            return CALL_DECLINED;
+        }
+        let Some(f) = Interpreter::binary_dunder_function(
+            inst,
+            crate::types::vm_key::FORMAT_FN,
+            "__format__",
+        ) else {
+            return CALL_DECLINED;
+        };
+        if spec == 0 {
+            at.add(1)
+                .write(Object::Str(crate::shared_value::SharedStr::from("")));
+        }
+        match dunder_call(st, pc, slot, 2, f, site, Some(records::MethodOp::Format)) {
+            CALL_DECLINED => {
+                if spec == 0 {
+                    crate::drop_hot_at(at.add(1));
+                }
+                CALL_DECLINED
+            }
+            0 => match crate::format_result(at.read()) {
+                Ok(v) => {
+                    at.write(v);
+                    st.len = slot + 1;
+                    0
+                }
+                Err(e) => {
+                    st.len = slot;
+                    st.pc = pc + 1;
+                    st.err = Some(e);
+                    RAISED
+                }
+            },
+            r => r,
+        }
     }
 }
 
@@ -27107,7 +27177,46 @@ impl<'a> Lower<'a> {
             .call(h_fstring as *const () as usize, &[at, kv], true)
             .expect("returns");
         let out = self.exit_with(pc, &[], INTERP);
-        self.branch_out(r, out);
+        if op == OpCode::FormatValue && !self.inlining() {
+            // An instance's Python `__format__`, called directly (see
+            // `h_format_dunder`).
+            let dunder = self.b.create_block();
+            let done = self.b.create_block();
+            self.b.ins().brif(r, dunder, &[], done, &[]);
+            self.b.set_cold_block(dunder);
+            self.b.switch_to_block(dunder);
+            let site: Box<DirectSite> = Box::default();
+            let site_at = self
+                .b
+                .ins()
+                .iconst(self.ptr, std::ptr::from_ref::<DirectSite>(&site) as i64);
+            self.direct_sites.push(site);
+            let code = self.code_ptr();
+            let pcv = self.b.ins().iconst(types::I64, pc as i64);
+            let slotv = self.b.ins().iconst(types::I64, (self.depth - n) as i64);
+            let spec = self.b.ins().iconst(types::I64, i64::from(n == 2));
+            let d = self
+                .call(
+                    h_format_dunder as *const () as usize,
+                    &[self.st, code, pcv, slotv, site_at, spec],
+                    true,
+                )
+                .expect("returns");
+            let other = self.b.create_block();
+            self.b.ins().brif(d, other, &[], done, &[]);
+            self.b.switch_to_block(other);
+            let no = self
+                .b
+                .ins()
+                .icmp_imm(IntCC::Equal, d, i64::from(CALL_DECLINED));
+            let leave = self.b.create_block();
+            self.b.ins().brif(no, out, &[], leave, &[]);
+            self.b.switch_to_block(leave);
+            self.leave(d);
+            self.b.switch_to_block(done);
+        } else {
+            self.branch_out(r, out);
+        }
         self.depth = self.depth - n + 1;
         self.set_last(pc);
         true

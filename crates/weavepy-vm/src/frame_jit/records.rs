@@ -71,6 +71,8 @@ pub(super) enum MethodOp<'a> {
     /// An augmented assignment's in-place method, on these operands: its
     /// `NotImplemented` goes on to the regular operator.
     Inplace(weavepy_compiler::BinOpKind, &'a Object, &'a Object),
+    /// A `FORMAT_VALUE`'s `__format__`: its result must be a string.
+    Format,
 }
 
 impl MethodOp<'_> {
@@ -87,6 +89,7 @@ impl MethodOp<'_> {
             MethodOp::Contains(invert) => crate::MethodOp::Contains(invert),
             MethodOp::Len => crate::MethodOp::Len,
             MethodOp::Inplace(op, a, b) => crate::MethodOp::Inplace(op, a.clone(), b.clone()),
+            MethodOp::Format => crate::MethodOp::Format,
         }
     }
 }

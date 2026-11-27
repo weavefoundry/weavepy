@@ -3530,6 +3530,14 @@ branch and pull request.
   - `dict.get` of such a key takes the same path: the entry that is the
     same object, or the default when no stored key could equal it
     (`d.get(k)` 1.86 to 0.89 times CPython).
+  - An f-string field of an instance whose class's Python `__format__`
+    doesn't evaluate frameless went through the general call. A declined
+    `FORMAT_VALUE` now calls the method directly on the field's slots
+    (an empty spec when there is none) and takes its result as
+    `PyObject_Format` does (the new `MethodOp::Format`) (`f"{k}"`
+    through a `__format__` that calls a method 1.63 to 0.73 times
+    CPython). The general path rendered a `str` subclass result as its
+    repr (`"'subz'"`); it now takes the text.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
