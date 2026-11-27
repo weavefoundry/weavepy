@@ -1252,6 +1252,16 @@ impl<T> FrameSlot<T> {
         }
     }
 
+    /// The value, when this slot owns it, taken out (a borrowed one is
+    /// forgotten); the slot is left empty.
+    pub(crate) fn take_owned(&mut self) -> Option<T> {
+        let value = self.value.take();
+        let owned = std::mem::replace(self.owned.get_mut(), true);
+        value
+            .filter(|_| owned)
+            .map(std::mem::ManuallyDrop::into_inner)
+    }
+
     pub(crate) fn clear(&mut self) {
         if let Some(mut value) = self.value.take() {
             if *self.owned.get_mut() {
@@ -1657,7 +1667,9 @@ pub struct PyTraceback {
     /// The frame this entry records: the frame object, or the live
     /// activation's spine shell until something asks for the object
     /// (see [`TbFrame`]). Read through [`Self::frame`].
-    frame: RefCell<TbFrame>,
+    /// (Taken by the entry's drop, which may keep a departed activation's
+    /// shell for reuse: see [`spare_departed_shell`].)
+    frame: std::mem::ManuallyDrop<RefCell<TbFrame>>,
     pub lineno: u32,
     pub lasti: u32,
     /// `types.TracebackType(…)` stores the caller-supplied `tb_lasti`
@@ -1727,7 +1739,7 @@ impl PyTraceback {
     /// An entry for an existing frame object.
     pub fn new(frame: Rc<PyFrame>, lineno: u32, lasti: u32, raw_lasti: Option<i64>) -> Self {
         Self {
-            frame: RefCell::new(TbFrame::Ready(frame)),
+            frame: std::mem::ManuallyDrop::new(RefCell::new(TbFrame::Ready(frame))),
             lineno,
             lasti,
             raw_lasti,
@@ -1740,7 +1752,9 @@ impl PyTraceback {
     /// [`TbFrame`]).
     pub fn new_lazy(shell: Rc<FrameShell>, lineno: u32, lasti: u32) -> Self {
         Self {
-            frame: RefCell::new(TbFrame::Lazy(LazyShellRef::new(shell))),
+            frame: std::mem::ManuallyDrop::new(RefCell::new(TbFrame::Lazy(LazyShellRef::new(
+                shell,
+            )))),
             lineno,
             lasti,
             raw_lasti: None,
@@ -1841,6 +1855,108 @@ impl Drop for PyTraceback {
             // SAFETY: the last owner: nothing else can reach the link.
             link = unsafe { (*tb.next.as_ptr()).take() };
             drop(tb);
+        }
+        // SAFETY: taken once, here, and never read again.
+        let frame = unsafe { std::mem::ManuallyDrop::take(&mut self.frame) }.into_inner();
+        if let TbFrame::Lazy(lazy) = frame {
+            spare_departed_shell(lazy);
+        }
+    }
+}
+
+/// Shells of departed activations (see [`FrameShell::depart`]) and their
+/// locals storage, emptied when the last traceback entry holding them
+/// died, for the next activations' spine shells and locals. An exception
+/// unwinding through calls departs every activation it leaves, and the
+/// traceback is their shells' last holder: without these, every level of
+/// every such unwinding allocated a shell and a locals vector (grown from
+/// empty) and freed both again with the traceback.
+struct DepartedSpares {
+    shells: Vec<Rc<FrameShell>>,
+    locals: Vec<Rc<RefCell<Vec<Object>>>>,
+}
+
+const DEPARTED_SPARES_CAP: usize = 32;
+
+thread_local! {
+    static DEPARTED_SPARES: std::cell::RefCell<DepartedSpares> = const {
+        std::cell::RefCell::new(DepartedSpares {
+            shells: Vec::new(),
+            locals: Vec::new(),
+        })
+    };
+}
+
+/// A departed activation's emptied shell (see [`DepartedSpares`]), sole
+/// owned, its slots empty and nothing materialized.
+pub(crate) fn take_spare_shell() -> Option<Rc<FrameShell>> {
+    DEPARTED_SPARES
+        .try_with(|s| s.borrow_mut().shells.pop())
+        .ok()
+        .flatten()
+}
+
+/// A departed activation's emptied locals vector (see
+/// [`DepartedSpares`]), sole owned.
+pub(crate) fn take_spare_locals() -> Option<Rc<RefCell<Vec<Object>>>> {
+    DEPARTED_SPARES
+        .try_with(|s| s.borrow_mut().locals.pop())
+        .ok()
+        .flatten()
+}
+
+/// A traceback entry's hold on `lazy`'s shell is ending. When that was the
+/// last hold on a departed activation's shell, release what the shell
+/// kept, as its drop would (the values first, as the frame object would
+/// have released them), and keep the emptied shell and locals vector for
+/// reuse (see [`DepartedSpares`]).
+fn spare_departed_shell(lazy: LazyShellRef) {
+    // A departed shell's caller link (see [`FrameShell::depart`]) is
+    // often the last hold on the caller's departed shell: the chain is
+    // walked here, not recursively (a `RecursionError`'s is ~1000 deep).
+    let mut next = Some(lazy);
+    while let Some(lazy) = next.take() {
+        let mut shell = lazy.0.clone();
+        drop(lazy);
+        if shell.is_gen || !shell.has_departed() {
+            return;
+        }
+        let Some(m) = Rc::get_mut(&mut shell) else {
+            return;
+        };
+        if m.materialized.get_mut().is_some() || *m.tb_refs.get_mut() != 0 {
+            return;
+        }
+        m.release_departed_values();
+        let locals = m.locals.take_owned();
+        m.code.clear();
+        m.cells.clear();
+        m.globals.clear();
+        m.builtins.clear();
+        m.builtins_obj = None;
+        m.class_namespace = None;
+        m.class_namespace_obj = None;
+        *m.gen_owner.get_mut() = None;
+        let back = std::mem::take(m.departed.back.get_mut());
+        m.departed = Departed::default();
+        *m.has_materialized.get_mut() = false;
+        // SAFETY: a sole owner's vector: nothing else reaches it.
+        let locals =
+            locals.filter(|l| Rc::strong_count(l) == 1 && unsafe { (*l.as_ptr()).is_empty() });
+        // What the spares can't take drops outside their borrow.
+        let mut rejected = (Some(shell), locals);
+        let _ = DEPARTED_SPARES.try_with(|s| {
+            let mut s = s.borrow_mut();
+            if s.shells.len() < DEPARTED_SPARES_CAP {
+                s.shells.extend(rejected.0.take());
+            }
+            if s.locals.len() < DEPARTED_SPARES_CAP {
+                s.locals.extend(rejected.1.take());
+            }
+        });
+        drop(rejected);
+        if let DepartedBack::Lazy(caller) = back {
+            next = Some(caller);
         }
     }
 }

@@ -5878,7 +5878,8 @@ impl Interpreter {
         // parked. The pool only ever holds sole-owner shells, so the
         // `get_mut` is a formality — but a fresh allocation is always a
         // correct fallback.
-        if let Some(mut pooled) = self.frame_shell_pool.borrow_mut().pop() {
+        let pooled = self.frame_shell_pool.borrow_mut().pop();
+        if let Some(mut pooled) = pooled.or_else(crate::object::take_spare_shell) {
             if let Some(m) = Rc::get_mut(&mut pooled) {
                 if is_gen {
                     // A generator's shell outlives this activation inside
@@ -8805,7 +8806,8 @@ impl Interpreter {
         } else {
             // The storage escaped (a materialized frame shares it): the
             // slot takes fresh storage.
-            let fresh = match self.frame_locals_pool.borrow_mut().pop() {
+            let pooled = self.frame_locals_pool.borrow_mut().pop();
+            let fresh = match pooled.or_else(crate::object::take_spare_locals) {
                 Some(rc) => rc,
                 None => Rc::new(RefCell::new(Vec::new())),
             };
@@ -9556,7 +9558,8 @@ impl Interpreter {
         } else {
             crate::object::FrameSlot::new(frame.cells.clone())
         };
-        if let Some(mut pooled) = self.frame_shell_pool.borrow_mut().pop() {
+        let pooled = self.frame_shell_pool.borrow_mut().pop();
+        if let Some(mut pooled) = pooled.or_else(crate::object::take_spare_shell) {
             if let Some(m) = Rc::get_mut(&mut pooled) {
                 // SAFETY: see `push_frame_shell`; a lean activation pops
                 // its shell through `pop_frame_shell` like any other.
