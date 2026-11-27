@@ -12268,6 +12268,10 @@ impl PyIterator {
                 .get(*index..)
                 .and_then(|rest| rest.chars().next())
                 .map(Object::from_char),
+            // (A `bytes` object's items are small ints.)
+            PyIterator::Bytes { data, index } => {
+                data.get(*index).map(|&b| Object::Int(i64::from(b)))
+            }
             PyIterator::Reversed {
                 items,
                 index,
@@ -12327,7 +12331,8 @@ impl PyIterator {
             PyIterator::List {
                 index, owner: None, ..
             }
-            | PyIterator::Tuple { index, .. } => *index += 1,
+            | PyIterator::Tuple { index, .. }
+            | PyIterator::Bytes { index, .. } => *index += 1,
             PyIterator::Range { current, step, .. } => *current = current.wrapping_add(*step),
             PyIterator::Str { s, index } => match s.get(*index..).and_then(|r| r.chars().next()) {
                 Some(ch) => *index += ch.len_utf8(),

@@ -3550,6 +3550,11 @@ branch and pull request.
     miss detection first. The stack receiver's slow read now tries the
     site's hook memo first, as the local's does (a proxy's `p.a` through
     `__getattr__` 1.43 to 1.13 times CPython).
+  - A `bytes` iterator feeding a native adapter (`map`, `filter`, `zip`)
+    took the general checked step for each item, the dictionary
+    iteration guard included; it now takes the plain cursors' in-place
+    step, as its `pure_ready` already promised (`urllib.parse.quote`,
+    whose drain is `map(quoter, bs)`, 3.6% fewer instructions).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
