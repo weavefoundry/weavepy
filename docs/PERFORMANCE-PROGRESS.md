@@ -3544,6 +3544,12 @@ branch and pull request.
     and takes the result as `str()` does (the new `MethodOp::Str`); a
     warm pure-leaf `__str__` keeps its frameless path (`str(k)` through a
     `__str__` that calls a method 1.34 to 0.73 times CPython).
+  - A read that a class's frameless `__getattr__` answered went straight
+    to the hook again only when the receiver was a local; one on the
+    stack (a global, an attribute chain, a call's result) took the whole
+    miss detection first. The stack receiver's slow read now tries the
+    site's hook memo first, as the local's does (a proxy's `p.a` through
+    `__getattr__` 1.43 to 1.13 times CPython).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

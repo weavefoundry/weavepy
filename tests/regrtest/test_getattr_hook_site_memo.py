@@ -68,5 +68,34 @@ class HookSiteMemo(unittest.TestCase):
             self.assertEqual([o.a for o in objs], [1, 5, 1, 5])
 
 
+    def test_stack_receivers(self):
+        # Receivers that live on the stack, not in a local: a global, an
+        # attribute chain, a call's result.
+        global G_OBJ
+        G_OBJ = G()
+
+        class Box:
+            pass
+
+        box = Box()
+        box.g = G()
+        out = []
+        for i in range(600):
+            if i == 300:
+                G_OBJ.a = 7
+                box.g.a = 8
+            out.append((G_OBJ.a, G_OBJ.zz, box.g.a, G().a))
+        self.assertEqual(out[0], (1, 0, 1, 1))
+        self.assertEqual(out[-1], (7, 0, 8, 1))
+        self.assertEqual(out.count((1, 0, 1, 1)), 300)
+
+    def test_stack_receiver_raises(self):
+        holder = [R()]
+        for _ in range(300):
+            self.assertEqual(holder[0].abcd, 4)
+            with self.assertRaises(AttributeError):
+                holder[0].boom
+
+
 if __name__ == "__main__":
     unittest.main()

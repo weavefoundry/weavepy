@@ -11782,6 +11782,22 @@ unsafe extern "C" fn attr_stack_slow(st: *mut State, site: *const AttrSite) -> u
             }
             // (A class attribute the site has read before.)
             Object::Instance(inst) => {
+                // A read the class's Python `__getattr__` answered before,
+                // for this class version, as `attr_local_slow` takes it
+                // first (the hook checks the default lookup still misses).
+                let ver = inst.cls_raw().attr_version.get();
+                if ver != 0 && site.py_hook.get() == ver && droppable(&*at) {
+                    let code = &*site.code;
+                    let arg = code.instructions[site.pc as usize].arg;
+                    if let Some(v) = code
+                        .names
+                        .get(arg as usize)
+                        .and_then(|name| (*(*st).interp).leaf_getattr_hook(&*at, name, code, arg))
+                    {
+                        crate::drop_hot(std::mem::replace(&mut *at, v));
+                        return 0;
+                    }
+                }
                 // An exception's pseudo-slot, as `attr_local_slow` reads it.
                 if let Some(v) = exc_slot_known(site, inst) {
                     if receiver_leaves(at, v) {
