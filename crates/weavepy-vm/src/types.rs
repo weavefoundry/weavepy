@@ -911,6 +911,8 @@ pub(crate) mod vm_key {
     pub(crate) const FORMAT_FN: u32 = 155;
     /// Its Python `__bool__`, for compiled truth tests' direct calls.
     pub(crate) const BOOL_FN: u32 = 156;
+    /// Its Python `__delitem__`, for compiled deletions' direct calls.
+    pub(crate) const DELITEM_FN: u32 = 157;
 }
 
 /// A builtin type's pure constructor (see [`TypeObject::pure_new`]).

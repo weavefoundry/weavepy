@@ -3485,6 +3485,17 @@ branch and pull request.
     errors otherwise; the new `MethodOp::Truth` settles a result the core
     loop finishes) (`if obj:` through a `__bool__` that counts its calls
     4.70 to 0.71 times CPython).
+  - `x in obj` (and `not in`) through a Python `__contains__` and
+    `del obj[k]` through a Python `__delitem__` took the same exits. The
+    frame JIT now calls both directly where the operands are on the stack
+    and nothing below them is virtual: `__contains__`'s answer is taken
+    as a `bool`, or through `obj_truthy` with the frame synced (the new
+    `MethodOp::Contains` settles one the core loop finishes), and
+    `__delitem__`'s result is dropped (`in` 2.13 to 1.33 times CPython,
+    `del` 2.85 to 1.11). The interpreter took an answer's truth without
+    its `__bool__` (`x in obj` was true for an answer whose `__bool__`
+    says false); it now uses `obj_truthy`, as CPython's
+    `PyObject_IsTrue`.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

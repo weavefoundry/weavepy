@@ -9426,6 +9426,11 @@ impl Interpreter {
             (Some(MethodOp::Compare(arg)), Ok(v)) => self.compare_finish(frame, arg, v),
             (Some(MethodOp::Iter), Ok(v)) => iter_result(v),
             (Some(MethodOp::Truth(from_len)), Ok(v)) => truth_result(v, from_len).map(Object::Bool),
+            (Some(MethodOp::Contains(invert)), Ok(v)) => {
+                let globals = frame.globals.clone();
+                self.obj_truthy(&v, &globals)
+                    .map(|b| Object::Bool(b != invert))
+            }
             (_, result) => result,
         };
         // A `functools.lru_cache` miss's function returned: its result is
@@ -10986,6 +10991,31 @@ impl Interpreter {
             return None;
         }
         Some((f, from_len))
+    }
+
+    /// The Python method of `(self, x)` a class's instances take
+    /// `CONTAINS_OP` (`key` `vm_key::CONTAINS`, `name` `__contains__`) or
+    /// `DELETE_SUBSCR` (`DELITEM_FN`, `__delitem__`) through. `None` for
+    /// anything else.
+    pub(crate) fn binary_dunder_function(
+        inst: &PyInstance,
+        key: u32,
+        name: &str,
+    ) -> Option<Rc<crate::object::PyFunction>> {
+        let f = Self::instance_dunder_function(inst, crate::types::AttrKey::vm(key), name)?;
+        // SAFETY: GIL-serialized raw read of the function's code cell.
+        let fc = unsafe { &*f.code.as_ptr() };
+        if fc.arg_count != 2
+            || fc.kwonly_count != 0
+            || fc.has_varargs
+            || fc.has_varkeywords
+            || fc.is_generator
+            || fc.is_coroutine
+            || fc.is_async_generator
+        {
+            return None;
+        }
+        Some(f)
     }
 
     /// The Python function a `STORE_ATTR` of `co_names[name_idx]` on
@@ -54045,7 +54075,8 @@ impl Interpreter {
                 "__contains__",
             ) {
                 let r = self.call_dunder_function(f, &[container.clone(), item.clone()])?;
-                return Ok(r.is_truthy());
+                // (`PyObject_IsTrue` of the answer: its own `__bool__` too.)
+                return self.obj_truthy(&r, globals);
             }
             // A dict subclass inheriting `dict.__contains__`, of a key that
             // settles by native equality.
@@ -54076,7 +54107,7 @@ impl Interpreter {
             if !Rc::ptr_eq(&meta, &builtin_types().type_) {
                 if let Some(Object::Function(f)) = meta.lookup("__contains__") {
                     let r = self.call_dunder_function(f, &[container.clone(), item.clone()])?;
-                    return Ok(r.is_truthy());
+                    return self.obj_truthy(&r, globals);
                 }
             }
         }
@@ -54084,7 +54115,7 @@ impl Interpreter {
             .or_else(|| metaclass_method(&container, "__contains__"))
         {
             let r = self.call(&method, std::slice::from_ref(item), &[], globals)?;
-            r.is_truthy()
+            self.obj_truthy(&r, globals)?
         } else if let Object::Instance(inst) = &container {
             if let Some(native) = inst.native.get().cloned() {
                 // Subclass of a built-in container (`class C(dict)`,
@@ -80922,6 +80953,9 @@ pub(crate) enum MethodOp {
     /// without `__bool__`): its result becomes the truth (see
     /// [`truth_result`]).
     Truth(bool),
+    /// A `CONTAINS_OP`'s Python `__contains__` (`true` for `not in`): the
+    /// result's truth, inverted for `not in`.
+    Contains(bool),
 }
 
 /// The truth a `__bool__` (or, `from_len`, a `__len__`) result `r` gives, as

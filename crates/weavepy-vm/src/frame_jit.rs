@@ -2725,6 +2725,12 @@ unsafe fn op_after_reload(st: &mut State, op: records::MethodOp<'_>) {
             records::MethodOp::Truth(from_len) => {
                 crate::truth_result(v, from_len).map(Object::Bool)
             }
+            records::MethodOp::Contains(invert) => {
+                let globals = frame.globals.clone();
+                interp
+                    .obj_truthy(&v, &globals)
+                    .map(|b| Object::Bool(b != invert))
+            }
         };
         match r {
             Ok(v) => frame.stack.push(v),
@@ -13353,6 +13359,171 @@ unsafe extern "C" fn h_setitem_dunder(
     }
 }
 
+/// `DELETE_SUBSCR` (the `pc`th instruction of `code`) of the container and
+/// key in the two stack slots from `slot` up, which `h_container`
+/// declined: a container whose class's `__delitem__` is a Python function,
+/// called directly ([`dunder_call`]) and its result dropped (see
+/// `records::MethodOp::Store`). Returns as [`h_setitem_dunder`] does.
+unsafe extern "C" fn h_delitem_dunder(
+    st: *mut State,
+    _code: *const CodeObject,
+    pc: u64,
+    slot: u64,
+    site: *mut DirectSite,
+) -> u32 {
+    // SAFETY: the code passes its live state, its own code and one of its
+    // `DELETE_SUBSCR`s, the operands' slot (with room for one more above
+    // them, and nothing virtual below), and the site's cache.
+    unsafe {
+        let st = &mut *st;
+        if st.sw.is_null() {
+            return CALL_DECLINED;
+        }
+        let (pc, slot) = (pc as usize, slot as usize);
+        let at = st.stack.add(slot);
+        let Object::Instance(inst) = &*at else {
+            return CALL_DECLINED;
+        };
+        let Some(f) = Interpreter::binary_dunder_function(
+            inst,
+            crate::types::vm_key::DELITEM_FN,
+            "__delitem__",
+        ) else {
+            return CALL_DECLINED;
+        };
+        match dunder_call(st, pc, slot, 2, f, site, Some(records::MethodOp::Store)) {
+            0 => {
+                // The method's result (`None`, as a rule) goes.
+                let res = at.read();
+                if !plain_release(&res) {
+                    (*st.interp.cast_mut()).release(res);
+                } else {
+                    std::mem::forget(res);
+                }
+                st.len = slot;
+                0
+            }
+            r => r,
+        }
+    }
+}
+
+/// `CONTAINS_OP` (the `pc`th instruction of `code`; `invert` for `not in`)
+/// of the item and container in the two stack slots from `slot` up, the
+/// faster tests declined: a container whose class's `__contains__` is a
+/// Python function, called directly ([`dunder_call`]) as
+/// `f(container, item)`. `0` or `1` whether the item was found (before
+/// `invert`), the operands gone; `CALL_DECLINED` declined untouched;
+/// `RAISED` or `RELOAD` as [`h_call`]'s (the core loop takes a result it
+/// settles as the operator does: see `records::MethodOp::Contains`).
+unsafe extern "C" fn h_contains_dunder(
+    st: *mut State,
+    _code: *const CodeObject,
+    pc: u64,
+    slot: u64,
+    site: *mut DirectSite,
+    invert: u64,
+) -> u32 {
+    // SAFETY: the code passes its live state, its own code and one of its
+    // `CONTAINS_OP`s, the operands' slot (with room for one more above
+    // them, and nothing virtual below), and the site's cache.
+    unsafe {
+        let st = &mut *st;
+        if st.sw.is_null() {
+            return CALL_DECLINED;
+        }
+        let (pc, slot) = (pc as usize, slot as usize);
+        let at = st.stack.add(slot);
+        let Object::Instance(inst) = &*at.add(1) else {
+            return CALL_DECLINED;
+        };
+        let Some(f) = Interpreter::binary_dunder_function(
+            inst,
+            crate::types::vm_key::CONTAINS,
+            "__contains__",
+        ) else {
+            return CALL_DECLINED;
+        };
+        // `[item, cont]` becomes `[cont, item]`, the method's arguments.
+        let item = at.read();
+        at.write(at.add(1).read());
+        at.add(1).write(item);
+        let invert = invert != 0;
+        let op = Some(records::MethodOp::Contains(invert));
+        match dunder_call(st, pc, slot, 2, f, site, op) {
+            CALL_DECLINED => {
+                let cont = at.read();
+                at.write(at.add(1).read());
+                at.add(1).write(cont);
+                CALL_DECLINED
+            }
+            0 => match &*at {
+                Object::Bool(b) => {
+                    let b = *b;
+                    st.len = slot;
+                    u32::from(b)
+                }
+                _ => contains_rest(st, pc, slot, invert),
+            },
+            r => r,
+        }
+    }
+}
+
+/// [`h_contains_dunder`] whose method answered something other than a
+/// `bool` (at `slot`): its truth (`Interpreter::obj_truthy`), which may run
+/// Python code, so the caller's frame is synced and its shell built first,
+/// as [`compare_rest`] syncs it. `0` or `1` as the helper's; `RAISED`, or
+/// `RELOAD` with the operator's `bool` on the frame's stack.
+#[cold]
+#[inline(never)]
+unsafe fn contains_rest(st: &mut State, pc: usize, slot: usize, invert: bool) -> u32 {
+    // SAFETY: as `h_contains_dunder`'s, the method's answer at `slot`.
+    unsafe {
+        let interp = &mut *st.interp.cast_mut();
+        let frame = &mut *st.frame;
+        frame.stack.set_len(slot + 1);
+        frame.pc = pc as u32 + 1;
+        settle(st);
+        let sw = &mut *st.sw;
+        let mut tmp = None;
+        let (cf, _, cshell) = sw.activation((*sw.inl).len(), &mut tmp);
+        interp.flush_lean(&mut *cf, &mut *cshell.cast::<crate::QuietShell<'_>>());
+        let v = frame.stack.pop().expect("the method's answer");
+        let globals = frame.globals.clone();
+        let r = interp.obj_truthy(&v, &globals);
+        drop(v);
+        *sw.last = pc;
+        let in_place = |sw: &crate::CoreSwitch| {
+            sw.pending.is_none()
+                && std::ptr::eq(sw.cur, st.frame)
+                && crate::hot_gates::loop_gen() == st.snap_gen
+        };
+        let b = match r {
+            Ok(b) => b,
+            Err(e) if in_place(sw) => {
+                st.len = slot;
+                st.pc = pc + 1;
+                st.err = Some(e);
+                return RAISED;
+            }
+            Err(e) => {
+                sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Raised(e)));
+                return RELOAD;
+            }
+        };
+        if interp.drain_if_maybe_dead() && crate::hot_gates::loop_gen() != st.snap_gen {
+            sw.pending = Some(crate::CoreExit::Stop(crate::LeafStop::Breaker));
+        }
+        if !in_place(sw) {
+            frame.stack.push(Object::Bool(b != invert));
+            return RELOAD;
+        }
+        st.len = slot;
+        u32::from(b)
+    }
+}
+
 /// [`h_binop_dunder`]'s lane for `a + b` of two instances of one plain
 /// class whose `__add__` is a native method with a leaf half (an
 /// `array`'s): the half's answer at `slot` (see [`pair_leaf_call`]). Only
@@ -23276,16 +23447,21 @@ impl<'a> Lower<'a> {
         // `super().name` of a property likewise: its getter, called
         // directly (see `h_super_property`).
         let ins_at = self.code.instructions[pc];
+        // (The helper, and how many operands the instruction takes.)
         let dunder_helper = match ins_at.op {
             OpCode::BinarySlice if crate::instance_site(self.ext, pc) => {
-                Some(h_slice_dunder as *const () as usize)
+                Some((h_slice_dunder as *const () as usize, 3))
             }
             OpCode::LoadSuperAttr if ins_at.arg & 1 == 0 => {
-                Some(h_super_property as *const () as usize)
+                Some((h_super_property as *const () as usize, 3))
             }
+            // A deletion from an instance whose class's `__delitem__` is a
+            // Python function (see `h_delitem_dunder`).
+            OpCode::DeleteSubscr => Some((h_delitem_dunder as *const () as usize, 2)),
             _ => None,
-        };
-        if let (false, true, Some(helper)) = (self.inlining(), self.depth >= 3, dunder_helper) {
+        }
+        .filter(|&(_, nops)| self.depth >= nops);
+        if let (false, Some((helper, nops))) = (self.inlining(), dunder_helper) {
             let dunder = self.b.create_block();
             let fine = self.b.create_block();
             self.b.ins().brif(declined, dunder, &[], fine, &[]);
@@ -23296,7 +23472,7 @@ impl<'a> Lower<'a> {
                 .ins()
                 .iconst(self.ptr, std::ptr::from_ref::<DirectSite>(&site) as i64);
             self.direct_sites.push(site);
-            let slotv = self.b.ins().iconst(types::I64, self.depth as i64 - 3);
+            let slotv = self.b.ins().iconst(types::I64, (self.depth - nops) as i64);
             let mut args = vec![self.st, code, pcv, slotv, site_at];
             args.extend(super_site);
             let d = self.call(helper, &args, true).expect("returns");
@@ -24278,7 +24454,54 @@ impl<'a> Lower<'a> {
         let r = self.b.block_params(done)[0];
         let declined = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThan, r, 1);
         let out = self.exit_with(pc, &[Item::Mem(slot), Item::Mem(slot + 1)], INTERP);
-        self.branch_out(declined, out);
+        // An instance's Python `__contains__`, called directly where both
+        // operands are on the stack and nothing below them is virtual (see
+        // `h_contains_dunder`).
+        // (A declined test leaves both operands owned in their slots.)
+        let r = if !self.inlining() && self.vs.iter().all(|i| matches!(i, Item::Mem(_))) {
+            let dunder = self.b.create_block();
+            let found_b = self.b.create_block();
+            self.b.append_block_param(found_b, types::I32);
+            self.b
+                .ins()
+                .brif(declined, dunder, &[], found_b, &[r.into()]);
+            self.b.set_cold_block(dunder);
+            self.b.switch_to_block(dunder);
+            let site: Box<DirectSite> = Box::default();
+            let site_at = self
+                .b
+                .ins()
+                .iconst(self.ptr, std::ptr::from_ref::<DirectSite>(&site) as i64);
+            self.direct_sites.push(site);
+            let code = self.code_ptr();
+            let pcv = self.b.ins().iconst(types::I64, pc as i64);
+            let slotv = self.b.ins().iconst(types::I64, slot as i64);
+            let inv = self.b.ins().iconst(types::I64, i64::from(arg == 1));
+            let d = self
+                .call(
+                    h_contains_dunder as *const () as usize,
+                    &[self.st, code, pcv, slotv, site_at, inv],
+                    true,
+                )
+                .expect("returns");
+            let other = self.b.create_block();
+            let more = self.b.ins().icmp_imm(IntCC::UnsignedGreaterThan, d, 1);
+            self.b.ins().brif(more, other, &[], found_b, &[d.into()]);
+            self.b.switch_to_block(other);
+            let no = self
+                .b
+                .ins()
+                .icmp_imm(IntCC::Equal, d, i64::from(CALL_DECLINED));
+            let leave = self.b.create_block();
+            self.b.ins().brif(no, out, &[], leave, &[]);
+            self.b.switch_to_block(leave);
+            self.leave(d);
+            self.b.switch_to_block(found_b);
+            self.b.block_params(found_b)[0]
+        } else {
+            self.branch_out(declined, out);
+            r
+        };
         let found = self.b.ins().icmp_imm(IntCC::NotEqual, r, 0);
         let found = if arg == 1 {
             self.b.ins().bxor_imm(found, 1)
