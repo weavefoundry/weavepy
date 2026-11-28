@@ -3596,6 +3596,16 @@ branch and pull request.
     general path (`d[k]` 1.32 to 1.16 times CPython, an equal key with a
     frameless `__eq__` 1.35 to 1.18, one with a full `__eq__` 1.21 to
     1.14).
+  - `str(obj)`, `f"{obj}"`, `f"{obj!s}"` and `"%s" % obj` of an instance
+    whose class defines only a Python `__repr__` took the general call,
+    since the direct lanes looked only for a Python `__str__`. They now
+    call the `__repr__` that `object.__str__` calls (an empty-spec
+    `f"{obj}"` through `object.__format__`'s `str(obj)`), its result
+    checked as `__str__`'s, and the frameless `str()` path evaluates a
+    pure-leaf `__repr__` too (`str(q)` 1.85 to 0.86 times CPython,
+    `f"{q}"` 1.96 to 0.74, a frameless `__repr__` 2.35 to 1.49, `"%s" % q`
+    1.60 to 1.46). A non-string result's TypeError now says `__str__`, as
+    CPython's does.
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

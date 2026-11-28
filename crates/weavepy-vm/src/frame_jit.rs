@@ -13477,7 +13477,31 @@ unsafe extern "C" fn h_format_dunder(
             crate::types::vm_key::FORMAT_FN,
             "__format__",
         ) else {
-            return CALL_DECLINED;
+            // `object.__format__` with no spec is `str(obj)`: its Python
+            // `__str__` (or the `__repr__` that `object.__str__` calls),
+            // called directly, its result checked as `str()` checks it.
+            if spec != 0 {
+                return CALL_DECLINED;
+            }
+            let Some(f) = Interpreter::instance_format_str_function(inst) else {
+                return CALL_DECLINED;
+            };
+            return match dunder_call(st, pc, slot, 1, f, site, Some(records::MethodOp::Str)) {
+                0 => match crate::str_result(at.read()) {
+                    Ok(v) => {
+                        at.write(v);
+                        st.len = slot + 1;
+                        0
+                    }
+                    Err(e) => {
+                        st.len = slot;
+                        st.pc = pc + 1;
+                        st.err = Some(e);
+                        RAISED
+                    }
+                },
+                r => r,
+            };
         };
         if spec == 0 {
             at.add(1)
@@ -13545,22 +13569,23 @@ unsafe extern "C" fn h_convert_dunder(
             }
             return 0;
         }
-        let (key, name, op) = if repr {
+        let (f, op) = if repr {
             (
-                crate::types::vm_key::REPR_FN,
-                "__repr__",
+                Interpreter::instance_dunder_function(
+                    inst,
+                    crate::types::AttrKey::vm(crate::types::vm_key::REPR_FN),
+                    "__repr__",
+                ),
                 records::MethodOp::Repr,
             )
         } else {
+            // (Or the `__repr__` that `object.__str__` calls.)
             (
-                crate::types::vm_key::STR_FN,
-                "__str__",
+                Interpreter::instance_str_function(inst),
                 records::MethodOp::Str,
             )
         };
-        let Some(f) =
-            Interpreter::instance_dunder_function(inst, crate::types::AttrKey::vm(key), name)
-        else {
+        let Some(f) = f else {
             return CALL_DECLINED;
         };
         match dunder_call(st, pc, slot, 1, f, site, Some(op)) {
@@ -17252,11 +17277,8 @@ unsafe fn str_call(
         if let Some(v) = Interpreter::native_text(inst, false) {
             return Some(text_in_place(s, pc, start, v));
         }
-        let f = Interpreter::instance_dunder_function(
-            inst,
-            crate::types::AttrKey::vm(crate::types::vm_key::STR_FN),
-            "__str__",
-        )?;
+        // (Or the `__repr__` that `object.__str__` calls.)
+        let f = Interpreter::instance_str_function(inst)?;
         {
             // SAFETY: GIL-serialized raw read of the function's code cell.
             let fc = &*f.code.as_ptr();

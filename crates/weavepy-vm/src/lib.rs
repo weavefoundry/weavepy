@@ -34009,6 +34009,53 @@ impl Interpreter {
         }
     }
 
+    /// The Python function `str(inst)` calls: the class's `__str__`, or,
+    /// for a plain instance (no native payload) whose class keeps
+    /// `object.__str__`, its `__repr__`, which `object.__str__` calls (the
+    /// result then checked as `__str__`'s, as [`Self::do_str_call`]
+    /// checks it). `None` for anything else.
+    pub(crate) fn instance_str_function(
+        inst: &PyInstance,
+    ) -> Option<Rc<crate::object::PyFunction>> {
+        if let Some(f) = Self::instance_dunder_function(
+            inst,
+            crate::types::AttrKey::vm(crate::types::vm_key::STR_FN),
+            "__str__",
+        ) {
+            return Some(f);
+        }
+        if inst.native.get().is_some()
+            || !Self::class_lacks(
+                inst.cls_raw(),
+                crate::types::AttrKey::vm(crate::types::vm_key::STR_ABSENT),
+                "__str__",
+            )
+        {
+            return None;
+        }
+        Self::instance_dunder_function(
+            inst,
+            crate::types::AttrKey::vm(crate::types::vm_key::REPR_FN),
+            "__repr__",
+        )
+    }
+
+    /// [`Self::instance_str_function`] for an instance whose class keeps
+    /// `object.__format__`, which formats with an empty spec as `str(obj)`.
+    /// `None` for anything else.
+    pub(crate) fn instance_format_str_function(
+        inst: &PyInstance,
+    ) -> Option<Rc<crate::object::PyFunction>> {
+        if !Self::class_lacks(
+            inst.cls_raw(),
+            crate::types::AttrKey::vm(crate::types::vm_key::FORMAT_LACKS),
+            "__format__",
+        ) {
+            return None;
+        }
+        Self::instance_str_function(inst)
+    }
+
     /// `repr(obj)` for an instance whose class's `__repr__` is a Python
     /// function (found once per class version), called with the instance
     /// directly: no bound method, and no walk of the MRO. `None` for any
@@ -35661,11 +35708,7 @@ impl Interpreter {
                 // A plain instance whose class's `__str__` is a Python
                 // function that evaluates as a pure leaf, answering a `str`.
                 [recv @ Object::Instance(inst)] if inst.native.get().is_none() => {
-                    let Some(f) = Self::instance_dunder_function(
-                        inst,
-                        crate::types::AttrKey::vm(crate::types::vm_key::STR_FN),
-                        "__str__",
-                    ) else {
+                    let Some(f) = Self::instance_str_function(inst) else {
                         // An exception's `BaseException.__str__`, when it
                         // runs no code of the argument's.
                         return Self::exc_str_leaf(inst);
@@ -53925,11 +53968,8 @@ impl Interpreter {
             // when a pure leaf, else called with the instance, without a
             // bound method.
             if inst.native.get().is_none() {
-                if let Some(f) = Self::instance_dunder_function(
-                    inst,
-                    crate::types::AttrKey::vm(crate::types::vm_key::STR_FN),
-                    "__str__",
-                ) {
+                // (Or the `__repr__` that `object.__str__` calls.)
+                if let Some(f) = Self::instance_str_function(inst) {
                     let r = match self.call_pure_leaf_with(&f, Some(v), &[]) {
                         Some(r) => r,
                         None => self.call_python(&f, std::slice::from_ref(v), &[])?,
