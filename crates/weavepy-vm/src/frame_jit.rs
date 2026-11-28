@@ -6565,15 +6565,29 @@ unsafe fn subscr_fast(
             usize::try_from(i).ok().filter(|&i| i < n)
         };
         let r = match c {
-            Object::Dict(d) => {
-                let Some(probe) = crate::object::LeafProbe::new(k) else {
-                    return 1;
-                };
-                let Some(v) = d.peek().and_then(|m| m.get_hot(&probe)) else {
-                    return 1;
-                };
-                crate::clone_hot(v)
-            }
+            Object::Dict(d) => match crate::object::LeafProbe::new(k) {
+                Some(probe) => {
+                    let Some(v) = d.peek().and_then(|m| m.get_hot(&probe)) else {
+                        return 1;
+                    };
+                    crate::clone_hot(v)
+                }
+                // An instance key whose class's `__hash__` evaluates
+                // frameless, found as itself or by a frameless `__eq__`
+                // (see `object::leaf_hashed_instance_get`); one the helper
+                // owns only while another reference keeps it alive (its
+                // release below runs nothing). A miss raises through the
+                // full path.
+                None => match k {
+                    Object::Instance(inst) if owned & 2 == 0 || Rc::strong_count(inst) > 1 => {
+                        match crate::object::leaf_hashed_instance_get(d, k) {
+                            Some(Some(v)) => v,
+                            _ => return 1,
+                        }
+                    }
+                    _ => return 1,
+                },
+            },
             Object::List(xs) => {
                 let Some(xs) = xs.peek() else {
                     return 1;

@@ -3588,6 +3588,14 @@ branch and pull request.
     else (a count that doesn't match, a tuple subclass, a width) still
     goes to the engine (`"%s" % k` 2.72 to 1.42 times CPython, with a
     `__str__` that formats 2.53 to 1.90).
+  - Compiled `d[k]` of an instance key whose class's `__hash__`
+    evaluates frameless took the general subscript in place, which probes
+    the table through the reentrant path. The in-place subscript now
+    reads it with the frameless hash, matching a stored key as itself or
+    by a frameless `__eq__`, and leaves a miss and anything else to the
+    general path (`d[k]` 1.32 to 1.16 times CPython, an equal key with a
+    frameless `__eq__` 1.35 to 1.18, one with a full `__eq__` 1.21 to
+    1.14).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts
