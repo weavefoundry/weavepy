@@ -81,6 +81,22 @@ impl Framer {
         self.frame_start = None;
     }
 
+    /// Protocol 5's `BYTEARRAY8` (always the eight-byte length, as
+    /// CPython's pickler writes it), a large one outside the frame.
+    fn bytearray8(&mut self, value: &[u8]) -> Option<()> {
+        let mut header = [0u8; 9];
+        header[0] = 0x96;
+        header[1..].copy_from_slice(&(value.len() as u64).to_le_bytes());
+        if value.len() >= FRAME_TARGET {
+            self.commit(true);
+            extend(&mut self.output, &header)?;
+            extend(&mut self.output, value)
+        } else {
+            self.write(&header)?;
+            self.write(value)
+        }
+    }
+
     fn data(&mut self, value: &[u8], unicode: bool) -> Option<()> {
         let len = value.len();
         if len <= 255 {
@@ -124,11 +140,13 @@ struct ClassPlan {
 
 struct Encoder<'a> {
     writer: Framer,
+    // The protocol written (4 or 5).
+    protocol: u8,
     // Memo positions by object identity.
     memo: MemoTable,
     // Pins prevent another thread's container mutation from releasing an
     // already memoized value and reusing its address during this operation.
-    // While one thread owns every object, nothing else can mutate the graph,
+    // While only one thread runs, nothing else can mutate the graph,
     // so the values stay alive and unpinned.
     pins: Option<Vec<Object>>,
     // Memo positions taken by the default state's temporary tuple and
@@ -265,6 +283,7 @@ fn identity(value: &Object) -> i64 {
     match value {
         Object::Str(text) => text.as_ptr() as usize as i64,
         Object::Bytes(bytes) => bytes.as_ptr() as usize as i64,
+        Object::ByteArray(bytes) => Rc::as_ptr(bytes) as usize as i64,
         Object::Tuple(items) => {
             crate::shared_value::ThinArc::as_ptr(items).cast::<()>() as usize as i64
         }
@@ -424,6 +443,14 @@ impl Encoder<'_> {
             Object::Bytes(bytes) => self
                 .save_memoized(value, identity(value), |writer| writer.data(bytes, false))
                 .map(drop),
+            // (Protocol 4 reduces a bytearray through `copyreg`: the Python
+            // pickler's.)
+            Object::ByteArray(bytes) if self.protocol >= 5 => {
+                // (A read that runs no code.)
+                let data = bytes.try_borrow().ok()?;
+                self.save_memoized(value, identity(value), |writer| writer.bytearray8(&data))
+                    .map(drop)
+            }
             // The empty tuple is never memoized.
             Object::Tuple(items) if items.is_empty() => self.writer.write(b")"),
             Object::Tuple(items) => {
@@ -856,8 +883,9 @@ fn encode_with_context(
             output: Vec::new(),
             frame_start: None,
         },
+        protocol,
         memo,
-        pins: (!crate::sync::bias_held()).then(Vec::new),
+        pins: crate::sync::threads_started().then(Vec::new),
         anonymous: 0,
         active: Vec::new(),
         python_headroom,

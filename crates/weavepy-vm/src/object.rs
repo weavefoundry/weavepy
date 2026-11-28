@@ -42,6 +42,23 @@ const _: () = {
     assert_sync::<Object>();
 };
 
+/// Push `b` as two lowercase hex digits.
+#[inline]
+pub(crate) fn push_hex_byte(out: &mut String, b: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    out.push(char::from(HEX[usize::from(b >> 4)]));
+    out.push(char::from(HEX[usize::from(b & 15)]));
+}
+
+/// The lowercase hex text of `bytes` (a digest's `hexdigest()`).
+pub(crate) fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        push_hex_byte(&mut out, b);
+    }
+    out
+}
+
 /// Code-point length of a `str`: O(1) from the count memoised in the
 /// string itself (see [`SharedStr::char_count`]). WeavePy stores `str` as
 /// UTF-8, so the first count is a scan; scanners and tokenisers that ask
@@ -1235,6 +1252,16 @@ impl<T> FrameSlot<T> {
         }
     }
 
+    /// The value, when this slot owns it, taken out (a borrowed one is
+    /// forgotten); the slot is left empty.
+    pub(crate) fn take_owned(&mut self) -> Option<T> {
+        let value = self.value.take();
+        let owned = std::mem::replace(self.owned.get_mut(), true);
+        value
+            .filter(|_| owned)
+            .map(std::mem::ManuallyDrop::into_inner)
+    }
+
     pub(crate) fn clear(&mut self) {
         if let Some(mut value) = self.value.take() {
             if *self.owned.get_mut() {
@@ -1640,7 +1667,9 @@ pub struct PyTraceback {
     /// The frame this entry records: the frame object, or the live
     /// activation's spine shell until something asks for the object
     /// (see [`TbFrame`]). Read through [`Self::frame`].
-    frame: RefCell<TbFrame>,
+    /// (Taken by the entry's drop, which may keep a departed activation's
+    /// shell for reuse: see [`spare_departed_shell`].)
+    frame: std::mem::ManuallyDrop<RefCell<TbFrame>>,
     pub lineno: u32,
     pub lasti: u32,
     /// `types.TracebackType(…)` stores the caller-supplied `tb_lasti`
@@ -1710,7 +1739,7 @@ impl PyTraceback {
     /// An entry for an existing frame object.
     pub fn new(frame: Rc<PyFrame>, lineno: u32, lasti: u32, raw_lasti: Option<i64>) -> Self {
         Self {
-            frame: RefCell::new(TbFrame::Ready(frame)),
+            frame: std::mem::ManuallyDrop::new(RefCell::new(TbFrame::Ready(frame))),
             lineno,
             lasti,
             raw_lasti,
@@ -1723,7 +1752,9 @@ impl PyTraceback {
     /// [`TbFrame`]).
     pub fn new_lazy(shell: Rc<FrameShell>, lineno: u32, lasti: u32) -> Self {
         Self {
-            frame: RefCell::new(TbFrame::Lazy(LazyShellRef::new(shell))),
+            frame: std::mem::ManuallyDrop::new(RefCell::new(TbFrame::Lazy(LazyShellRef::new(
+                shell,
+            )))),
             lineno,
             lasti,
             raw_lasti: None,
@@ -1825,6 +1856,108 @@ impl Drop for PyTraceback {
             link = unsafe { (*tb.next.as_ptr()).take() };
             drop(tb);
         }
+        // SAFETY: taken once, here, and never read again.
+        let frame = unsafe { std::mem::ManuallyDrop::take(&mut self.frame) }.into_inner();
+        if let TbFrame::Lazy(lazy) = frame {
+            spare_departed_shell(lazy);
+        }
+    }
+}
+
+/// Shells of departed activations (see [`FrameShell::depart`]) and their
+/// locals storage, emptied when the last traceback entry holding them
+/// died, for the next activations' spine shells and locals. An exception
+/// unwinding through calls departs every activation it leaves, and the
+/// traceback is their shells' last holder: without these, every level of
+/// every such unwinding allocated a shell and a locals vector (grown from
+/// empty) and freed both again with the traceback.
+struct DepartedSpares {
+    shells: Vec<Rc<FrameShell>>,
+    locals: Vec<Rc<RefCell<Vec<Object>>>>,
+}
+
+const DEPARTED_SPARES_CAP: usize = 32;
+
+thread_local! {
+    static DEPARTED_SPARES: std::cell::RefCell<DepartedSpares> = const {
+        std::cell::RefCell::new(DepartedSpares {
+            shells: Vec::new(),
+            locals: Vec::new(),
+        })
+    };
+}
+
+/// A departed activation's emptied shell (see [`DepartedSpares`]), sole
+/// owned, its slots empty and nothing materialized.
+pub(crate) fn take_spare_shell() -> Option<Rc<FrameShell>> {
+    DEPARTED_SPARES
+        .try_with(|s| s.borrow_mut().shells.pop())
+        .ok()
+        .flatten()
+}
+
+/// A departed activation's emptied locals vector (see
+/// [`DepartedSpares`]), sole owned.
+pub(crate) fn take_spare_locals() -> Option<Rc<RefCell<Vec<Object>>>> {
+    DEPARTED_SPARES
+        .try_with(|s| s.borrow_mut().locals.pop())
+        .ok()
+        .flatten()
+}
+
+/// A traceback entry's hold on `lazy`'s shell is ending. When that was the
+/// last hold on a departed activation's shell, release what the shell
+/// kept, as its drop would (the values first, as the frame object would
+/// have released them), and keep the emptied shell and locals vector for
+/// reuse (see [`DepartedSpares`]).
+fn spare_departed_shell(lazy: LazyShellRef) {
+    // A departed shell's caller link (see [`FrameShell::depart`]) is
+    // often the last hold on the caller's departed shell: the chain is
+    // walked here, not recursively (a `RecursionError`'s is ~1000 deep).
+    let mut next = Some(lazy);
+    while let Some(lazy) = next.take() {
+        let mut shell = lazy.0.clone();
+        drop(lazy);
+        if shell.is_gen || !shell.has_departed() {
+            return;
+        }
+        let Some(m) = Rc::get_mut(&mut shell) else {
+            return;
+        };
+        if m.materialized.get_mut().is_some() || *m.tb_refs.get_mut() != 0 {
+            return;
+        }
+        m.release_departed_values();
+        let locals = m.locals.take_owned();
+        m.code.clear();
+        m.cells.clear();
+        m.globals.clear();
+        m.builtins.clear();
+        m.builtins_obj = None;
+        m.class_namespace = None;
+        m.class_namespace_obj = None;
+        *m.gen_owner.get_mut() = None;
+        let back = std::mem::take(m.departed.back.get_mut());
+        m.departed = Departed::default();
+        *m.has_materialized.get_mut() = false;
+        // SAFETY: a sole owner's vector: nothing else reaches it.
+        let locals =
+            locals.filter(|l| Rc::strong_count(l) == 1 && unsafe { (*l.as_ptr()).is_empty() });
+        // What the spares can't take drops outside their borrow.
+        let mut rejected = (Some(shell), locals);
+        let _ = DEPARTED_SPARES.try_with(|s| {
+            let mut s = s.borrow_mut();
+            if s.shells.len() < DEPARTED_SPARES_CAP {
+                s.shells.extend(rejected.0.take());
+            }
+            if s.locals.len() < DEPARTED_SPARES_CAP {
+                s.locals.extend(rejected.1.take());
+            }
+        });
+        drop(rejected);
+        if let DepartedBack::Lazy(caller) = back {
+            next = Some(caller);
+        }
     }
 }
 
@@ -1839,11 +1972,11 @@ impl Drop for PyTraceback {
 static BYTEARRAY_EXPORT_TOTAL: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-type ExportMap = std::collections::HashMap<usize, (crate::sync::Weak<RefCell<Vec<u8>>>, usize)>;
+type ExportMap = crate::fasthash::FxHashMap<usize, (crate::sync::Weak<RefCell<Vec<u8>>>, usize)>;
 
 fn bytearray_export_map() -> &'static std::sync::Mutex<ExportMap> {
     static MAP: std::sync::OnceLock<std::sync::Mutex<ExportMap>> = std::sync::OnceLock::new();
-    MAP.get_or_init(|| std::sync::Mutex::new(ExportMap::new()))
+    MAP.get_or_init(|| std::sync::Mutex::new(ExportMap::default()))
 }
 
 /// Register a live export of `buf`. Pair with
@@ -2026,6 +2159,14 @@ impl MemoryViewBuffer {
 /// views are RFC 0023 future work; the surface is enough for
 /// `pickle.PickleBuffer`, `socket.recv_into`, and the standard
 /// `memoryview(b'hello').tobytes()` patterns.
+/// The unsigned-byte format `"B"`, one shared string for every view.
+fn unsigned_byte_format() -> SharedStr {
+    match Object::from_static("B") {
+        Object::Str(s) => s,
+        _ => SharedStr::from("B"),
+    }
+}
+
 #[derive(Debug)]
 pub struct PyMemoryView {
     pub buffer: MemoryViewBuffer,
@@ -2038,7 +2179,7 @@ pub struct PyMemoryView {
     pub len: Cell<usize>,
     pub readonly: Cell<bool>,
     pub released: Cell<bool>,
-    pub format: RefCell<String>,
+    pub format: RefCell<SharedStr>,
     pub itemsize: Cell<usize>,
     /// Logical dimensions, in *elements*. Empty means "derive a 1-D
     /// `[len / itemsize]` shape", which keeps every simple constructor a
@@ -2097,7 +2238,7 @@ impl PyMemoryView {
             len: Cell::new(len),
             readonly: Cell::new(true),
             released: Cell::new(false),
-            format: RefCell::new("B".to_owned()),
+            format: RefCell::new(unsigned_byte_format()),
             itemsize: Cell::new(1),
             shape: RefCell::new(Vec::new()),
             strides: RefCell::new(Vec::new()),
@@ -2122,7 +2263,7 @@ impl PyMemoryView {
             len: Cell::new(len),
             readonly: Cell::new(readonly),
             released: Cell::new(false),
-            format: RefCell::new("B".to_owned()),
+            format: RefCell::new(unsigned_byte_format()),
             itemsize: Cell::new(1),
             shape: RefCell::new(Vec::new()),
             strides: RefCell::new(Vec::new()),
@@ -2148,7 +2289,7 @@ impl PyMemoryView {
             len: Cell::new(len),
             readonly: Cell::new(false),
             released: Cell::new(false),
-            format: RefCell::new("B".to_owned()),
+            format: RefCell::new(unsigned_byte_format()),
             itemsize: Cell::new(1),
             shape: RefCell::new(Vec::new()),
             strides: RefCell::new(Vec::new()),
@@ -2180,7 +2321,7 @@ impl PyMemoryView {
             len: Cell::new(len),
             readonly: Cell::new(readonly),
             released: Cell::new(false),
-            format: RefCell::new(format),
+            format: RefCell::new(SharedStr::from(format)),
             itemsize: Cell::new(itemsize),
             shape: RefCell::new(Vec::new()),
             strides: RefCell::new(Vec::new()),
@@ -2207,18 +2348,28 @@ impl PyMemoryView {
             }
             MemoryViewBuffer::Shared(s) => MemoryViewBuffer::Shared(s.clone()),
         };
+        // (Guard-free reads where no borrow is live: cloning these runs no
+        // code. A cell borrowed mutably takes the checked borrow, which
+        // reports it.)
+        fn read<T: Clone>(cell: &RefCell<T>) -> T {
+            // SAFETY: the view ends with the clone, which runs no code.
+            match unsafe { cell.peek() } {
+                Some(v) => v.clone(),
+                None => cell.borrow().clone(),
+            }
+        }
         Self {
             buffer,
             start: Cell::new(self.start.get()),
             len: Cell::new(self.len.get()),
             readonly: Cell::new(self.readonly.get()),
             released: Cell::new(self.released.get()),
-            format: RefCell::new(self.format.borrow().clone()),
+            format: RefCell::new(read(&self.format)),
             itemsize: Cell::new(self.itemsize.get()),
-            shape: RefCell::new(self.shape.borrow().clone()),
-            strides: RefCell::new(self.strides.borrow().clone()),
-            suboffsets: RefCell::new(self.suboffsets.borrow().clone()),
-            exporter: RefCell::new(self.exporter.borrow().clone()),
+            shape: RefCell::new(read(&self.shape)),
+            strides: RefCell::new(read(&self.strides)),
+            suboffsets: RefCell::new(read(&self.suboffsets)),
+            exporter: RefCell::new(read(&self.exporter)),
             zero_dim: Cell::new(self.zero_dim.get()),
             // A fresh object: the hash cache and re-entrancy guard are
             // per-view state, not shared with the source.
@@ -2305,6 +2456,14 @@ impl PyMemoryView {
     /// negative or gapped stride (e.g. `mv[::-1]`, `mv[::2]`) or with
     /// suboffsets is not.
     pub fn is_c_contiguous(&self) -> bool {
+        // (The derived layout, no suboffsets or stored strides, read
+        // guard-free: the common one-dimensional view.)
+        // SAFETY: views that end at once; nothing here runs code.
+        if unsafe { self.suboffsets.peek() }.is_some_and(Vec::is_empty)
+            && unsafe { self.strides.peek() }.is_some_and(Vec::is_empty)
+        {
+            return true;
+        }
         if self.has_suboffsets() {
             return false;
         }
@@ -2446,6 +2605,17 @@ impl PyMemoryView {
     /// fast `[start..start+nbytes]` path; strided/reversed views are gathered
     /// element-by-element following `strides`, exactly like CPython's
     /// `memoryview.tobytes()`.
+    /// `f` on the view's bytes: where they are for a C-contiguous view,
+    /// gathered first for any other (see [`Self::to_bytes`]).
+    pub fn with_bytes<R>(&self, f: impl FnOnce(&[u8]) -> R) -> R {
+        if self.is_c_contiguous() {
+            let start = self.start.get();
+            let end = start + self.len.get();
+            return self.buffer.with_read(|all| f(&all[start..end]));
+        }
+        f(&self.to_bytes())
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let itemsize = self.itemsize.get().max(1);
         if self.is_c_contiguous() {
@@ -2454,6 +2624,28 @@ impl PyMemoryView {
             return self.buffer.with_read(|all| all[start..end].to_vec());
         }
         let shape = self.shape_dims();
+        // A one-dimensional strided view: its elements gathered in one
+        // read of the buffer (any element outside it takes the walk below,
+        // which skips such elements).
+        if let ([n], false) = (shape.as_slice(), self.has_suboffsets()) {
+            let (n, start) = (*n, self.start.get() as isize);
+            let stride = self
+                .stride_bytes()
+                .first()
+                .copied()
+                .unwrap_or(itemsize as isize);
+            let gathered = self.buffer.with_read(|all| {
+                let mut out = Vec::with_capacity(n * itemsize);
+                for i in 0..n {
+                    let off = usize::try_from(start + i as isize * stride).ok()?;
+                    out.extend_from_slice(all.get(off..off + itemsize)?);
+                }
+                Some(out)
+            });
+            if let Some(out) = gathered {
+                return out;
+            }
+        }
         let total: usize = shape.iter().product();
         let mut out = Vec::with_capacity(total * itemsize);
         let mut index = vec![0usize; shape.len()];
@@ -2480,7 +2672,8 @@ impl PyMemoryView {
     /// are also `"B"`.
     fn norm_format(&self) -> String {
         let f = self.format.borrow();
-        f.strip_prefix('@').unwrap_or(&f).to_owned()
+        let f: &str = &f;
+        f.strip_prefix('@').unwrap_or(f).to_owned()
     }
 
     /// `memoryview == memoryview` per CPython's `memory_richcompare`:
@@ -3333,6 +3526,19 @@ fn write_drain_fd_intr(
     pending: &mut Vec<u8>,
     lock: &std::sync::Mutex<()>,
 ) -> Result<(), RuntimeError> {
+    let (off, res) = write_slice_fd_intr(fd, pending, lock);
+    pending.drain(..off.min(pending.len()));
+    res
+}
+
+/// [`write_drain_fd_intr`] over a slice: how much of it was written, and how
+/// the writing ended.
+#[cfg(unix)]
+fn write_slice_fd_intr(
+    fd: std::os::unix::io::RawFd,
+    pending: &[u8],
+    lock: &std::sync::Mutex<()>,
+) -> (usize, Result<(), RuntimeError>) {
     let mut off = 0usize;
     let res = loop {
         if off >= pending.len() {
@@ -3379,8 +3585,7 @@ fn write_drain_fd_intr(
             break Err(e);
         }
     };
-    pending.drain(..off.min(pending.len()));
-    res
+    (off, res)
 }
 
 /// EAGAIN value to default to when a `BlockingIOError` lacks an explicit
@@ -3829,6 +4034,17 @@ impl<'a> LeafProbe<'a> {
         }
     }
 
+    /// A probe for an instance hashed by identity (no native value, and
+    /// its class keeps `object`'s `__hash__`), or `None`.
+    #[inline(always)]
+    pub(crate) fn identity_instance(key: &'a Object) -> Option<Self> {
+        let Object::Instance(i) = key else {
+            return None;
+        };
+        (i.native.get().is_none() && i.class_dunder(crate::types::Dunder::Hash).object_owner())
+            .then(|| Self::with_hash(key, pointer_hash(Rc::as_ptr(i).cast())))
+    }
+
     /// [`Self::new`]'s hash for a key other than a `str` or an `int`.
     #[inline(never)]
     fn other_hash(key: &Object) -> Option<i64> {
@@ -3856,6 +4072,9 @@ impl<'a> LeafProbe<'a> {
             // (`re`'s `(LITERAL, 97)` and `(RANGE, (48, 57))`): the same.
             Object::Tuple(t) if t.iter().all(|x| leaf_tuple_item(x, 0)) => py_hash_value(key)?,
             Object::Bytes(_) => py_hash_value(key)?,
+            // `None` and the `bool`s (a key of another kind with an equal
+            // hash, `1` against `True`, marks the probe foreign).
+            Object::None | Object::Bool(_) => py_hash_value(key)?,
             // Kinds that hash and compare by identity alone.
             Object::Function(_)
             | Object::Generator(_)
@@ -3928,7 +4147,14 @@ pub(crate) fn int_order_value(o: &Object) -> Option<i64> {
 fn leaf_tuple_item(o: &Object, depth: u32) -> bool {
     match o {
         Object::Int(_) | Object::Str(_) | Object::Bytes(_) | Object::None => true,
-        Object::Instance(i) => int_like_value(i).is_some(),
+        // (A compiled pattern hashes natively, and equals only itself
+        // here: `re._compile`'s `(type(p), p, flags)` cache key.)
+        Object::Instance(i) => {
+            int_like_value(i).is_some()
+                || identity_instance(i)
+                || crate::stdlib::sre_objects::native_hash(i).is_some()
+        }
+        Object::Type(t) => type_hash_is_identity(t),
         Object::Tuple(t) => depth < 3 && t.iter().all(|x| leaf_tuple_item(x, depth + 1)),
         _ => false,
     }
@@ -3947,6 +4173,17 @@ fn leaf_tuples_eq(a: &[Object], b: &[Object], depth: u32) -> Option<bool> {
             (Object::Bytes(p), Object::Bytes(q)) => p[..] == q[..],
             (Object::None, Object::None) => true,
             (Object::Instance(p), Object::Instance(q)) if Rc::ptr_eq(p, q) => true,
+            // Objects that compare by identity alone: only themselves.
+            (Object::Instance(p), Object::Instance(q))
+                if identity_instance(p) && identity_instance(q) =>
+            {
+                false
+            }
+            (Object::Type(p), Object::Type(q))
+                if type_hash_is_identity(p) && type_hash_is_identity(q) =>
+            {
+                Rc::ptr_eq(p, q)
+            }
             (Object::Tuple(p), Object::Tuple(q)) if depth < 3 => {
                 p.len() == q.len() && leaf_tuples_eq(p, q, depth + 1)?
             }
@@ -3957,6 +4194,18 @@ fn leaf_tuples_eq(a: &[Object], b: &[Object], depth: u32) -> Option<bool> {
         };
     }
     Some(equal)
+}
+
+/// Whether `i` hashes and compares by identity alone: a plain instance
+/// (no native payload) whose class keeps `object`'s `__hash__`, `__eq__`
+/// and `__ne__`.
+#[inline]
+pub(crate) fn identity_instance(i: &crate::types::PyInstance) -> bool {
+    use crate::types::Dunder;
+    i.native.get().is_none()
+        && i.class_dunder(Dunder::Hash).object_owner()
+        && i.class_dunder(Dunder::Eq).object_owner()
+        && i.class_dunder(Dunder::Ne).object_owner()
 }
 
 /// A machine `int`'s value, or an [`int_like_value`] instance's.
@@ -4013,6 +4262,8 @@ impl crate::dictmap::Probe for LeafProbe<'_> {
             (Object::Int(a), Object::Int(b)) => a == b,
             // The same class (a class probe meets its own entry).
             (Object::Type(a), Object::Type(b)) if Rc::ptr_eq(a, b) => true,
+            // The same instance (CPython compares keys with `is` first).
+            (Object::Instance(a), Object::Instance(b)) if Rc::ptr_eq(a, b) => true,
             _ => self.other_eq(key),
         }
     }
@@ -4041,6 +4292,8 @@ impl LeafProbe<'_> {
             | (Object::AsyncGenerator(a), Object::AsyncGenerator(b)) => Rc::ptr_eq(a, b),
             (Object::Module(a), Object::Module(b)) => Rc::ptr_eq(a, b),
             (Object::Bytes(a), Object::Bytes(b)) => a[..] == b[..],
+            (Object::None, Object::None) => true,
+            (Object::Bool(a), Object::Bool(b)) => a == b,
             // Item by item; any item pairing other than int-int or str-str
             // (an equal `True` or `1.0`, say) may need Python's equality.
             (Object::Tuple(a), Object::Tuple(b)) if a.len() == b.len() => {
@@ -4110,6 +4363,15 @@ fn current_interp_hash(obj: &Object) -> Option<i64> {
     // another thread can't take the GIL and then deadlock on that same mutex.
     let _no_yield = crate::gil::no_gil_handoff();
     interp.reentrant_py_hash(obj)
+}
+
+/// [`current_interp_hash`] for an instance whose `__hash__` evaluates as a
+/// pure leaf (see `Interpreter::leaf_instance_hash`): no reentrant call,
+/// and no code run. `None` when it doesn't apply.
+fn current_interp_pure_hash(obj: &Object) -> Option<i64> {
+    let ptr = crate::vm_singletons::current_interpreter_ptr()?;
+    // SAFETY: see `current_interp_hash`; the evaluation reads only.
+    unsafe { &*ptr }.leaf_instance_hash(obj)
 }
 
 /// Companion to [`current_interp_hash`] for `a == b` via Python `__eq__`.
@@ -4382,20 +4644,22 @@ pub(crate) fn take_repr_error() -> Option<RuntimeError> {
 
 impl PartialEq for DictKey {
     fn eq(&self, other: &Self) -> bool {
+        // Two plain strings or machine ints, the common keys, are equal by
+        // value alone (a string by identity first), before the general
+        // identity test below.
+        match (&self.0, &other.0) {
+            (Object::Str(a), Object::Str(b)) => {
+                return SharedStr::ptr_eq(a, b)
+                    || crate::dictmap::key_bytes_eq(a.as_bytes(), b.as_bytes());
+            }
+            (Object::Int(a), Object::Int(b)) => return a == b,
+            _ => {}
+        }
         // CPython compares dict/set keys with `a is b or a == b`; the identity
         // half makes a stored `nan` findable by itself (`{nan}` contains its
         // own nan even though `nan != nan`).
         if self.0.is_same(&other.0) {
             return true;
-        }
-        // Two plain strings or machine ints, the common keys, are equal by
-        // value alone.
-        match (&self.0, &other.0) {
-            (Object::Str(a), Object::Str(b)) => {
-                return crate::dictmap::key_bytes_eq(a.as_bytes(), b.as_bytes());
-            }
-            (Object::Int(a), Object::Int(b)) => return a == b,
-            _ => {}
         }
         // Native fast path also covers instance *identity* (`Rc::ptr_eq`),
         // which is the `a is b` half of CPython's dict-key comparison.
@@ -4584,6 +4848,7 @@ fn key_eq_defer_active() -> bool {
 /// exactly once per operation (`test_setdefault_atomic`). Builtin-owned
 /// overrides (`weakref` comparing by referent) stay on the fast path: they
 /// cannot re-enter user code.
+#[inline]
 pub(crate) fn dict_key_is_reentrant(key: &Object) -> bool {
     match key {
         Object::Instance(inst) => {
@@ -4846,7 +5111,7 @@ pub(crate) fn dict_reentrant_remove(
             let mut m = d.borrow_mut();
             match m.find_by_hash(probe.hash, |k| k.0.is_same(&stored)) {
                 Some(i) => {
-                    let (k, v) = m.shift_remove_index(i).expect("found above");
+                    let (k, v) = m.lazy_remove_index(i).expect("found above");
                     drop(m);
                     dict_watch_bump(d);
                     dict_mutation_event(d);
@@ -4866,9 +5131,10 @@ pub(crate) fn dict_reentrant_remove(
 // same `ma_used`, so the size trip-wire stays silent — because the delete
 // leaves a tombstone and the reinsert *appends*: the iterator then finds an
 // entry beyond the `di->len` elements it expected and raises `RuntimeError:
-// dictionary keys changed during iteration`. Our table has no
-// tombstones (`shift_remove` compacts in place), so the layout carries no
-// trace of the churn. Instead, dict iterators register a *watch* on their
+// dictionary keys changed during iteration`. Our table keeps positions
+// dense (a removal moves the later keys' positions down, whether or not it
+// leaves a tombstone in the entry list), so an iterator's position carries
+// no trace of the churn. Instead, dict iterators register a *watch* on their
 // source dict; the centralized structural mutators (`dict_insert` on a new
 // key, `dict_remove`, `clear`, `popitem`) bump the watched dict's version,
 // and the iterator's checked `__next__` raises on a version change.
@@ -4880,11 +5146,76 @@ pub(crate) fn dict_reentrant_remove(
 // thread-local read, keeping `d[k] = v` hot paths unaffected.
 // ---------------------------------------------------------------------------
 
+/// The live dict watches of a thread (see the section notes): a few in a
+/// vector scanned in place (one or two dict loops running at a time is
+/// the rule, and each registration through a hash map cost about a
+/// hundred instructions), the rest in a map beside it.
+#[derive(Default)]
+struct DictWatches {
+    /// dict address, shared structural version, live watcher count.
+    small: Vec<(usize, Rc<Cell<u64>>, usize)>,
+    big: std::collections::HashMap<usize, (Rc<Cell<u64>>, usize), crate::fasthash::FxBuildHasher>,
+}
+
+/// How many watched dicts the scanned vector holds before the map takes
+/// the rest.
+const SMALL_WATCHES: usize = 8;
+
+impl DictWatches {
+    /// Count one more watcher of `ptr`, its version shared (a fresh one,
+    /// `fresh`'s, when the dict had none).
+    fn enter(&mut self, ptr: usize, fresh: impl FnOnce() -> Rc<Cell<u64>>) -> Rc<Cell<u64>> {
+        if let Some(e) = self.small.iter_mut().find(|e| e.0 == ptr) {
+            e.2 += 1;
+            return e.1.clone();
+        }
+        if let Some(e) = self.big.get_mut(&ptr) {
+            e.1 += 1;
+            return e.0.clone();
+        }
+        let version = fresh();
+        if self.small.len() < SMALL_WATCHES {
+            self.small.push((ptr, version.clone(), 1));
+        } else {
+            self.big.insert(ptr, (version.clone(), 1));
+        }
+        version
+    }
+
+    /// Count one watcher of `ptr` fewer, dropping the entry at none.
+    fn leave(&mut self, ptr: usize) {
+        if let Some(i) = self.small.iter().position(|e| e.0 == ptr) {
+            let e = &mut self.small[i];
+            e.2 = e.2.saturating_sub(1);
+            if e.2 == 0 {
+                self.small.swap_remove(i);
+            }
+            return;
+        }
+        if let Some(e) = self.big.get_mut(&ptr) {
+            e.1 = e.1.saturating_sub(1);
+            if e.1 == 0 {
+                self.big.remove(&ptr);
+            }
+        }
+    }
+
+    fn version(&self, ptr: usize) -> Option<&Rc<Cell<u64>>> {
+        match self.small.iter().find(|e| e.0 == ptr) {
+            Some(e) => Some(&e.1),
+            None if self.big.is_empty() => None,
+            None => self.big.get(&ptr).map(|e| &e.0),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.small.len() + self.big.len()
+    }
+}
+
 thread_local! {
-    /// dict address -> (shared structural version, live watcher count).
-    static DICT_WATCHES: std::cell::RefCell<
-        std::collections::HashMap<usize, (Rc<Cell<u64>>, usize), crate::fasthash::FxBuildHasher>,
-    > = std::cell::RefCell::new(std::collections::HashMap::default());
+    static DICT_WATCHES: crate::gil::ReleaseUnderGil<std::cell::RefCell<DictWatches>> =
+        crate::gil::ReleaseUnderGil::new(std::cell::RefCell::new(DictWatches::default()));
     /// Number of entries in `DICT_WATCHES` (fast gate for mutators).
     static DICT_WATCH_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -4903,11 +5234,10 @@ impl DictWatch {
         let ptr = std::ptr::from_ref::<RefCell<DictData>>(&**d) as usize;
         let version = DICT_WATCHES.with(|w| {
             let mut w = w.borrow_mut();
-            let entry = w.entry(ptr).or_insert_with(|| (Rc::new(Cell::new(0)), 0));
-            entry.1 += 1;
-            entry.0.clone()
+            let v = w.enter(ptr, || Rc::new(Cell::new(0)));
+            DICT_WATCH_COUNT.with(|c| c.set(w.len()));
+            v
         });
-        DICT_WATCH_COUNT.with(|c| c.set(DICT_WATCHES.with(|w| w.borrow().len())));
         let start = version.get();
         DictWatch {
             ptr,
@@ -4930,12 +5260,9 @@ impl Clone for DictWatch {
         // the watch alive after the original drops).
         DICT_WATCHES.with(|w| {
             let mut w = w.borrow_mut();
-            let entry = w
-                .entry(self.ptr)
-                .or_insert_with(|| (self.version.clone(), 0));
-            entry.1 += 1;
+            w.enter(self.ptr, || self.version.clone());
+            DICT_WATCH_COUNT.with(|c| c.set(w.len()));
         });
-        DICT_WATCH_COUNT.with(|c| c.set(DICT_WATCHES.with(|w| w.borrow().len())));
         DictWatch {
             ptr: self.ptr,
             version: self.version.clone(),
@@ -4948,14 +5275,9 @@ impl Drop for DictWatch {
     fn drop(&mut self) {
         DICT_WATCHES.with(|w| {
             let mut w = w.borrow_mut();
-            if let Some(entry) = w.get_mut(&self.ptr) {
-                entry.1 = entry.1.saturating_sub(1);
-                if entry.1 == 0 {
-                    w.remove(&self.ptr);
-                }
-            }
+            w.leave(self.ptr);
+            DICT_WATCH_COUNT.with(|c| c.set(w.len()));
         });
-        DICT_WATCH_COUNT.with(|c| c.set(DICT_WATCHES.with(|w| w.borrow().len())));
     }
 }
 
@@ -4967,7 +5289,7 @@ pub(crate) fn dict_watch_bump(d: &RefCell<DictData>) {
     }
     let ptr = std::ptr::from_ref::<RefCell<DictData>>(d) as usize;
     DICT_WATCHES.with(|w| {
-        if let Some((version, _)) = w.borrow().get(&ptr) {
+        if let Some(version) = w.borrow().version(ptr) {
             version.set(version.get() + 1);
         }
     });
@@ -5162,6 +5484,12 @@ pub struct DictData {
     key_filter: std::sync::atomic::AtomicU64,
 }
 
+impl Drop for DictData {
+    fn drop(&mut self) {
+        self.map.clear_entries_inline();
+    }
+}
+
 impl Clone for DictData {
     fn clone(&self) -> Self {
         Self {
@@ -5174,6 +5502,11 @@ impl Clone for DictData {
 }
 
 impl DictData {
+    /// Room for `additional` more entries without growing.
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        self.map.reserve(additional);
+    }
+
     #[inline]
     pub fn with_capacity_and_hasher(n: usize, h: crate::fasthash::FxBuildHasher) -> Self {
         Self {
@@ -5390,8 +5723,8 @@ impl IntoIterator for DictData {
     type Item = (DictKey, Object);
     type IntoIter = crate::dictmap::IntoIter;
 
-    fn into_iter(self) -> Self::IntoIter {
-        self.map.into_iter()
+    fn into_iter(mut self) -> Self::IntoIter {
+        std::mem::take(&mut self.map).into_iter()
     }
 }
 
@@ -5661,11 +5994,11 @@ impl PyFunction {
         }
         map.insert(
             DictKey(name_key.clone()),
-            crate::stdlib::sys::intern_name(&code.name),
+            crate::stdlib::sys::intern_code_name(&code.name),
         );
         map.insert(
             DictKey(qualname_key.clone()),
-            crate::stdlib::sys::intern_name(&code.qualname),
+            crate::stdlib::sys::intern_code_name(&code.qualname),
         );
         let mut slots = self.slots_cell().borrow_mut();
         // Every store goes through `slots()`, which plants the seed
@@ -5681,8 +6014,8 @@ impl PyFunction {
         if self.names_seeded() {
             let code = self.code();
             return (
-                Some(crate::stdlib::sys::intern_name(&code.name)),
-                Some(crate::stdlib::sys::intern_name(&code.qualname)),
+                Some(crate::stdlib::sys::intern_code_name(&code.name)),
+                Some(crate::stdlib::sys::intern_code_name(&code.qualname)),
             );
         }
         let Some(slots) = self.slots_raw.get() else {
@@ -5754,6 +6087,7 @@ impl PyFunction {
             self.defaults_override
                 .0
                 .store(true, std::sync::atomic::Ordering::Relaxed);
+            crate::rare_events::note_func_edit();
         }
         self.slots()
             .borrow_mut()
@@ -7114,6 +7448,11 @@ pub struct PyFile {
     /// `.buffer` access; `None` until then and for streams that are their own
     /// buffer.
     pub binary_buffer_cache: RefCell<Option<Object>>,
+    /// The last `BytesIO.getvalue()` result, handed out again while the
+    /// buffer is unchanged (CPython shares its bytes object the same way).
+    /// Every write, truncate, re-init, `__setstate__` and `getbuffer()`
+    /// clears it; see [`Self::mem_changed`].
+    pub mem_value: RefCell<Option<SharedSlice<u8>>>,
     /// Observed line endings, as CPython's `IncrementalNewlineDecoder` tracks
     /// them for the text-mode `.newlines` attribute. Bit flags: `1`=`\r`,
     /// `2`=`\n`, `4`=`\r\n`. Updated on every text-mode read (regardless of the
@@ -7225,6 +7564,7 @@ impl PyFile {
             closefd: crate::sync::Cell::new(true),
             extra_attrs: RefCell::new(Vec::new()),
             binary_buffer_cache: RefCell::new(None),
+            mem_value: RefCell::new(None),
             seennl: crate::sync::Cell::new(0),
             write_buf: RefCell::new(Vec::new()),
             line_buffering: crate::sync::Cell::new(LINE_BUFFER_UNDECIDED),
@@ -7696,10 +8036,17 @@ impl PyFile {
     /// do not carry the `mode`/`name` attributes that OS-backed file objects
     /// do, so callers gate those attributes on this.
     pub fn is_memory(&self) -> bool {
-        matches!(
-            &*self.backend.borrow(),
-            FileBackend::MemBytes { .. } | FileBackend::MemText { .. }
-        )
+        let memory = |b: &FileBackend| {
+            matches!(
+                b,
+                FileBackend::MemBytes { .. } | FileBackend::MemText { .. }
+            )
+        };
+        // SAFETY: the variant is read and the view dropped at once.
+        if let Some(b) = unsafe { self.backend.peek() } {
+            return memory(b);
+        }
+        memory(&self.backend.borrow())
     }
 
     /// Whether the stream is attached to a terminal (`f.isatty()`). The
@@ -7896,6 +8243,18 @@ impl PyFile {
     /// translation, or this stream hasn't been through the general path yet.
     /// Runs no code, so a loop can take it without publishing its frame.
     pub(crate) fn next_line_pure(&self, limit: Option<usize>) -> Option<Object> {
+        self.next_line_pure_with(limit, Some)
+    }
+
+    /// [`PyFile::next_line_pure`] handed to `take`, the line consumed only
+    /// when `take` accepts it (the stream is as it was when it declines).
+    /// `take` runs with the stream's buffer borrowed, so it must not touch
+    /// the stream.
+    pub(crate) fn next_line_pure_with<R>(
+        &self,
+        limit: Option<usize>,
+        take: impl FnOnce(Object) -> Option<R>,
+    ) -> Option<R> {
         // (A zero limit reads nothing, which isn't a line to hand out.)
         if limit == Some(0) {
             return None;
@@ -7956,7 +8315,7 @@ impl PyFile {
                 // Bytes wait here only on an open stream that has been read.
                 let mut ra = self.read_ahead.try_borrow_mut().ok()?;
                 let n = line_take(ra.rest(), end, cut(ra.rest()))?;
-                let line = make(&ra.rest()[..n])?;
+                let line = take(make(&ra.rest()[..n])?)?;
                 ra.consume(n);
                 Some(line)
             }
@@ -7967,7 +8326,7 @@ impl PyFile {
                 let d = data.try_borrow().ok()?;
                 let rest = d.get(*pos..).filter(|r| !r.is_empty())?;
                 let n = line_take(rest, end, cut(rest)).unwrap_or(rest.len());
-                let line = make(&rest[..n])?;
+                let line = take(make(&rest[..n])?)?;
                 *pos += n;
                 Some(line)
             }
@@ -7977,7 +8336,7 @@ impl PyFile {
                 }
                 let rest = data.as_bytes().get(*pos..).filter(|r| !r.is_empty())?;
                 let n = line_take(rest, end, utf8_limit(rest, limit)).unwrap_or(rest.len());
-                let line = make(&rest[..n])?;
+                let line = take(make(&rest[..n])?)?;
                 *pos += n;
                 Some(line)
             }
@@ -8059,6 +8418,121 @@ impl PyFile {
         true
     }
 
+    /// `BytesIO.write(data)` at the stream's end with nothing exported (a
+    /// `getbuffer()` view would make it raise): the bytes appended, as
+    /// the full write appends them. `false`, touching nothing, otherwise.
+    pub(crate) fn mem_bytes_append(&self, data: &[u8]) -> bool {
+        if self.io_kind.get() != IoKind::BytesIO || data.is_empty() {
+            return false;
+        }
+        // SAFETY: guard-free views, each dropped at once (nothing here
+        // runs code).
+        if unsafe { self.closed.peek() }.is_none_or(|c| *c) {
+            return false;
+        }
+        // SAFETY: as above (the cache's release only frees bytes).
+        let Some(FileBackend::MemBytes { data: buf, pos }) = (unsafe { self.backend.peek_mut() })
+        else {
+            return false;
+        };
+        if bytearray_is_exported(buf) {
+            return false;
+        }
+        // SAFETY: as above.
+        let Some(b) = (unsafe { buf.peek_mut() }) else {
+            return false;
+        };
+        // SAFETY: as above.
+        if let Some(m) = unsafe { self.mem_value.peek_mut() } {
+            *m = None;
+        } else {
+            return false;
+        }
+        // (At the end: appended. Inside the buffer, after a seek: written
+        // over what is there, the buffer growing if the data runs past its
+        // end. Past the end is the full method's, which fills the gap.)
+        let at = *pos;
+        if at > b.len() {
+            return false;
+        }
+        let over = data.len().min(b.len() - at);
+        b[at..at + over].copy_from_slice(&data[..over]);
+        b.extend_from_slice(&data[over..]);
+        *pos = at + data.len();
+        true
+    }
+
+    /// `StringIO.read(n)` (all with `None`) when the characters to read
+    /// are ASCII with no `\r` (so no newline translation or surrogate
+    /// bridge touches them): the `str` copied from the buffer, the position
+    /// moved past it. `None`, having changed nothing, otherwise.
+    pub(crate) fn mem_text_read_ascii(&self, n: Option<usize>) -> Option<Object> {
+        if self.io_kind.get() != IoKind::StringIO || self.binary {
+            return None;
+        }
+        // SAFETY: guard-free views, each dropped at once (nothing here
+        // runs code).
+        if unsafe { self.closed.peek() }.is_none_or(|c| *c)
+            || unsafe { self.read_ahead.peek() }.is_none_or(|ra| ra.pending() != 0)
+        {
+            return None;
+        }
+        let mut backend = self.backend.try_borrow_mut().ok()?;
+        let FileBackend::MemText { data, pos } = &mut *backend else {
+            return None;
+        };
+        let bytes = data.as_bytes();
+        // (At or past the end: nothing, the position kept where a seek
+        // left it.)
+        if *pos >= bytes.len() {
+            return Some(Object::from_static(""));
+        }
+        let start = *pos;
+        let end = n.map_or(bytes.len(), |n| start.saturating_add(n).min(bytes.len()));
+        let run = &bytes[start..end];
+        if !run.is_ascii() || run.contains(&b'\r') {
+            return None;
+        }
+        // SAFETY: an ASCII run of valid UTF-8 is valid UTF-8.
+        let text = unsafe { std::str::from_utf8_unchecked(run) };
+        let out = Object::from_str(text);
+        *pos = end;
+        Some(out)
+    }
+
+    /// The open `BytesIO`'s bytes at its position, where they are: `f` on
+    /// up to `n` of them (all of them with `None`), the position then moved
+    /// past the `f`'s count. `None` for any other stream, a closed one, or
+    /// one with bytes parked ahead of it.
+    pub(crate) fn mem_bytes_read_with<R>(
+        &self,
+        n: Option<usize>,
+        f: impl FnOnce(&[u8]) -> (R, usize),
+    ) -> Option<R> {
+        if self.io_kind.get() != IoKind::BytesIO {
+            return None;
+        }
+        // SAFETY: guard-free views, each dropped at once (nothing here
+        // runs code).
+        if unsafe { self.closed.peek() }.is_none_or(|c| *c)
+            || unsafe { self.read_ahead.peek() }.is_none_or(|ra| ra.pending() != 0)
+        {
+            return None;
+        }
+        let mut backend = self.backend.try_borrow_mut().ok()?;
+        let FileBackend::MemBytes { data, pos } = &mut *backend else {
+            return None;
+        };
+        let d = data.try_borrow().ok()?;
+        let start = (*pos).min(d.len());
+        let end = n.map_or(d.len(), |n| start.saturating_add(n).min(d.len()));
+        let (r, used) = f(&d[start..end]);
+        if used > 0 {
+            *pos = start + used;
+        }
+        Some(r)
+    }
+
     /// `sys.stdout.write(s)` when the text's bytes go to the shared sink as
     /// they are: `None` for any other stream or text, having touched nothing.
     /// Runs no Python code (a full buffer is written out with the handlers
@@ -8125,42 +8599,60 @@ impl PyFile {
     /// and returns `true`. `false` touches nothing; the general path then
     /// runs (overwrites, newline translation, an explicit codec).
     pub fn mem_text_append(&self, s: &str) -> bool {
-        if self.io_kind.get() != IoKind::StringIO || *self.closed.borrow() {
+        if self.io_kind.get() != IoKind::StringIO {
             return false;
         }
-        if self.encoding.borrow().is_some()
-            || self
-                .errors
-                .borrow()
-                .as_deref()
-                .is_some_and(|e| e != "strict")
+        // The settings are read through guard-free views, each dropped at
+        // once (nothing here runs code), and a borrow when one is live.
+        fn read<T, R>(c: &RefCell<T>, f: impl FnOnce(&T) -> R) -> R {
+            // SAFETY: as above.
+            match unsafe { c.peek() } {
+                Some(v) => f(v),
+                None => f(&c.borrow()),
+            }
+        }
+        if read(&self.closed, |c| *c)
+            || read(&self.encoding, Option::is_some)
+            || read(&self.errors, |e| {
+                e.as_deref().is_some_and(|e| e != "strict")
+            })
         {
             return false;
         }
-        let collapse = match self.newline.borrow().as_deref() {
-            Some("\n" | "") => false,
-            None if self.io_kind.get() == IoKind::StringIO => true,
-            _ => return false,
+        let collapse = match read(&self.newline, |n| match n.as_deref() {
+            Some("\n" | "") => Some(false),
+            None => Some(true),
+            _ => None,
+        }) {
+            Some(c) => c,
+            None => return false,
         };
         if collapse && s.as_bytes().contains(&b'\r') {
             return false;
         }
-        let Ok(mut backend) = self.backend.try_borrow_mut() else {
-            return false;
+        let append = |backend: &mut FileBackend| {
+            let FileBackend::MemText { data, pos } = backend else {
+                return false;
+            };
+            if *pos != data.len() {
+                return false;
+            }
+            data.push_str(s);
+            *pos = data.len();
+            true
         };
-        let FileBackend::MemText { data, pos } = &mut *backend else {
-            return false;
+        // SAFETY: the buffer is extended and the view dropped at once.
+        let done = match unsafe { self.backend.peek_mut() } {
+            Some(b) => append(b),
+            None => match self.backend.try_borrow_mut() {
+                Ok(mut b) => append(&mut b),
+                Err(_) => false,
+            },
         };
-        if *pos != data.len() {
-            return false;
-        }
-        data.push_str(s);
-        *pos = data.len();
-        drop(backend);
-        if collapse {
+        if done && collapse {
             self.record_seen_newlines(s);
         }
-        true
+        done
     }
 
     fn translate_newlines_write(&self, s: &str) -> String {
@@ -8898,7 +9390,7 @@ impl PyFile {
             while skip_bytes > 0 {
                 pf_call_method(&decoder, "setstate", &[make_state_tuple(&dec_flags_bi)])?;
                 let upto = &next_input[..skip_bytes as usize];
-                let dec = pf_call_method(&decoder, "decode", &[Object::new_bytes(upto.to_vec())])?;
+                let dec = pf_call_method(&decoder, "decode", &[Object::new_bytes(upto)])?;
                 let n = dec.to_str().chars().count();
                 if n <= chars_to_skip {
                     let st = pf_call_method(&decoder, "getstate", &[])?;
@@ -8934,11 +9426,8 @@ impl PyFile {
             let mut reached = false;
             for i in (skip_bytes as usize)..next_input.len() {
                 bytes_fed += 1;
-                let dec = pf_call_method(
-                    &decoder,
-                    "decode",
-                    &[Object::new_bytes(next_input[i..=i].to_vec())],
-                )?;
+                let dec =
+                    pf_call_method(&decoder, "decode", &[Object::new_bytes(&next_input[i..=i])])?;
                 chars_decoded += dec.to_str().chars().count();
                 let st = pf_call_method(&decoder, "getstate", &[])?;
                 let (b, d) = decoder_state_parts(&st)?;
@@ -9203,6 +9692,7 @@ impl PyFile {
     /// the rare read↔write re-init, which CPython itself rejects mid-stream).
     pub fn reinit_fileio(&self, new_backend: FileBackend, closefd: bool) {
         self.close();
+        self.mem_changed();
         *self.backend.borrow_mut() = new_backend;
         self.closefd.set(closefd);
         *self.closed.borrow_mut() = false;
@@ -9212,6 +9702,370 @@ impl PyFile {
         self.text_plan.set(TextPlan::UNKNOWN);
         self.text_start_of_stream.set(true);
         *self.binary_buffer_cache.borrow_mut() = None;
+    }
+
+    /// The position of an open `BytesIO` with nothing read ahead or written
+    /// to flush (its `tell()`), read guard-free; `None` for anything else.
+    pub(crate) fn mem_bytes_tell(&self) -> Option<usize> {
+        if self.io_kind.get() != IoKind::BytesIO {
+            return None;
+        }
+        // SAFETY: guard-free views, each dropped at once (nothing here runs
+        // code).
+        unsafe {
+            if self.closed.peek().is_none_or(|c| *c)
+                || self.read_ahead.peek().is_none_or(|r| r.pending() != 0)
+                || self.write_buf.peek().is_none_or(|w| !w.is_empty())
+            {
+                return None;
+            }
+            match self.backend.peek()? {
+                FileBackend::MemBytes { pos, .. } => Some(*pos),
+                _ => None,
+            }
+        }
+    }
+
+    /// `seek(at)` (from the start, `at` not negative) of such a stream: the
+    /// position set as the full method sets it (past the end too), and
+    /// `tell()` enabled. `None`, nothing touched, for anything else.
+    pub(crate) fn mem_bytes_seek(&self, at: usize) -> Option<()> {
+        self.mem_bytes_tell()?;
+        let mut backend = self.backend.try_borrow_mut().ok()?;
+        let FileBackend::MemBytes { pos, .. } = &mut *backend else {
+            return None;
+        };
+        *pos = at;
+        drop(backend);
+        self.telling.set(true);
+        Some(())
+    }
+
+    /// `read(want)` of an open, readable, buffered binary disk stream with
+    /// nothing written to flush and no text sibling, when its read-ahead
+    /// holds all `want` bytes: those bytes, consumed, with no system call
+    /// and no code run (a leaf half's read). `None`, nothing touched, for
+    /// anything else.
+    pub(crate) fn read_ahead_pure(&self, want: usize) -> Option<Object> {
+        if want == 0 || !self.binary || self.io_kind.get() == IoKind::Raw {
+            return None;
+        }
+        // SAFETY: guard-free views, each dropped at once (nothing here runs
+        // code).
+        unsafe {
+            if self.closed.peek().is_none_or(|c| *c)
+                || self.write_buf.peek().is_none_or(|w| !w.is_empty())
+                || self.binary_buffer_cache.peek().is_none_or(Option::is_some)
+                || !matches!(self.backend.peek()?, FileBackend::Disk(_))
+            {
+                return None;
+            }
+        }
+        if !self.mode.bytes().any(|b| b == b'r' || b == b'+') {
+            return None;
+        }
+        let mut ra = self.read_ahead.try_borrow_mut().ok()?;
+        if ra.pending() < want {
+            return None;
+        }
+        let out = SharedSlice::from(&ra.rest()[..want]);
+        ra.consume(want);
+        Some(Object::Bytes(out))
+    }
+
+    /// `readinto` of `want` bytes into `copy`, when the read-ahead of an
+    /// open, readable, buffered binary disk stream with nothing written to
+    /// flush and no text sibling holds them all: `copy` is handed them and
+    /// they are consumed, with no system call and no code run (a leaf
+    /// half's read). `None`, nothing touched, for anything else.
+    pub(crate) fn read_ahead_into(&self, want: usize, copy: impl FnOnce(&[u8])) -> Option<()> {
+        if want == 0 || !self.binary || self.io_kind.get() == IoKind::Raw {
+            return None;
+        }
+        // SAFETY: guard-free views, each dropped at once (nothing here runs
+        // code).
+        unsafe {
+            if self.closed.peek().is_none_or(|c| *c)
+                || self.write_buf.peek().is_none_or(|w| !w.is_empty())
+                || self.binary_buffer_cache.peek().is_none_or(Option::is_some)
+                || !matches!(self.backend.peek()?, FileBackend::Disk(_))
+            {
+                return None;
+            }
+        }
+        if !self.mode.bytes().any(|b| b == b'r' || b == b'+') {
+            return None;
+        }
+        let mut ra = self.read_ahead.try_borrow_mut().ok()?;
+        if ra.pending() < want {
+            return None;
+        }
+        copy(&ra.rest()[..want]);
+        ra.consume(want);
+        Some(())
+    }
+
+    /// `readinto` of up to `want` bytes from a buffered binary disk file
+    /// through its read-ahead, as CPython's `BufferedReader` serves a read
+    /// of less than half its buffer: `copy` is handed each run taken from
+    /// the read-ahead (which one `read(2)` of a buffer's worth refills, with
+    /// the GIL released and nothing of the caller's borrowed) and returns
+    /// how much of it it took, until `want` bytes are taken or the file
+    /// ends. The count taken, or `None` when another path must serve it
+    /// (another backend or kind of stream, a larger read, a non-blocking
+    /// descriptor with nothing taken yet).
+    #[cfg(unix)]
+    pub fn readinto_buffered(
+        &self,
+        want: usize,
+        mut copy: impl FnMut(&[u8]) -> usize,
+    ) -> Option<Result<usize, RuntimeError>> {
+        use std::os::unix::io::AsRawFd;
+        if want == 0 || !self.binary {
+            return None;
+        }
+        let fd = match &*self.backend.borrow() {
+            FileBackend::Disk(f) if self.io_kind.get() != IoKind::Raw => f.as_raw_fd(),
+            _ => return None,
+        };
+        let room = self.buf_size.get().clamp(8192, 8192 * 1024);
+        if want * 2 > room {
+            return None;
+        }
+        if let Err(e) = self.check_open().and_then(|()| self.flush_write_buf()) {
+            return Some(Err(e));
+        }
+        let lock = &self.fd_syscall_lock;
+        let mut done = 0;
+        while done < want {
+            if self.read_ahead.borrow().pending() == 0 {
+                if fd_is_nonblocking(fd) {
+                    return (done != 0).then_some(Ok(done));
+                }
+                // (The storage leaves the cell for the read, as in
+                // `fill_read_ahead`.)
+                let mut buf = self.read_ahead.borrow_mut().begin_fill(room);
+                let got = read_fd_into(fd, &mut buf, room, lock);
+                self.read_ahead.borrow_mut().put_back(buf);
+                match got {
+                    Err(e) => return Some(Err(e)),
+                    Ok(0) => break,
+                    Ok(_) => {}
+                }
+            }
+            let mut ra = self.read_ahead.borrow_mut();
+            let k = (want - done).min(ra.pending());
+            let took = copy(&ra.rest()[..k]).min(k);
+            ra.consume(took);
+            done += took;
+            if took < k {
+                break;
+            }
+        }
+        Some(Ok(done))
+    }
+
+    /// A sized binary read of a disk file with nothing parked, read straight
+    /// into the `bytes` object's own storage: `Ok(Ok(bytes))` when one
+    /// `read(2)` filled all `want` bytes, `Ok(Err(partial))` with what it
+    /// read otherwise (end of file or a short read, for the caller to carry
+    /// on with). `None` when another path must serve the read (another
+    /// backend, read-ahead waiting, a would-block). The first read of the
+    /// stream sets `PyFile`'s pre-read state as `read_bytes_opt` does.
+    #[cfg(unix)]
+    pub fn read_sized_shared(
+        &self,
+        want: usize,
+    ) -> Option<Result<Result<Object, Vec<u8>>, RuntimeError>> {
+        use std::os::unix::io::AsRawFd;
+        if !(1..=1 << 24).contains(&want) {
+            return None;
+        }
+        let fd = match &*self.backend.borrow() {
+            FileBackend::Disk(f) if self.io_kind.get() != IoKind::Raw => f.as_raw_fd(),
+            _ => return None,
+        };
+        if let Err(e) = self.check_open().and_then(|()| self.flush_write_buf()) {
+            return Some(Err(e));
+        }
+        let lock = &self.fd_syscall_lock;
+        // A read of less than half a buffer is served from the read-ahead,
+        // which one `read(2)` of a buffer's worth fills, as CPython's
+        // `BufferedReader` serves it (line reads share it).
+        let room = self.buf_size.get().clamp(8192, 8192 * 1024);
+        if want * 2 <= room {
+            if self.read_ahead.borrow().pending() == 0 {
+                if fd_is_nonblocking(fd) {
+                    return None;
+                }
+                // (The storage leaves the cell for the read, as in
+                // `fill_read_ahead`.)
+                let mut buf = self.read_ahead.borrow_mut().begin_fill(room);
+                let got = read_fd_into(fd, &mut buf, room, lock);
+                self.read_ahead.borrow_mut().put_back(buf);
+                match got {
+                    Err(e) => return Some(Err(e)),
+                    Ok(0) => return Some(Ok(Err(Vec::new()))),
+                    Ok(_) => {}
+                }
+            }
+            let mut ra = self.read_ahead.borrow_mut();
+            let k = want.min(ra.pending());
+            let out = SharedSlice::from(&ra.rest()[..k]);
+            ra.consume(k);
+            return Some(Ok(if k == want {
+                Ok(Object::Bytes(out))
+            } else {
+                Err(out.to_vec())
+            }));
+        }
+        if self.read_ahead.borrow().pending() != 0 {
+            return None;
+        }
+        // One `read(2)` (retried on a signal): the count, or `usize::MAX`
+        // for a would-block.
+        let read = |dst: *mut u8| -> Result<usize, RuntimeError> {
+            loop {
+                let r = crate::gil::allow_threads_then(|| {
+                    let _serialized = fd_lock(lock);
+                    // SAFETY: `dst` has room for `want` bytes.
+                    unsafe { libc::read(fd, dst.cast(), want) }
+                });
+                if r >= 0 {
+                    return Ok(r as usize);
+                }
+                let err = std::io::Error::last_os_error();
+                match err.raw_os_error() {
+                    Some(libc::EINTR) => service_pending_signals_io()?,
+                    Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => {
+                        return Ok(usize::MAX)
+                    }
+                    _ => return Err(crate::error::io_error_to_py(&err)),
+                }
+            }
+        };
+        let mut got: Result<usize, RuntimeError> = Ok(0);
+        let mut partial = Vec::new();
+        // SAFETY: a full read writes all `want` bytes; after anything less
+        // what came is copied out and the slice zeroed whole before it
+        // drops unread.
+        let full = unsafe {
+            SharedSlice::<u8>::build_uninit(want, |dst| {
+                got = read(dst);
+                match got {
+                    Ok(k) if k == want => {}
+                    Ok(k) => {
+                        if k < want {
+                            partial = std::slice::from_raw_parts(dst, k).to_vec();
+                        }
+                        std::ptr::write_bytes(dst, 0, want);
+                    }
+                    Err(_) => std::ptr::write_bytes(dst, 0, want),
+                }
+            })
+        };
+        match got {
+            Ok(k) if k == want => Some(Ok(Ok(Object::Bytes(full)))),
+            Ok(usize::MAX) => None,
+            Ok(_) => Some(Ok(Err(partial))),
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    /// A binary read to the end of a regular disk file, straight into the
+    /// `bytes` object's own storage, sized by what `fstat` says is left: the
+    /// bytes, or `None` when another path must serve it (another backend or
+    /// kind of file, read-ahead waiting, a non-blocking descriptor, an empty
+    /// or very large remainder). A file that grew or shrank meanwhile is
+    /// read on to its end and copied.
+    #[cfg(unix)]
+    pub fn read_all_shared(&self) -> Option<Result<Object, RuntimeError>> {
+        use std::os::unix::io::AsRawFd;
+        let fd = match &*self.backend.borrow() {
+            FileBackend::Disk(f) => f.as_raw_fd(),
+            _ => return None,
+        };
+        if let Err(e) = self.check_open().and_then(|()| self.flush_write_buf()) {
+            return Some(Err(e));
+        }
+        self.rewind_read_ahead();
+        if self.read_ahead.borrow().pending() != 0 || fd_is_nonblocking(fd) {
+            return None;
+        }
+        // SAFETY: plain queries of our own descriptor.
+        let est = unsafe {
+            let mut st: libc::stat = std::mem::zeroed();
+            if libc::fstat(fd, &raw mut st) != 0 || (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+                return None;
+            }
+            let pos = libc::lseek(fd, 0, libc::SEEK_CUR);
+            if pos < 0 || st.st_size <= pos as libc::off_t {
+                return None;
+            }
+            (st.st_size - pos as libc::off_t) as usize
+        };
+        if est > 1 << 30 {
+            return None;
+        }
+        let lock = &self.fd_syscall_lock;
+        let read = |dst: *mut u8, room: usize| -> Result<usize, RuntimeError> {
+            loop {
+                let r = crate::gil::allow_threads_then(|| {
+                    let _serialized = fd_lock(lock);
+                    // SAFETY: `dst` has room for `room` bytes.
+                    unsafe { libc::read(fd, dst.cast(), room) }
+                });
+                if r >= 0 {
+                    return Ok(r as usize);
+                }
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EINTR) {
+                    service_pending_signals_io()?;
+                    continue;
+                }
+                return Err(crate::error::io_error_to_py(&err));
+            }
+        };
+        let mut done = 0usize;
+        let mut failed: Option<RuntimeError> = None;
+        // SAFETY: the bytes past `done` are zeroed before the slice can be
+        // read; when it's kept, `done` is all of it.
+        let full = unsafe {
+            SharedSlice::<u8>::build_uninit(est, |dst| {
+                while done < est {
+                    match read(dst.add(done), est - done) {
+                        Ok(0) => break,
+                        Ok(k) => done += k,
+                        Err(e) => {
+                            failed = Some(e);
+                            break;
+                        }
+                    }
+                }
+                std::ptr::write_bytes(dst.add(done), 0, est - done);
+            })
+        };
+        if let Some(e) = failed {
+            return Some(Err(e));
+        }
+        // The end of the file, or whatever it has gained since.
+        let mut more = [0u8; 1];
+        let extra = match read(more.as_mut_ptr(), 1) {
+            Ok(k) => k,
+            Err(e) => return Some(Err(e)),
+        };
+        if done == est && extra == 0 {
+            return Some(Ok(Object::Bytes(full)));
+        }
+        let mut out = full[..done].to_vec();
+        if extra > 0 {
+            out.push(more[0]);
+            match read_fd_intr(fd, None, lock) {
+                Ok(rest) => out.extend_from_slice(&rest),
+                Err(e) => return Some(Err(e)),
+            }
+        }
+        Some(Ok(Object::new_bytes(out)))
     }
 
     /// Read up to `n` bytes from the backend; `None` reads everything.
@@ -9729,6 +10583,37 @@ impl PyFile {
         // raises only here / at close.
         if self.is_write_buffered() {
             let bufsize = self.buf_size.get();
+            // A write of at least a buffer's worth with nothing staged goes
+            // to a blocking descriptor directly, as CPython's
+            // `BufferedWriter` writes it, instead of through the buffer.
+            #[cfg(unix)]
+            if data.len() >= bufsize && self.write_buf.borrow().is_empty() {
+                use std::os::unix::io::AsRawFd;
+                let fd = match &*self.backend.borrow() {
+                    FileBackend::Disk(f) => Some(f.as_raw_fd()),
+                    _ => None,
+                };
+                if let Some(fd) = fd.filter(|&fd| !fd_is_nonblocking(fd)) {
+                    // (Settles a text stream's `.buffer` sibling first.)
+                    self.flush_write_buf()?;
+                    if self.write_buf.borrow().is_empty() {
+                        let (off, res) = write_slice_fd_intr(fd, data, &self.fd_syscall_lock);
+                        if res.is_err() && off < data.len() {
+                            // What a raising signal handler cut short waits
+                            // in the buffer, as a flush leaves it.
+                            self.write_buf.borrow_mut().extend_from_slice(&data[off..]);
+                            let addr = std::ptr::from_ref(self) as usize;
+                            if self.write_listed.get() != addr {
+                                self.unlist_writer();
+                                self.write_listed.set(addr);
+                                pending_writers().push(addr);
+                            }
+                        }
+                        res?;
+                        return Ok(data.len());
+                    }
+                }
+            }
             // Pre-flush if the buffer is already over size (a prior partial
             // non-blocking flush left it full). A `BlockingIOError` here means
             // none of `data` has been accepted yet, so it re-raises with
@@ -9799,6 +10684,7 @@ impl PyFile {
                 if data.is_empty() {
                     return Ok(0);
                 }
+                self.mem_changed();
                 let mut b = buf.borrow_mut();
                 if *pos > b.len() {
                     // Seeked past EOF: writing zero-fills the gap (CPython
@@ -10128,6 +11014,7 @@ impl PyFile {
                 // live (CPython `bytesio.c` `check_exports`).
                 bytearray_check_resizable(data)?;
                 let n = size.unwrap_or(*pos as u64) as usize;
+                self.mem_changed();
                 let mut d = data.borrow_mut();
                 // `bytesio.c` only ever *shrinks*: a size beyond the end
                 // leaves the buffer untouched, and the requested size is
@@ -10162,12 +11049,90 @@ impl PyFile {
         }
     }
 
+    /// Drop the cached `getvalue()` result: the in-memory buffer changed
+    /// (or may change through a `getbuffer()` view).
+    #[inline]
+    pub(crate) fn mem_changed(&self) {
+        // SAFETY: a guard-free view, dropped at once.
+        if unsafe { self.mem_value.peek() }.is_some_and(|v| v.is_some()) {
+            *self.mem_value.borrow_mut() = None;
+        }
+    }
+
+    /// Seed the cached `getvalue()` result with the initial bytes object,
+    /// so `BytesIO(b).getvalue()` returns `b` itself, as in CPython.
+    pub(crate) fn mem_seed(&self, v: SharedSlice<u8>) {
+        *self.mem_value.borrow_mut() = Some(v);
+    }
+
     /// Extract the entire buffer of an in-memory StringIO/BytesIO.
     /// Used by `StringIO.getvalue()` / `BytesIO.getvalue()`.
+    /// `getvalue()` of an open `BytesIO` when the value cached at the last
+    /// call is still the buffer's: shared again, read through guard-free
+    /// views. `None` otherwise (nothing cached, a buffer changed since or
+    /// with a live `getbuffer()` view, a closed or other stream).
+    pub(crate) fn mem_value_cached(&self) -> Option<Object> {
+        // SAFETY: guard-free views, each dropped at once (nothing here runs
+        // code).
+        unsafe {
+            if self.closed.peek().is_none_or(|c| *c) {
+                return None;
+            }
+            let FileBackend::MemBytes { data, .. } = self.backend.peek()? else {
+                return None;
+            };
+            let v = self.mem_value.peek()?.as_ref()?;
+            if v.len() != data.peek()?.len() || bytearray_is_exported(data) {
+                return None;
+            }
+            Some(Object::Bytes(v.clone()))
+        }
+    }
+
     pub fn getvalue(&self) -> Option<Object> {
+        // (A `BytesIO`'s value read through views: nothing here runs code.)
+        // SAFETY: the views end with this block; the cache store only
+        // releases bytes.
+        unsafe {
+            if let Some(FileBackend::MemBytes { data, .. }) = self.backend.peek() {
+                if let Some(d) = data.peek() {
+                    let exported = bytearray_is_exported(data);
+                    if !exported {
+                        if let Some(Some(v)) = self.mem_value.peek() {
+                            if v.len() == d.len() {
+                                return Some(Object::Bytes(v.clone()));
+                            }
+                        }
+                    }
+                    let v = SharedSlice::from(d.as_slice());
+                    if !exported {
+                        if let Some(m) = self.mem_value.peek_mut() {
+                            *m = Some(v.clone());
+                        }
+                    }
+                    return Some(Object::Bytes(v));
+                }
+            }
+        }
         match &*self.backend.borrow() {
             FileBackend::MemBytes { data, .. } => {
-                Some(Object::Bytes(SharedSlice::from(data.borrow().as_slice())))
+                let d = data.borrow();
+                // A cached value is good while nothing has changed the
+                // buffer: the mutators clear it, and a live `getbuffer()`
+                // view (which can write in place) bypasses it.
+                let exported = bytearray_is_exported(data);
+                if !exported {
+                    if let Some(v) = self.mem_value.borrow().as_ref() {
+                        if v.len() == d.len() {
+                            return Some(Object::Bytes(v.clone()));
+                        }
+                    }
+                }
+                let v = SharedSlice::from(d.as_slice());
+                if !exported {
+                    *self.mem_value.borrow_mut() = Some(v.clone());
+                }
+                Some(Object::Bytes(v))
             }
             // The buffer stores lone surrogates as bridged PUA code points
             // (so a Rust `String` can hold them); map them back to a `str`/
@@ -10189,6 +11154,7 @@ impl PyFile {
     /// stream, and the export keeps the buffer pinned (a subsequent
     /// `write`/`truncate` raises `BufferError`) until the view is released.
     pub fn getbuffer(&self) -> Result<Object, RuntimeError> {
+        self.mem_changed();
         match &*self.backend.borrow() {
             FileBackend::MemBytes { data, .. } => Ok(Object::MemoryView(Rc::new(
                 PyMemoryView::from_bytearray(data.clone()),
@@ -10467,13 +11433,14 @@ impl PyLazyIter {
             LazyIterKind::Zip {
                 iters,
                 result,
+                spare,
                 held,
                 ..
             } => {
                 for it in iters.iter().chain(held.iter()) {
                     visit(it);
                 }
-                if let Some(t) = result {
+                for t in result.iter().chain(spare.iter()) {
                     for v in t.iter() {
                         visit(v);
                     }
@@ -10701,7 +11668,17 @@ pub enum LazyIterKind {
         iters: Vec<Object>,
         strict: bool,
         result: Option<SharedTuple>,
+        /// The result before `result`, kept to refill once its holder
+        /// lets go: a loop that binds each tuple (`for t in zip(xs, ys)`)
+        /// still holds `result` when it asks for the next, so the two
+        /// take turns and no step allocates.
+        spare: Option<SharedTuple>,
         held: Vec<Object>,
+        /// Whether no source is another's alias (the same iterator passed
+        /// twice), decided at the first native step: the sources never
+        /// change, and comparing every pair at every step made
+        /// `zip(*rows)` quadratic in its rows.
+        distinct: Option<bool>,
     },
     /// The builtin `enumerate(iterable, start)` over a source only the
     /// interpreter can step (a generator, a user iterator); a native
@@ -10909,6 +11886,20 @@ pub enum PyIterator {
     },
 }
 
+/// The empty store an exhausted list or reverse iterator detaches to:
+/// one per thread, shared, so a loop's end allocates nothing (CPython
+/// clears `it_seq`). Nothing writes to a detached iterator's store, and
+/// `__reduce__` reports a fresh list for an empty one, so no one sees it
+/// shared. (Never dropped: its thread's exit runs no destructor.)
+#[inline]
+pub(crate) fn detached_store() -> Rc<RefCell<Vec<Object>>> {
+    thread_local! {
+        static EMPTY: std::mem::ManuallyDrop<Rc<RefCell<Vec<Object>>>> =
+            std::mem::ManuallyDrop::new(Rc::new(RefCell::new(Vec::new())));
+    }
+    EMPTY.with(|e| Rc::clone(e))
+}
+
 impl PyIterator {
     /// Pull the next value out of the iterator, or `None` if exhausted.
     pub fn next_value(&mut self) -> Option<Object> {
@@ -10932,7 +11923,7 @@ impl PyIterator {
                         // subclass keepalive drops with it, running its
                         // `__del__` here like CPython freeing the list
                         // (test_free_after_iterating).
-                        *items = Rc::new(RefCell::new(Vec::new()));
+                        *items = crate::object::detached_store();
                         *owner = None;
                         None
                     }
@@ -11178,7 +12169,7 @@ impl PyIterator {
                 owner,
             } => {
                 if *index < 0 {
-                    *items = Rc::new(RefCell::new(Vec::new()));
+                    *items = crate::object::detached_store();
                     *owner = None;
                     return None;
                 }
@@ -11190,7 +12181,7 @@ impl PyIterator {
                     }
                     None => {
                         // Index out of range (list shrank): exhaust + detach.
-                        *items = Rc::new(RefCell::new(Vec::new()));
+                        *items = crate::object::detached_store();
                         *index = -1;
                         *owner = None;
                         None
@@ -11234,6 +12225,22 @@ impl PyIterator {
             PyIterator::Enumerate { inner, .. } | PyIterator::Shared(inner) => {
                 inner.try_borrow().is_ok_and(|i| i.pure_ready())
             }
+            // A plain dict's forward iterator past its first (checked) step,
+            // its dict unchanged and an entry left: the step `next_value`
+            // takes is the checked one's.
+            PyIterator::DictKeys {
+                index,
+                dict: Some(d),
+                len,
+                watch: Some(w),
+                reverse: false,
+                odict: None,
+                ..
+            } => {
+                !w.changed()
+                    && d.try_borrow()
+                        .is_ok_and(|data| data.len() == *len && data.get_index(*index).is_some())
+            }
             _ => false,
         }
     }
@@ -11261,6 +12268,10 @@ impl PyIterator {
                 .get(*index..)
                 .and_then(|rest| rest.chars().next())
                 .map(Object::from_char),
+            // (A `bytes` object's items are small ints.)
+            PyIterator::Bytes { data, index } => {
+                data.get(*index).map(|&b| Object::Int(i64::from(b)))
+            }
             PyIterator::Reversed {
                 items,
                 index,
@@ -11268,6 +12279,44 @@ impl PyIterator {
             } if *index >= 0 => {
                 // SAFETY: as above.
                 unsafe { items.peek() }?.get(*index as usize).cloned()
+            }
+            _ => None,
+        }
+    }
+
+    /// [`Self::pure_peek`] and [`Self::pure_skip`] in one, for the plain
+    /// cursors (a list's with no owner, a tuple's, a range's): the next
+    /// item, stepped past. `None`, changing nothing, when there is none or
+    /// for any other iterator.
+    #[inline]
+    pub fn pure_next(&mut self) -> Option<Object> {
+        match self {
+            PyIterator::List {
+                items,
+                index,
+                owner: None,
+            } => {
+                // SAFETY: a read that runs no code.
+                let v = crate::clone_hot(unsafe { items.peek() }?.get(*index)?);
+                *index += 1;
+                Some(v)
+            }
+            PyIterator::Tuple { items, index } => {
+                let v = crate::clone_hot(items.get(*index)?);
+                *index += 1;
+                Some(v)
+            }
+            PyIterator::Range {
+                current,
+                stop,
+                step,
+            } => {
+                if !((*step > 0 && current < stop) || (*step < 0 && current > stop)) {
+                    return None;
+                }
+                let v = *current;
+                *current = current.wrapping_add(*step);
+                Some(Object::Int(v))
             }
             _ => None,
         }
@@ -11282,7 +12331,8 @@ impl PyIterator {
             PyIterator::List {
                 index, owner: None, ..
             }
-            | PyIterator::Tuple { index, .. } => *index += 1,
+            | PyIterator::Tuple { index, .. }
+            | PyIterator::Bytes { index, .. } => *index += 1,
             PyIterator::Range { current, step, .. } => *current = current.wrapping_add(*step),
             PyIterator::Str { s, index } => match s.get(*index..).and_then(|r| r.chars().next()) {
                 Some(ch) => *index += ch.len_utf8(),
@@ -11972,6 +13022,98 @@ const PAYLOAD_OFFSET: usize = 16;
 /// collector tracks them by (`Str`, `WStr`, `Bytes`), by tag.
 const TEXT_TAGS: u64 = 1 << 7 | 1 << 8 | 1 << 27;
 
+/// Clones of `src`'s elements written to the `src.len()` slots at `dst`:
+/// the elements copied whole, then their counts taken in a second pass.
+/// (A clone moved through an iterator or `Vec::clone` goes by way of the
+/// stack in two unaligned halves, about twenty instructions an element.)
+///
+/// # Safety
+///
+/// `dst` is valid for `src.len()` writes and doesn't overlap `src`; the
+/// slots hold nothing that needs dropping.
+#[inline]
+pub(crate) unsafe fn clone_objects_into(src: &[Object], dst: *mut Object) {
+    // SAFETY: per the caller; each copied element's count is taken before
+    // anything can release the copy (nothing here runs code or unwinds,
+    // and the bias can't change hands meanwhile).
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.as_ptr(), dst, src.len());
+        if crate::rc::refcounts_biased() {
+            for item in src {
+                if let Some(word) = item.strong_word() {
+                    crate::rc::plain_increment(word);
+                }
+            }
+        } else {
+            for item in src {
+                if let Some(word) = item.strong_word() {
+                    crate::rc::increment_word(word);
+                }
+            }
+        }
+    }
+}
+
+/// Clones of the objects `items` yields, written to `dst` one after
+/// another: each copied whole and its count taken, as
+/// [`clone_objects_into`] does for a slice (a gather by index moves no
+/// object through the iterator, only its address).
+///
+/// # Safety
+///
+/// As [`clone_objects_into`]: `dst` has room for every item `items` yields.
+pub(crate) unsafe fn clone_refs_into<'a>(
+    items: impl Iterator<Item = &'a Object>,
+    dst: *mut Object,
+) {
+    // SAFETY: per the caller; as `clone_objects_into`'s.
+    unsafe {
+        let biased = crate::rc::refcounts_biased();
+        for (at, item) in items.enumerate() {
+            std::ptr::copy_nonoverlapping(item, dst.add(at), 1);
+            if let Some(word) = item.strong_word() {
+                if biased {
+                    crate::rc::plain_increment(word);
+                } else {
+                    crate::rc::increment_word(word);
+                }
+            }
+        }
+    }
+}
+
+/// Clones of `src`'s elements appended to `dst` (see
+/// [`clone_objects_into`]).
+#[inline]
+pub(crate) fn extend_cloned(dst: &mut Vec<Object>, src: &[Object]) {
+    dst.reserve(src.len());
+    // SAFETY: the reservation leaves room for `src.len()` more elements,
+    // all of them written before the length covers them.
+    unsafe {
+        clone_objects_into(src, dst.as_mut_ptr().add(dst.len()));
+        dst.set_len(dst.len() + src.len());
+    }
+}
+
+/// A vector of clones of `src`'s elements (see [`clone_objects_into`]).
+#[inline]
+pub(crate) fn cloned_vec(src: &[Object]) -> Vec<Object> {
+    let mut items = Vec::with_capacity(src.len());
+    extend_cloned(&mut items, src);
+    items
+}
+
+/// Whether two items of sequences being compared are equal: the same
+/// object, or equal values. (Two machine ints, the commonest pair, are
+/// settled in line, without the two calls.)
+#[inline(always)]
+fn items_equal(x: &Object, y: &Object) -> bool {
+    if let (Object::Int(a), Object::Int(b)) = (x, y) {
+        return a == b;
+    }
+    x.is_same(y) || x.eq_value(y)
+}
+
 impl Clone for Object {
     /// A new owner: the strong count (if any) bumped in place and the two
     /// words copied, with no per-variant dispatch.
@@ -12252,6 +13394,19 @@ impl Object {
             let r = rhs_native.as_ref().unwrap_or(other);
             return l.eq_value(r);
         }
+        // Two sets: on the sets themselves, with their stored hashes and
+        // any Python comparison deferred (see `setalg`); the arms below
+        // compare snapshots when that leaves it undecided.
+        if matches!(self, Object::Set(_) | Object::FrozenSet(_))
+            && matches!(other, Object::Set(_) | Object::FrozenSet(_))
+        {
+            let eq = crate::setalg::with_sets(self, other, |x, y| {
+                crate::setalg::pure(|| crate::setalg::equal(x, y))
+            });
+            if let Some(Some(eq)) = eq {
+                return eq;
+            }
+        }
         match (self, other) {
             (Object::None, Object::None) => true,
             (Object::Bool(a), Object::Bool(b)) => a == b,
@@ -12300,18 +13455,12 @@ impl Object {
             // Sequence comparison is element-wise `PyObject_RichCompareBool`,
             // which is identity-first — so `[nan] == [nan]` (same nan) is true.
             (Object::Tuple(a), Object::Tuple(b)) => {
-                a.len() == b.len()
-                    && a.iter()
-                        .zip(b.iter())
-                        .all(|(x, y)| x.is_same(y) || x.eq_value(y))
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| items_equal(x, y))
             }
             (Object::List(a), Object::List(b)) => {
                 let a = a.borrow();
                 let b = b.borrow();
-                a.len() == b.len()
-                    && a.iter()
-                        .zip(b.iter())
-                        .all(|(x, y)| x.is_same(y) || x.eq_value(y))
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| items_equal(x, y))
             }
             (Object::Dict(a), Object::Dict(b)) => {
                 let a = a.borrow();
@@ -12685,6 +13834,18 @@ impl Object {
             }
             Object::Bytes(haystack) => bytes_membership(haystack, item),
             Object::ByteArray(haystack) => {
+                // (A plain needle converts without running code: the
+                // bytes are searched where they are.)
+                if matches!(
+                    item,
+                    Object::Int(_)
+                        | Object::Bool(_)
+                        | Object::Long(_)
+                        | Object::Bytes(_)
+                        | Object::ByteArray(_)
+                ) {
+                    return bytes_membership(&haystack.borrow(), item);
+                }
                 // Hold a buffer export: converting `item` can reenter
                 // Python (a user `__index__`/`__buffer__`) that tries to
                 // resize this bytearray; the resize then raises
@@ -12772,6 +13933,7 @@ impl Object {
                 DictViewKind::Items => {
                     if let Object::Tuple(t) = item {
                         if t.len() == 2 {
+                            crate::builtins::ensure_dict_key(&t[0])?;
                             if let Some(stored) = crate::builtins::dict_lookup(&v.dict, &t[0])? {
                                 return member_eq(&stored, &t[1]);
                             }
@@ -12918,7 +14080,9 @@ impl Object {
             }),
             Object::MemoryView(mv) => {
                 if mv.released.get() {
-                    return Err(value_error("memoryview: released"));
+                    return Err(value_error(
+                        "operation forbidden on released memoryview object",
+                    ));
                 }
                 // CPython's `memoryiter` yields *format-unpacked elements*
                 // (an `int64` exporter iterates as Python ints, `'d'` as
@@ -12931,6 +14095,37 @@ impl Object {
                     return Err(crate::error::not_implemented_error(
                         "multi-dimensional sub-views are not implemented",
                     ));
+                }
+                // A plain byte view of a `bytes` object: its bytes, which
+                // can't change, stepped as the `bytes` object's would be
+                // (no object made for each element first).
+                if let (Some((start, len)), MemoryViewBuffer::Bytes(all)) =
+                    (crate::mv_plain_bytes(mv), &mv.buffer)
+                {
+                    // (The whole object shares its storage; a window is
+                    // copied.)
+                    let data = if start == 0 && len == all.len() {
+                        Some(all.clone())
+                    } else {
+                        all.get(start..start + len).map(SharedSlice::from)
+                    };
+                    if let Some(data) = data {
+                        return Ok(PyIterator::Bytes { data, index: 0 });
+                    }
+                }
+                // A plain byte view over a whole `bytearray` (which can't
+                // be resized while the view exports it): the bytearray's
+                // live iterator, which sees a store made mid-loop, as
+                // CPython's `memoryiter` does.
+                if let (Some((0, len)), MemoryViewBuffer::ByteArray(data)) =
+                    (crate::mv_plain_bytes(mv), &mv.buffer)
+                {
+                    if data.try_borrow().is_ok_and(|d| d.len() == len) {
+                        return Ok(PyIterator::ByteArray {
+                            data: data.clone(),
+                            index: 0,
+                        });
+                    }
                 }
                 let items = crate::mv_element_objects(mv)?;
                 Ok(PyIterator::List {
@@ -13158,7 +14353,7 @@ impl Object {
             Object::Unbound => "<unbound>".to_owned(),
             Object::Bool(b) => if *b { "True" } else { "False" }.to_owned(),
             Object::Int(i) => i.to_string(),
-            Object::Long(b) => b.to_string(),
+            Object::Long(b) => bigint_decimal(b),
             Object::Complex(c) => complex_repr(c.real, c.imag),
             Object::Float(f) => float_repr(*f),
             Object::Str(s) => {
@@ -13197,7 +14392,8 @@ impl Object {
                         c => {
                             let n = c as u32;
                             if n <= 0xff {
-                                out.push_str(&format!("\\x{n:02x}"));
+                                out.push_str("\\x");
+                                push_hex_byte(&mut out, n as u8);
                             } else if n <= 0xffff {
                                 out.push_str(&format!("\\u{n:04x}"));
                             } else {
@@ -13235,7 +14431,8 @@ impl Object {
                         // non-printable scalars escape by code-point width.
                         _ => {
                             if n <= 0xff {
-                                out.push_str(&format!("\\x{n:02x}"));
+                                out.push_str("\\x");
+                                push_hex_byte(&mut out, n as u8);
                             } else if n <= 0xffff {
                                 out.push_str(&format!("\\u{n:04x}"));
                             } else {
@@ -13252,12 +14449,13 @@ impl Object {
                 if !repr_enter(id) {
                     return "(...)".to_owned();
                 }
-                let mut s = String::from("(");
+                let mut s = String::with_capacity(2 + 4 * items.len());
+                s.push('(');
                 for (i, x) in items.iter().enumerate() {
                     if i > 0 {
                         s.push_str(", ");
                     }
-                    s.push_str(&x.repr());
+                    push_item_repr(&mut s, x);
                 }
                 if items.len() == 1 {
                     s.push(',');
@@ -13277,7 +14475,8 @@ impl Object {
                 // (test_list.test_repr_mutate pops it), which CPython's
                 // index-based `list_repr` tolerates — holding the borrow
                 // across the call would instead panic the cell.
-                let mut s = String::from("[");
+                let mut s = String::with_capacity(2 + 4 * items.borrow().len());
+                s.push('[');
                 let mut i = 0usize;
                 loop {
                     let x = {
@@ -13290,7 +14489,7 @@ impl Object {
                     if i > 0 {
                         s.push_str(", ");
                     }
-                    s.push_str(&x.repr());
+                    push_item_repr(&mut s, &x);
                     i += 1;
                 }
                 s.push(']');
@@ -13311,14 +14510,15 @@ impl Object {
                         .map(|(k, v)| (k.0.clone(), v.clone()))
                         .collect()
                 };
-                let mut s = String::from("{");
+                let mut s = String::with_capacity(2 + 8 * pairs.len());
+                s.push('{');
                 for (i, (k, v)) in pairs.iter().enumerate() {
                     if i > 0 {
                         s.push_str(", ");
                     }
-                    s.push_str(&k.repr());
+                    push_item_repr(&mut s, k);
                     s.push_str(": ");
-                    s.push_str(&v.repr());
+                    push_item_repr(&mut s, v);
                 }
                 s.push('}');
                 repr_leave();
@@ -13517,6 +14717,23 @@ impl Object {
                 file.repr_with_addr(Rc::as_ptr(file) as usize)
             }
             Object::Instance(inst) => {
+                // A class whose `__repr__` is a Python function: called
+                // directly through the live interpreter (as below, with the
+                // same error handling).
+                if let Some(ptr) = crate::vm_singletons::current_interpreter_ptr() {
+                    // SAFETY: published by an enclosing VM frame still live on
+                    // this thread; the GIL keeps it exclusive.
+                    let interp = unsafe { &mut *ptr };
+                    if let Some(r) = interp.instance_python_repr(self) {
+                        return match r {
+                            Ok(r) => r.to_str(),
+                            Err(e) => {
+                                stash_repr_error(e);
+                                format!("<{} object>", inst.cls().name)
+                            }
+                        };
+                    }
+                }
                 // The `Ellipsis` / `NotImplemented` singletons render as
                 // fixed text — CPython's `ellipsis`/`NotImplementedType`
                 // `tp_repr`. We supply it here, keyed on the registry type
@@ -14465,6 +15682,10 @@ pub(crate) fn py_hash_long_i64(n: i64) -> i64 {
     // the high bits onto the low ones instead of dividing: `|n| < 2**64`
     // leaves at most one subtraction.
     const MOD: u64 = (1u64 << PY_HASH_BITS) - 1;
+    // (A non-negative int below the modulus is its own hash.)
+    if (n as u64) < MOD {
+        return n;
+    }
     let a = n.unsigned_abs();
     let mut r = (a & MOD) + (a >> PY_HASH_BITS);
     if r >= MOD {
@@ -14482,10 +15703,81 @@ pub(crate) fn py_hash_long_i64(n: i64) -> i64 {
 
 /// CPython `long_hash` for a big int. `BigInt %` is truncating, so it
 /// already carries the dividend's sign with magnitude `|n| mod P`.
+/// `str(n)` of a big integer: its magnitude's 32-bit limbs folded, most
+/// significant first, into base `10**9` digits, as CPython's
+/// `long_to_decimal_string` does (a division by the constant `10**9`
+/// compiles to a multiply, where num-bigint divides by `10**19` with the
+/// 128-by-64-bit hardware division: 7,500 cycles to 2,900 for a 634-bit
+/// value). The quadratic fold is kept to values of at most 8,192 bits;
+/// larger ones take num-bigint's conversion.
+pub(crate) fn bigint_decimal(b: &BigInt) -> String {
+    const BASE: u64 = 1_000_000_000;
+    let mag = b.magnitude();
+    if mag.bits() > 8192 {
+        return b.to_string();
+    }
+    let limbs: Vec<u32> = mag.iter_u32_digits().collect();
+    // (Each 32-bit limb adds at most 1.07 base-10**9 digits.)
+    let mut out: Vec<u32> = Vec::with_capacity(limbs.len() + limbs.len() / 8 + 2);
+    for &d in limbs.iter().rev() {
+        let mut carry = u64::from(d);
+        for o in &mut out {
+            let z = (u64::from(*o) << 32) + carry;
+            *o = (z % BASE) as u32;
+            carry = z / BASE;
+        }
+        while carry != 0 {
+            out.push((carry % BASE) as u32);
+            carry /= BASE;
+        }
+    }
+    let mut s = String::with_capacity(out.len() * 9 + 1);
+    if b.sign() == num_bigint::Sign::Minus {
+        s.push('-');
+    }
+    let Some((&top, rest)) = out.split_last() else {
+        s.push('0');
+        return s;
+    };
+    use std::fmt::Write as _;
+    let _ = write!(s, "{top}");
+    let mut buf = [b'0'; 9];
+    for &d in rest.iter().rev() {
+        let mut v = d;
+        for slot in buf.iter_mut().rev() {
+            *slot = b'0' + (v % 10) as u8;
+            v /= 10;
+        }
+        // SAFETY: ASCII digits.
+        s.push_str(unsafe { std::str::from_utf8_unchecked(&buf) });
+    }
+    s
+}
+
 pub(crate) fn py_hash_long_bigint(value: &BigInt) -> i64 {
-    let modulus = BigInt::from((1u64 << PY_HASH_BITS) - 1);
-    let rem = value % &modulus;
-    let mut x = rem.to_i64().unwrap_or(0);
+    // `|value| mod P` (P = 2**61 - 1) folded over the magnitude's 64-bit
+    // limbs, most significant first, with shifts and adds instead of a
+    // big division: 2**64 is 8 (mod P), and a word's residue is its low
+    // 61 bits plus its top 3. The sign then applies as CPython's
+    // `long_hash` applies it.
+    const P: u64 = (1u64 << PY_HASH_BITS) - 1;
+    #[inline(always)]
+    fn reduce(v: u64) -> u64 {
+        let r = (v & P) + (v >> PY_HASH_BITS);
+        if r >= P {
+            r - P
+        } else {
+            r
+        }
+    }
+    let mut x: u64 = 0;
+    for d in value.magnitude().iter_u64_digits().rev() {
+        x = reduce(reduce(x << 3) + reduce(d));
+    }
+    let mut x = x as i64;
+    if value.sign() == num_bigint::Sign::Minus {
+        x = -x;
+    }
     if x == -1 {
         x = -2;
     }
@@ -14777,7 +16069,7 @@ fn sip_memo(bytes: &[u8], compute: impl FnOnce(&[u8]) -> i64) -> i64 {
     h
 }
 
-fn py_hash_bytes_slice(bytes: &[u8]) -> i64 {
+pub(crate) fn py_hash_bytes_slice(bytes: &[u8]) -> i64 {
     if bytes.is_empty() {
         return 0;
     }
@@ -15167,18 +16459,21 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
             }
             // Ints and strings (the usual composite key): their hashes can
             // neither fail nor run code, so no error scope is needed.
-            if items
-                .iter()
-                .all(|x| matches!(x, Object::Int(_) | Object::Str(_)))
-            {
-                let mut hash = TupleHasher::new();
-                for item in items.iter() {
-                    hash.push(match item {
-                        Object::Int(i) => py_hash_long_i64(*i),
-                        Object::Str(s) => SharedStr::hash_cached(s),
-                        _ => unreachable!("matched above"),
-                    });
-                }
+            // (One pass: anything else ends it, and the general walk below
+            // starts over.)
+            let mut hash = TupleHasher::new();
+            let mut plain = true;
+            for item in items.iter() {
+                hash.push(match item {
+                    Object::Int(i) => py_hash_long_i64(*i),
+                    Object::Str(s) => SharedStr::hash_cached(s),
+                    _ => {
+                        plain = false;
+                        break;
+                    }
+                });
+            }
+            if plain {
                 let hash = hash.finish(items.len());
                 items.store_hash(hash);
                 return Some(hash);
@@ -15285,6 +16580,21 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
             {
                 return Some(identity_hash(obj));
             }
+            // A Python `__hash__` that evaluates as a pure leaf (an `Enum`
+            // member's, a frozen dataclass's): in place, ahead of the native
+            // kinds below, none of which has one. (Recorded as the dispatch
+            // below records its result.)
+            if inst.native.get().is_none() {
+                if let Some(h) = current_interp_pure_hash(obj) {
+                    inst.hash_cache.store(h);
+                    return Some(h);
+                }
+            }
+            // A compiled pattern hashes natively (see
+            // `stdlib::sre_objects::native_hash`).
+            if let Some(h) = crate::stdlib::sre_objects::native_hash(inst) {
+                return Some(h);
+            }
             // An exact `decimal.Decimal` hashes natively (see
             // `stdlib::decimal_native`).
             if crate::stdlib::decimal_native::is_decimal_instance(inst) {
@@ -15332,7 +16642,9 @@ pub(crate) fn py_hash_value(obj: &Object) -> Option<i64> {
                 // (`DictKey::eq` / `dict_reentrant_probe`), CPython reads the
                 // entry, never re-invoking `__hash__` — `test_dict`'s
                 // `test_setdefault_atomic` counts exactly one call per key.
-                let h = current_interp_hash(obj);
+                // (A `__hash__` that evaluates as a pure leaf, an `Enum`
+                // member's, in place: the same value with no call.)
+                let h = current_interp_pure_hash(obj).or_else(|| current_interp_hash(obj));
                 if let Some(hv) = h {
                     inst.hash_cache.store(hv);
                 }
@@ -15637,7 +16949,10 @@ fn bytes_repr_inner(b: &[u8], smartquotes: bool) -> String {
             b'\r' => out.push_str("\\r"),
             b'\t' => out.push_str("\\t"),
             0x20..=0x7E => out.push(c as char),
-            _ => out.push_str(&format!("\\x{c:02x}")),
+            _ => {
+                out.push_str("\\x");
+                push_hex_byte(&mut out, c);
+            }
         }
     }
     out.push(quote as char);
@@ -15805,8 +17120,59 @@ impl Object {
         Object::Str(rc)
     }
 
+    /// A `str` of a literal's text, shared per thread through a small
+    /// direct-mapped cache keyed by the literal's address and length: code
+    /// that builds keys from literals over and over (`os.stat`'s fields,
+    /// attribute names) gets the same hash-caching string back instead of
+    /// allocating and rehashing it. A collision just replaces the entry.
     pub fn from_static(s: &'static str) -> Self {
-        Object::Str(SharedStr::from(s))
+        const SLOTS: usize = 1024;
+        type Slot = Option<((usize, usize), SharedStr)>;
+        /// A thread's table, which an exiting thread leaves to the next
+        /// (a literal's address and text are the process's, so an entry
+        /// holds on any thread) instead of building and dropping its own.
+        struct Statics(Option<Box<[Slot]>>);
+        static POOL: std::sync::Mutex<Vec<Box<[Slot]>>> = std::sync::Mutex::new(Vec::new());
+        impl Drop for Statics {
+            fn drop(&mut self) {
+                if let (Some(t), Ok(mut pool)) = (self.0.take(), POOL.lock()) {
+                    if pool.len() < 4 {
+                        pool.push(t);
+                    }
+                }
+            }
+        }
+        thread_local! {
+            // (Released under the GIL at its thread's exit: a table the
+            // pool has no room for drops its strings.)
+            static STATICS: crate::gil::ReleaseUnderGil<std::cell::RefCell<Statics>> =
+                const { crate::gil::ReleaseUnderGil::new(std::cell::RefCell::new(Statics(None))) };
+        }
+        if s.len() <= 2 {
+            return Object::Str(SharedStr::from(s));
+        }
+        let key = (s.as_ptr() as usize, s.len());
+        let ix = ((key.0 >> 3) ^ (key.0 >> 13) ^ key.1) & (SLOTS - 1);
+        let hit = STATICS.try_with(|t| {
+            let Ok(mut t) = t.try_borrow_mut() else {
+                return SharedStr::from(s);
+            };
+            let table = t.0.get_or_insert_with(|| {
+                POOL.lock()
+                    .ok()
+                    .and_then(|mut p| p.pop())
+                    .unwrap_or_else(|| (0..SLOTS).map(|_| None).collect())
+            });
+            match &table[ix] {
+                Some((k, v)) if *k == key => v.clone(),
+                _ => {
+                    let v = SharedStr::from(s);
+                    table[ix] = Some((key, v.clone()));
+                    v
+                }
+            }
+        });
+        Object::Str(hit.unwrap_or_else(|_| SharedStr::from(s)))
     }
 
     pub fn new_list(items: Vec<Object>) -> Self {
@@ -15819,9 +17185,12 @@ impl Object {
             // `functools.update_wrapper` asserts identity on copied
             // `__type_params__` and similar empty-tuple attributes.
             thread_local! {
-                static EMPTY_TUPLE: crate::object::SharedTuple = TupleStorage::from_array([]);
+                // (Released under the GIL at its thread's exit, as any
+                // other reference to it is.)
+                static EMPTY_TUPLE: crate::gil::ReleaseUnderGil<crate::object::SharedTuple> =
+                    crate::gil::ReleaseUnderGil::new(TupleStorage::from_array([]));
             }
-            return Object::Tuple(EMPTY_TUPLE.with(Clone::clone));
+            return Object::Tuple(EMPTY_TUPLE.with(|t| crate::object::SharedTuple::clone(t)));
         }
         Object::Tuple(TupleStorage::from_vec(items))
     }
@@ -15833,6 +17202,25 @@ impl Object {
             return Self::new_tuple(Vec::new());
         }
         Object::Tuple(TupleStorage::from_exact_iter(items))
+    }
+
+    /// A tuple of clones of the objects `items` yields (a gather from a
+    /// pool by index), each copied into its storage whole (the empty
+    /// tuple is the interned one). `items` yields exactly its length.
+    pub fn tuple_from_refs<'a>(items: impl ExactSizeIterator<Item = &'a Object>) -> Self {
+        if items.len() == 0 {
+            return Self::new_tuple(Vec::new());
+        }
+        Object::Tuple(TupleStorage::from_cloned_refs(items))
+    }
+
+    /// A tuple of clones of `items`, copied into its storage in one pass
+    /// (the empty tuple is the interned one).
+    pub fn tuple_from_slice(items: &[Object]) -> Self {
+        if items.is_empty() {
+            return Self::new_tuple(Vec::new());
+        }
+        Object::Tuple(TupleStorage::from_cloned_slice(items))
     }
 
     /// Build a fixed-size tuple directly in reference-counted storage,
@@ -15891,15 +17279,41 @@ impl Object {
         Object::FrozenSet(Rc::new(FrozenSetObj::new(s)))
     }
 
-    pub fn new_bytes(data: impl Into<Vec<u8>>) -> Self {
-        let v = data.into();
+    /// A `bytes` of `data`, copied once into its own allocation (a slice
+    /// isn't gathered into a vector first).
+    pub fn new_bytes(data: impl AsRef<[u8]>) -> Self {
+        let v = data.as_ref();
         if v.is_empty() {
             // CPython caches the empty bytes object (`b"" is b""` across
             // compiles — test_ast ConstantTests.test_singletons).
             static EMPTY: std::sync::OnceLock<SharedSlice<u8>> = std::sync::OnceLock::new();
             return Object::Bytes(EMPTY.get_or_init(|| SharedSlice::from(&[][..])).clone());
         }
-        Object::Bytes(SharedSlice::from(v.as_slice()))
+        if let [b] = v {
+            // And each one-byte object (CPython's `characters` table:
+            // `bytes([97]) is b"a"`), made once.
+            static ONE: std::sync::OnceLock<Vec<SharedSlice<u8>>> = std::sync::OnceLock::new();
+            let table =
+                ONE.get_or_init(|| (0..=255u8).map(|b| SharedSlice::from(&[b][..])).collect());
+            return Object::Bytes(table[usize::from(*b)].clone());
+        }
+        Object::Bytes(SharedSlice::from(v))
+    }
+
+    /// The `bytes` of `head` followed by `tail`, each copied once into the
+    /// result's allocation.
+    pub fn bytes_concat(head: &[u8], tail: &[u8]) -> Self {
+        let len = head.len() + tail.len();
+        if len == 0 {
+            return Self::new_bytes([]);
+        }
+        // SAFETY: the two copies initialize all `len` bytes.
+        Object::Bytes(unsafe {
+            SharedSlice::build_uninit(len, |dst| {
+                std::ptr::copy_nonoverlapping(head.as_ptr(), dst, head.len());
+                std::ptr::copy_nonoverlapping(tail.as_ptr(), dst.add(head.len()), tail.len());
+            })
+        })
     }
 
     pub fn new_bytearray(data: impl Into<Vec<u8>>) -> Self {
@@ -16007,6 +17421,54 @@ impl Object {
         }
     }
 
+    /// `f` on this value's bytes where they are (a `bytes`, a `bytearray`,
+    /// a contiguous `memoryview`; any other view's are gathered first), or
+    /// `None` for any other type. The buffer is borrowed while `f` runs:
+    /// it must not run Python code or touch the buffer's owner. (A caller
+    /// that needs a few bytes of a large buffer shouldn't pay for a copy of
+    /// all of it, which is what [`Self::as_bytes_view`] makes.)
+    /// For a `memoryview`, CPython's errors for a buffer taken as one
+    /// contiguous run (`PyBUF_SIMPLE`, as `zlib` and `hashlib` take one):
+    /// a released view's `ValueError`, a strided view's `BufferError`.
+    /// `Ok` for anything else.
+    pub fn check_simple_buffer(&self) -> Result<(), crate::RuntimeError> {
+        if let Object::MemoryView(mv) = self {
+            if mv.released.get() {
+                return Err(crate::error::value_error(
+                    "operation forbidden on released memoryview object",
+                ));
+            }
+            if !mv.is_c_contiguous() {
+                return Err(crate::error::buffer_error(
+                    "memoryview: underlying buffer is not C-contiguous",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn with_bytes_view<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
+        match self {
+            Object::Bytes(b) => Some(f(b)),
+            Object::ByteArray(b) => Some(f(&b.borrow())),
+            Object::MemoryView(mv) => Some(mv.with_bytes(f)),
+            _ => None,
+        }
+    }
+
+    /// This value's bytes for a caller that only reads them: a `bytes`
+    /// object's own, borrowed; a copy of a `bytearray`'s or a
+    /// `memoryview`'s (which can change, or be borrowed, while the caller
+    /// works). `None` for any other type.
+    pub fn bytes_cow(&self) -> Option<std::borrow::Cow<'_, [u8]>> {
+        match self {
+            Object::Bytes(b) => Some(std::borrow::Cow::Borrowed(&b[..])),
+            Object::ByteArray(b) => Some(std::borrow::Cow::Owned(b.borrow().clone())),
+            Object::MemoryView(mv) => Some(std::borrow::Cow::Owned(mv.to_bytes())),
+            _ => None,
+        }
+    }
+
     /// Try to view this value as bytes (works for `bytes`, `bytearray`,
     /// and contiguous `memoryview`). Returns `None` for any other type.
     pub fn as_bytes_view(&self) -> Option<Vec<u8>> {
@@ -16022,6 +17484,44 @@ impl Object {
 // Every payload is one word or smaller, so a value is a tag and a word.
 const _: () = assert!(std::mem::size_of::<Object>() == 16);
 const _: () = assert!(std::mem::size_of::<Option<Object>>() == 16);
+
+/// A container item's repr appended to `out`: an `int`, `bool` or `None`
+/// written in place, anything else through its own [`Object::repr`].
+fn push_item_repr(out: &mut String, x: &Object) {
+    match x {
+        Object::Int(i) => {
+            let mut buf = [0u8; 20];
+            let mut at = buf.len();
+            let mut n = i.unsigned_abs();
+            loop {
+                at -= 1;
+                buf[at] = b'0' + (n % 10) as u8;
+                n /= 10;
+                if n == 0 {
+                    break;
+                }
+            }
+            if *i < 0 {
+                out.push('-');
+            }
+            // SAFETY: the digits are ASCII.
+            out.push_str(unsafe { std::str::from_utf8_unchecked(&buf[at..]) });
+        }
+        Object::Bool(b) => out.push_str(if *b { "True" } else { "False" }),
+        Object::None => out.push_str("None"),
+        // Printable ASCII with no quote or backslash: single-quoted as is.
+        Object::Str(t)
+            if t.as_bytes()
+                .iter()
+                .all(|&c| (0x20..0x7f).contains(&c) && c != b'\'' && c != b'\\') =>
+        {
+            out.push('\'');
+            out.push_str(t);
+            out.push('\'');
+        }
+        _ => out.push_str(&x.repr()),
+    }
+}
 
 #[cfg(test)]
 mod tests {

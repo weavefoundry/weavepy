@@ -848,7 +848,7 @@ fn run_row(
                 trim_reason(&format!("venv creation failed: {}", o.tail())),
             )
         }
-        Err(TimedOut) => {
+        Err(TimedOut(_)) => {
             return RowOutcome::fail(
                 FailStage::Timeout,
                 "venv creation exceeded the wall budget".to_owned(),
@@ -884,7 +884,7 @@ fn run_row(
                     trim_reason(&format!("pip install failed: {}", o.tail())),
                 )
             }
-            Err(TimedOut) => {
+            Err(TimedOut(_)) => {
                 return RowOutcome::fail(
                     FailStage::Timeout,
                     "pip install exceeded the wall budget".to_owned(),
@@ -913,10 +913,10 @@ fn run_row(
                 trim_reason(&format!("probe failed: {}", o.tail())),
             )
         }
-        Err(TimedOut) => {
+        Err(TimedOut(tail)) => {
             return RowOutcome::fail(
                 FailStage::Timeout,
-                "probe exceeded the wall budget".to_owned(),
+                format!("probe exceeded the wall budget: {tail}"),
             )
         }
     }
@@ -1014,7 +1014,7 @@ fn install_from_sdist(
             FailStage::Install,
             trim_reason(&format!("sdist install failed: {}", o.tail())),
         )),
-        Err(TimedOut) => Err(RowOutcome::fail(
+        Err(TimedOut(_)) => Err(RowOutcome::fail(
             FailStage::Timeout,
             "sdist install exceeded the wall budget".to_owned(),
         )),
@@ -1116,7 +1116,7 @@ fn run_selftest_stage(
         match run_with_deadline(&mut cmd, deadline) {
             Ok(o) if o.success => {}
             Ok(o) => return fail(format!("selftest deps install failed: {}", o.tail())),
-            Err(TimedOut) => {
+            Err(TimedOut(_)) => {
                 return fail("selftest deps install exceeded the selftest budget".to_owned())
             }
         }
@@ -1148,7 +1148,9 @@ fn run_selftest_stage(
     match run_with_deadline(&mut cmd, deadline) {
         Ok(o) if o.success => (RowStatus::Pass, None),
         Ok(o) => fail(format!("selftest failed: {}", o.tail_n(50))),
-        Err(TimedOut) => fail(format!("selftest exceeded the {budget}s selftest budget")),
+        Err(TimedOut(tail)) => fail(format!(
+            "selftest exceeded the {budget}s selftest budget: {tail}"
+        )),
     }
 }
 
@@ -1179,7 +1181,7 @@ fn fetch_and_extract_sdist(
     match out {
         Ok(o) if o.success => {}
         Ok(o) => return Err(format!("sdist extract failed: {}", o.tail())),
-        Err(TimedOut) => return Err("sdist extract exceeded the selftest budget".to_owned()),
+        Err(TimedOut(_)) => return Err("sdist extract exceeded the selftest budget".to_owned()),
     }
     single_subdir(&extract_dir).ok_or_else(|| {
         format!(
@@ -1215,7 +1217,7 @@ fn venv_purelib(python: &Path, deadline: Instant) -> std::result::Result<PathBuf
             Ok(PathBuf::from(p))
         }
         Ok(o) => Err(format!("sysconfig probe failed: {}", o.tail())),
-        Err(TimedOut) => Err("sysconfig probe exceeded the selftest budget".to_owned()),
+        Err(TimedOut(_)) => Err("sysconfig probe exceeded the selftest budget".to_owned()),
     }
 }
 
@@ -1311,7 +1313,7 @@ fn obtain_sdist(
             Ok(path)
         }
         Ok(o) => Err(format!("sdist download failed: {}", o.tail())),
-        Err(TimedOut) => Err("sdist download exceeded the wall budget".to_owned()),
+        Err(TimedOut(_)) => Err("sdist download exceeded the wall budget".to_owned()),
     }
 }
 
@@ -1357,7 +1359,10 @@ fn venv_python(venv_dir: &Path) -> PathBuf {
     }
 }
 
-struct TimedOut;
+/// A child killed at its deadline, with the tail of what it wrote (on
+/// Unix, after a `SIGABRT` so a child with `faulthandler` enabled dumps
+/// every thread's stack first).
+struct TimedOut(String);
 
 struct CmdOutput {
     success: bool,
@@ -1376,7 +1381,31 @@ impl CmdOutput {
     fn tail_n(&self, n: usize) -> String {
         let lines: Vec<&str> = self.combined.lines().collect();
         let start = lines.len().saturating_sub(n);
-        let tail = lines[start..].join("\n");
+        let mut tail = lines[start..].join("\n");
+        // A Rust panic's own line (and its message, on the next line when
+        // the location ends it) names the cause; the backtrace and the
+        // abort after it can push it out of the tail. The first panic is
+        // the cause: a later one is the abort of a panic that reached a
+        // function that can't unwind ("panic in a function that cannot
+        // unwind"), kept too.
+        let panics: Vec<usize> = lines[..start]
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains(" panicked at "))
+            .map(|(i, _)| i)
+            .collect();
+        if let (Some(&first), Some(&last)) = (panics.first(), panics.last()) {
+            let mut kept = lines[first..(first + 3).min(start)]
+                .iter()
+                .take_while(|l| !l.trim_start().starts_with("stack backtrace:"))
+                .copied()
+                .collect::<Vec<_>>();
+            if last != first {
+                kept.push("[…]");
+                kept.extend(&lines[last..(last + 2).min(start)]);
+            }
+            tail = format!("{}\n[…]\n{tail}", kept.join("\n"));
+        }
         if tail.trim().is_empty() {
             // A silent nonzero exit (e.g. a crash) would otherwise
             // produce an empty, undebuggable reason.
@@ -1449,12 +1478,25 @@ fn run_with_deadline(cmd: &mut Command, deadline: Instant) -> Result<CmdOutput, 
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
+                    abort_for_traceback(&mut child);
                     let _ = child.kill();
                     let _ = child.wait();
-                    // Reap the drain threads so they don't leak.
-                    let _ = join(out_thread);
-                    let _ = join(err_thread);
-                    return Err(TimedOut);
+                    // A grandchild (a worker process) may still hold the
+                    // pipes open: wait a few seconds for the drains, then
+                    // leave them.
+                    let out = join_within(out_thread, Duration::from_secs(5));
+                    let err = join_within(err_thread, Duration::from_secs(5));
+                    let o = CmdOutput {
+                        success: false,
+                        code: None,
+                        combined: format!("{out}\n{err}"),
+                    };
+                    let tail = o.tail_n(60);
+                    let mut cut = tail.len().saturating_sub(1900);
+                    while !tail.is_char_boundary(cut) {
+                        cut += 1;
+                    }
+                    return Err(TimedOut(tail[cut..].to_owned()));
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -1471,6 +1513,37 @@ fn run_with_deadline(cmd: &mut Command, deadline: Instant) -> Result<CmdOutput, 
             }
         }
     }
+}
+
+/// Send `SIGABRT` and give the child a moment to write its stacks (a
+/// Python child with `faulthandler` enabled dumps every thread's).
+fn abort_for_traceback(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // SAFETY: plain kill(2) on the child's pid.
+        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGABRT) };
+        let until = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < until {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = child;
+}
+
+/// Join a drain thread, or give up on it after `wait`.
+fn join_within(t: std::thread::JoinHandle<String>, wait: Duration) -> String {
+    let until = Instant::now() + wait;
+    while !t.is_finished() {
+        if Instant::now() >= until {
+            return "(output pipe still held open)".to_owned();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    t.join().unwrap_or_default()
 }
 
 fn trim_reason(s: &str) -> String {
@@ -1913,6 +1986,58 @@ mod simple_tables {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tail_keeps_a_panic_line_above_it() {
+        let mut out = String::from("start\nthread '<unnamed>' panicked at src/x.rs:1:2:\nboom\n");
+        for k in 0..30 {
+            out.push_str(&format!("  {k}: frame\n"));
+        }
+        out.push_str("Fatal Python error: Aborted\n");
+        let o = CmdOutput {
+            success: false,
+            code: None,
+            combined: out,
+        };
+        let t = o.tail();
+        assert!(
+            t.starts_with("thread '<unnamed>' panicked at src/x.rs:1:2:\nboom\n  0: frame\n[…]\n")
+        );
+        assert!(t.ends_with("Fatal Python error: Aborted"));
+        // A panic that reached a non-unwinding function: the first panic
+        // (the cause) and the abort's.
+        let mut out = String::from(
+            "thread '<unnamed>' panicked at src/gil.rs:5:9:\nalready borrowed\nstack backtrace:\n",
+        );
+        for k in 0..20 {
+            out.push_str(&format!("  {k}: frame\n"));
+        }
+        out.push_str("thread '<unnamed>' panicked at library/core/src/panicking.rs:225:5:\npanic in a function that cannot unwind\n");
+        for k in 0..20 {
+            out.push_str(&format!("  {k}: frame\n"));
+        }
+        out.push_str("thread caused non-unwinding panic. aborting.\n");
+        let o = CmdOutput {
+            success: false,
+            code: None,
+            combined: out,
+        };
+        let t = o.tail();
+        assert!(
+            t.starts_with(
+                "thread '<unnamed>' panicked at src/gil.rs:5:9:\nalready borrowed\n[…]\n\
+                 thread '<unnamed>' panicked at library/core/src/panicking.rs:225:5:\n\
+                 panic in a function that cannot unwind\n[…]\n"
+            ),
+            "{t}"
+        );
+        let quiet = CmdOutput {
+            success: false,
+            code: Some(1),
+            combined: "a\nb\n".to_owned(),
+        };
+        assert_eq!(quiet.tail(), "a\nb");
+    }
 
     // -- manifest parsing ---------------------------------------------------
 

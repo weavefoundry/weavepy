@@ -43,12 +43,11 @@ thread_local! {
     /// Pending `__del__` finalizer invocations queued by the cycle
     /// GC. Drained at the next eval-loop tick by the interpreter.
     /// See [`crate::gc_trace::run_finalizer`] for the producer side.
-    pub(crate) static PENDING_FINALIZERS: RefCell<Vec<Object>> = const { RefCell::new(Vec::new()) };
+    pub(crate) static PENDING_FINALIZERS: crate::gil::ReleaseUnderGil<RefCell<Vec<Object>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(Vec::new())) };
     /// Pending weakref-callback invocations `(callback, weakref_obj)`
     /// queued when a referent dies (cycle GC, refcount reap, registry
     /// sweep). Drained alongside the finalizer queue.
-    pub(crate) static PENDING_WEAKREF_CALLBACKS: RefCell<Vec<(Object, Object)>> =
-        const { RefCell::new(Vec::new()) };
+    pub(crate) static PENDING_WEAKREF_CALLBACKS: crate::gil::ReleaseUnderGil<RefCell<Vec<(Object, Object)>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(Vec::new())) };
 }
 
 /// Process-wide count of parked `__del__` requests and weakref callbacks
@@ -550,6 +549,16 @@ pub fn clear_thread_python_tls() {
     }
     crate::builtin_types::clear_thread_type_registry();
     crate::stdlib::local_native::forget_thread();
+    // The thread's entry in the traceback dumper's registry (its frame
+    // and exception stacks) and its interned names: objects, released
+    // here, where the caller still holds the GIL, not by the thread's
+    // destructors after it has given the GIL back.
+    let _ = FAULTHANDLER_REG.try_with(|slot| {
+        if let Ok(mut slot) = slot.try_borrow_mut() {
+            slot.take();
+        }
+    });
+    crate::stdlib::sys::forget_thread_interns();
 }
 
 /// Look up the worker thread id for the currently-running OS thread,
@@ -682,7 +691,44 @@ pub fn activate_thread_handles(handles: ThreadHandles) -> ThreadHandlesGuard {
         }
     });
     CURRENT_THREAD_HANDLES.with(|cell| cell.borrow_mut().push(handles));
-    ThreadHandlesGuard { _private: () }
+    ThreadHandlesGuard { pushed: true }
+}
+
+/// Whether the handles on top of this thread's stack are exactly these
+/// (every one the same shared cell): activating them again would push a
+/// copy of the top, so [`ThreadHandlesGuard::unpushed`] stands in.
+pub(crate) fn thread_handles_top_is(
+    frame_stack: &crate::object::FrameStack,
+    exc_info_stack: &Rc<RefCell<Vec<Object>>>,
+    excepthook: &Rc<RefCell<Object>>,
+    unraisable_hook: &Rc<RefCell<Object>>,
+) -> bool {
+    CURRENT_THREAD_HANDLES
+        .try_with(|cell| {
+            cell.try_borrow().is_ok_and(|v| {
+                v.last().is_some_and(|h| {
+                    Rc::ptr_eq(&h.frame_stack, frame_stack)
+                        && Rc::ptr_eq(&h.exc_info_stack, exc_info_stack)
+                        && Rc::ptr_eq(&h.excepthook, excepthook)
+                        && Rc::ptr_eq(&h.unraisable_hook, unraisable_hook)
+                })
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Whether the handles on top of this thread's stack are the ones whose
+/// frame stack is `frame_stack`: its interpreter activated them already
+/// (an embedder entry's re-activation would only push the same again).
+pub(crate) fn thread_handles_are(frame_stack: &crate::object::FrameStack) -> bool {
+    CURRENT_THREAD_HANDLES
+        .try_with(|cell| {
+            cell.try_borrow()
+                .ok()
+                .and_then(|v| v.last().map(|h| Rc::ptr_eq(&h.frame_stack, frame_stack)))
+                .unwrap_or(false)
+        })
+        .unwrap_or(false)
 }
 
 /// Read-only view of the current thread's handles. Returns `None`
@@ -715,11 +761,23 @@ pub fn swap_thread_handles_stack(new: Vec<ThreadHandles>) -> Vec<ThreadHandles> 
 /// most-recently-pushed handles on drop.
 #[derive(Debug)]
 pub struct ThreadHandlesGuard {
-    _private: (),
+    /// Whether this guard pushed (see [`thread_handles_top_is`]).
+    pushed: bool,
+}
+
+impl ThreadHandlesGuard {
+    /// A guard for handles already on top: it pushed nothing, so it pops
+    /// nothing.
+    pub(crate) fn unpushed() -> Self {
+        Self { pushed: false }
+    }
 }
 
 impl Drop for ThreadHandlesGuard {
     fn drop(&mut self) {
+        if !self.pushed {
+            return;
+        }
         CURRENT_THREAD_HANDLES.with(|cell| {
             let _ = cell.borrow_mut().pop();
         });
@@ -737,8 +795,24 @@ thread_local! {
     /// Stored as a raw pointer because the VM owns the storage —
     /// the guard pops on drop so the pointer never outlives the
     /// owning `&mut Interpreter` borrow.
-    static CURRENT_INTERPRETER_PTR: RefCell<Vec<*mut crate::Interpreter>> =
-        const { RefCell::new(Vec::new()) };
+    static CURRENT_INTERPRETER_PTR: RefCell<InterpStack> =
+        const { RefCell::new(InterpStack(Vec::new())) };
+    /// The top of [`CURRENT_INTERPRETER_PTR`] (null when it is empty), so a
+    /// lookup is one thread-local load: a constant-initialized cell with no
+    /// destructor, readable through thread teardown.
+    static CURRENT_INTERPRETER_TOP: std::cell::Cell<*mut crate::Interpreter> =
+        const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// The published interpreters (see [`CURRENT_INTERPRETER_PTR`]); its
+/// destruction with the thread clears the top's mirror, so a lookup past
+/// it finds none.
+struct InterpStack(Vec<*mut crate::Interpreter>);
+
+impl Drop for InterpStack {
+    fn drop(&mut self) {
+        let _ = CURRENT_INTERPRETER_TOP.try_with(|t| t.set(std::ptr::null_mut()));
+    }
 }
 
 /// RAII guard that pushes `interp` onto [`CURRENT_INTERPRETER_PTR`]
@@ -746,16 +820,27 @@ thread_local! {
 /// might run user code which re-enters the C-API.
 #[derive(Debug)]
 pub struct InterpreterGuard {
-    _private: (),
+    /// Whether this guard pushed: publishing the interpreter already on
+    /// top pushes nothing (lookups read the top, which stays the same), so
+    /// its guard pops nothing either.
+    pushed: bool,
 }
 
 impl Drop for InterpreterGuard {
     fn drop(&mut self) {
+        if !self.pushed {
+            return;
+        }
         // `try_with`: guards can unwind during thread teardown after the
         // TLS slot is gone; the stack died with it, so popping is moot.
-        let _ = CURRENT_INTERPRETER_PTR.try_with(|cell| {
-            let _ = cell.borrow_mut().pop();
-        });
+        let top = CURRENT_INTERPRETER_PTR
+            .try_with(|cell| {
+                let mut stack = cell.borrow_mut();
+                let _ = stack.0.pop();
+                stack.0.last().copied().unwrap_or(std::ptr::null_mut())
+            })
+            .unwrap_or(std::ptr::null_mut());
+        let _ = CURRENT_INTERPRETER_TOP.try_with(|t| t.set(top));
     }
 }
 
@@ -953,7 +1038,7 @@ thread_local! {
     /// here instead; the eval loop reaps it at the next
     /// between-bytecodes safe point — before any subsequent Python-level
     /// weakref read can observe the stale referent.
-    static PENDING_CEXT_DROPS: RefCell<Vec<Object>> = const { RefCell::new(Vec::new()) };
+    static PENDING_CEXT_DROPS: crate::gil::ReleaseUnderGil<RefCell<Vec<Object>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(Vec::new())) };
     /// Cheap "is this thread's C-drop queue non-empty?" probe for the
     /// eval-loop safe point. Thread-local (unlike `PENDING_RW_FLAG`)
     /// because the queues are: a global flag cleared by whichever thread
@@ -1422,8 +1507,14 @@ pub fn warn_default_encoding() -> bool {
 /// the returned guard. Re-entrant calls produce a stack so the
 /// most recent guard wins on `current_interpreter_ptr` lookups.
 pub fn publish_interpreter_ptr(interp: *mut crate::Interpreter) -> InterpreterGuard {
-    CURRENT_INTERPRETER_PTR.with(|cell| cell.borrow_mut().push(interp));
-    InterpreterGuard { _private: () }
+    // (Re-entering the interpreter already on top, the common nested
+    // call, leaves the stack as it is.)
+    if !interp.is_null() && CURRENT_INTERPRETER_TOP.with(std::cell::Cell::get) == interp {
+        return InterpreterGuard { pushed: false };
+    }
+    CURRENT_INTERPRETER_PTR.with(|cell| cell.borrow_mut().0.push(interp));
+    CURRENT_INTERPRETER_TOP.with(|t| t.set(interp));
+    InterpreterGuard { pushed: true }
 }
 
 /// Read the most recently published interpreter pointer, or
@@ -1434,10 +1525,12 @@ pub fn publish_interpreter_ptr(interp: *mut crate::Interpreter) -> InterpreterGu
 /// shm-manager child) probe `Py_IsInitialized` after this thread's
 /// TLS has been destroyed — report "no interpreter" rather than
 /// aborting the process (RFC 0076 WS5).
+#[inline]
 pub fn current_interpreter_ptr() -> Option<*mut crate::Interpreter> {
-    CURRENT_INTERPRETER_PTR
-        .try_with(|cell| cell.borrow().last().copied())
-        .unwrap_or(None)
+    let top = CURRENT_INTERPRETER_TOP
+        .try_with(std::cell::Cell::get)
+        .unwrap_or(std::ptr::null_mut());
+    (!top.is_null()).then_some(top)
 }
 
 /// `quit` and `exit` — interactive sentinels that raise `SystemExit`.

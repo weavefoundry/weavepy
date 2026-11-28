@@ -56,6 +56,27 @@ pub(super) enum MethodOp<'a> {
     /// A `COMPARE_OP`'s first method, the instruction's oparg: the
     /// operands wait under the call on the caller's stack.
     Compare(u32),
+    /// A `GET_ITER`'s `__iter__`: its result must be an iterator.
+    Iter,
+    /// A `STORE_ATTR`'s setter or a `STORE_SUBSCR`'s `__setitem__`: its
+    /// result is dropped.
+    Store,
+    /// A `TO_BOOL`'s `__bool__` (`true`: its `__len__`): its result becomes
+    /// the truth.
+    Truth(bool),
+    /// A `CONTAINS_OP`'s `__contains__` (`true`: `not in`).
+    Contains(bool),
+    /// `len(obj)`'s `__len__`: its result becomes the length.
+    Len,
+    /// An augmented assignment's in-place method, on these operands: its
+    /// `NotImplemented` goes on to the regular operator.
+    Inplace(weavepy_compiler::BinOpKind, &'a Object, &'a Object),
+    /// A `FORMAT_VALUE`'s `__format__`: its result must be a string.
+    Format,
+    /// `str(obj)`'s `__str__`: its result must be a string.
+    Str,
+    /// `repr(obj)`'s `__repr__`: its result must be a string.
+    Repr,
 }
 
 impl MethodOp<'_> {
@@ -66,6 +87,15 @@ impl MethodOp<'_> {
                 crate::MethodOp::Binary(op, inplace, l.clone(), r.clone())
             }
             MethodOp::Compare(arg) => crate::MethodOp::Compare(arg),
+            MethodOp::Iter => crate::MethodOp::Iter,
+            MethodOp::Store => crate::MethodOp::Store,
+            MethodOp::Truth(from_len) => crate::MethodOp::Truth(from_len),
+            MethodOp::Contains(invert) => crate::MethodOp::Contains(invert),
+            MethodOp::Len => crate::MethodOp::Len,
+            MethodOp::Inplace(op, a, b) => crate::MethodOp::Inplace(op, a.clone(), b.clone()),
+            MethodOp::Format => crate::MethodOp::Format,
+            MethodOp::Str => crate::MethodOp::Str,
+            MethodOp::Repr => crate::MethodOp::Repr,
         }
     }
 }
@@ -640,7 +670,7 @@ unsafe extern "C" fn enter_more(
         let missing = params - n;
         let defaults = &(*fp).defaults;
         if missing != 0
-            && (crate::sync::release_gates() != 0
+            && (crate::sync::release_gates() & crate::sync::RELEASE_OBSERVER_GATES != 0
                 || defaults.len() < missing
                 || (*fp).defaults_maybe_overridden())
         {
@@ -661,15 +691,21 @@ unsafe extern "C" fn enter_more(
         move_args(slot.add(2 - usize::from(has_self)), dst, n);
         if missing != 0 {
             let defaults = defaults.as_ptr().add(defaults.len() - missing);
+            let shared = crate::sync::release_gates() != 0;
             for k in 0..missing {
                 let d = defaults.add(k);
-                // While the gates are off this thread alone updates counts.
+                // While the gates are off this thread alone updates counts;
+                // with counts shared, a locked update.
                 if let Some(word) = (*d).strong_word() {
                     let w = &*word;
-                    w.store(
-                        w.load(std::sync::atomic::Ordering::Relaxed) + 1,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
+                    if shared {
+                        w.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        w.store(
+                            w.load(std::sync::atomic::Ordering::Relaxed) + 1,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
                 }
                 let (a, b) = (d.cast::<u64>(), dst.add(n + k).cast::<u64>());
                 let (x, y) = (a.read(), a.add(1).read());
@@ -823,6 +859,61 @@ pub(super) unsafe fn ctor_direct(st: &mut State, call: CallAt, len: usize) -> Op
     }
 }
 
+/// [`crate::specialize::kw_perm`] for a constructor's `__init__`, through
+/// a per-thread memo by function, code, names tuple and argument count:
+/// the site has no cache of its own, and the permutation compares every
+/// keyword's name (about 330 instructions for three). A function whose
+/// defaults may have been reassigned asks afresh; another function at a
+/// freed one's address with the same code and as many defaults binds the
+/// same way.
+fn ctor_kw_perm(
+    init: &Rc<crate::object::PyFunction>,
+    code: &CodeObject,
+    argc: usize,
+    names: &crate::tuple_storage::TupleStorage,
+) -> Option<(u32, u32)> {
+    type Key = (usize, usize, usize, usize, usize);
+    const WAYS: usize = 32;
+    thread_local! {
+        static MEMO: [std::cell::Cell<(Key, (u32, u32))>; WAYS] =
+            const { [const { std::cell::Cell::new(((0, 0, 0, 0, 0), (0, 0))) }; WAYS] };
+    }
+    let memo_ok = !init.defaults_maybe_overridden();
+    let key: Key = (
+        Rc::as_ptr(init) as usize,
+        std::ptr::from_ref(code) as usize,
+        std::ptr::from_ref(names).cast::<u8>() as usize,
+        argc,
+        (init.defaults.len() << 16) | init.kw_defaults.len(),
+    );
+    let way = (key.0 >> 4 ^ key.2 >> 4) % WAYS;
+    if memo_ok {
+        let hit = MEMO
+            .try_with(|m| {
+                let e = m[way].get();
+                (e.0 == key).then_some(e.1)
+            })
+            .ok()
+            .flatten();
+        if hit.is_some() {
+            return hit;
+        }
+    }
+    let r = crate::specialize::kw_perm(
+        init,
+        code,
+        argc,
+        names.iter().map(|n| match n {
+            Object::Str(s) => &**s,
+            _ => "",
+        }),
+    )?;
+    if memo_ok {
+        let _ = MEMO.try_with(|m| m[way].set((key, r)));
+    }
+    Some(r)
+}
+
 /// [`ctor_direct`] for a `CALL_KW` of a plain class (`C(i, b=2)`), its
 /// operands from `start` up a `len`-deep stack (the class, its empty self
 /// slot, `argc` positionals, `kwc` keyword values and the names tuple):
@@ -898,15 +989,7 @@ pub(super) unsafe fn ctor_direct_kw(
         if names.len() != kwc || !names.iter().all(|n| matches!(n, Object::Str(_))) {
             return None;
         }
-        let (perm, covered) = crate::specialize::kw_perm(
-            init,
-            code,
-            argc + 1,
-            names.iter().map(|n| match n {
-                Object::Str(s) => &**s,
-                _ => "",
-            }),
-        )?;
+        let (perm, covered) = ctor_kw_perm(init, code, argc + 1, names)?;
         let dc = &*st.depth_cell;
         if dc.get() + 1 > crate::recursion::recursion_limit() {
             return None;
@@ -994,7 +1077,10 @@ unsafe fn new_direct(st: &mut State, call: CallAt, len: usize) -> Option<u32> {
         // `Interpreter::core_new_user` declines them; a named tuple's is
         // its own lane's.)
         if plan.abstract_error.is_some()
-            || !matches!(plan.native, crate::types::NativeKind::Plain)
+            || !matches!(
+                plan.native,
+                crate::types::NativeKind::Plain | crate::types::NativeKind::Value { .. }
+            )
             || plan.seeds_exception_args
             || plan.tuple_new.is_some()
             || ty.is_type_subclass()
@@ -1312,10 +1398,12 @@ pub(super) unsafe extern "C" fn h_direct_leave(
             || (*rec.locals_count).load(std::sync::atomic::Ordering::Relaxed) > 1
             || interp.gil_countdown <= 2
             || crate::hot_gates::loop_gen() != rec.st.snap_gen
-            || crate::sync::release_gates() != 0
+            || crate::sync::release_gates() & crate::sync::RELEASE_OBSERVER_GATES != 0
         {
             return left_slowly(s, rec, status);
         }
+        // (With counts shared, each release below is a locked update.)
+        let shared = crate::sync::release_gates() != 0;
         interp.lazy_top.set(rec.outer);
         (*rec.frame).stack.set_len(0);
         let n = (*rec.locals).len();
@@ -1328,6 +1416,12 @@ pub(super) unsafe extern "C" fn h_direct_leave(
             k -= 1;
             if let Some(word) = (*locals.add(k)).strong_word() {
                 // While the gates are off this thread alone updates counts.
+                if shared {
+                    if !crate::rc::release_unless_last(word) {
+                        return release_rest(s, rec, k + 1);
+                    }
+                    continue;
+                }
                 let w = &*word;
                 let c = w.load(std::sync::atomic::Ordering::Relaxed);
                 if c == 1 {
@@ -1342,11 +1436,17 @@ pub(super) unsafe extern "C" fn h_direct_leave(
         }
         // (A function's second word is its count's address.)
         let word = &**slot.cast::<*const std::sync::atomic::AtomicUsize>().add(1);
-        let c = word.load(std::sync::atomic::Ordering::Relaxed);
-        if c == 1 {
-            return finish_rest(s, rec);
+        if shared {
+            if !crate::rc::release_unless_last(word) {
+                return finish_rest(s, rec);
+            }
+        } else {
+            let c = word.load(std::sync::atomic::Ordering::Relaxed);
+            if c == 1 {
+                return finish_rest(s, rec);
+            }
+            word.store(c - 1, std::sync::atomic::Ordering::Relaxed);
         }
-        word.store(c - 1, std::sync::atomic::Ordering::Relaxed);
         let (a, b) = (rec.st.stack.cast::<u64>(), slot.cast::<u64>());
         let (x, y) = (a.read(), a.add(1).read());
         b.write(x);
@@ -1517,18 +1617,30 @@ unsafe fn chain_init(st: &mut State, rec: &mut DirectRec, interp: &mut Interpret
             return None;
         }
         let ni: &crate::NewInit = act.new_init.as_deref()?;
-        if ni.plan.init_from_object {
-            return None;
-        }
         let Object::Instance(made) = &*rec.st.stack else {
             return None;
         };
-        if !std::ptr::eq(made.cls_raw(), Rc::as_ptr(&ni.ty)) {
+        // `type(obj).__init__` runs: the class's own, or, for an instance of
+        // a subclass `__new__` made (`Path.__new__`'s `PosixPath`), that
+        // subclass's, from its own plan.
+        let sub_plan;
+        let plan: &crate::types::InstancePlan = if std::ptr::eq(made.cls_raw(), Rc::as_ptr(&ni.ty))
+        {
+            &ni.plan
+        } else {
+            let made_cls = made.cls();
+            if !made_cls.is_subclass_of(&ni.ty) {
+                return None;
+            }
+            sub_plan = interp.instance_plan(&made_cls);
+            &sub_plan
+        };
+        if plan.init_from_object {
             return None;
         }
         // (The plan's `__init__` as `Interpreter::core_push_init` takes it:
         // a class with its own `__new__` keeps no lean form of it.)
-        let Some(Object::Function(init)) = &ni.plan.init_fn else {
+        let Some(Object::Function(init)) = &plan.init_fn else {
             return None;
         };
         // SAFETY: GIL-serialized raw read of the function's code cell.

@@ -608,7 +608,7 @@ fn wcio_write(args: &[Object]) -> Result<Object, RuntimeError> {
 pub(crate) fn windows_console_io_type() -> Rc<TypeObject> {
     use crate::object::MethodWrapper;
     thread_local! {
-        static CLS: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
+        static CLS: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
     }
     CLS.with(|slot| {
         if let Some(c) = slot.borrow().as_ref() {

@@ -1234,6 +1234,23 @@ fn unwrap_shim(inner: Rc<BuiltinFn>, owner: &Rc<TypeObject>) -> Object {
                 return Ok(());
             }
         }
+        // An exact builtin value of the owner's own type (`str.upper(w)`),
+        // by address: no class to fetch.
+        let bt = crate::builtin_types::builtin_types();
+        let exact = match first {
+            Object::Str(_) => Some(&bt.str_),
+            Object::List(_) => Some(&bt.list_),
+            Object::Dict(_) => Some(&bt.dict_),
+            Object::Tuple(_) => Some(&bt.tuple_),
+            Object::Set(_) => Some(&bt.set_),
+            Object::Int(_) => Some(&bt.int_),
+            Object::Float(_) => Some(&bt.float_),
+            Object::Bytes(_) => Some(&bt.bytes_),
+            _ => None,
+        };
+        if exact.is_some_and(|t| std::ptr::eq(Rc::as_ptr(t), owner.as_ptr())) {
+            return Ok(());
+        }
         if let Some(owner) = owner.upgrade() {
             let cls = crate::builtins::class_of(first);
             if !cls.is_subclass_of(&owner) {
@@ -1270,7 +1287,14 @@ fn unwrap_shim(inner: Rc<BuiltinFn>, owner: &Rc<TypeObject>) -> Object {
                 if !keep_instance {
                     let unwrapped = as_native(first);
                     if !unwrapped.is_same(first) {
-                        return with_receiver(args, unwrapped, |v| (inner_pos.call)(v));
+                        let r = with_receiver(args, unwrapped.clone(), |v| (inner_pos.call)(v))?;
+                        // An iterator type's `__iter__` returns its receiver:
+                        // for a subclass's instance, that's the instance
+                        // (`iter(e) is e`), whose class may step it its own way.
+                        if inner_pos.name == "__iter__" && r.is_same(&unwrapped) {
+                            return Ok(first.clone());
+                        }
+                        return Ok(r);
                     }
                 }
             }

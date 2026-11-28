@@ -104,10 +104,9 @@ struct MacRegEntry {
 }
 
 thread_local! {
-    static MAC_REGISTRY: RefCell<HashMap<i64, Rc<MacRegEntry>>> =
-        RefCell::new(HashMap::new());
+    static MAC_REGISTRY: crate::gil::ReleaseUnderGil<RefCell<HashMap<i64, Rc<MacRegEntry>>>> = crate::gil::ReleaseUnderGil::new(RefCell::new(HashMap::new()));
     static MAC_NEXT_ID: RefCell<i64> = const { RefCell::new(1) };
-    static MAC_CLASS: RefCell<Option<Rc<TypeObject>>> = const { RefCell::new(None) };
+    static MAC_CLASS: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
 }
 
 fn register_mac(state: AnyMac, key: Vec<u8>, digest_name: String) -> i64 {
@@ -233,12 +232,7 @@ fn mac_hexdigest(args: &[Object]) -> Result<Object, RuntimeError> {
     let id = instance_handle(args)?;
     let entry = lookup_mac(id)?;
     let bytes = entry.state.borrow().digest();
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        use std::fmt::Write;
-        write!(out, "{b:02x}").unwrap();
-    }
-    Ok(Object::from_str(out))
+    Ok(Object::from_str(crate::object::hex_lower(&bytes)))
 }
 
 fn mac_copy(args: &[Object]) -> Result<Object, RuntimeError> {

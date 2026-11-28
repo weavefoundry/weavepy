@@ -837,7 +837,7 @@ fn resolve_path(file: &[u8], env: &Object) -> Vec<Vec<u8>> {
             // A plain `dict` is str-keyed ("PATH"); `os.environ`'s `_Environ`
             // backing store is bytes-keyed (b"PATH").
             d.get(&DictKey(Object::from_static("PATH")))
-                .or_else(|| d.get(&DictKey(Object::new_bytes(b"PATH".to_vec()))))
+                .or_else(|| d.get(&DictKey(Object::new_bytes(b"PATH"))))
                 .and_then(bytes_of)
         })
         .unwrap_or_else(|| b"/usr/bin:/bin".to_vec());

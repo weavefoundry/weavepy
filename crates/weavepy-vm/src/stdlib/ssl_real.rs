@@ -2619,7 +2619,7 @@ fn ns_get_ca_certs(args: &[Object]) -> Result<Object, RuntimeError> {
             .iter()
             .chain(c.capath_used.iter())
             .filter(|c| der_is_ca(c.as_ref()))
-            .map(|c| Object::new_bytes(c.as_ref().to_vec()))
+            .map(|c| Object::new_bytes(c.as_ref()))
             .collect::<Vec<_>>()
     })?;
     Ok(Object::new_list(ders))
@@ -2985,7 +2985,7 @@ fn transcript_events(stream: &[u8], direction: &str, version: i64, out: &mut Vec
                     Object::Int(version),
                     Object::Int(20),
                     Object::Int(0x0101),
-                    Object::new_bytes(body.to_vec()),
+                    Object::new_bytes(body),
                 ]));
                 encrypted = true;
             }
@@ -3003,7 +3003,7 @@ fn transcript_events(stream: &[u8], direction: &str, version: i64, out: &mut Vec
                         Object::Int(version),
                         Object::Int(22),
                         Object::Int(i64::from(mtype)),
-                        Object::new_bytes(body[j + 4..mend].to_vec()),
+                        Object::new_bytes(&body[j + 4..mend]),
                     ]));
                     j = mend;
                 }

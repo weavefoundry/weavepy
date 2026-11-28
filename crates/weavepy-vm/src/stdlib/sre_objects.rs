@@ -88,6 +88,8 @@ pub(crate) struct State {
     compile_template: Object,
     /// Per pattern handle, the last replacement template it expanded.
     templates: parking_lot::Mutex<HashMap<i64, (Object, Rc<Vec<Piece>>)>>,
+    /// The address of the native `Pattern.__hash__` (see [`native_hash`]).
+    hash_fn: std::sync::OnceLock<usize>,
 }
 
 #[inline]
@@ -126,8 +128,7 @@ fn with_interp<R>(
 }
 
 fn build(cls: Rc<TypeObject>, layout: &SharedSlice<DictKey>, values: Vec<Object>) -> Object {
-    let mut i = PyInstance::new(cls);
-    i.slots = RefCell::new(SlotStorage::from_layout(layout.clone(), values));
+    let i = PyInstance::with_slots(cls, SlotStorage::from_layout(layout.clone(), values));
     Object::Instance(Rc::new(i))
 }
 
@@ -145,9 +146,51 @@ fn fast_subject(o: &Object, cc: &CompiledCode) -> bool {
     }
 }
 
+/// [`fast_subject`], or a `bytearray` for a bytes pattern: read in place
+/// for as long as a body that runs no Python code holds it (see
+/// [`with_pattern`]); its pieces are `bytes`, as CPython's are.
+#[inline]
+fn fast_or_buffer_subject(o: &Object, cc: &CompiledCode) -> bool {
+    fast_subject(o, cc)
+        || (cc.is_str != Some(true)
+            && (matches!(o, Object::ByteArray(_)) || plain_view_window(o).is_some()))
+}
+
+/// A live, plain view of unsigned bytes (h11's and urllib3's subjects):
+/// where its bytes start in its buffer, and how many it spans.
+fn plain_view_window(o: &Object) -> Option<(usize, usize)> {
+    let Object::MemoryView(mv) = o else {
+        return None;
+    };
+    (!mv.released.get()
+        && mv.itemsize.get() == 1
+        && !mv.zero_dim.get()
+        && mv.shape.borrow().is_empty()
+        && mv.strides.borrow().is_empty()
+        && mv.suboffsets.borrow().is_empty()
+        && mv.format.borrow().as_str() == "B")
+        .then(|| (mv.start.get(), mv.len.get()))
+}
+
+/// The subject a slicing body (`findall`, `split`) reads: a str
+/// subclass's instance reads as its payload, its pieces exact strs as
+/// CPython's slices of it are. (A body that builds match objects keeps the
+/// instance, which `Match.string` returns.)
+fn sliced_subject(o: &Object) -> &Object {
+    match o {
+        Object::Instance(i) => match i.native.get() {
+            Some(p @ Object::Str(_)) => p,
+            _ => o,
+        },
+        _ => o,
+    }
+}
+
 fn empty_like(o: &Object) -> Object {
     match o {
-        Object::Bytes(_) => Object::new_bytes(Vec::new()),
+        Object::Bytes(_) | Object::ByteArray(_) | Object::MemoryView(_) => {
+            Object::new_bytes(Vec::new())
+        }
         _ => Object::Str(SharedStr::from_ascii("")),
     }
 }
@@ -200,6 +243,15 @@ fn subject_slice(o: &Object, a: usize, b: usize) -> Option<Object> {
             }
             Some(Object::Bytes(SharedSlice::from(&bs[a..b])))
         }
+        // (A buffer's piece is a `bytes` of what it holds now, as
+        // CPython's `getslice` reads it.)
+        Object::ByteArray(bs) => {
+            let bs = bs.try_borrow().ok()?;
+            if b > bs.len() || a > b {
+                return None;
+            }
+            Some(Object::new_bytes(&bs[a..b]))
+        }
         _ => None,
     }
 }
@@ -210,6 +262,12 @@ fn subject_slice(o: &Object, a: usize, b: usize) -> Option<Object> {
 enum Units<'a> {
     Narrow(&'a [u8]),
     Wide(Rc<Vec<u32>>),
+    /// A `bytearray`'s bytes (or a view's window of them, from `.1` to
+    /// `.2`), borrowed for the subject's life (only bodies that run no
+    /// Python code make one: see [`fast_or_buffer_subject`]).
+    Held(crate::sync::Ref<'a, Vec<u8>>, usize, usize),
+    /// A view's window of a `bytes` object's bytes.
+    Window(&'a [u8]),
 }
 
 /// A subject ready for matching, with cheap slicing for `str`/`bytes`.
@@ -223,6 +281,27 @@ impl<'a> Subject<'a> {
         let units = match obj {
             Object::Str(s) if SharedStr::is_ascii(s) => Units::Narrow(s.as_bytes()),
             Object::Bytes(b) => Units::Narrow(&b[..]),
+            Object::ByteArray(b) => match b.try_borrow() {
+                Ok(held) => {
+                    let n = held.len();
+                    Units::Held(held, 0, n)
+                }
+                Err(_) => Units::Wide(sre_mod::decode_subject_cached(obj)?),
+            },
+            Object::MemoryView(mv) => match (plain_view_window(obj), &mv.buffer) {
+                (Some((start, n)), crate::object::MemoryViewBuffer::Bytes(b))
+                    if start + n <= b.len() =>
+                {
+                    Units::Window(&b[start..start + n])
+                }
+                (Some((start, n)), crate::object::MemoryViewBuffer::ByteArray(b)) => {
+                    match b.try_borrow() {
+                        Ok(held) if start + n <= held.len() => Units::Held(held, start, start + n),
+                        _ => Units::Wide(sre_mod::decode_subject_cached(obj)?),
+                    }
+                }
+                _ => Units::Wide(sre_mod::decode_subject_cached(obj)?),
+            },
             _ => Units::Wide(sre_mod::decode_subject_cached(obj)?),
         };
         Ok(Self { obj, units })
@@ -232,6 +311,8 @@ impl<'a> Subject<'a> {
         match &self.units {
             Units::Narrow(b) => b.len(),
             Units::Wide(w) => w.len(),
+            Units::Held(_, start, end) => end - start,
+            Units::Window(b) => b.len(),
         }
     }
 
@@ -248,12 +329,24 @@ impl<'a> Subject<'a> {
         match &self.units {
             Units::Narrow(b) => sre_mod::exec_found(cc, b, pos, endpos, mode, must_advance, f),
             Units::Wide(w) => sre_mod::exec_found(cc, &w[..], pos, endpos, mode, must_advance, f),
+            Units::Held(b, start, end) => {
+                sre_mod::exec_found(cc, &b[*start..*end], pos, endpos, mode, must_advance, f)
+            }
+            Units::Window(b) => sre_mod::exec_found(cc, b, pos, endpos, mode, must_advance, f),
         }
     }
 
     /// `[a:b]` as a new object (the subject itself for the whole range).
     fn slice(&self, a: usize, b: usize) -> Object {
         let (a, b) = (a.min(self.len()), b.min(self.len()));
+        // (A buffer's piece is a `bytes`, never the buffer itself.)
+        match &self.units {
+            Units::Held(held, start, _) => {
+                return Object::new_bytes(&held[start + a..start + b.max(a)]);
+            }
+            Units::Window(bytes) => return Object::new_bytes(&bytes[a..b.max(a)]),
+            _ => {}
+        }
         if a == 0 && b == self.len() {
             return self.obj.clone();
         }
@@ -306,7 +399,9 @@ enum Sink {
 impl Sink {
     fn new(subject: &Subject<'_>) -> Self {
         match subject.obj {
-            Object::Bytes(_) => Sink::Bytes(Vec::new()),
+            Object::Bytes(_) | Object::ByteArray(_) | Object::MemoryView(_) => {
+                Sink::Bytes(Vec::new())
+            }
             _ => Sink::Str(String::new()),
         }
     }
@@ -319,6 +414,10 @@ impl Sink {
             (Sink::Str(t), Object::Str(s), Units::Narrow(_)) => t.push_str(&s[a..b]),
             (Sink::Str(t), Object::Str(_), Units::Wide(w)) => push_cps(t, &w[a..b]),
             (Sink::Bytes(v), Object::Bytes(bs), _) => v.extend_from_slice(&bs[a..b]),
+            (Sink::Bytes(v), _, Units::Held(bs, start, _)) => {
+                v.extend_from_slice(&bs[start + a..start + b]);
+            }
+            (Sink::Bytes(v), _, Units::Window(bs)) => v.extend_from_slice(&bs[a..b]),
             (Sink::Parts(parts), _, _) => parts.push(subject.slice(a, b)),
             _ => {}
         }
@@ -433,7 +532,7 @@ fn new_match(
         .match_cls
         .upgrade()
         .ok_or_else(|| type_error("re.Match is gone"))?;
-    let values = vec![
+    let values = [
         pattern.clone(),
         string.clone(),
         Object::Int(pos as i64),
@@ -441,7 +540,10 @@ fn new_match(
         marks_tuple(found),
         Object::Int(found.lastindex as i64),
     ];
-    Ok(build(cls, &st.match_layout, values))
+    let slots = SlotStorage::from_layout_array(st.match_layout.clone(), values);
+    Ok(Object::Instance(Rc::new(PyInstance::with_slots(
+        cls, slots,
+    ))))
 }
 
 // ---------------------------------------------------------------------
@@ -485,7 +587,7 @@ fn with_pattern<R>(
     };
     with_state(inst, |st| {
         let (cc, handle) = pattern_code(st, inst)?;
-        if !fast_subject(string, cc) {
+        if !fast_or_buffer_subject(string, cc) {
             return None;
         }
         Some(f(st, cc, handle))
@@ -524,6 +626,101 @@ fn pattern_exec(args: &[Object], mode: i64) -> Option<Result<Object, RuntimeErro
     })
 }
 
+/// A pattern's `pattern` and `flags` slots, read in place.
+fn pattern_key(o: &Object) -> Option<(Rc<crate::types::TypeObject>, Object, Object)> {
+    let Object::Instance(inst) = o else {
+        return None;
+    };
+    with_state(inst, |st| {
+        let slots = inst.slots.try_borrow().ok()?;
+        let v = slots.values_for_layout(&st.pattern_layout)?;
+        Some((inst.cls(), v[1].clone(), v[2].clone()))
+    })?
+}
+
+/// The hash of `inst` when it's a pattern whose class still answers
+/// `__hash__` with [`pattern_hash`], computed in place: `hash((Pattern,
+/// self.pattern, self.flags))` for a `str` or `bytes` pattern and `int`
+/// flags. `re._compile` probes its cache with `(type(p), p, flags)` for
+/// every compiled pattern a module function is handed. `None` for anything
+/// else (and under free threading, whose state reads go through the class
+/// cell).
+pub(crate) fn native_hash(inst: &PyInstance) -> Option<i64> {
+    if crate::gil::free_threading_enabled() {
+        return None;
+    }
+    let cls = inst.cls_raw();
+    let st = state_of(cls)?;
+    let hash_is_native = cls.memo_verdict(crate::types::Verdict::NativePatternHash, "", || {
+        let ours = st.hash_fn.get().copied();
+        matches!(
+            cls.lookup("__hash__"),
+            Some(Object::Builtin(b)) if Some(Rc::as_ptr(&b) as usize) == ours
+        )
+    });
+    if !hash_is_native {
+        return None;
+    }
+    let slots = inst.slots.try_borrow().ok()?;
+    let v = slots.values_for_layout(&st.pattern_layout)?;
+    let pat = match &v[1] {
+        Object::Str(s) => SharedStr::hash_cached(s),
+        Object::Bytes(b) => {
+            crate::shared_value::SharedSlice::hash_cached(b, crate::object::py_hash_bytes_slice)
+        }
+        _ => return None,
+    };
+    let Object::Int(flags) = v[2] else {
+        return None;
+    };
+    let mut h = crate::object::TupleHasher::new();
+    h.push(crate::object::pointer_hash(std::ptr::from_ref(cls).cast()));
+    h.push(pat);
+    h.push(crate::object::py_hash_long_i64(flags));
+    Some(h.finish(3))
+}
+
+/// `Pattern.__hash__`: `hash((Pattern, self.pattern, self.flags))`, as the
+/// Python method computes it, for a `str` or `bytes` pattern and `int`
+/// flags (whose hashes run no code).
+fn pattern_hash(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [p] = args else {
+        return None;
+    };
+    let (cls, pat, flags) = pattern_key(p)?;
+    if !matches!(pat, Object::Str(_) | Object::Bytes(_)) || !matches!(flags, Object::Int(_)) {
+        return None;
+    }
+    let key = Object::new_tuple_array([Object::Type(cls), pat, flags]);
+    crate::object::py_hash_value(&key).map(|h| Ok(Object::Int(h)))
+}
+
+/// `Pattern.__eq__` of two patterns with `str` or `bytes` patterns and
+/// `int` flags.
+fn pattern_eq(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [a, b] = args else {
+        return None;
+    };
+    if a.is_same(b) {
+        return Some(Ok(Object::Bool(true)));
+    }
+    let ((ca, pa, fa), (cb, pb, fb)) = (pattern_key(a)?, pattern_key(b)?);
+    if !Rc::ptr_eq(&ca, &cb) {
+        return None;
+    }
+    let eq = match (&pa, &pb, &fa, &fb) {
+        (Object::Str(x), Object::Str(y), Object::Int(f), Object::Int(g)) => x == y && f == g,
+        (Object::Bytes(x), Object::Bytes(y), Object::Int(f), Object::Int(g)) => {
+            x[..] == y[..] && f == g
+        }
+        (Object::Str(_), Object::Bytes(_), _, _) | (Object::Bytes(_), Object::Str(_), _, _) => {
+            false
+        }
+        _ => return None,
+    };
+    Some(Ok(Object::Bool(eq)))
+}
+
 fn pattern_match(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     pattern_exec(args, 1)
 }
@@ -537,7 +734,8 @@ fn pattern_search(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
 }
 
 fn pattern_findall(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
-    let a = exec_args(args)?;
+    let mut a = exec_args(args)?;
+    a.string = sliced_subject(a.string);
     with_pattern(a.recv, a.string, |_, cc, _| {
         let subject = Subject::new(a.string)?;
         let (mut p, e) = clamp(a.pos, a.endpos, subject.len());
@@ -559,7 +757,9 @@ fn pattern_findall(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
             must_advance = s == en;
             p = en;
         }
-        Ok(Object::new_list(out))
+        let out = Object::new_list(out);
+        crate::gc_trace::track_built(&out);
+        Ok(out)
     })
 }
 
@@ -868,6 +1068,7 @@ fn pattern_split(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
         [Object::Bool(b)] => i64::from(*b),
         _ => return None,
     };
+    let string = sliced_subject(string);
     with_pattern(recv, string, |_, cc, _| {
         let subject = Subject::new(string)?;
         let e = subject.len();
@@ -1204,6 +1405,22 @@ const EXEC_PARAMS: &[&str] = &["string", "pos", "endpos"];
 const SPECS: &[Spec] = &[
     Spec {
         cls: 0,
+        name: "__hash__",
+        key: "Pattern.__hash__",
+        fast: pattern_hash,
+        full: None,
+        params: &[],
+    },
+    Spec {
+        cls: 0,
+        name: "__eq__",
+        key: "Pattern.__eq__",
+        fast: pattern_eq,
+        full: None,
+        params: &[],
+    },
+    Spec {
+        cls: 0,
         name: "match",
         key: "Pattern.match",
         fast: pattern_match,
@@ -1368,6 +1585,23 @@ fn interned(s: &str) -> SharedStr {
     }
 }
 
+/// `cls`'s own member layout when it lays out exactly `names` in order (so
+/// compiled code reads a member of an instance built natively in line, as
+/// it reads one its class's `__init__` set), else a layout of `names`.
+fn class_layout(cls: &TypeObject, names: &[&str]) -> SharedSlice<DictKey> {
+    if let Some(own) = cls.own_slot_layout() {
+        let same = own.len() == names.len()
+            && own
+                .iter()
+                .zip(names)
+                .all(|(k, n)| matches!(&k.0, Object::Str(s) if s.as_ref() == *n));
+        if same {
+            return own.clone();
+        }
+    }
+    layout(names)
+}
+
 fn layout(names: &[&str]) -> SharedSlice<DictKey> {
     names
         .iter()
@@ -1412,12 +1646,13 @@ pub(crate) fn install(args: &[Object]) -> Result<Object, RuntimeError> {
     let state = Rc::new(State {
         match_cls: Rc::downgrade(matchc),
         scanner_cls: Rc::downgrade(scanner),
-        pattern_layout: layout(&PATTERN_SLOTS),
-        match_layout: layout(&MATCH_SLOTS),
-        scanner_layout: layout(&SCANNER_SLOTS),
+        pattern_layout: class_layout(pattern, &PATTERN_SLOTS),
+        match_layout: class_layout(matchc, &MATCH_SLOTS),
+        scanner_layout: class_layout(scanner, &SCANNER_SLOTS),
         orig,
         compile_template: compile_template.clone(),
         templates: parking_lot::Mutex::new(HashMap::new()),
+        hash_fn: std::sync::OnceLock::new(),
     });
     for cls in [pattern, matchc, scanner] {
         let _ = cls
@@ -1444,6 +1679,9 @@ pub(crate) fn install(args: &[Object]) -> Result<Object, RuntimeError> {
             call_kw,
         });
         crate::leaf_builtins::register_fast(&b, spec.fast);
+        if spec.key == "Pattern.__hash__" {
+            let _ = state.hash_fn.set(Rc::as_ptr(&b) as usize);
+        }
         classes[spec.cls].dict.borrow_mut().insert(
             DictKey(Object::Str(interned(spec.name))),
             Object::Builtin(b),
@@ -1546,6 +1784,20 @@ fn compile_cached_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> 
     let [Object::Dict(cache), _, Object::Type(flag_type)] = &front[..] else {
         return None;
     };
+    // A compiled pattern with no flags (`re.match(SECTCRE, key)`): `_compile`
+    // finds it in neither cache (they key only strings and bytes), raising
+    // and catching a `KeyError` on the way, and returns it as is.
+    if let Object::Instance(inst) = pattern {
+        let no_flags = match flags {
+            Object::Int(0) | Object::Bool(false) => true,
+            Object::Instance(i) if Rc::ptr_eq(&i.cls(), flag_type) => {
+                matches!(i.native.get(), Some(Object::Int(0)))
+            }
+            _ => false,
+        };
+        let compiled = with_state(inst, |st| pattern_code(st, inst).is_some()) == Some(true);
+        return (no_flags && compiled).then(|| Ok(pattern.clone()));
+    }
     let bt = crate::builtin_types::builtin_types();
     let ty = match pattern {
         Object::Str(_) => bt.str_.clone(),

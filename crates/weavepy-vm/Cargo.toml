@@ -63,6 +63,7 @@ memmap2               = { workspace = true }
 memchr                = { workspace = true }
 libc                  = { workspace = true }
 rustls                = { workspace = true }
+ring                  = { workspace = true }
 rustls-pki-types      = { workspace = true }
 pkcs8                 = { workspace = true }
 rustls-pemfile        = { workspace = true }

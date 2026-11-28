@@ -299,6 +299,11 @@ fn run_source_with_options_impl(
     opts: &RunOptions,
     keep_interpreter: bool,
 ) -> (Option<vm::Interpreter>, Result<(), Error>) {
+    // The GIL, for the whole run: the interpreter is built, run, shut
+    // down and released by this thread, beside whatever threads the
+    // program starts (declared first, so released last; a blocking call
+    // gives it up while it waits, as in any thread).
+    let _gil = vm::gil::hold_gil();
     // `-x`: drop the first physical line (typical use is to allow a
     // shell-style shebang to live above a self-extracting payload).
     let effective_source: String;

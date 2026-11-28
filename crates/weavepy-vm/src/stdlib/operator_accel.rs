@@ -132,7 +132,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         // have no dunders, so the native arithmetic is the whole call (a
         // core-loop or compiled caller, and a `partial` over one, run it in
         // place). Anything else declines to the full body.
-        for (name, fast) in BINARY_FAST {
+        for (name, fast) in BINARY_FAST.iter().chain(OTHER_FAST) {
             if let Some(Object::Builtin(b)) = d.get(&crate::object::StrKey(name)) {
                 crate::leaf_builtins::register_fast(b, *fast);
             }
@@ -181,6 +181,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 // A plain attribute read that runs no code, in place.
                 crate::leaf_builtins::register_fast(&b, attrgetter_fast);
             }
+            if name == ".methodcaller.__call__" {
+                // A native value's leaf method, in place.
+                crate::leaf_builtins::register_fast(&b, methodcaller_fast);
+            }
             d.insert(DictKey(Object::from_static(export)), Object::Builtin(b));
         }
 
@@ -217,6 +221,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                             None,
                         );
                     }
+                    register_getter_ctor(cls);
                 }
                 Ok(Object::None)
             }),
@@ -341,10 +346,59 @@ const BINARY_FAST: &[(&str, crate::leaf_builtins::Fast)] = &[
     ("rshift", |a| binary_fast(a, BinOpKind::RShift)),
 ];
 
-/// Whether `f` is one of [`BINARY_FAST`]'s halves, which run no code (a
-/// frameless leaf may call them).
+/// The leaf halves of the unary and comparison functions: a plain int or
+/// float operand has no dunders, so the native operation is the whole call
+/// (`sorted(xs, key=operator.neg)` computes its keys in place).
+const OTHER_FAST: &[(&str, crate::leaf_builtins::Fast)] = &[
+    ("neg", |a| unary_fast(a, UnaryKind::Neg)),
+    ("pos", |a| unary_fast(a, UnaryKind::Pos)),
+    ("invert", |a| unary_fast(a, UnaryKind::Invert)),
+    ("inv", |a| unary_fast(a, UnaryKind::Invert)),
+    ("lt", |a| compare_fast(a, CompareKind::Lt)),
+    ("le", |a| compare_fast(a, CompareKind::LtE)),
+    ("eq", |a| compare_fast(a, CompareKind::Eq)),
+    ("ne", |a| compare_fast(a, CompareKind::NotEq)),
+    ("gt", |a| compare_fast(a, CompareKind::Gt)),
+    ("ge", |a| compare_fast(a, CompareKind::GtE)),
+];
+
+fn unary_fast(args: &[Object], op: UnaryKind) -> Option<Result<Object, RuntimeError>> {
+    Some(Ok(match (args, op) {
+        ([Object::Int(x)], UnaryKind::Neg) => Object::Int(x.checked_neg()?),
+        ([Object::Int(x)], UnaryKind::Pos) => Object::Int(*x),
+        ([Object::Int(x)], UnaryKind::Invert) => Object::Int(!x),
+        ([Object::Float(x)], UnaryKind::Neg) => Object::Float(-x),
+        ([Object::Float(x)], UnaryKind::Pos) => Object::Float(*x),
+        _ => return None,
+    }))
+}
+
+fn compare_fast(args: &[Object], op: CompareKind) -> Option<Result<Object, RuntimeError>> {
+    use std::cmp::Ordering;
+    let ord = match args {
+        [Object::Int(x), Object::Int(y)] => Some(x.cmp(y)),
+        [Object::Float(x), Object::Float(y)] => x.partial_cmp(y),
+        _ => return None,
+    };
+    let r = match op {
+        CompareKind::Lt => ord == Some(Ordering::Less),
+        CompareKind::LtE => matches!(ord, Some(Ordering::Less | Ordering::Equal)),
+        CompareKind::Eq => ord == Some(Ordering::Equal),
+        // (NaN is unequal to everything, itself included.)
+        CompareKind::NotEq => ord != Some(Ordering::Equal),
+        CompareKind::Gt => ord == Some(Ordering::Greater),
+        CompareKind::GtE => matches!(ord, Some(Ordering::Greater | Ordering::Equal)),
+    };
+    Some(Ok(Object::Bool(r)))
+}
+
+/// Whether `f` is one of [`BINARY_FAST`]'s or [`OTHER_FAST`]'s halves,
+/// which run no code (a frameless leaf may call them).
 pub(crate) fn is_fast_half(f: crate::leaf_builtins::Fast) -> bool {
-    BINARY_FAST.iter().any(|&(_, p)| std::ptr::fn_addr_eq(p, f))
+    BINARY_FAST
+        .iter()
+        .chain(OTHER_FAST)
+        .any(|&(_, p)| std::ptr::fn_addr_eq(p, f))
 }
 
 fn binary(args: &[Object], op: BinOpKind, name: &str) -> Result<Object, RuntimeError> {
@@ -487,20 +541,39 @@ fn attrgetter_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let [Object::Instance(inst), obj] = args else {
         return None;
     };
-    // SAFETY: a read that runs no code.
-    let Object::Tuple(attrs) = unsafe { inst.slots.peek() }?
-        .get_hinted(0, "_attrs")?
-        .clone()
-    else {
+    // SAFETY: a view that ends with the read, which runs no code (so
+    // nothing can rebind the getter's names meanwhile).
+    let Object::Tuple(attrs) = unsafe { inst.slots.peek() }?.get_hinted(0, "_attrs")? else {
         return None;
     };
     let [name @ Object::Str(s)] = &attrs[..] else {
         return None;
     };
-    if s.contains('.') {
+    if memchr::memchr(b'.', s.as_bytes()).is_some() {
         return None;
     }
     crate::Interpreter::leaf_getattr_value(obj, name).map(Ok)
+}
+
+/// The one int index an `itemgetter(i)` holds, when `f` is an instance
+/// whose class's `__call__` is the native getter's (a sort's key, read once
+/// for every item).
+pub(crate) fn itemgetter_single_index(f: &Object) -> Option<i64> {
+    let Object::Instance(inst) = f else {
+        return None;
+    };
+    match inst.cls_raw().lookup("__call__")? {
+        Object::Builtin(b) if b.name == ".itemgetter.__call__" => {}
+        _ => return None,
+    }
+    // SAFETY: a read that runs no code.
+    let Object::Tuple(items) = unsafe { inst.slots.peek() }?.get_hinted(0, "_items")? else {
+        return None;
+    };
+    match &items[..] {
+        [Object::Int(i)] => Some(*i),
+        _ => None,
+    }
 }
 
 /// [`itemgetter_call`]'s pure fast half (the dispatch loop's leaf call):
@@ -511,42 +584,225 @@ fn itemgetter_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
     let [Object::Instance(inst), obj] = args else {
         return None;
     };
-    // SAFETY: a read that runs no code.
-    let Object::Tuple(items) = unsafe { inst.slots.peek() }?
-        .get_hinted(0, "_items")?
-        .clone()
-    else {
+    // A subclass of one of them (a named tuple) whose `__getitem__` is
+    // still the base's own reads its payload the same way.
+    let obj = match obj {
+        Object::Instance(o) => match o.native.get() {
+            Some(native @ (Object::Tuple(_) | Object::List(_) | Object::Dict(_)))
+                if crate::Interpreter::native_payload_getitem(o) =>
+            {
+                native
+            }
+            _ => return None,
+        },
+        _ => obj,
+    };
+    // SAFETY: guard-free reads that run no code (nothing below can change
+    // the instance's slots or the operand).
+    unsafe {
+        let Object::Tuple(items) = inst.slots.peek()?.get_hinted(0, "_items")? else {
+            return None;
+        };
+        let get = |item: &Object| -> Option<Object> {
+            let index = |len: usize| -> Option<usize> {
+                let Object::Int(i) = item else {
+                    return None;
+                };
+                let len = len as i64;
+                let k = if *i < 0 { i + len } else { *i };
+                (0..len).contains(&k).then_some(k as usize)
+            };
+            match obj {
+                Object::Tuple(t) => t.get(index(t.len())?).cloned(),
+                Object::List(l) => {
+                    let v = l.peek()?;
+                    v.get(index(v.len())?).cloned()
+                }
+                Object::Dict(d) => {
+                    if matches!(item, Object::Instance(_)) {
+                        return None;
+                    }
+                    let probe = crate::object::LeafProbe::new(item)?;
+                    d.peek()?.get(&probe).cloned()
+                }
+                _ => None,
+            }
+        };
+        Some(Ok(match &items[..] {
+            [item] => get(item)?,
+            many => Object::new_tuple(many.iter().map(get).collect::<Option<Vec<_>>>()?),
+        }))
+    }
+}
+
+/// Which of the three classes a pure constructor builds, and the class's
+/// attribute version when it was registered (a class changed since, its
+/// `__init__` replaced say, constructs through its Python methods).
+struct GetterCtor {
+    slots: &'static [&'static str],
+    version: u64,
+}
+
+/// The exact `attrgetter`, `itemgetter` and `methodcaller` classes' pure
+/// constructors (see `TypeObject::pure_new`): `itemgetter(1)` builds its
+/// instance in place, as CPython's C constructor does, rather than running
+/// the Python `__init__` with its `*items`.
+fn register_getter_ctor(cls: &Rc<crate::types::TypeObject>) {
+    let (slots, pure): (&'static [&'static str], crate::types::PureNew) = match cls.name.as_str() {
+        "itemgetter" => (&["_items"], itemgetter_new_pure),
+        "attrgetter" => (&["_attrs"], attrgetter_new_pure),
+        "methodcaller" => (&["_name", "_args", "_kwargs"], methodcaller_new_pure),
+        _ => return,
+    };
+    let laid_out = cls.own_slot_layout().is_some_and(|layout| {
+        layout.len() == slots.len()
+            && layout
+                .iter()
+                .zip(slots)
+                .all(|(k, n)| matches!(&k.0, Object::Str(s) if s.as_ref() == *n))
+    });
+    let reg = Rc::new(GetterCtor {
+        slots,
+        version: cls.attr_version.get(),
+    });
+    if laid_out
+        && cls
+            .native_ext
+            .set(crate::rc_unsize!(reg => dyn std::any::Any + Send + Sync))
+            .is_ok()
+    {
+        cls.pure_new.set(Some(pure));
+    }
+}
+
+/// An instance of `cls` with `values` in its slots, laid out at once,
+/// when `cls` is the registered class unchanged since.
+fn getter_instance<const N: usize>(
+    cls: &Rc<crate::types::TypeObject>,
+    values: [Object; N],
+) -> Option<Object> {
+    let reg = cls.native_ext.get()?.downcast_ref::<GetterCtor>()?;
+    if reg.version != cls.attr_version.get() || reg.slots.len() != N {
+        return None;
+    }
+    let layout = cls.own_slot_layout()?;
+    let inst = crate::types::PyInstance::with_slots(
+        cls.clone(),
+        crate::types::SlotStorage::from_layout_array(layout.clone(), values),
+    );
+    let obj = Object::Instance(Rc::new(inst));
+    crate::gc_trace::track(&obj);
+    Some(obj)
+}
+
+/// `itemgetter(item, *items)`.
+fn itemgetter_new_pure(cls: &Rc<crate::types::TypeObject>, args: &[Object]) -> Option<Object> {
+    if args.is_empty() {
+        return None;
+    }
+    getter_instance(cls, [Object::tuple_from_slice(args)])
+}
+
+/// `attrgetter(attr, *attrs)` of `str` names (anything else raises from
+/// the Python `__init__`).
+fn attrgetter_new_pure(cls: &Rc<crate::types::TypeObject>, args: &[Object]) -> Option<Object> {
+    if args.is_empty() || !args.iter().all(|a| matches!(a, Object::Str(_))) {
+        return None;
+    }
+    getter_instance(cls, [Object::tuple_from_slice(args)])
+}
+
+/// `methodcaller(name, *args)` of a `str` name, with no keywords.
+fn methodcaller_new_pure(cls: &Rc<crate::types::TypeObject>, args: &[Object]) -> Option<Object> {
+    let [name @ Object::Str(_), rest @ ..] = args else {
         return None;
     };
-    let get = |item: &Object| -> Option<Object> {
-        let index = |len: usize| -> Option<usize> {
-            let Object::Int(i) = item else {
-                return None;
+    let kwargs = Object::Dict(Rc::new(RefCell::new(DictData::default())));
+    crate::gc_trace::track(&kwargs);
+    getter_instance(cls, [name.clone(), Object::tuple_from_slice(rest), kwargs])
+}
+
+/// A `methodcaller`'s stored name and positional arguments, read from its
+/// slots, when it stores no keywords.
+fn methodcaller_parts(inst: &crate::types::PyInstance) -> Option<(Object, Object)> {
+    // SAFETY: reads that run no code; the values are cloned out before
+    // anything runs.
+    unsafe {
+        inst.slots.peek().and_then(|slots| {
+            let name = slots.get_hinted(0, "_name")?.clone();
+            let stored = slots.get_hinted(1, "_args")?.clone();
+            let plain = match slots.get_hinted(2, "_kwargs")? {
+                Object::Dict(d) => d.peek()?.is_empty(),
+                _ => false,
             };
-            let len = len as i64;
-            let k = if *i < 0 { i + len } else { *i };
-            (0..len).contains(&k).then_some(k as usize)
-        };
-        match obj {
-            Object::List(l) => {
-                let v = l.try_borrow().ok()?;
-                v.get(index(v.len())?).cloned()
-            }
-            Object::Tuple(t) => t.get(index(t.len())?).cloned(),
-            Object::Dict(d) => {
-                let probe = crate::object::LeafProbe::new(item)?;
-                if matches!(item, Object::Instance(_)) {
-                    return None;
-                }
-                d.try_borrow().ok()?.get(&probe).cloned()
-            }
-            _ => None,
-        }
+            plain.then_some((name, stored))
+        })
+    }
+}
+
+/// `methodcaller(name, *args)(obj)` (`slf` the methodcaller) of a plain
+/// instance whose class's method `name` is a Python function (see
+/// `Interpreter::plain_instance_method`), with no stored keywords: the
+/// function and the stored positional arguments, which the compiled call
+/// site calls directly. `None` for anything else.
+pub(crate) fn methodcaller_target(
+    slf: &crate::types::PyInstance,
+    obj: &Object,
+) -> Option<(Rc<crate::object::PyFunction>, Object)> {
+    let (Object::Str(name), stored @ Object::Tuple(_)) = methodcaller_parts(slf)? else {
+        return None;
     };
-    Some(Ok(match &items[..] {
-        [item] => get(item)?,
-        many => Object::new_tuple(many.iter().map(get).collect::<Option<Vec<_>>>()?),
-    }))
+    Some((
+        crate::Interpreter::plain_instance_method(obj, &name)?,
+        stored,
+    ))
+}
+
+/// `methodcaller(name, *args)(obj)`'s leaf half: a native value's method
+/// (`str.lower`, `dict.get`) that is itself a leaf builtin, called with
+/// `obj` and the stored arguments as the core loop's leaf call of
+/// `obj.name(*args)` calls it. `None` (nothing run) for anything else: an
+/// instance, stored keywords, a method that isn't a leaf, or arguments
+/// its leaf doesn't take.
+fn methodcaller_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Instance(slf), obj] = args else {
+        return None;
+    };
+    // (Only the receivers `leaf_builtin_method` knows, tested first: a
+    // declined call may try the half again on its way to the full path.)
+    if !matches!(
+        obj,
+        Object::List(_)
+            | Object::Dict(_)
+            | Object::Set(_)
+            | Object::Str(_)
+            | Object::Int(_)
+            | Object::Bytes(_)
+            | Object::ByteArray(_)
+    ) {
+        return None;
+    }
+    let (Object::Str(name), Object::Tuple(stored)) = methodcaller_parts(slf)? else {
+        return None;
+    };
+    let ptr = crate::vm_singletons::current_interpreter_ptr()?;
+    // SAFETY: published by the enclosing VM frame on this thread; only its
+    // method tables are read.
+    let interp = unsafe { &*ptr };
+    let method = interp.leaf_builtin_method(obj, &name)?;
+    let kind = interp.leaf_call_kind(&method)?;
+    let call = |a: &[Object]| interp.leaf_builtin_call(kind, &method, a);
+    match &stored[..] {
+        [] => call(std::slice::from_ref(obj)),
+        [a] => call(&[obj.clone(), a.clone()]),
+        [a, b] => call(&[obj.clone(), a.clone(), b.clone()]),
+        more => {
+            let mut call_args = Vec::with_capacity(more.len() + 1);
+            call_args.push(obj.clone());
+            call_args.extend_from_slice(more);
+            call(&call_args)
+        }
+    }
 }
 
 /// `methodcaller.__call__(self, obj, /)` without a Python frame. Looks up
@@ -554,6 +810,24 @@ fn itemgetter_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
 /// args/kwargs through the interpreter.
 fn methodcaller_call(args: &[Object]) -> Result<Object, RuntimeError> {
     let (slf, obj) = two_args(args, "methodcaller.__call__")?;
+    // The usual shape: the stored fields in their slots, positional
+    // arguments only, and a Python method of a plain instance, called
+    // with the instance first (no bound method, no attribute read).
+    if let Object::Instance(inst) = slf {
+        if let Some((Object::Str(name), Object::Tuple(stored))) = methodcaller_parts(inst) {
+            if let Some(f) = crate::Interpreter::plain_instance_method(obj, &name) {
+                return with_interp(|interp| {
+                    if stored.is_empty() {
+                        return interp.call_dunder_function(f, std::slice::from_ref(obj));
+                    }
+                    let mut call_args = Vec::with_capacity(stored.len() + 1);
+                    call_args.push(obj.clone());
+                    call_args.extend_from_slice(&stored);
+                    interp.call_dunder_function(f, &call_args)
+                });
+            }
+        }
+    }
     with_interp(|interp| {
         let name = field(interp, slf, "_name")?;
         let Object::Str(name) = &name else {

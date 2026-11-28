@@ -572,3 +572,16 @@ class finalize:
             finalize._shutdown = True
             if reenable_gc:
                 gc.enable()
+
+
+# The plain lookups of the weak tables (a class or a plain instance as the
+# key, compared by identity) are served natively, as CPython's are dict
+# and set operations on `ref` keys in C; each falls back to the Python
+# method above for any other key.
+try:
+    from _weakref import _install_weak_tables
+except ImportError:
+    pass
+else:
+    _install_weak_tables(WeakKeyDictionary, WeakSet, KeyedRef)
+    del _install_weak_tables

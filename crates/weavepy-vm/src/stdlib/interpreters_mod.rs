@@ -1237,47 +1237,66 @@ fn c_send(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     // Drop the GIL for the wait (`Py_BEGIN_ALLOW_THREADS`): the
     // receiving thread needs to run Python code to drain the item.
-    crate::gil::allow_threads_then(|| {
+    // Nothing in the wait builds or releases an object: its outcome,
+    // with any item it withdrew, comes back to be handled under the GIL.
+    enum Waited {
+        Received,
+        Closed,
+        TimedOut(Vec<ChannelItem>),
+        Poisoned,
+    }
+    let waited = crate::gil::allow_threads_then(|| {
         let deadline =
             timeout.map(|t| std::time::Instant::now() + std::time::Duration::from_secs_f64(t));
-        let mut guard = registry()
-            .lock()
-            .map_err(|_| runtime_error("sub-interpreter registry poisoned"))?;
+        let Ok(mut guard) = registry().lock() else {
+            return Waited::Poisoned;
+        };
         loop {
             let Some(entry) = guard.channels.get_mut(&id) else {
                 // Destroyed while waiting — the item is gone with it.
-                return Err(channel_closed(id));
+                return Waited::Closed;
             };
             if !entry.buffer.iter().any(|it| it.seq == token) {
                 if entry.closed {
                     // A force-close dropped the pending item before anyone
                     // received it (test_send_closed_while_waiting).
-                    return Err(channel_closed(id));
+                    return Waited::Closed;
                 }
-                return Ok(Object::None);
+                return Waited::Received;
             }
             if entry.closed {
-                return Err(channel_closed(id));
+                return Waited::Closed;
             }
-            if let Some(dl) = deadline {
-                let now = std::time::Instant::now();
-                if now >= dl {
-                    entry.buffer.retain(|it| it.seq != token);
-                    return Err(crate::error::timeout_error("channel send timed out"));
+            let wait = match deadline {
+                Some(dl) => {
+                    let now = std::time::Instant::now();
+                    if now >= dl {
+                        let (withdrawn, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut entry.buffer)
+                            .into_iter()
+                            .partition(|it| it.seq == token);
+                        entry.buffer = kept.into();
+                        return Waited::TimedOut(withdrawn);
+                    }
+                    dl - now
                 }
-                let (g, _) = channel_cv()
-                    .wait_timeout(guard, dl - now)
-                    .map_err(|_| runtime_error("sub-interpreter registry poisoned"))?;
-                guard = g;
-            } else {
                 // Periodic re-check guards against a missed notify.
-                let (g, _) = channel_cv()
-                    .wait_timeout(guard, std::time::Duration::from_millis(100))
-                    .map_err(|_| runtime_error("sub-interpreter registry poisoned"))?;
-                guard = g;
-            }
+                None => std::time::Duration::from_millis(100),
+            };
+            let Ok((g, _)) = channel_cv().wait_timeout(guard, wait) else {
+                return Waited::Poisoned;
+            };
+            guard = g;
         }
-    })
+    });
+    match waited {
+        Waited::Received => Ok(Object::None),
+        Waited::Closed => Err(channel_closed(id)),
+        Waited::TimedOut(withdrawn) => {
+            drop(withdrawn);
+            Err(crate::error::timeout_error("channel send timed out"))
+        }
+        Waited::Poisoned => Err(runtime_error("sub-interpreter registry poisoned")),
+    }
 }
 
 /// `channel_recv(cid[, default])` → `(obj, unboundop)` — pop the next

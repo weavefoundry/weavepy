@@ -118,6 +118,35 @@ fn reader_keys() -> &'static ReaderKeys {
     })
 }
 
+/// A dialect's attribute keys, which every reader's dialect is built with
+/// and read by (and a reader's `dialect`): built once.
+struct DialectKeys {
+    delimiter: DictKey,
+    quotechar: DictKey,
+    escapechar: DictKey,
+    lineterminator: DictKey,
+    quoting: DictKey,
+    doublequote: DictKey,
+    skipinitialspace: DictKey,
+    strict: DictKey,
+    dialect: DictKey,
+}
+
+fn dialect_keys() -> &'static DialectKeys {
+    static KEYS: OnceLock<DialectKeys> = OnceLock::new();
+    KEYS.get_or_init(|| DialectKeys {
+        delimiter: key("delimiter"),
+        quotechar: key("quotechar"),
+        escapechar: key("escapechar"),
+        lineterminator: key("lineterminator"),
+        quoting: key("quoting"),
+        doublequote: key("doublequote"),
+        skipinitialspace: key("skipinitialspace"),
+        strict: key("strict"),
+        dialect: key("dialect"),
+    })
+}
+
 /// A module-level function taking only positional args.
 fn b(name: &'static str, body: fn(&[Object]) -> Result<Object, RuntimeError>) -> Object {
     Object::Builtin(Rc::new(BuiltinFn {
@@ -426,21 +455,22 @@ fn dialect_new(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, R
 
         let inst = PyInstance::new(dialect_type());
         {
+            let k = dialect_keys();
             let mut d = inst.dict_cell().borrow_mut();
-            d.insert(key("delimiter"), Object::from_str(delim.to_string()));
+            d.insert(k.delimiter.clone(), Object::from_char(delim));
             d.insert(
-                key("quotechar"),
-                qc.map_or(Object::None, |c| Object::from_str(c.to_string())),
+                k.quotechar.clone(),
+                qc.map_or(Object::None, Object::from_char),
             );
             d.insert(
-                key("escapechar"),
-                esc.map_or(Object::None, |c| Object::from_str(c.to_string())),
+                k.escapechar.clone(),
+                esc.map_or(Object::None, Object::from_char),
             );
-            d.insert(key("lineterminator"), Object::from_str(lineterm));
-            d.insert(key("quoting"), Object::Int(quot));
-            d.insert(key("doublequote"), Object::Bool(dq));
-            d.insert(key("skipinitialspace"), Object::Bool(sis));
-            d.insert(key("strict"), Object::Bool(strict_v));
+            d.insert(k.lineterminator.clone(), Object::from_str(lineterm));
+            d.insert(k.quoting.clone(), Object::Int(quot));
+            d.insert(k.doublequote.clone(), Object::Bool(dq));
+            d.insert(k.skipinitialspace.clone(), Object::Bool(sis));
+            d.insert(k.strict.clone(), Object::Bool(strict_v));
         }
         Ok(Object::Instance(Rc::new(inst)))
     })
@@ -577,13 +607,44 @@ struct DialectCfg {
     strict: bool,
 }
 
+impl DialectCfg {
+    /// Whether `f` holds none of the characters [`join_append`] quotes or
+    /// escapes (an ASCII dialect's, checked a byte at a time).
+    fn plain_field(&self, f: &str) -> bool {
+        let ascii = |c: Option<char>| c.is_none_or(|c| c.is_ascii());
+        if !(self.delimiter.is_ascii()
+            && ascii(self.quotechar)
+            && ascii(self.escapechar)
+            && self.lineterminator.is_ascii())
+        {
+            return false;
+        }
+        let byte = |c: Option<char>| c.map_or(0, |c| c as u8);
+        let (d, q, e) = (
+            self.delimiter as u8,
+            byte(self.quotechar),
+            byte(self.escapechar),
+        );
+        let term = self.lineterminator.as_bytes();
+        f.bytes().all(|b| {
+            b != d
+                && b != b'\n'
+                && b != b'\r'
+                && (b != q || q == 0)
+                && (b != e || e == 0)
+                && !term.contains(&b)
+        })
+    }
+}
+
 fn read_cfg(dialect: &Object) -> Result<DialectCfg, RuntimeError> {
     let inst = match dialect {
         Object::Instance(i) => i,
         _ => return Err(type_error("invalid dialect")),
     };
     let d = inst.dict_cell().borrow();
-    let get = |n: &'static str| d.get(&DictKey(Object::from_static(n))).cloned();
+    let get = |k: &DictKey| d.get(k).cloned();
+    let k = dialect_keys();
     let as_char = |o: Option<Object>| -> Option<char> {
         match o {
             Some(Object::Str(s)) => one_char(&s),
@@ -591,20 +652,20 @@ fn read_cfg(dialect: &Object) -> Result<DialectCfg, RuntimeError> {
         }
     };
     Ok(DialectCfg {
-        delimiter: as_char(get("delimiter")).unwrap_or(','),
-        quotechar: as_char(get("quotechar")),
-        escapechar: as_char(get("escapechar")),
-        lineterminator: match get("lineterminator") {
+        delimiter: as_char(get(&k.delimiter)).unwrap_or(','),
+        quotechar: as_char(get(&k.quotechar)),
+        escapechar: as_char(get(&k.escapechar)),
+        lineterminator: match get(&k.lineterminator) {
             Some(Object::Str(s)) => s.to_string(),
             _ => "\r\n".to_owned(),
         },
-        quoting: match get("quoting") {
+        quoting: match get(&k.quoting) {
             Some(Object::Int(n)) => n,
             _ => QUOTE_MINIMAL,
         },
-        doublequote: matches!(get("doublequote"), Some(Object::Bool(true))),
-        skipinitialspace: matches!(get("skipinitialspace"), Some(Object::Bool(true))),
-        strict: matches!(get("strict"), Some(Object::Bool(true))),
+        doublequote: matches!(get(&k.doublequote), Some(Object::Bool(true))),
+        skipinitialspace: matches!(get(&k.skipinitialspace), Some(Object::Bool(true))),
+        strict: matches!(get(&k.strict), Some(Object::Bool(true))),
     })
 }
 
@@ -676,6 +737,32 @@ enum St {
     AfterEscapedCrnl,
 }
 
+/// How [`Parser::save_field`] converts an unquoted field to a `float` for
+/// the numeric quoting styles: through `float` itself, or (for the leaf
+/// half, which never reads with those styles) not at all.
+trait FloatConv {
+    fn to_float(&mut self, val: Object) -> Result<Object, RuntimeError>;
+}
+
+impl FloatConv for Interpreter {
+    fn to_float(&mut self, val: Object) -> Result<Object, RuntimeError> {
+        self.call_object(
+            Object::Type(builtin_types().float_.clone()),
+            std::slice::from_ref(&val),
+            &[],
+        )
+    }
+}
+
+/// The leaf half's [`FloatConv`]: it declines the styles that convert.
+struct NoFloats;
+
+impl FloatConv for NoFloats {
+    fn to_float(&mut self, _val: Object) -> Result<Object, RuntimeError> {
+        Err(type_error("this reader converts no fields"))
+    }
+}
+
 struct Parser {
     cfg: DialectCfg,
     state: St,
@@ -709,7 +796,7 @@ impl Parser {
         Ok(())
     }
 
-    fn save_field(&mut self, interp: &mut Interpreter) -> Result<(), RuntimeError> {
+    fn save_field(&mut self, interp: &mut impl FloatConv) -> Result<(), RuntimeError> {
         let q = self.cfg.quoting;
         if self.unquoted && self.field_len == 0 && (q == QUOTE_NOTNULL || q == QUOTE_STRINGS) {
             self.fields.push(Object::None);
@@ -717,11 +804,7 @@ impl Parser {
             let mut val = crate::builtins::bridge_to_object(&self.field);
             if self.unquoted && self.field_len != 0 && (q == QUOTE_NONNUMERIC || q == QUOTE_STRINGS)
             {
-                val = interp.call_object(
-                    Object::Type(builtin_types().float_.clone()),
-                    std::slice::from_ref(&val),
-                    &[],
-                )?;
+                val = interp.to_float(val)?;
             }
             self.fields.push(val);
         }
@@ -793,6 +876,24 @@ impl Parser {
         true
     }
 
+    /// Run one line through the machine, then its end-of-line marker.
+    /// Runs of a field's ordinary characters go in whole; the characters
+    /// that mean something go through [`Parser::process`].
+    fn feed_line(&mut self, interp: &mut impl FloatConv, line: &str) -> Result<(), RuntimeError> {
+        let mut at = 0;
+        while at < line.len() {
+            let run = self.plain_run(&line.as_bytes()[at..]);
+            if run > 0 && self.add_run(&line[at..at + run]) {
+                at += run;
+                continue;
+            }
+            let ch = line[at..].chars().next().expect("at a character");
+            self.process(interp, Some(ch))?;
+            at += ch.len_utf8();
+        }
+        self.process(interp, None)
+    }
+
     fn is_quote(&self, c: Option<char>) -> bool {
         self.cfg.quotechar.is_some_and(|q| c == Some(q))
     }
@@ -801,7 +902,11 @@ impl Parser {
         self.cfg.escapechar.is_some_and(|e| c == Some(e))
     }
 
-    fn process(&mut self, interp: &mut Interpreter, c: Option<char>) -> Result<(), RuntimeError> {
+    fn process(
+        &mut self,
+        interp: &mut impl FloatConv,
+        c: Option<char>,
+    ) -> Result<(), RuntimeError> {
         match self.state {
             St::StartRecord => {
                 if c.is_none() {
@@ -895,7 +1000,7 @@ impl Parser {
 
     fn process_start_field(
         &mut self,
-        interp: &mut Interpreter,
+        interp: &mut impl FloatConv,
         c: Option<char>,
     ) -> Result<(), RuntimeError> {
         self.unquoted = true;
@@ -924,7 +1029,7 @@ impl Parser {
 
     fn process_in_field(
         &mut self,
-        interp: &mut Interpreter,
+        interp: &mut impl FloatConv,
         c: Option<char>,
     ) -> Result<(), RuntimeError> {
         if matches!(c, None | Some('\n') | Some('\r')) {
@@ -976,19 +1081,49 @@ fn csv_reader(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
         let iterable = args[0].clone();
         let dialect_pos = args.get(1).cloned();
         let input_iter = interp.iter_object(iterable)?;
-        let dialect = call_dialect(interp, dialect_pos, kwargs)?;
-        let cfg = pack_reader_cfg(&read_cfg(&dialect)?);
+        // (No dialect and no overrides: the default dialect, immutable,
+        // built once with its packed view.)
+        let (dialect, cfg) = if dialect_pos.is_none() && kwargs.is_empty() {
+            default_dialect(interp)?
+        } else {
+            let dialect = call_dialect(interp, dialect_pos, kwargs)?;
+            let cfg = pack_reader_cfg(&read_cfg(&dialect)?);
+            (dialect, cfg)
+        };
         let inst = PyInstance::new(reader_type());
         {
             let keys = reader_keys();
             let mut d = inst.dict_cell().borrow_mut();
             d.insert(keys.input_iter.clone(), input_iter);
-            d.insert(key("dialect"), dialect);
+            d.insert(dialect_keys().dialect.clone(), dialect);
             d.insert(keys.cfg.clone(), cfg);
             d.insert(keys.line_num.clone(), Object::Int(0));
+            // (No `__next__` in progress, so the leaf half reads the first
+            // row too.)
+            d.insert(keys.fields_live.clone(), Object::Bool(false));
         }
         Ok(Object::Instance(Rc::new(inst)))
     })
+}
+
+thread_local! {
+    /// The default `Dialect()` and its packed reader view (see
+    /// [`default_dialect`]).
+    static DEFAULT_DIALECT: crate::gil::ReleaseUnderGil<RefCell<Option<(Object, Object)>>> =
+        const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
+}
+
+/// The dialect a reader made with no dialect and no format parameters
+/// reads by (CPython builds an equal one each time; a dialect never
+/// changes once built), and its packed view.
+fn default_dialect(interp: &mut Interpreter) -> Result<(Object, Object), RuntimeError> {
+    if let Some(hit) = DEFAULT_DIALECT.with(|d| d.borrow().clone()) {
+        return Ok(hit);
+    }
+    let dialect = call_dialect(interp, None, &[])?;
+    let cfg = pack_reader_cfg(&read_cfg(&dialect)?);
+    DEFAULT_DIALECT.with(|d| *d.borrow_mut() = Some((dialect.clone(), cfg.clone())));
+    Ok((dialect, cfg))
 }
 
 fn reader_iter_self(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1011,7 +1146,7 @@ fn reader_iternext(args: &[Object]) -> Result<Object, RuntimeError> {
                 Some(cfg) => cfg,
                 None => {
                     let dialect = d
-                        .get(&key("dialect"))
+                        .get(&dialect_keys().dialect)
                         .ok_or_else(|| type_error("reader is missing its dialect"))?;
                     read_cfg(dialect)?
                 }
@@ -1025,9 +1160,7 @@ fn reader_iternext(args: &[Object]) -> Result<Object, RuntimeError> {
         // `__next__` hands it out and leaves NULL behind. A re-entrant
         // `next(reader)` from inside the input iterator that completes
         // therefore makes the outer call see NULL and raise (gh-145105).
-        inst.dict_cell()
-            .borrow_mut()
-            .insert(keys.fields_live.clone(), Object::Bool(true));
+        set_reader_value(&inst, &keys.fields_live, Object::Bool(true));
         loop {
             match interp.iter_next_object(input_iter.clone())? {
                 None => {
@@ -1056,37 +1189,272 @@ fn reader_iternext(args: &[Object]) -> Result<Object, RuntimeError> {
                         if !matches!(d.get(&keys.fields_live), Some(Object::Bool(true))) {
                             return Err(csv_error("iterator has already advanced the reader"));
                         }
-                        let n = match d.get(&keys.line_num) {
-                            Some(Object::Int(n)) => *n,
-                            _ => 0,
-                        };
-                        d.insert(keys.line_num.clone(), Object::Int(n + 1));
-                    }
-                    // Runs of a field's ordinary characters go in whole; the
-                    // characters that mean something go through the machine.
-                    let mut at = 0;
-                    while at < line.len() {
-                        let run = p.plain_run(&line.as_bytes()[at..]);
-                        if run > 0 && p.add_run(&line[at..at + run]) {
-                            at += run;
-                            continue;
+                        // (Updated in place: the key is there after the
+                        // first line.)
+                        match d.get_mut(&keys.line_num) {
+                            Some(v @ Object::Int(_)) => {
+                                let Object::Int(n) = *v else { unreachable!() };
+                                *v = Object::Int(n + 1);
+                            }
+                            _ => {
+                                d.insert(keys.line_num.clone(), Object::Int(1));
+                            }
                         }
-                        let ch = line[at..].chars().next().expect("at a character");
-                        p.process(interp, Some(ch))?;
-                        at += ch.len_utf8();
                     }
-                    p.process(interp, None)?;
+                    p.feed_line(interp, &line)?;
                 }
             }
             if p.state == St::StartRecord {
                 break;
             }
         }
-        inst.dict_cell()
-            .borrow_mut()
-            .insert(keys.fields_live.clone(), Object::Bool(false));
+        set_reader_value(&inst, &keys.fields_live, Object::Bool(false));
         Ok(Object::new_list(std::mem::take(&mut p.fields)))
     })
+}
+
+/// The reader's `__next__` leaf half: a line that is one whole record,
+/// read without the dispatch loop's full call, from a list or tuple
+/// iterator or from a text stream that has the line in its buffer (see
+/// `PyFile::next_line_pure`). A line of plain and quoted fields is split
+/// directly (see [`split_direct`]); any other runs through the machine. A
+/// record that goes on past its line, a line the machine raises on, a line
+/// that isn't a plain `str`, a quoting style that converts fields to
+/// `float`, a reader in the middle of a call, and
+/// any other input decline to the full parser, which then reads the same
+/// line.
+/// A reader's state entries, by the position `csv_reader` inserts them at.
+const AT_INPUT_ITER: usize = 0;
+const AT_CFG: usize = 2;
+const AT_LINE_NUM: usize = 3;
+const AT_FIELDS_LIVE: usize = 4;
+
+/// Whether `a` is the very key `b` (the same interned name).
+fn same_key(a: &DictKey, b: &DictKey) -> bool {
+    matches!((&a.0, &b.0), (Object::Str(x), Object::Str(y)) if crate::shared_value::SharedStr::ptr_eq(x, y))
+}
+
+/// A reader's state entry `key`, read at position `at` while that still
+/// holds it (the layout `csv_reader` builds), else found by hash.
+fn state_get<'a>(d: &'a DictData, at: usize, key: &DictKey) -> Option<&'a Object> {
+    match d.get_index(at) {
+        Some((k, v)) if same_key(k, key) => Some(v),
+        _ => d.get(key),
+    }
+}
+
+fn reader_next_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Instance(inst)] = args else {
+        return None;
+    };
+    let keys = reader_keys();
+    let mut d = inst.dict_cell().try_borrow_mut().ok()?;
+    let src = match state_get(&d, AT_INPUT_ITER, &keys.input_iter) {
+        Some(o @ Object::Iter(_)) => o.clone(),
+        Some(o @ Object::File(f)) if !f.binary => o.clone(),
+        _ => return None,
+    };
+    if !matches!(
+        state_get(&d, AT_FIELDS_LIVE, &keys.fields_live),
+        Some(Object::Bool(false))
+    ) || !matches!(
+        state_get(&d, AT_LINE_NUM, &keys.line_num),
+        Some(Object::Int(_))
+    ) {
+        return None;
+    }
+    let cfg = state_get(&d, AT_CFG, &keys.cfg).and_then(unpack_reader_cfg)?;
+    if matches!(cfg.quoting, QUOTE_NONNUMERIC | QUOTE_STRINGS) {
+        return None;
+    }
+    let fields = match &src {
+        Object::Iter(it) => {
+            let mut it = it.try_borrow_mut().ok()?;
+            // (`None` at the source's end, with no record begun: the end.)
+            let next = match &mut *it {
+                crate::object::PyIterator::List {
+                    items,
+                    index,
+                    owner: None,
+                } => {
+                    let items = items.try_borrow().ok()?;
+                    match items.get(*index) {
+                        Some(Object::Str(s)) => Some((s.clone(), index)),
+                        None => None,
+                        _ => return None,
+                    }
+                }
+                crate::object::PyIterator::Tuple { items, index } => match items.get(*index) {
+                    Some(Object::Str(s)) => Some((s.clone(), index)),
+                    None => None,
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            let Some((line, index)) = next else {
+                // The step that finds the end, as the full path's leaves the
+                // iterator, then the end itself.
+                let end = it.next_value();
+                debug_assert!(end.is_none());
+                drop(end);
+                return Some(Err(stop_iteration()));
+            };
+            let fields = record_fields(cfg, &line)?;
+            *index += 1;
+            fields
+        }
+        Object::File(f) => {
+            let fields = f.next_line_pure_with(None, |line| match &line {
+                Object::Str(s) => record_fields(cfg, s),
+                _ => None,
+            })?;
+            // (As a text stream's own `__next__` leaves it.)
+            f.telling.set(false);
+            fields
+        }
+        _ => return None,
+    };
+    let line_num = match d.get_index_mut(AT_LINE_NUM) {
+        Some((k, v)) if same_key(k, &keys.line_num) => Some(v),
+        _ => d.get_mut(&keys.line_num),
+    };
+    if let Some(Object::Int(n)) = line_num {
+        *n += 1;
+    }
+    Some(Ok(Object::new_list(fields)))
+}
+
+/// The fields of `line` when it is one whole record the machine reads
+/// without raising (and without converting fields, which `cfg` doesn't).
+fn record_fields(cfg: DialectCfg, line: &str) -> Option<Vec<Object>> {
+    if let Some(fields) = split_direct(&cfg, line) {
+        return Some(fields);
+    }
+    let mut p = Parser::new(cfg);
+    // (Sized once: no field is longer than its line, and a record has at
+    // most one field more than the line has delimiters.)
+    p.field.reserve(line.len());
+    if p.cfg.delimiter.is_ascii() {
+        let d = p.cfg.delimiter as u8;
+        p.fields
+            .reserve(memchr::memchr_iter(d, line.as_bytes()).count() + 1);
+    }
+    p.feed_line(&mut NoFloats, line).ok()?;
+    (p.state == St::StartRecord).then_some(p.fields)
+}
+
+/// `line`'s fields read straight off it, which is what the machine makes
+/// of it: for a dialect with ASCII characters, no escape in the line, no
+/// `skipinitialspace`, and a quoting style that leaves unquoted fields as
+/// they are, a line that is one whole record of unquoted fields (in which a
+/// quote is an ordinary character) and quoted ones (doubled quotes inside
+/// them read as one, when the dialect doubles), each quoted field closed
+/// before the next delimiter, and no carriage return or newline outside a
+/// quoted field before the line's own terminator. `None` for any other line
+/// (a record that goes on past its line, a line the machine raises on or
+/// reads characters after a closing quote into, an empty line, one longer
+/// than the field limit), which the machine then reads.
+fn split_direct(cfg: &DialectCfg, line: &str) -> Option<Vec<Object>> {
+    if !matches!(cfg.quoting, QUOTE_MINIMAL | QUOTE_ALL | QUOTE_NONE) || cfg.skipinitialspace {
+        return None;
+    }
+    let ascii = |c: char| c.is_ascii().then_some(c as u8);
+    let delimiter = ascii(cfg.delimiter).filter(|&b| b != b'\r' && b != b'\n')?;
+    let quote = match cfg.quotechar {
+        Some(q) if cfg.quoting != QUOTE_NONE => {
+            Some(ascii(q).filter(|&q| q != delimiter && q != b'\r' && q != b'\n')?)
+        }
+        _ => None,
+    };
+    let bytes = line.as_bytes();
+    let body = match bytes {
+        [.., b'\r', b'\n'] => bytes.len() - 2,
+        [.., b'\n' | b'\r'] => bytes.len() - 1,
+        _ => bytes.len(),
+    };
+    if body == 0 || body as i64 > FIELD_LIMIT.load(Ordering::Relaxed) {
+        return None;
+    }
+    let b = &bytes[..body];
+    if let Some(e) = cfg.escapechar {
+        if memchr::memchr(ascii(e)?, b).is_some() {
+            return None;
+        }
+    }
+    // (Every cut is at an ASCII byte, so every piece is whole text.)
+    let plain = b.is_ascii();
+    let text = |s: &str| {
+        if plain {
+            Object::from_str(s)
+        } else {
+            crate::builtins::bridge_to_object(s)
+        }
+    };
+    let mut fields = Vec::with_capacity(memchr::memchr_iter(delimiter, b).count() + 1);
+    let mut at = 0;
+    loop {
+        if let Some(q) = quote.filter(|&q| b.get(at) == Some(&q)) {
+            let mut from = at + 1;
+            let mut doubled = String::new();
+            let close = loop {
+                // (No closing quote: the record goes on past the line.)
+                let next = from + memchr::memchr(q, &b[from..])?;
+                if b.get(next + 1) != Some(&q) {
+                    break next;
+                }
+                if !cfg.doublequote {
+                    return None;
+                }
+                doubled.push_str(&line[from..=next]);
+                from = next + 2;
+            };
+            if doubled.is_empty() {
+                fields.push(text(&line[from..close]));
+            } else {
+                doubled.push_str(&line[from..close]);
+                fields.push(text(&doubled));
+            }
+            at = close + 1;
+            match b.get(at) {
+                None => return Some(fields),
+                Some(&c) if c == delimiter => at += 1,
+                Some(_) => return None,
+            }
+        } else {
+            match memchr::memchr3(delimiter, b'\r', b'\n', &b[at..]) {
+                None => {
+                    fields.push(text(&line[at..body]));
+                    return Some(fields);
+                }
+                Some(n) if b[at + n] == delimiter => {
+                    fields.push(text(&line[at..at + n]));
+                    at += n + 1;
+                }
+                Some(_) => return None,
+            }
+        }
+        // (A delimiter that ends the line leaves an empty last field.)
+        if at == body {
+            fields.push(text(""));
+            return Some(fields);
+        }
+    }
+}
+
+/// `inst.<key> = value` on a reader's state: replaced in place when it is
+/// there (every row's), inserted otherwise.
+fn set_reader_value(inst: &PyInstance, key: &DictKey, value: Object) {
+    let mut d = inst.dict_cell().borrow_mut();
+    match d.get_mut(key) {
+        Some(v) => {
+            let old = std::mem::replace(v, value);
+            drop(d);
+            drop(old);
+        }
+        None => {
+            d.insert(key.clone(), value);
+        }
+    }
 }
 
 fn reader_type() -> Rc<TypeObject> {
@@ -1095,7 +1463,11 @@ fn reader_type() -> Rc<TypeObject> {
         let bt = builtin_types();
         let mut dict = DictData::default();
         dict.insert(key("__iter__"), method("__iter__", reader_iter_self));
-        dict.insert(key("__next__"), method("__next__", reader_iternext));
+        let next = method("__next__", reader_iternext);
+        if let Object::Builtin(b) = &next {
+            crate::leaf_builtins::register_fast(b, reader_next_fast);
+        }
+        dict.insert(key("__next__"), next);
         dict.insert(
             key("__new__"),
             Object::Builtin(Rc::new(BuiltinFn {
@@ -1156,7 +1528,7 @@ fn csv_writer(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, Ru
         {
             let mut d = inst.dict_cell().borrow_mut();
             d.insert(key("write"), write);
-            d.insert(key("dialect"), dialect);
+            d.insert(dialect_keys().dialect.clone(), dialect);
         }
         Ok(Object::Instance(Rc::new(inst)))
     })
@@ -1169,7 +1541,11 @@ fn writer_disallow_new(_args: &[Object]) -> Result<Object, RuntimeError> {
 /// Number predicate for `QUOTE_NONNUMERIC` (`PyNumber_Check`).
 fn is_number(o: &Object) -> bool {
     match o {
-        Object::Int(_) | Object::Float(_) | Object::Complex(_) | Object::Bool(_) => true,
+        Object::Int(_)
+        | Object::Long(_)
+        | Object::Float(_)
+        | Object::Complex(_)
+        | Object::Bool(_) => true,
         Object::Instance(_) => {
             crate::instance_method(o, "__index__").is_some()
                 || crate::instance_method(o, "__int__").is_some()
@@ -1188,6 +1564,23 @@ fn join_append(
     field: Option<&str>,
     quoted_in: bool,
 ) -> Result<(), RuntimeError> {
+    // A field with nothing to quote or escape (the common case) is copied
+    // whole.
+    if let Some(f) = field {
+        if !f.is_empty() && cfg.plain_field(f) {
+            if num_fields > 0 {
+                rec.push(cfg.delimiter);
+            }
+            if quoted_in {
+                rec.push(cfg.quotechar.unwrap_or('"'));
+            }
+            rec.push_str(f);
+            if quoted_in {
+                rec.push(cfg.quotechar.unwrap_or('"'));
+            }
+            return Ok(());
+        }
+    }
     let field_len = field.map_or(0, |f| f.chars().count());
     let mut quoted = quoted_in;
     if field_len == 0 && cfg.delimiter == ' ' && cfg.skipinitialspace {
@@ -1254,66 +1647,139 @@ fn join_append(
     Ok(())
 }
 
-fn writer_writerow_inner(
-    interp: &mut Interpreter,
-    inst: &Rc<PyInstance>,
-    seq: Object,
-) -> Result<Object, RuntimeError> {
+/// A writer's `write` method and its dialect's settings.
+fn writer_parts(inst: &Rc<PyInstance>) -> Result<(Object, DialectCfg), RuntimeError> {
     let (write, dialect_obj) = {
         let d = inst.dict_cell().borrow();
         (
             d.get(&key("write")).cloned(),
-            d.get(&key("dialect")).cloned(),
+            d.get(&dialect_keys().dialect).cloned(),
         )
     };
     let write = write.ok_or_else(|| type_error("writer is missing its write method"))?;
     let dialect_obj = dialect_obj.ok_or_else(|| type_error("writer is missing its dialect"))?;
-    let cfg = read_cfg(&dialect_obj)?;
+    Ok((write, writer_cfg(&dialect_obj)?))
+}
 
-    let iter = match interp.iter_object(seq.clone()) {
-        Ok(it) => it,
-        Err(RuntimeError::PyException(e)) if e.type_name() == "TypeError" => {
-            return Err(csv_error(format!(
-                "iterable expected, not {}",
-                seq.type_name()
-            )))
-        }
-        Err(e) => return Err(e),
+thread_local! {
+    /// The last dialect a writer read (by address and its dict's stamp)
+    /// and its settings: a writer's `writerow` reads them every row.
+    static WRITER_CFG: std::cell::RefCell<Option<(usize, u64, DialectCfg)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// [`read_cfg`] for a writer, through [`WRITER_CFG`]: the dialect's dict
+/// unchanged since (its stamp moves with every store) means the same
+/// settings.
+fn writer_cfg(dialect: &Object) -> Result<DialectCfg, RuntimeError> {
+    let Object::Instance(inst) = dialect else {
+        return read_cfg(dialect);
     };
+    let at = Rc::as_ptr(inst) as usize;
+    let stamp = inst.dict_cell().borrow().mutation_stamp();
+    let hit = WRITER_CFG.with(|c| {
+        c.try_borrow().ok().and_then(|c| match &*c {
+            Some((a, st, cfg)) if *a == at && *st == stamp => Some(cfg.clone()),
+            _ => None,
+        })
+    });
+    if let Some(cfg) = hit {
+        return Ok(cfg);
+    }
+    let cfg = read_cfg(dialect)?;
+    WRITER_CFG.with(|c| {
+        if let Ok(mut c) = c.try_borrow_mut() {
+            *c = Some((at, stamp, cfg.clone()));
+        }
+    });
+    Ok(cfg)
+}
 
+fn writer_writerow_inner(
+    interp: &mut Interpreter,
+    write: &Object,
+    cfg: &DialectCfg,
+    seq: Object,
+) -> Result<Object, RuntimeError> {
     let mut rec = String::new();
     let mut num_fields: i64 = 0;
     let mut last_null = false;
-    loop {
-        let field = match interp.iter_next_object(iter.clone())? {
-            Some(f) => f,
-            None => break,
-        };
+    let mut emit = |interp: &mut Interpreter, field: &Object| -> Result<(), RuntimeError> {
         let quoted = match cfg.quoting {
-            QUOTE_NONNUMERIC => !is_number(&field),
+            QUOTE_NONNUMERIC => !is_number(field),
             QUOTE_ALL => true,
             QUOTE_STRINGS => matches!(field, Object::Str(_) | Object::WStr(_)),
             QUOTE_NOTNULL => !matches!(field, Object::None),
             _ => false,
         };
         last_null = matches!(field, Object::None);
-        if let Some(s) = str_chars(&field) {
-            join_append(&mut rec, &cfg, num_fields, Some(&s), quoted)?;
-            num_fields += 1;
+        if let Some(s) = str_chars(field) {
+            join_append(&mut rec, cfg, num_fields, Some(&s), quoted)?;
         } else if last_null {
-            join_append(&mut rec, &cfg, num_fields, None, quoted)?;
-            num_fields += 1;
+            join_append(&mut rec, cfg, num_fields, None, quoted)?;
         } else {
-            let s = interp.call_object(
-                Object::Type(builtin_types().str_.clone()),
-                std::slice::from_ref(&field),
-                &[],
-            )?;
-            let s = str_chars(&s).unwrap_or_default();
-            join_append(&mut rec, &cfg, num_fields, Some(&s), quoted)?;
-            num_fields += 1;
+            // (`str()` of a plain number or bool is its own text.)
+            let text = match field {
+                Object::Int(n) => Some(itoa::Buffer::new().format(*n).to_owned()),
+                Object::Float(x) => Some(crate::object::float_repr(*x)),
+                Object::Bool(b) => Some(if *b { "True" } else { "False" }.to_owned()),
+                _ => None,
+            };
+            match text {
+                Some(t) => join_append(&mut rec, cfg, num_fields, Some(&t), quoted)?,
+                None => {
+                    let s = interp.call_object(
+                        Object::Type(builtin_types().str_.clone()),
+                        std::slice::from_ref(field),
+                        &[],
+                    )?;
+                    let s = str_chars(&s).unwrap_or_default();
+                    join_append(&mut rec, cfg, num_fields, Some(&s), quoted)?;
+                }
+            }
+        }
+        num_fields += 1;
+        Ok(())
+    };
+
+    // A list or tuple of plain strings, numbers, bools and `None`s: its
+    // items in order, read at once (writing them runs no code, so
+    // iterating the sequence live would see the same items).
+    let plain = |x: &Object| {
+        matches!(
+            x,
+            Object::Str(_) | Object::Int(_) | Object::Float(_) | Object::Bool(_) | Object::None
+        )
+    };
+    let items = match &seq {
+        Object::List(l) => l
+            .try_borrow()
+            .ok()
+            .filter(|v| v.iter().all(plain))
+            .map(|v| v.clone()),
+        Object::Tuple(t) => t.iter().all(plain).then(|| t.to_vec()),
+        _ => None,
+    };
+    if let Some(items) = items {
+        for field in &items {
+            emit(interp, field)?;
+        }
+    } else {
+        let iter = match interp.iter_object(seq.clone()) {
+            Ok(it) => it,
+            Err(RuntimeError::PyException(e)) if e.type_name() == "TypeError" => {
+                return Err(csv_error(format!(
+                    "iterable expected, not {}",
+                    seq.type_name()
+                )))
+            }
+            Err(e) => return Err(e),
+        };
+        while let Some(field) = interp.iter_next_object(iter.clone())? {
+            emit(interp, &field)?;
         }
     }
+    drop(emit);
 
     if num_fields > 0 && rec.is_empty() {
         if cfg.quoting == QUOTE_NONE
@@ -1321,12 +1787,12 @@ fn writer_writerow_inner(
         {
             return Err(csv_error("single empty field record must be quoted"));
         }
-        join_append(&mut rec, &cfg, num_fields - 1, None, true)?;
+        join_append(&mut rec, cfg, num_fields - 1, None, true)?;
     }
 
     rec.push_str(&cfg.lineterminator);
     let line = Object::from_str(rec);
-    interp.call_object(write, &[line], &[])
+    interp.call_object(write.clone(), &[line], &[])
 }
 
 fn writer_writerow(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1335,7 +1801,8 @@ fn writer_writerow(args: &[Object]) -> Result<Object, RuntimeError> {
         .get(1)
         .cloned()
         .ok_or_else(|| type_error("writerow() takes exactly one argument (0 given)"))?;
-    with_interp(|interp| writer_writerow_inner(interp, &inst, seq))
+    let (write, cfg) = writer_parts(&inst)?;
+    with_interp(|interp| writer_writerow_inner(interp, &write, &cfg, seq))
 }
 
 fn writer_writerows(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -1344,6 +1811,9 @@ fn writer_writerows(args: &[Object]) -> Result<Object, RuntimeError> {
         .get(1)
         .cloned()
         .ok_or_else(|| type_error("writerows() takes exactly one argument (0 given)"))?;
+    // (CPython's writer holds its `write` and dialect from creation; both
+    // are read-only attributes there.)
+    let (write, cfg) = writer_parts(&inst)?;
     with_interp(|interp| {
         let row_iter = interp.iter_object(seqseq)?;
         loop {
@@ -1351,7 +1821,7 @@ fn writer_writerows(args: &[Object]) -> Result<Object, RuntimeError> {
                 Some(r) => r,
                 None => break,
             };
-            writer_writerow_inner(interp, &inst, row)?;
+            writer_writerow_inner(interp, &write, &cfg, row)?;
         }
         Ok(Object::None)
     })

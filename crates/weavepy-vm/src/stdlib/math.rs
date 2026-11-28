@@ -294,7 +294,9 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
 /// computed without the body's argument conversion and result checks. A
 /// domain or range error, or a NaN (which the body re-tags), declines to
 /// the full body.
-const FAST_HALVES: [(&str, crate::leaf_builtins::Fast); 12] = [
+const FAST_HALVES: [(&str, crate::leaf_builtins::Fast); 14] = [
+    ("prod", prod_fast),
+    ("fsum", fsum_fast),
     ("floor", floor_fast),
     ("ceil", ceil_fast),
     ("sqrt", sqrt_fast),
@@ -315,6 +317,59 @@ pub(crate) fn is_fast_half(f: crate::leaf_builtins::Fast) -> bool {
 }
 
 type FastResult = Option<Result<Object, RuntimeError>>;
+
+/// A list's or tuple's items, when every one is a plain `int` or `float`
+/// (reading them runs no code), handed to `f`.
+fn plain_numbers<R>(seq: &Object, f: impl FnOnce(&[Object]) -> Option<R>) -> Option<R> {
+    let plain = |xs: &[Object]| {
+        xs.iter()
+            .all(|x| matches!(x, Object::Int(_) | Object::Float(_)))
+    };
+    match seq {
+        Object::List(l) => {
+            let xs = l.try_borrow().ok()?;
+            plain(&xs).then(|| f(&xs)).flatten()
+        }
+        Object::Tuple(t) => plain(t).then(|| f(t)).flatten(),
+        _ => None,
+    }
+}
+
+/// `math.prod(xs)` (no `start`) of a list or tuple of plain numbers: the
+/// left-to-right product, machine ints while they don't overflow, then
+/// doubles once a `float` comes, as CPython's int and float paths compute
+/// it. An overflowing int product declines to the full body.
+fn prod_fast(args: &[Object]) -> FastResult {
+    let [seq] = args else {
+        return None;
+    };
+    plain_numbers(seq, |xs| {
+        let mut int_acc: i64 = 1;
+        let mut flt: Option<f64> = None;
+        for x in xs {
+            match (flt, x) {
+                (None, Object::Int(i)) => int_acc = int_acc.checked_mul(*i)?,
+                (None, Object::Float(f)) => flt = Some(int_acc as f64 * f),
+                (Some(a), Object::Float(f)) => flt = Some(a * f),
+                (Some(a), Object::Int(i)) => flt = Some(a * *i as f64),
+                _ => return None,
+            }
+        }
+        Some(Ok(match flt {
+            Some(f) => Object::Float(f),
+            None => Object::Int(int_acc),
+        }))
+    })
+}
+
+/// `math.fsum(xs)` of a list or tuple of plain numbers: the full body,
+/// which reads such items with no code run.
+fn fsum_fast(args: &[Object]) -> FastResult {
+    let [seq] = args else {
+        return None;
+    };
+    plain_numbers(seq, |_| Some(math_fsum(args)))
+}
 
 /// A plain `float` or `int` argument's value.
 #[inline]
@@ -985,10 +1040,10 @@ fn math_gcd(args: &[Object]) -> Result<Object, RuntimeError> {
         Object::Bool(b) => Some(u64::from(*b)),
         _ => None,
     };
-    if let Some(words) = args.iter().map(small).collect::<Option<Vec<u64>>>() {
-        let g = words
-            .into_iter()
-            .fold(0u64, |a, b| gcd_u128(u128::from(a), u128::from(b)) as u64);
+    // (Folded as they come, no list of them built.)
+    if let Some(g) = args.iter().try_fold(0u64, |a, o| {
+        small(o).map(|b| gcd_u128(u128::from(a), u128::from(b)) as u64)
+    }) {
         return Ok(i64::try_from(g).map_or_else(
             |_| Object::int_from_bigint(num_bigint::BigInt::from(g)),
             Object::Int,
@@ -1196,6 +1251,27 @@ fn math_isclose(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
 /// ``_PyIter_GetIter`` flow: try to make an iterator and pull values
 /// until exhaustion, coercing each to f64 along the way.
 fn collect_numbers(arg: &Object, func: &str) -> Result<Vec<f64>, RuntimeError> {
+    // An exact list or tuple of floats and machine ints: read in place.
+    let plain = |items: &[Object]| -> Option<Vec<f64>> {
+        items
+            .iter()
+            .map(|x| match *x {
+                Object::Float(f) => Some(f),
+                // (Exactly as `float(i)` rounds it.)
+                Object::Int(i) => Some(i as f64),
+                Object::Bool(b) => Some(f64::from(u8::from(b))),
+                _ => None,
+            })
+            .collect()
+    };
+    let read = match arg {
+        Object::List(l) => l.try_borrow().ok().and_then(|v| plain(&v)),
+        Object::Tuple(t) => plain(t),
+        _ => None,
+    };
+    if let Some(values) = read {
+        return Ok(values);
+    }
     // Iterate through the interpreter so tuple subclasses, generators, and
     // user `__iter__` work (CPython's `dist`/`fsum` accept any iterable):
     // `dist(T((1,2,3)), ...)` for a `tuple` subclass `T` reaches here as an
@@ -1223,10 +1299,13 @@ fn object_to_f64(value: &Object, func: &str) -> Result<f64, RuntimeError> {
     // take `FloatLike` and `Fraction`-style operands).
     match crate::builtins::coerce_f64_opt(value)? {
         Some(f) => Ok(f),
-        None => Err(type_error(format!(
-            "{func}() element must be a real number, not '{}'",
-            value.type_name()
-        ))),
+        None => {
+            let _ = func;
+            Err(type_error(format!(
+                "must be real number, not {}",
+                value.type_name()
+            )))
+        }
     }
 }
 
@@ -1817,6 +1896,33 @@ fn math_modf(args: &[Object]) -> Result<Object, RuntimeError> {
     ]))
 }
 
+/// `comb(n, k)` or `perm(n, k)` of two machine ints whose product stays
+/// within 128 bits at every step (each step of `comb` is exact:
+/// `C(n, i + 1) = C(n, i) * (n - i) / (i + 1)`). `None` for a negative
+/// argument (whose error the general path raises) or an overflow (which
+/// it computes with big ints).
+fn comb_perm_small(n: i64, k: i64, comb: bool) -> Option<Object> {
+    if n < 0 || k < 0 {
+        return None;
+    }
+    if k > n {
+        return Some(Object::Int(0));
+    }
+    let (n, k) = (n as u128, k as u128);
+    let steps = if comb { k.min(n - k) } else { k };
+    let mut r: u128 = 1;
+    for i in 0..steps {
+        r = r.checked_mul(n - i)?;
+        if comb {
+            r /= i + 1;
+        }
+    }
+    Some(match i64::try_from(r) {
+        Ok(v) => Object::Int(v),
+        Err(_) => Object::int_from_bigint(num_bigint::BigInt::from(r)),
+    })
+}
+
 fn math_comb(args: &[Object]) -> Result<Object, RuntimeError> {
     use num_traits::{Signed, ToPrimitive};
     if args.len() != 2 {
@@ -1824,6 +1930,11 @@ fn math_comb(args: &[Object]) -> Result<Object, RuntimeError> {
             "comb() takes exactly 2 arguments ({} given)",
             args.len()
         )));
+    }
+    if let [Object::Int(n), Object::Int(k)] = args {
+        if let Some(r) = comb_perm_small(*n, *k, true) {
+            return Ok(r);
+        }
     }
     let n = index_bigint(&args[0])?;
     let k = index_bigint(&args[1])?;
@@ -1867,6 +1978,11 @@ fn math_perm(args: &[Object]) -> Result<Object, RuntimeError> {
     // perm(n) and perm(n, None) are factorial(n).
     if matches!(args.get(1), None | Some(Object::None)) {
         return factorial_impl(&args[0]);
+    }
+    if let [Object::Int(n), Object::Int(k)] = args {
+        if let Some(r) = comb_perm_small(*n, *k, false) {
+            return Ok(r);
+        }
     }
     let n = index_bigint(&args[0])?;
     let k = index_bigint(&args[1])?;
@@ -2408,6 +2524,21 @@ fn math_lgamma(args: &[Object]) -> Result<Object, RuntimeError> {
 fn math_isqrt(args: &[Object]) -> Result<Object, RuntimeError> {
     use num_traits::Signed;
     expect_nargs(args, "isqrt", 1)?;
+    // A non-negative machine int: the float root's estimate, corrected to
+    // the exact floor (the estimate is within one of it).
+    if let Object::Int(n) = &args[0] {
+        if let Ok(n) = u64::try_from(*n) {
+            let n = u128::from(n);
+            let mut r = (n as f64).sqrt() as u128;
+            while r * r > n {
+                r -= 1;
+            }
+            while (r + 1) * (r + 1) <= n {
+                r += 1;
+            }
+            return Ok(Object::Int(r as i64));
+        }
+    }
     // Accept any integer, including big and `__index__`-able values
     // (CPython uses `_PyNumber_Index`). A float approximation overflows for
     // large inputs, so we take the exact integer square root over BigInt.

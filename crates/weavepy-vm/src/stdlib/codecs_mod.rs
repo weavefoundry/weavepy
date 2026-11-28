@@ -199,12 +199,17 @@ fn arg_codec_name(args: &[Object], idx: usize, name: &str) -> Result<String, Run
     }
 }
 
-fn arg_bytes(args: &[Object], idx: usize, name: &str) -> Result<Vec<u8>, RuntimeError> {
+fn arg_bytes<'a>(
+    args: &'a [Object],
+    idx: usize,
+    name: &str,
+) -> Result<std::borrow::Cow<'a, [u8]>, RuntimeError> {
     let _ = name;
     match args.get(idx) {
         // Argument-clinic `Py_buffer` converter wording (`codecs.utf_8_decode("x")`
         // → "a bytes-like object is required, not 'str'").
-        Some(o) => o.as_bytes_view().ok_or_else(|| {
+        // (A `bytes` object's bytes are read where they are.)
+        Some(o) => o.bytes_cow().ok_or_else(|| {
             type_error(format!(
                 "a bytes-like object is required, not '{}'",
                 o.type_name()
@@ -219,7 +224,7 @@ fn arg_bytes(args: &[Object], idx: usize, name: &str) -> Result<Vec<u8>, Runtime
 fn arg_bytes_or_str_utf8(args: &[Object], idx: usize, name: &str) -> Result<Vec<u8>, RuntimeError> {
     match args.get(idx) {
         Some(Object::Str(s)) => Ok(s.as_bytes().to_vec()),
-        _ => arg_bytes(args, idx, name),
+        _ => arg_bytes(args, idx, name).map(std::borrow::Cow::into_owned),
     }
 }
 
@@ -972,7 +977,7 @@ fn decode_via_registry(
     let res = with_interp(|interp| {
         interp.call_object(
             codec,
-            &[Object::new_bytes(bytes.to_vec()), Object::from_str(errors)],
+            &[Object::new_bytes(bytes), Object::from_str(errors)],
             &[],
         )
     });
@@ -1212,36 +1217,14 @@ fn encode_special(s: &str, encoding: &str, errors: &str) -> Result<Option<Vec<u8
         }
         "ascii" => Some(crate::stdlib::codecs_engine::ascii_encode(&cps(), errors)?),
         "latin1" | "iso88591" => Some(crate::stdlib::codecs_engine::latin1_encode(&cps(), errors)?),
-        "utf16" => Some(crate::stdlib::codecs_engine::utf16_encode(
-            &cps(),
-            errors,
-            0,
-        )?),
-        "utf16le" => Some(crate::stdlib::codecs_engine::utf16_encode(
-            &cps(),
-            errors,
-            -1,
-        )?),
-        "utf16be" => Some(crate::stdlib::codecs_engine::utf16_encode(
-            &cps(),
-            errors,
-            1,
-        )?),
-        "utf32" => Some(crate::stdlib::codecs_engine::utf32_encode(
-            &cps(),
-            errors,
-            0,
-        )?),
-        "utf32le" => Some(crate::stdlib::codecs_engine::utf32_encode(
-            &cps(),
-            errors,
-            -1,
-        )?),
-        "utf32be" => Some(crate::stdlib::codecs_engine::utf32_encode(
-            &cps(),
-            errors,
-            1,
-        )?),
+        // (A `str` has no lone surrogate, so nothing for a handler: its
+        // units are written straight from the text.)
+        "utf16" => Some(crate::stdlib::codecs_engine::utf16_encode_str(s, 0)),
+        "utf16le" => Some(crate::stdlib::codecs_engine::utf16_encode_str(s, -1)),
+        "utf16be" => Some(crate::stdlib::codecs_engine::utf16_encode_str(s, 1)),
+        "utf32" => Some(crate::stdlib::codecs_engine::utf32_encode_str(s, 0)),
+        "utf32le" => Some(crate::stdlib::codecs_engine::utf32_encode_str(s, -1)),
+        "utf32be" => Some(crate::stdlib::codecs_engine::utf32_encode_str(s, 1)),
         "rawunicodeescape" => Some(encode_raw_unicode_escape(s)),
         "unicodeescape" => Some(encode_unicode_escape(s)),
         "utf7" => Some(crate::stdlib::codecs_engine::utf7_encode(&cps(), errors)?),

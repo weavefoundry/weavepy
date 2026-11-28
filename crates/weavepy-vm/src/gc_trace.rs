@@ -1186,35 +1186,50 @@ impl GcState {
     /// garbage can appear, and nothing deferred here can be part of a
     /// cycle. A population that genuinely accumulates is paced by
     /// `DEFERRED_CAP` instead.
+    #[inline]
     fn defer_container(&self, obj: &Object) -> bool {
         let Some(weak) = DeferredContainer::new(obj) else {
             return false;
         };
-        let over = {
-            // SAFETY: nothing below runs code while the list is borrowed
-            // (a dead predecessor's release only frees memory).
-            let mut guard = None;
-            let deferred = match unsafe { self.deferred.peek_mut() } {
-                Some(d) => d,
-                None => match self.deferred.try_borrow_mut() {
-                    Ok(g) => &mut **guard.insert(g),
-                    // A sweep is already walking the list (it upgrades and
-                    // can re-enter through a promotion). Track eagerly
-                    // rather than queue onto a list we cannot touch.
-                    Err(_) => return false,
-                },
-            };
-            // The churn shape — a loop that builds a container and drops
-            // the previous one — leaves its dead predecessors just below
-            // the tail: reclaim them here, so steady churn neither grows
-            // the list nor parks dead allocations until a sweep.
-            let n = deferred.len();
-            for i in (n.saturating_sub(2)..n).rev() {
-                if deferred[i].is_dead() {
-                    deferred.swap_remove(i);
-                }
+        // SAFETY: nothing below runs code while the list is viewed (a dead
+        // predecessor's release only frees memory).
+        let Some(deferred) = (unsafe { self.deferred.peek_mut() }) else {
+            return self.defer_container_slow(weak);
+        };
+        Self::push_deferred(deferred, weak);
+        if deferred.len() >= self.deferred_limit.load(Ordering::Relaxed) {
+            self.sweep_deferred(false);
+        }
+        true
+    }
+
+    /// Queue `weak`, first reclaiming the dead predecessors just below the
+    /// tail: the churn shape (a loop that builds a container and drops the
+    /// previous one) leaves them there, so steady churn neither grows the
+    /// list nor parks dead allocations until a sweep.
+    #[inline(always)]
+    fn push_deferred(deferred: &mut Vec<DeferredContainer>, weak: DeferredContainer) {
+        let n = deferred.len();
+        for i in (n.saturating_sub(2)..n).rev() {
+            if deferred[i].is_dead() {
+                deferred.swap_remove(i);
             }
-            deferred.push(weak);
+        }
+        deferred.push(weak);
+    }
+
+    /// [`Self::defer_container`] when the list is held by a guard: through
+    /// a borrow of its own, or (a sweep is already walking the list, which
+    /// upgrades and can re-enter through a promotion) not at all, the
+    /// container then tracked eagerly.
+    #[cold]
+    #[inline(never)]
+    fn defer_container_slow(&self, weak: DeferredContainer) -> bool {
+        let over = {
+            let Ok(mut deferred) = self.deferred.try_borrow_mut() else {
+                return false;
+            };
+            Self::push_deferred(&mut deferred, weak);
             deferred.len() >= self.deferred_limit.load(Ordering::Relaxed)
         };
         if over {
@@ -1861,7 +1876,9 @@ impl GcState {
     /// structure and drops the previous one thus seldom collects, as in
     /// CPython; the pruning costs a few steps per allocation.)
     pub fn maybe_auto_collect(&self) -> bool {
-        if !self.is_enabled() || self.collecting.load(Ordering::Acquire) {
+        // (The gauge settles the common answer, not due yet, from one
+        // load: no borrow of the counts or thresholds.)
+        if !self.auto_collect_due() {
             return false;
         }
         // How many collections in a row have found nothing (see `wanted`
@@ -3504,6 +3521,13 @@ fn traverse_impl<const PEEK: bool, V: Visit + ?Sized>(obj: &Object, visit: &mut 
                     visit_rc::<PEEK, _, V>(visit, meta, Object::Type);
                 }
             }
+            // The `__mro__`/`__bases__` tuples the class keeps (see
+            // `TypeObject::links_tuple`), the MRO's one holding the class.
+            if let Ok(links) = t.link_tuples.try_borrow() {
+                for tuple in [&links.0, &links.1].into_iter().flatten() {
+                    visit.visit(tuple);
+                }
+            }
             // The cached instantiation plan holds strong refs to the
             // resolved `__new__`/`__init__` (usually aliases of the dict
             // entries visited above, but still *extra* edges). Without
@@ -3889,6 +3913,9 @@ pub fn clear_object_fields(obj: &Object) -> bool {
             if let Ok(mut mro) = t.mro.try_borrow_mut() {
                 mro.clear();
             }
+            if let Ok(mut links) = t.link_tuples.try_borrow_mut() {
+                *links = (None, None);
+            }
             if let Ok(mut meta) = t.metaclass.try_borrow_mut() {
                 *meta = None;
             }
@@ -3968,6 +3995,15 @@ pub fn track(obj: &Object) {
         // SAFETY: a guard-free view that ends before anything runs.
         if unsafe { l.peek() }.is_some_and(Vec::is_empty) {
             track_inert(obj);
+            return;
+        }
+    }
+    // A frozenset of atomic values (`frozenset((1, 2, 3))`) can never be
+    // part of a cycle, whatever happens later: it can't change. It isn't
+    // registered (`gc.is_tracked` registers it on asking, as CPython tracks
+    // every frozenset).
+    if let Object::FrozenSet(fs) = obj {
+        if fs.len() <= 64 && fs.iter().all(|k| is_atomic(&k.0)) {
             return;
         }
     }

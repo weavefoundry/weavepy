@@ -32,6 +32,11 @@ from _thread import RLock
 WRAPPER_ASSIGNMENTS = ('__module__', '__name__', '__qualname__', '__doc__',
                        '__annotate__', '__type_params__')
 WRAPPER_UPDATES = ('__dict__',)
+try:
+    from _functools import _update_wrapper_plain
+except ImportError:
+    def _update_wrapper_plain(wrapper, wrapped):
+        return None
 def update_wrapper(wrapper,
                    wrapped,
                    assigned = WRAPPER_ASSIGNMENTS,
@@ -47,6 +52,11 @@ def update_wrapper(wrapper,
        are updated with the corresponding attribute from the wrapped
        function (defaults to functools.WRAPPER_UPDATES)
     """
+    # (Two plain functions and the default lists: the same steps, native.)
+    if assigned is WRAPPER_ASSIGNMENTS and updated is WRAPPER_UPDATES:
+        done = _update_wrapper_plain(wrapper, wrapped)
+        if done is not None:
+            return done
     for attr in assigned:
         try:
             value = getattr(wrapped, attr)
@@ -223,6 +233,46 @@ def _cmp_to_key_py(mycmp):
     return K
 
 cmp_to_key = _cmp_to_key_py
+
+
+# WeavePy: the native `cmp_to_key` (CPython's is C) returns one of these
+# instead of a class made per call: a callable `key(obj)` whose results
+# compare through the wrapped `mycmp`. Making a class for every
+# `sorted(xs, key=cmp_to_key(f))` cost far more than the sort.
+class _CmpKey:
+    __slots__ = ('obj', '_mycmp')
+    __hash__ = None
+    __weave_immutable_type__ = True
+
+    def __lt__(self, other):
+        return self._mycmp(self.obj, other.obj) < 0
+
+    def __gt__(self, other):
+        return self._mycmp(self.obj, other.obj) > 0
+
+    def __eq__(self, other):
+        return self._mycmp(self.obj, other.obj) == 0
+
+    def __le__(self, other):
+        return self._mycmp(self.obj, other.obj) <= 0
+
+    def __ge__(self, other):
+        return self._mycmp(self.obj, other.obj) >= 0
+
+
+class _CmpToKey:
+    __slots__ = ('_mycmp',)
+    __weave_immutable_type__ = True
+
+    def __init__(self, mycmp):
+        self._mycmp = mycmp
+
+    def __call__(self, obj):
+        key = _CmpKey.__new__(_CmpKey)
+        key.obj = obj
+        key._mycmp = self._mycmp
+        return key
+
 
 try:
     # The native version is a non-binding builtin (CPython's is a C

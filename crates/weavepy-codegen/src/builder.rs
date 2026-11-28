@@ -24,6 +24,9 @@ pub struct FunctionBuilder<'a> {
     /// definition serves every use (code generation rematerializes a
     /// constant where it's used, whatever block defines it).
     consts: HashMap<(Type, i64), Value>,
+    /// How many call instructions have been built (see
+    /// [`Self::calls_emitted`]).
+    calls: u32,
 }
 
 impl<'a> FunctionBuilder<'a> {
@@ -35,6 +38,7 @@ impl<'a> FunctionBuilder<'a> {
             defs: HashMap::default(),
             reads: Vec::new(),
             consts: HashMap::default(),
+            calls: 0,
         }
     }
 
@@ -68,6 +72,12 @@ impl<'a> FunctionBuilder<'a> {
     pub fn import_function(&mut self, data: ExtFuncData) -> FuncRef {
         self.func.dfg.funcs.push(data);
         FuncRef(self.func.dfg.funcs.len() as u32 - 1)
+    }
+
+    /// The number of call instructions built so far: a front end that
+    /// keeps facts only until the next call compares two readings.
+    pub fn calls_emitted(&self) -> u32 {
+        self.calls
     }
 
     pub fn create_block(&mut self) -> Block {
@@ -445,6 +455,7 @@ impl FuncInstBuilder<'_, '_> {
             .iter()
             .map(|r| r.value_type)
             .collect();
+        self.b.calls += 1;
         self.b.push(Op::Call(f), args, &rets)
     }
 
@@ -480,6 +491,7 @@ impl FuncInstBuilder<'_, '_> {
         let mut all = Vec::with_capacity(args.len() + 1);
         all.push(callee);
         all.extend_from_slice(args);
+        self.b.calls += 1;
         self.b.push(Op::CallIndirect(sig), &all, &rets)
     }
 

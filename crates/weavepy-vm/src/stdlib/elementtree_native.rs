@@ -925,17 +925,19 @@ fn new_iter(cls: Rc<TypeObject>, root: Object, tag: Object, mode: i64) -> Object
     } else {
         (new_list(vec![root, Object::Int(F_VISIT_ROOT)]), tag)
     };
-    let mut i = PyInstance::new(t.cls.clone());
-    i.slots = RefCell::new(SlotStorage::from_layout(
-        t.layout.clone(),
-        vec![
-            stack,
-            tag,
-            Object::Int(mode),
-            Object::Bool(false),
-            Object::Type(cls),
-        ],
-    ));
+    let i = PyInstance::with_slots(
+        t.cls.clone(),
+        SlotStorage::from_layout(
+            t.layout.clone(),
+            vec![
+                stack,
+                tag,
+                Object::Int(mode),
+                Object::Bool(false),
+                Object::Type(cls),
+            ],
+        ),
+    );
     let o = Object::Instance(Rc::new(i));
     crate::gc_trace::track(&o);
     o

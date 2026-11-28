@@ -1,0 +1,124 @@
+"""`OrderedDict` stores, construction from pairs, and `list(od)`.
+
+A fresh `OrderedDict`'s first `od[key] = value` starts its order in place,
+as the full store does; construction from an iterable unpacks 2-tuples
+directly and anything else as CPython's `odict` does, with its errors.
+`list(od)` of an exact `OrderedDict` takes the keys in order at once; a
+subclass's own `__iter__` iterates.
+"""
+
+import unittest
+from collections import OrderedDict
+
+N = 3000
+
+
+class S(OrderedDict):
+    def __setitem__(self, k, v):
+        super().__setitem__(k, v * 10)
+
+
+class OdictFreshStoreTests(unittest.TestCase):
+    def test_fresh_stores_keep_order(self):
+        for _ in range(N):
+            o = OrderedDict()
+            o["b"] = 1
+            o["a"] = 2
+            o["b"] = 3
+        self.assertEqual(list(o.items()), [("b", 3), ("a", 2)])
+        o.move_to_end("b")
+        self.assertEqual(list(o), ["a", "b"])
+        del o["a"]
+        self.assertEqual(list(o), ["b"])
+
+    def test_construction_from_pairs(self):
+        P = [("a", 1), ("b", 2)]
+        for _ in range(N):
+            g = OrderedDict((k, v) for k, v in P)
+            m = OrderedDict(iter([("x", 1), ["y", 2], "zq"]))
+        self.assertEqual(list(g.items()), P)
+        self.assertEqual(list(m.items()), [("x", 1), ("y", 2), ("z", "q")])
+
+    def test_pair_errors(self):
+        for bad, msg in [([()], "need more than 0"), ([(1,)], "need more than 1"),
+                         ([(1, 2, 3)], "too many values")]:
+            with self.assertRaises(ValueError) as cm:
+                OrderedDict(iter(bad))
+            self.assertIn(msg, str(cm.exception))
+
+    def test_subclass_setitem(self):
+        for _ in range(N):
+            s = S(iter([("a", 1)]))
+            s["b"] = 2
+        self.assertEqual(dict(s), {"a": 10, "b": 20})
+
+    def test_unhashable_key(self):
+        o = OrderedDict()
+        with self.assertRaises(TypeError):
+            o[[1]] = 2
+        self.assertEqual(list(o), [])
+
+    def test_list_of_keys(self):
+        o = OrderedDict([("a", 1), ("b", 2), ("c", 3)])
+        o.move_to_end("a")
+        del o["b"]
+        o["d"] = 4
+        for _ in range(N):
+            r = list(o)
+            t = tuple(o)
+        self.assertEqual(r, ["c", "a", "d"])
+        self.assertEqual(t, ("c", "a", "d"))
+        self.assertEqual(list(OrderedDict()), [])
+
+    def test_list_of_keys_overridden(self):
+        class R(OrderedDict):
+            def __iter__(self):
+                return iter(["z"])
+
+        for _ in range(N):
+            r = list(R(a=1))
+        self.assertEqual(r, ["z"])
+        self.assertEqual(list(OrderedDict(a=1)), ["a"])
+
+    def test_list_of_views(self):
+        o = OrderedDict([("a", 1), ("b", 2), ("c", 3)])
+        o.move_to_end("a")
+        for _ in range(N):
+            k = list(o.keys())
+            v = list(o.values())
+            i = list(o.items())
+        self.assertEqual(k, ["b", "c", "a"])
+        self.assertEqual(v, [2, 3, 1])
+        self.assertEqual(i, [("b", 2), ("c", 3), ("a", 1)])
+
+    def test_views_with_python_keys(self):
+        class K:
+            def __init__(self, n):
+                self.n = n
+
+            def __hash__(self):
+                return hash(self.n)
+
+            def __eq__(self, other):
+                return isinstance(other, K) and other.n == self.n
+
+        o = OrderedDict([(K(1), "x"), (K(2), "y")])
+        for _ in range(N):
+            v = list(o.values())
+            i = [(k.n, w) for k, w in list(o.items())]
+        self.assertEqual(v, ["x", "y"])
+        self.assertEqual(i, [(1, "x"), (2, "y")])
+
+    def test_subclass_views(self):
+        class O2(OrderedDict):
+            pass
+
+        o = O2(a=1)
+        o["b"] = 2
+        for _ in range(N):
+            i = list(o.items())
+        self.assertEqual(i, [("a", 1), ("b", 2)])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -120,6 +120,7 @@ if _HAVE_NATIVE:
     _islice_core = _n.islice_core
     _repeat_core = _n.repeat_core
     _tee_core = _n.tee_core
+    _tee_native = getattr(_n, "tee_native", None)
     _count_core = _n.count_core
     _cycle_core = _n.cycle_core
     _chain_core = _n.chain_core
@@ -769,7 +770,7 @@ class count:
         return self
 
     def __iter__(self):
-        return self._core
+        return self
 
     def __next__(self):
         return next(self._core)
@@ -810,7 +811,7 @@ class cycle:
         return self
 
     def __iter__(self):
-        return self._core
+        return self
 
     def __next__(self):
         return next(self._core)
@@ -890,7 +891,7 @@ class repeat:
         return self
 
     def __iter__(self):
-        return self._core
+        return self
 
     def __next__(self):
         return next(self._core)
@@ -963,7 +964,7 @@ class accumulate:
         return self
 
     def __iter__(self):
-        return self._core
+        return self
 
     def __next__(self):
         return next(self._core)
@@ -1019,7 +1020,7 @@ class chain:
         return self
 
     def __iter__(self):
-        return self._core
+        return self
 
     def __next__(self):
         return next(self._core)
@@ -1116,7 +1117,7 @@ class compress:
         return self
 
     def __iter__(self):
-        return self._core
+        return self
 
     def __next__(self):
         return next(self._core)
@@ -1147,7 +1148,7 @@ class dropwhile:
         return self
 
     def __iter__(self):
-        return self._core
+        return self
 
     def __next__(self):
         return next(self._core)
@@ -1179,7 +1180,7 @@ class takewhile:
         return self
 
     def __iter__(self):
-        return self._core
+        return self
 
     def __next__(self):
         return next(self._core)
@@ -1211,7 +1212,7 @@ class filterfalse:
         return self
 
     def __iter__(self):
-        return self._core
+        return self
 
     def __next__(self):
         return next(self._core)
@@ -1238,7 +1239,7 @@ class starmap:
         return self
 
     def __iter__(self):
-        return self._core
+        return self
 
     def __next__(self):
         return next(self._core)
@@ -1508,7 +1509,7 @@ class islice:
         return self
 
     def __iter__(self):
-        return self._core
+        return self
 
     def __next__(self):
         return next(self._core)
@@ -1544,7 +1545,7 @@ class pairwise:
         return self
 
     def __iter__(self):
-        return self._core
+        return self
 
     def __next__(self):
         return next(self._core)
@@ -1578,7 +1579,7 @@ class zip_longest:
         return self
 
     def __iter__(self):
-        return self._core
+        return self
 
     def __next__(self):
         return next(self._core)
@@ -1624,7 +1625,7 @@ class product:
         return self
 
     def __iter__(self):
-        return self._core
+        return self
 
     def __next__(self):
         return next(self._core)
@@ -1719,7 +1720,7 @@ class permutations:
         return self
 
     def __iter__(self):
-        return self._core
+        return self
 
     def __next__(self):
         return next(self._core)
@@ -1797,7 +1798,7 @@ class combinations:
         return self
 
     def __iter__(self):
-        return self._core
+        return self
 
     def __next__(self):
         return next(self._core)
@@ -1888,7 +1889,7 @@ class combinations_with_replacement:
         return self
 
     def __iter__(self):
-        return self._core
+        return self
 
     def __next__(self):
         return next(self._core)
@@ -1972,7 +1973,7 @@ class batched:
         return self
 
     def __iter__(self):
-        return self._core
+        return self
 
     def __next__(self):
         return next(self._core)
@@ -2026,7 +2027,7 @@ class _tee:
         return self
 
     def __iter__(self):
-        return self._core
+        return self
 
     def __next__(self):
         return next(self._core)
@@ -2056,9 +2057,35 @@ class _tee:
 if _HAVE_NATIVE and hasattr(_n, "_register_types"):
     _n._register_types(globals())
 
+# A native `__next__` for the classes whose own is `next(self._core)` (the
+# pure-Python fallbacks keep theirs): no Python frame per step, as
+# CPython's C types (`c.__next__()` of a count, as `threading` names its
+# threads).
+if _HAVE_NATIVE and hasattr(_n, "_core_next"):
+    for _name in ("count", "cycle", "repeat", "accumulate", "chain", "compress",
+                  "dropwhile", "takewhile", "filterfalse", "starmap", "groupby",
+                  "_grouper", "islice", "pairwise", "zip_longest", "product",
+                  "permutations", "combinations", "combinations_with_replacement",
+                  "batched", "_tee"):
+        _cls = globals().get(_name)
+        _f = getattr(_cls, "__dict__", {}).get("__next__")
+        _c = getattr(_f, "__code__", None)
+        if _c is not None and _c.co_names == ("next", "_core"):
+            _cls.__next__ = _n._core_next
+    del _name, _cls, _f, _c
+    # (`_tee` instances are their own iterators, natively.)
+    if hasattr(_n, "_iter_self"):
+        _tee.__iter__ = _n._iter_self
+
 
 def tee(iterable, n=2):
     """tee(iterable, n=2) --> tuple of n independent iterators."""
+    # (Branches over a fresh shared buffer, built natively; a tee's own
+    # copies and any other shape are made below.)
+    if _HAVE_NATIVE and _tee_native is not None:
+        result = _tee_native(iterable, n, _tee, _tee_dataobject)
+        if result is not None:
+            return result
     n = _as_int(n)
     if n < 0:
         raise ValueError("n must be >= 0")

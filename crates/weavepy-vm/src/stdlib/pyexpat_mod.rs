@@ -184,8 +184,7 @@ fn state_from_ud(ud: *mut c_void) -> Option<StateRef> {
     // The last parser this thread looked up, held weakly: a parse makes
     // every callback ask for the same one.
     thread_local! {
-        static LAST: std::cell::RefCell<(i64, crate::sync::Weak<RefCell<ExpatState>>)> =
-            const { std::cell::RefCell::new((0, crate::sync::Weak::new())) };
+        static LAST: crate::gil::ReleaseUnderGil<std::cell::RefCell<(i64, crate::sync::Weak<RefCell<ExpatState>>)>> = const { crate::gil::ReleaseUnderGil::new(std::cell::RefCell::new((0, crate::sync::Weak::new()))) };
     }
     let id = ud as i64;
     let hit = LAST.with(|last| {
@@ -2023,7 +2022,7 @@ fn get_input_context_method(args: &[Object]) -> Result<Object, RuntimeError> {
             (size - offset) as usize,
         )
     };
-    Ok(Object::new_bytes(bytes.to_vec()))
+    Ok(Object::new_bytes(bytes))
 }
 
 fn set_param_entity_parsing_method(args: &[Object]) -> Result<Object, RuntimeError> {

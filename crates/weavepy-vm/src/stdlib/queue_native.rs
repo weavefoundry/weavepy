@@ -30,14 +30,41 @@ use crate::stdlib::collections_native as deque;
 fn field(
     interp: &mut crate::Interpreter,
     recv: &Object,
-    name: &str,
+    name: &'static str,
 ) -> Result<Object, RuntimeError> {
     if let Object::Instance(inst) = recv {
-        if let Some(v) = inst.attr_get_str(name) {
+        let found = match field_name(name) {
+            // (The names' hashes computed once, their positions remembered.)
+            Some(n) => inst.attr_get_memo(name, n.hash, &n.memo),
+            None => inst.attr_get_str(name),
+        };
+        if let Some(v) = found {
             return Ok(v);
         }
     }
     interp.load_attr_public(recv, name)
+}
+
+/// A queue attribute the native methods read on every call.
+struct FieldName {
+    hash: i64,
+    memo: crate::inst_dict::PosMemo,
+}
+
+/// [`FieldName`] of `_queue` or `_locked`.
+fn field_name(name: &str) -> Option<&'static FieldName> {
+    static NAMES: std::sync::OnceLock<[FieldName; 2]> = std::sync::OnceLock::new();
+    let names = NAMES.get_or_init(|| {
+        ["_queue", "_locked"].map(|n| FieldName {
+            hash: crate::object::py_str_hash(n),
+            memo: crate::inst_dict::PosMemo::new(),
+        })
+    });
+    match name {
+        "_queue" => Some(&names[0]),
+        "_locked" => Some(&names[1]),
+        _ => None,
+    }
 }
 
 /// `SimpleQueue.put(self, item, block=True, timeout=None)` — append to

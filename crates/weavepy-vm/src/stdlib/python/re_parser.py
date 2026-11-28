@@ -169,6 +169,9 @@ class SubPattern:
         if isinstance(index, slice):
             return SubPattern(self.state, self.data[index])
         return self.data[index]
+    def __iter__(self):
+        # (The item sequence `__getitem__` reads, without a call per item.)
+        return iter(self.data)
     def __setitem__(self, index, code):
         self.data[index] = code
     def insert(self, index, code):

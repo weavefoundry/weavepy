@@ -9,6 +9,11 @@ import annotationlib
 import abc
 from reprlib import recursive_repr
 
+try:
+    from _weave_collections import _asdict_plain
+except ImportError:
+    _asdict_plain = None
+
 
 __all__ = ['dataclass',
            'field',
@@ -1502,6 +1507,12 @@ def asdict(obj, *, dict_factory=dict):
     """
     if not _is_dataclass_instance(obj):
         raise TypeError("asdict() should be called on dataclass instances")
+    # (A tree of plain values copies natively; anything else, or a hook
+    # watching, is the Python copy's.)
+    if dict_factory is dict and _asdict_plain is not None:
+        result = _asdict_plain(obj, _FIELD)
+        if result is not None:
+            return result
     return _asdict_inner(obj, dict_factory)
 
 

@@ -872,7 +872,7 @@ fn register_gc_hooks() {
 // ---- running-loop slot (per OS thread) ----
 
 thread_local! {
-    static RUNNING_LOOP: RefCell<Object> = const { RefCell::new(Object::None) };
+    static RUNNING_LOOP: crate::gil::ReleaseUnderGil<RefCell<Object>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(Object::None)) };
 }
 
 fn running_loop() -> Object {

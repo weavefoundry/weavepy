@@ -2002,6 +2002,18 @@ root = RootLogger(WARNING)
 Logger.root = root
 Logger.manager = Manager(Logger.root)
 
+# Native level methods: a call a disabled level would drop returns at once
+# (see `_weave_collections._log_methods`); everything else is the method
+# above.
+try:
+    from _weave_collections import _log_methods
+except ImportError:
+    pass
+else:
+    for _name, _method in _log_methods(Logger):
+        setattr(Logger, _name, _method)
+    del _name, _method, _log_methods
+
 #---------------------------------------------------------------------------
 # Configuration classes and functions
 #---------------------------------------------------------------------------

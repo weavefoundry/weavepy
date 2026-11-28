@@ -515,7 +515,7 @@ fn describe_native_export(obj: &Object) -> Result<NativeExport, ()> {
             let base_ptr = memoryview_backing_ptr(&mv.buffer);
             let ptr = unsafe { base_ptr.add(start) };
             let itemsize = mv.itemsize.get().max(1);
-            let format = mv.format.borrow().clone().into_bytes();
+            let format = mv.format.borrow().as_bytes().to_vec();
             // Element shape/stride: honour an explicit shape, else derive a
             // 1-D `[len / itemsize]` C-contiguous layout. This is what keeps
             // a typed view's `itemsize`/`format` self-consistent with the

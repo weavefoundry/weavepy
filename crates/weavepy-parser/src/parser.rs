@@ -2453,7 +2453,8 @@ impl<'src> Parser<'src> {
         // (positional-only, positional-or-keyword, `*args`, keyword-only,
         // `**kwargs`) — CPython raises "duplicate argument '<n>' in
         // function definition".
-        let mut seen: Vec<&str> = Vec::new();
+        // (A set: generated signatures run to thousands of parameters.)
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         let dup_span = |span: Span, name: &str| ParseError::Unexpected {
             span,
             message: format!("duplicate argument '{name}' in function definition"),
@@ -2466,10 +2467,9 @@ impl<'src> Parser<'src> {
             .chain(args.kwonlyargs.iter())
             .chain(args.kwarg.iter())
         {
-            if seen.contains(&a.name.as_str()) {
+            if !seen.insert(a.name.as_str()) {
                 return Err(dup_span(a.span, &a.name));
             }
-            seen.push(a.name.as_str());
         }
         Ok(args)
     }

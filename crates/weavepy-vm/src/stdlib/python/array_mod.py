@@ -13,6 +13,8 @@ place (``test_array``/``test_io.test_readinto_array``).
 import struct as _struct
 import sys as _sys
 
+import _struct as _struct_core
+
 
 __all__ = ['array', 'ArrayType', 'typecodes', '_array_reconstructor']
 
@@ -64,17 +66,77 @@ del _tc, _f, _size
 
 _MISSING = object()
 
+# What an item is, per typecode: 0 an int (within `_lo.._hi`), 1 a float,
+# 2 a one-character str. The item methods test this small int instead of
+# searching the typecode strings.
+_KIND_INT, _KIND_FLOAT, _KIND_CHAR = 0, 1, 2
+_KINDS = {}
+for _tc in _INT_TYPECODES:
+    _KINDS[_tc] = _KIND_INT
+for _tc in _FLOAT_TYPECODES:
+    _KINDS[_tc] = _KIND_FLOAT
+for _tc in _UNICODE_TYPECODES:
+    _KINDS[_tc] = _KIND_CHAR
+del _tc
+
+_unpack_from = _struct.unpack_from
+_pack_into = _struct.pack_into
+_struct_pack = _struct.pack
+try:
+    from _struct import _all_exact
+except ImportError:
+    def _all_exact(seq, want):
+        for v in seq:
+            if type(v) is not want:
+                return False
+        return True
+_struct_unpack = _struct.unpack
+_struct_error = _struct.error
+
+
+def _setup(self, typecode):
+    fmt, size = _TYPECODES[typecode]
+    self._typecode = typecode
+    self._fmt = fmt
+    self._itemsize = size
+    self._kind = _KINDS[typecode]
+    self._lo, self._hi = _INT_RANGES.get(typecode, (0, 0))
+    self._buf = bytearray()
+
 
 def _make_array(typecode):
     """Internal bare constructor: no typecode re-validation and — key for
     'u' — no re-firing of the DeprecationWarning on every slice/repeat."""
     self = object.__new__(array)
-    fmt, size = _TYPECODES[typecode]
-    self._typecode = typecode
-    self._fmt = fmt
-    self._itemsize = size
-    self._buf = bytearray()
+    _setup(self, typecode)
     return self
+
+
+def _like(src, buf):
+    """A new array of `src`'s type code over `buf`: its fields copied, not
+    looked up again (slices, sums, repeats and copies)."""
+    out = _object_new(array)
+    out._typecode = src._typecode
+    out._fmt = src._fmt
+    out._itemsize = src._itemsize
+    out._kind = src._kind
+    out._lo = src._lo
+    out._hi = src._hi
+    out._buf = buf
+    return out
+
+
+_object_new = object.__new__
+
+
+def _values(self):
+    """Every stored value in one unpacking: a tuple of numbers (a unicode
+    array's are code points)."""
+    buf = self._buf
+    n = len(buf) // self._itemsize
+    if not n:
+        return ()
+    return _struct_unpack('%d%s' % (n, self._fmt), buf)
 
 
 class _array_iterator:
@@ -97,9 +159,14 @@ class _array_iterator:
         if ao is None:
             raise StopIteration
         i = self._index
-        if i < len(ao):
+        buf = ao._buf
+        off = i * ao._itemsize
+        if off < len(buf):
             self._index = i + 1
-            return ao._unpack(i)
+            value = _unpack_from(ao._fmt, buf, off)[0]
+            if ao._kind == _KIND_CHAR:
+                return chr(value)
+            return value
         self._ao = None
         raise StopIteration
 
@@ -125,7 +192,8 @@ class array:
     # CPython's array is a fixed C struct: instances have no __dict__
     # (subclasses without __slots__ regain one), and typecode/itemsize
     # are read-only getsets.
-    __slots__ = ('_typecode', '_fmt', '_itemsize', '_buf', '__weakref__')
+    __slots__ = ('_typecode', '_fmt', '_itemsize', '_buf', '_kind', '_lo',
+                 '_hi', '__weakref__')
 
     # The C type carries Py_TPFLAGS_SEQUENCE, so `case [..]:` patterns
     # match arrays (PEP 634); WeavePy's VM reads the flag off this private
@@ -139,7 +207,7 @@ class array:
 
         return types.GenericAlias(cls, item)
 
-    def __new__(cls, typecode=_MISSING, initializer=_MISSING, *rest, **kwargs):
+    def __new__(cls, typecode=_MISSING, initializer=_MISSING, /, *rest, **kwargs):
         if typecode is _MISSING:
             raise TypeError(
                 "array() takes at least 1 argument (0 given)"
@@ -151,7 +219,7 @@ class array:
         # CPython rejects keywords only for the exact base type; subclasses
         # route extra keywords to their own __init__ (SF bug #1486663).
         if kwargs and cls is array:
-            raise TypeError("array() takes no keyword arguments")
+            raise TypeError("array.array() takes no keyword arguments")
         if not isinstance(typecode, str) or len(typecode) != 1:
             raise TypeError(
                 "array() argument 1 must be a unicode character, not %s"
@@ -171,11 +239,7 @@ class array:
                 stacklevel=2,
             )
         self = object.__new__(cls)
-        fmt, size = _TYPECODES[typecode]
-        self._typecode = typecode
-        self._fmt = fmt
-        self._itemsize = size
-        self._buf = bytearray()
+        _setup(self, typecode)
         if initializer is _MISSING:
             return self
         if typecode in _UNICODE_TYPECODES:
@@ -210,6 +274,9 @@ class array:
                 else:
                     for v in initializer:
                         self.append(v)
+            elif type(initializer) is list:
+                # (Packed at once when every item is plain.)
+                self.fromlist(initializer)
             else:
                 for item in initializer:
                     self.append(item)
@@ -314,6 +381,22 @@ class array:
     # -- mutating sequence API ------------------------------------------
 
     def append(self, value):
+        # A plain int in range, or a float, packs directly; anything else
+        # (and any value the packing refuses) takes the full conversion,
+        # which raises what CPython's setters raise.
+        kind = self._kind
+        if kind == _KIND_INT:
+            if type(value) is int and self._lo <= value <= self._hi:
+                self._buf += _struct_pack(self._fmt, value)
+                return
+        elif kind == _KIND_FLOAT and type(value) is float:
+            try:
+                packed = _struct_pack(self._fmt, value)
+            except (OverflowError, _struct_error):
+                packed = None
+            if packed is not None:
+                self._buf += packed
+                return
         self._buf += self._pack(value)
 
     def extend(self, iterable):
@@ -359,11 +442,16 @@ class array:
         del self._buf[:]
 
     def reverse(self):
-        n = len(self)
+        buf = self._buf
         size = self._itemsize
-        items = [bytes(self._buf[i * size:(i + 1) * size]) for i in range(n)]
-        items.reverse()
-        self._buf[:] = b''.join(items)
+        if size == 1:
+            buf.reverse()
+            return
+        # (The items as whole chunks, last first, written back in place.)
+        self._buf[:] = b''.join(
+            [bytes(buf[off:off + size])
+             for off in range(len(buf) - size, -1, -size)]
+        )
 
     def byteswap(self):
         # Reverse the byte order of every item in place. CPython supports this
@@ -382,7 +470,7 @@ class array:
     # -- non-mutating queries -------------------------------------------
 
     def count(self, value):
-        return sum(1 for v in self if v == value)
+        return self.tolist().count(value)
 
     def index(self, value, *args):
         # Support optional start/stop like list.index.
@@ -398,13 +486,16 @@ class array:
                 if stop < 0:
                     stop += n
                 stop = min(stop, n)
-        for i in range(start, stop):
-            if self._unpack(i) == value:
-                return i
-        raise ValueError('array.index(x): x not in array')
+        try:
+            return self.tolist().index(value, start, max(stop, 0))
+        except ValueError:
+            raise ValueError('array.index(x): x not in array') from None
 
     def tolist(self):
-        return [self._unpack(i) for i in range(len(self))]
+        values = _values(self)
+        if self._kind == _KIND_CHAR:
+            return [chr(v) for v in values]
+        return list(values)
 
     def buffer_info(self):
         # CPython returns the real data pointer — ctypes tests build
@@ -437,6 +528,19 @@ class array:
     def fromlist(self, seq):
         if not isinstance(seq, list):
             raise TypeError('arg must be list')
+        # Plain ints (or floats) pack in one call; an item of another type
+        # or out of range leaves the list to the item-by-item conversion
+        # below, which raises what CPython's setters raise.
+        n = len(seq)
+        want = int if self._kind == _KIND_INT else float
+        if n and self._kind != _KIND_CHAR and _all_exact(seq, want):
+            try:
+                packed = _struct_pack('%d%s' % (n, self._fmt), *seq)
+            except (OverflowError, _struct_error):
+                packed = None
+            if packed is not None:
+                self._buf += packed
+                return
         # All-or-nothing: pack into a scratch buffer first.
         scratch = bytearray()
         for v in seq:
@@ -504,25 +608,63 @@ class array:
         return _array_iterator(self)
 
     def __getitem__(self, key):
-        if isinstance(key, slice):
-            out = _make_array(self._typecode)
-            indices = range(*key.indices(len(self)))
+        if type(key) is int:
+            buf = self._buf
             size = self._itemsize
+            n = len(buf) // size
+            if key < 0:
+                key += n
+            if 0 <= key < n:
+                value = _unpack_from(self._fmt, buf, key * size)[0]
+                if self._kind == _KIND_CHAR:
+                    return chr(value)
+                return value
+            raise IndexError('array index out of range')
+        if isinstance(key, slice):
+            size = self._itemsize
+            buf = self._buf
+            start, stop, step = key.indices(len(buf) // size)
+            if step == 1:
+                # (A run of items is a run of bytes.)
+                return _like(self, buf[start * size:stop * size] if stop > start else bytearray())
             chunks = []
-            for i in indices:
-                chunks.append(bytes(self._buf[i * size:(i + 1) * size]))
-            out._buf = bytearray(b''.join(chunks))
-            return out
+            for i in range(start, stop, step):
+                chunks.append(bytes(buf[i * size:(i + 1) * size]))
+            return _like(self, bytearray(b''.join(chunks)))
         return self._unpack(self._normalize_index(key))
 
     def __setitem__(self, key, value):
         size = self._itemsize
-        if isinstance(key, slice):
+        if type(key) is int:
+            # A plain int in range, or a float, is written where it goes;
+            # anything else takes the full conversion below.
+            kind = self._kind
+            if (type(value) is int and kind == _KIND_INT
+                    and self._lo <= value <= self._hi) or (
+                    type(value) is float and kind == _KIND_FLOAT):
+                buf = self._buf
+                n = len(buf) // size
+                index = key + n if key < 0 else key
+                if 0 <= index < n:
+                    try:
+                        _pack_into(self._fmt, buf, index * size, value)
+                        return
+                    except (OverflowError, _struct_error):
+                        pass
+        elif isinstance(key, slice):
             start, stop, step = key.indices(len(self))
-            indices = list(range(start, stop, step))
             if isinstance(value, array):
                 if value._typecode != self._typecode:
                     raise TypeError("bad argument type for built-in operation")
+                if step == 1:
+                    # (A run of items is a run of bytes; a bytearray
+                    # stored into itself is copied first.)
+                    lo = start * size
+                    hi = max(stop, start) * size
+                    self._buf[lo:hi] = value._buf
+                    return
+            indices = list(range(start, stop, step))
+            if isinstance(value, array):
                 packed = [bytes(value._buf[i * size:(i + 1) * size])
                           for i in range(len(value))]
             else:
@@ -551,7 +693,13 @@ class array:
     def __delitem__(self, key):
         size = self._itemsize
         if isinstance(key, slice):
-            indices = list(range(*key.indices(len(self))))
+            start, stop, step = key.indices(len(self))
+            if step == 1:
+                # (A run of items is a run of bytes.)
+                if stop > start:
+                    del self._buf[start * size:stop * size]
+                return
+            indices = list(range(start, stop, step))
             for i in sorted(indices, reverse=True):
                 del self._buf[i * size:(i + 1) * size]
             return
@@ -559,18 +707,13 @@ class array:
         del self._buf[index * size:(index + 1) * size]
 
     def __contains__(self, value):
-        for v in self:
-            if v == value:
-                return True
-        return False
+        return value in self.tolist()
 
     def __add__(self, other):
         if not isinstance(other, array) or other._typecode != self._typecode:
             raise TypeError("can only append array (not \"%s\") to array"
                             % type(other).__name__)
-        out = _make_array(self._typecode)
-        out._buf = bytearray(self._buf) + other._buf
-        return out
+        return _like(self, bytearray(self._buf) + other._buf)
 
     def __iadd__(self, other):
         if not isinstance(other, array) or other._typecode != self._typecode:
@@ -672,9 +815,7 @@ class array:
         return (type(self), (self._typecode, initializer), state)
 
     def __copy__(self):
-        out = _make_array(self._typecode)
-        out._buf = bytearray(self._buf)
-        return out
+        return _like(self, bytearray(self._buf))
 
     def __deepcopy__(self, memo):
         return self.__copy__()
@@ -774,3 +915,12 @@ try:
     del _MutableSequence
 except ImportError:
     pass
+
+
+# The item methods and the iterator's step are served natively for plain
+# indexes and values (CPython's array is a C type); each calls the method
+# above that it replaces for everything else.
+if hasattr(_struct_core, '_array_methods'):
+    for _owner, _name, _method in _struct_core._array_methods(array, _array_iterator):
+        setattr(_owner, _name, _method)
+    del _owner, _name, _method

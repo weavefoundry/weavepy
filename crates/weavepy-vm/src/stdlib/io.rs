@@ -420,6 +420,10 @@ fn bytesio_file(args: &[Object], kwargs: &[(String, Object)]) -> Result<Rc<PyFil
         .get(1)
         .cloned()
         .or_else(|| kw_get(kwargs, "initial_bytes"));
+    let seed = match &initial {
+        Some(Object::Bytes(b)) => Some(b.clone()),
+        _ => None,
+    };
     let data = match initial {
         Some(Object::Bytes(b)) => b.to_vec(),
         Some(Object::ByteArray(b)) => b.borrow().clone(),
@@ -447,6 +451,9 @@ fn bytesio_file(args: &[Object], kwargs: &[(String, Object)]) -> Result<Rc<PyFil
         },
     );
     f.no_name.set(true);
+    if let Some(b) = seed {
+        f.mem_seed(b);
+    }
     Ok(Rc::new(f))
 }
 
@@ -952,6 +959,7 @@ fn bytesio_init(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, 
     if let Ok(f) = crate::builtins::file_self(args) {
         if let FileBackend::MemBytes { data, pos } = &mut *f.backend.borrow_mut() {
             crate::object::bytearray_check_resizable(data)?;
+            f.mem_changed();
             data.borrow_mut().clear();
             *pos = 0;
         }
@@ -1792,6 +1800,27 @@ pub(crate) fn build_iobase_family() -> IoFamily {
     fam
 }
 
+/// `io.BytesIO()` / `io.BytesIO(b)` of the exact type with plain `bytes`:
+/// the stream its `__new__` builds, which its `__init__` would leave as it
+/// is. `None` for other arguments, for the full constructor.
+fn bytesio_new_pure(cls: &Rc<crate::types::TypeObject>, args: &[Object]) -> Option<Object> {
+    match args {
+        [] => bytesio_new(&[Object::Type(cls.clone())], &[]).ok(),
+        [b @ Object::Bytes(_)] => bytesio_new(&[Object::Type(cls.clone()), b.clone()], &[]).ok(),
+        _ => None,
+    }
+}
+
+/// `io.StringIO()` / `io.StringIO(s)` of the exact type with a plain `str`
+/// (see [`bytesio_new_pure`]).
+fn stringio_new_pure(cls: &Rc<crate::types::TypeObject>, args: &[Object]) -> Option<Object> {
+    match args {
+        [] => stringio_new(&[Object::Type(cls.clone())], &[]).ok(),
+        [s @ Object::Str(_)] => stringio_new(&[Object::Type(cls.clone()), s.clone()], &[]).ok(),
+        _ => None,
+    }
+}
+
 /// Whether a native [`PyFile`] should be considered an instance of one of the
 /// `io` ABCs (`info` is the candidate class). `None` means "not an io ABC"
 /// (the caller falls back to ordinary MRO matching). A native binary stream is
@@ -1954,6 +1983,8 @@ fn build_iobase_family_inner() -> IoFamily {
     ] {
         set_type_module(conc, "_io");
     }
+    bytes_io.pure_new.set(Some(bytesio_new_pure));
+    string_io.pure_new.set(Some(stringio_new_pure));
     IoFamily {
         iobase,
         raw,
@@ -2210,7 +2241,7 @@ fn rawiobase_read(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let n = n_i as usize;
     let bytes = buf.as_bytes_view().unwrap_or_default();
-    Ok(Object::new_bytes(bytes[..n.min(bytes.len())].to_vec()))
+    Ok(Object::new_bytes(&bytes[..n.min(bytes.len())]))
 }
 
 /// `RawIOBase.readall()` — read and return all bytes until EOF by repeatedly
@@ -2727,7 +2758,7 @@ fn raw_write(target: &RawTarget, data: &[u8]) -> Result<Option<usize>, RuntimeEr
     match target {
         RawTarget::Native(raw) => Ok(Some(raw.write_bytes(data)?)),
         RawTarget::Py(raw) => {
-            let res = py_call(raw, "write", &[Object::new_bytes(data.to_vec())])?;
+            let res = py_call(raw, "write", &[Object::new_bytes(data)])?;
             if matches!(res, Object::None) {
                 return Ok(None);
             }
@@ -3526,7 +3557,7 @@ fn tw_fill_chunk(inst: &Rc<crate::types::PyInstance>) -> Result<(), RuntimeError
     if is_wstr {
         tw_set(inst, "_dec_wstr", Object::Bool(true));
     }
-    tw_set(inst, "_dec_partial", Object::new_bytes(leftover.to_vec()));
+    tw_set(inst, "_dec_partial", Object::new_bytes(leftover));
     if eof {
         tw_set(inst, "_dec_done", Object::Bool(true));
     }

@@ -1315,6 +1315,10 @@ struct State {
     ctx_epoch: AtomicU64,
     /// The last context read (see [`State::read_ctx`]).
     ctx_cache: RefCell<Option<CtxCache>>,
+    /// The context [`State::current`] found last, with the `contextvars`
+    /// generation it was found under (see
+    /// `contextvars_native::generation`).
+    current_memo: RefCell<Option<(u64, Weak<PyInstance>)>>,
     /// The native `Decimal` methods (by address) → their [`SPECS`] index,
     /// for keyword calls from the dispatch loop (see [`method_kw`]).
     methods: HashMap<usize, usize>,
@@ -1575,8 +1579,10 @@ impl State {
             drop(Rc::into_arc(inst));
         }
         let cls = self.decimal.upgrade()?;
-        let mut i = PyInstance::new(cls);
-        *i.slots.get_mut() = SlotStorage::from_packed(PackedSlots::new_decimal(parts));
+        let i = PyInstance::with_slots(
+            cls,
+            SlotStorage::from_packed(PackedSlots::new_decimal(parts)),
+        );
         Some(Object::Instance(Rc::new(i)))
     }
 
@@ -1584,15 +1590,17 @@ impl State {
     fn make_fixed(&self, d: &Fin) -> Option<Object> {
         let cls = self.decimal.upgrade()?;
         let digits = Object::Str(d.coef.with_digits(SharedStr::from_ascii));
-        let mut i = PyInstance::new(cls);
-        *i.slots.get_mut() = SlotStorage::from_layout(
-            self.layout.clone(),
-            vec![
-                Object::Int(i64::from(d.sign)),
-                digits,
-                Object::Int(d.exp),
-                Object::Bool(false),
-            ],
+        let i = PyInstance::with_slots(
+            cls,
+            SlotStorage::from_layout(
+                self.layout.clone(),
+                vec![
+                    Object::Int(i64::from(d.sign)),
+                    digits,
+                    Object::Int(d.exp),
+                    Object::Bool(false),
+                ],
+            ),
         );
         Some(Object::Instance(Rc::new(i)))
     }
@@ -1626,8 +1634,10 @@ impl State {
     /// A new exact `Decimal` with the slot values `v` (a copy).
     fn make_raw(&self, v: [Object; 4]) -> Option<Object> {
         let cls = self.decimal.upgrade()?;
-        let mut i = PyInstance::new(cls);
-        *i.slots.get_mut() = SlotStorage::from_layout(self.layout.clone(), v.to_vec());
+        let i = PyInstance::with_slots(
+            cls,
+            SlotStorage::from_layout(self.layout.clone(), v.to_vec()),
+        );
         Some(Object::Instance(Rc::new(i)))
     }
 
@@ -1676,6 +1686,26 @@ impl State {
     /// (an exact `Context`): the thread's current `contextvars.Context`'s
     /// `_data[var]`.
     fn current(&self) -> Option<Rc<PyInstance>> {
+        // While the thread's current context and the mappings stand, the
+        // context found last.
+        let gen = crate::stdlib::contextvars_native::generation();
+        // SAFETY: a guard-free read that runs no code.
+        if let Some((g, w)) = unsafe { self.current_memo.peek() }.and_then(Option::as_ref) {
+            if *g == gen && gen != 0 {
+                if let Some(c) = w.upgrade() {
+                    return Some(c);
+                }
+            }
+        }
+        let c = self.current_lookup()?;
+        if let Ok(mut memo) = self.current_memo.try_borrow_mut() {
+            *memo = Some((gen, Rc::downgrade(&c)));
+        }
+        Some(c)
+    }
+
+    /// [`Self::current`] past its memo.
+    fn current_lookup(&self) -> Option<Rc<PyInstance>> {
         let data = crate::stdlib::contextvars_native::peek_current_data()?;
         // SAFETY: reads that run no code (the key is a plain instance,
         // which hashes and compares natively); the context is cloned
@@ -4143,6 +4173,7 @@ pub(crate) fn install(args: &[Object]) -> Result<Object, RuntimeError> {
         ctx_keys: AtomicUsize::new(0),
         ctx_epoch: AtomicU64::new(1),
         ctx_cache: RefCell::new(None),
+        current_memo: RefCell::new(None),
         methods: HashMap::new(),
     };
     // The natives go in first, then the class version they leave is the

@@ -53,6 +53,11 @@ import types
 import weakref
 from copyreg import dispatch_table
 
+try:
+    from _weave_collections import _deepcopy_plain
+except ImportError:
+    _deepcopy_plain = None
+
 class Error(Exception):
     pass
 error = Error   # backward compatibility
@@ -117,6 +122,13 @@ def deepcopy(x, memo=None, _nil=[]):
 
     if cls in _atomic_types:
         return x
+
+    # A tree of plain dicts, lists and tuples over atoms, copied natively
+    # as the table below copies it (anything else comes back None).
+    if memo is None and (cls is dict or cls is list or cls is tuple) and _deepcopy_plain is not None:
+        y = _deepcopy_plain(x)
+        if y is not None:
+            return y
 
     d = id(x)
     if memo is None:

@@ -227,7 +227,7 @@ fn b_read_mem(args: &[Object]) -> Result<Object, RuntimeError> {
         return Err(value_error("read_mem: NULL pointer access"));
     }
     let slice = unsafe { std::slice::from_raw_parts(addr as *const u8, n) };
-    Ok(Object::new_bytes(slice.to_vec()))
+    Ok(Object::new_bytes(slice))
 }
 
 /// `write_mem(addr, data)` — copy `data` into raw memory.
@@ -638,7 +638,7 @@ fn b_configure_view(args: &[Object]) -> Result<Object, RuntimeError> {
     };
     let fmt = arg_str(args, 1)?;
     let itemsize = arg_usize(args, 2)?;
-    *mv.format.borrow_mut() = fmt;
+    *mv.format.borrow_mut() = crate::shared_value::SharedStr::from(fmt);
     mv.itemsize.set(itemsize);
     mv.strides.borrow_mut().clear();
     match arg(args, 3)? {

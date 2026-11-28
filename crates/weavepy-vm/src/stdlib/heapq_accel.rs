@@ -81,17 +81,14 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     })
 }
 
-/// Borrow the active interpreter published on this thread by the dispatch
-/// loop. Always present while a builtin runs.
-fn with_interp<F, R>(f: F) -> Result<R, RuntimeError>
-where
-    F: FnOnce(&mut crate::Interpreter) -> Result<R, RuntimeError>,
-{
+/// The active interpreter published on this thread by the dispatch loop
+/// (always present while a builtin runs), looked up only for a comparison
+/// that may run Python: a heap of scalars never needs it.
+fn interp() -> Result<&'static mut crate::Interpreter, RuntimeError> {
     let ptr = crate::vm_singletons::current_interpreter_ptr()
         .ok_or_else(|| type_error("_heapq: no active interpreter"))?;
     // SAFETY: published by the enclosing VM frame on this thread.
-    let interp = unsafe { &mut *ptr };
-    f(interp)
+    Ok(unsafe { &mut *ptr })
 }
 
 /// The first argument must be a `list` (CPython requires `PyList_Check`).
@@ -106,27 +103,45 @@ fn heap_arg(args: &[Object]) -> Result<Rc<RefCell<Vec<Object>>>, RuntimeError> {
 /// (which runs no code, so the heap can't change under it), else on
 /// copies through the full comparison.
 #[inline]
-fn heap_lt(
-    interp: &mut crate::Interpreter,
+fn heap_lt(heap: &Rc<RefCell<Vec<Object>>>, i: usize, j: usize) -> Result<bool, RuntimeError> {
+    // SAFETY: a view that runs no code, ending with the statement.
+    let native = unsafe { heap.peek() }
+        .and_then(|h| crate::native_scalar_compare(h.get(i)?, h.get(j)?, CompareKind::Lt));
+    if let Some(lt) = native {
+        return Ok(lt);
+    }
+    let (a, b) = {
+        let h = heap.borrow();
+        (h[i].clone(), h[j].clone())
+    };
+    interp()?.op_compare(&a, &b, CompareKind::Lt)
+}
+
+/// `heap[i] < heap[j]` for two native scalars (see
+/// [`crate::native_scalar_compare`]), and when it holds, `heap[a]` and
+/// `heap[b]` swapped, under one view of the list: no code runs, so nothing
+/// can change it meanwhile. `None`, touching nothing, for any other pair.
+#[inline]
+fn native_lt_swap(
     heap: &Rc<RefCell<Vec<Object>>>,
     i: usize,
     j: usize,
-) -> Result<bool, RuntimeError> {
-    let (a, b) = {
-        let h = heap.borrow();
-        if let Some(lt) = crate::native_scalar_compare(&h[i], &h[j], CompareKind::Lt) {
-            return Ok(lt);
-        }
-        (h[i].clone(), h[j].clone())
-    };
-    interp.op_compare(&a, &b, CompareKind::Lt)
+    a: usize,
+    b: usize,
+) -> Option<bool> {
+    // SAFETY: a view that runs no code, ending with this call.
+    let h = unsafe { heap.peek_mut() }?;
+    let lt = crate::native_scalar_compare(h.get(i)?, h.get(j)?, CompareKind::Lt)?;
+    if lt {
+        h.swap(a, b);
+    }
+    Some(lt)
 }
 
 /// `siftdown` (CPython's confusingly named "move toward the root"): the item
 /// at `pos` bubbles up past larger parents until it fits. `max_heap` flips the
 /// comparison direction so the `_*_max` helpers build a max-heap.
 fn siftdown(
-    interp: &mut crate::Interpreter,
     heap: &Rc<RefCell<Vec<Object>>>,
     startpos: usize,
     mut pos: usize,
@@ -138,11 +153,26 @@ fn siftdown(
     }
     while pos > startpos {
         let parentpos = (pos - 1) >> 1;
+        // (Two native scalars: compared, and swapped when out of order,
+        // under one view of the list.)
+        let (x, y) = if max_heap {
+            (parentpos, pos)
+        } else {
+            (pos, parentpos)
+        };
+        match native_lt_swap(heap, x, y, pos, parentpos) {
+            Some(true) => {
+                pos = parentpos;
+                continue;
+            }
+            Some(false) => break,
+            None => {}
+        }
         // min-heap: `cur < parent`; max-heap: `parent < cur`.
         let cmp = if max_heap {
-            heap_lt(interp, heap, parentpos, pos)?
+            heap_lt(heap, parentpos, pos)?
         } else {
-            heap_lt(interp, heap, pos, parentpos)?
+            heap_lt(heap, pos, parentpos)?
         };
         if heap.borrow().len() != size {
             return Err(runtime_error("list changed size during iteration"));
@@ -159,7 +189,6 @@ fn siftdown(
 /// `siftup` (CPython's "move toward the leaves"): bubble the smaller (or, for a
 /// max-heap, larger) child up until reaching a leaf, then `siftdown` to settle.
 fn siftup(
-    interp: &mut crate::Interpreter,
     heap: &Rc<RefCell<Vec<Object>>>,
     mut pos: usize,
     max_heap: bool,
@@ -175,10 +204,29 @@ fn siftup(
         if childpos + 1 < endpos {
             // Pick the smaller child (min) / larger child (max); ties go right,
             // matching CPython's `childpos += (cmp ^ 1)`.
-            let cmp = if max_heap {
-                heap_lt(interp, heap, childpos + 1, childpos)?
+            let (x, y) = if max_heap {
+                (childpos + 1, childpos)
             } else {
-                heap_lt(interp, heap, childpos, childpos + 1)?
+                (childpos, childpos + 1)
+            };
+            // (Two native scalars: compared in place, nothing swapped.)
+            // SAFETY: a view that runs no code, ending with the statement.
+            let native = unsafe { heap.peek() }
+                .and_then(|h| crate::native_scalar_compare(h.get(x)?, h.get(y)?, CompareKind::Lt));
+            if let Some(cmp) = native {
+                childpos += usize::from(!cmp);
+                // SAFETY: as above; both positions are in the list.
+                if let Some(h) = unsafe { heap.peek_mut() } {
+                    h.swap(pos, childpos);
+                    pos = childpos;
+                    continue;
+                }
+                childpos -= usize::from(!cmp);
+            }
+            let cmp = if max_heap {
+                heap_lt(heap, childpos + 1, childpos)?
+            } else {
+                heap_lt(heap, childpos, childpos + 1)?
             };
             childpos += usize::from(!cmp);
             if heap.borrow().len() != endpos {
@@ -188,7 +236,7 @@ fn siftup(
         heap.borrow_mut().swap(pos, childpos);
         pos = childpos;
     }
-    siftdown(interp, heap, startpos, pos, max_heap)
+    siftdown(heap, startpos, pos, max_heap)
 }
 
 fn heappush_impl(args: &[Object], max_heap: bool) -> Result<Object, RuntimeError> {
@@ -197,15 +245,15 @@ fn heappush_impl(args: &[Object], max_heap: bool) -> Result<Object, RuntimeError
         .get(1)
         .cloned()
         .ok_or_else(|| type_error("heappush expected 2 arguments"))?;
-    with_interp(|interp| {
+    {
         let pos = {
             let mut h = heap.borrow_mut();
             h.push(item);
             h.len() - 1
         };
-        siftdown(interp, &heap, 0, pos, max_heap)?;
+        siftdown(&heap, 0, pos, max_heap)?;
         Ok(Object::None)
-    })
+    }
 }
 
 fn heappush(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -214,7 +262,7 @@ fn heappush(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn heappop_impl(args: &[Object], max_heap: bool) -> Result<Object, RuntimeError> {
     let heap = heap_arg(args)?;
-    with_interp(|interp| {
+    {
         let lastelt = {
             let mut h = heap.borrow_mut();
             match h.pop() {
@@ -229,9 +277,9 @@ fn heappop_impl(args: &[Object], max_heap: bool) -> Result<Object, RuntimeError>
             let mut h = heap.borrow_mut();
             std::mem::replace(&mut h[0], lastelt)
         };
-        siftup(interp, &heap, 0, max_heap)?;
+        siftup(&heap, 0, max_heap)?;
         Ok(returnitem)
-    })
+    }
 }
 
 fn heappop(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -244,7 +292,7 @@ fn heapreplace_impl(args: &[Object], max_heap: bool) -> Result<Object, RuntimeEr
         .get(1)
         .cloned()
         .ok_or_else(|| type_error("heapreplace expected 2 arguments"))?;
-    with_interp(|interp| {
+    {
         let returnitem = {
             let mut h = heap.borrow_mut();
             if h.is_empty() {
@@ -252,9 +300,9 @@ fn heapreplace_impl(args: &[Object], max_heap: bool) -> Result<Object, RuntimeEr
             }
             std::mem::replace(&mut h[0], item)
         };
-        siftup(interp, &heap, 0, max_heap)?;
+        siftup(&heap, 0, max_heap)?;
         Ok(returnitem)
-    })
+    }
 }
 
 fn heapreplace(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -267,7 +315,7 @@ fn heappushpop_impl(args: &[Object], max_heap: bool) -> Result<Object, RuntimeEr
         .get(1)
         .cloned()
         .ok_or_else(|| type_error("heappushpop expected 2 arguments"))?;
-    with_interp(|interp| {
+    {
         let top = {
             let h = heap.borrow();
             h.first().cloned()
@@ -278,9 +326,9 @@ fn heappushpop_impl(args: &[Object], max_heap: bool) -> Result<Object, RuntimeEr
         // Only replace when `heap[0] < item` (min-heap) / `item < heap[0]`
         // (max-heap), else `item` is the extreme and is returned untouched.
         let replace = if max_heap {
-            interp.op_compare(&item, &top, CompareKind::Lt)?
+            interp()?.op_compare(&item, &top, CompareKind::Lt)?
         } else {
-            interp.op_compare(&top, &item, CompareKind::Lt)?
+            interp()?.op_compare(&top, &item, CompareKind::Lt)?
         };
         if !replace {
             return Ok(item);
@@ -296,9 +344,9 @@ fn heappushpop_impl(args: &[Object], max_heap: bool) -> Result<Object, RuntimeEr
             }
             std::mem::replace(&mut h[0], item)
         };
-        siftup(interp, &heap, 0, max_heap)?;
+        siftup(&heap, 0, max_heap)?;
         Ok(returnitem)
-    })
+    }
 }
 
 fn heappushpop(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -307,14 +355,14 @@ fn heappushpop(args: &[Object]) -> Result<Object, RuntimeError> {
 
 fn heapify_impl(args: &[Object], max_heap: bool) -> Result<Object, RuntimeError> {
     let heap = heap_arg(args)?;
-    with_interp(|interp| {
+    {
         let n = heap.borrow().len();
         // Transform bottom-up: the largest index with a child is n//2 - 1.
         for i in (0..n / 2).rev() {
-            siftup(interp, &heap, i, max_heap)?;
+            siftup(&heap, i, max_heap)?;
         }
         Ok(Object::None)
-    })
+    }
 }
 
 fn heapify(args: &[Object]) -> Result<Object, RuntimeError> {

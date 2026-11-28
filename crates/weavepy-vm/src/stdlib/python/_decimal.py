@@ -4265,10 +4265,24 @@ class Context(object):
 
     def copy(self, /):
         """Returns a deep copy from self."""
-        nc = Context(self.prec, self.rounding, self.Emin, self.Emax,
-                     self.capitals, self.clamp,
-                     self.flags.copy(), self.traps.copy())
-        nc._ignored_flags = self._ignored_flags
+        # WEAVEPY: the source's values are a context's, already checked, so
+        # the copy (a plain Context, as the C type's is) takes them as they
+        # are; its flag and trap mappings are new ones it owns.
+        nc = object.__new__(Context)
+        _set = object.__setattr__
+        _set(nc, 'prec', self.prec)
+        _set(nc, 'rounding', self.rounding)
+        _set(nc, 'Emin', self.Emin)
+        _set(nc, 'Emax', self.Emax)
+        _set(nc, 'capitals', self.capitals)
+        _set(nc, 'clamp', self.clamp)
+        owner = _weakref.ref(nc)
+        for name in ('flags', 'traps'):
+            d = SignalDict(dict.copy(getattr(self, name)))
+            d._owner = owner
+            _set(nc, name, d)
+        _set(nc, '_ignored_flags', self._ignored_flags)
+        _context_changed()
         return nc
     __copy__ = copy
 

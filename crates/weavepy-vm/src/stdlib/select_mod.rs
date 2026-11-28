@@ -629,7 +629,7 @@ static NEXT_POLL_HANDLE: std::sync::atomic::AtomicI64 = std::sync::atomic::Atomi
 
 #[cfg(unix)]
 thread_local! {
-    static POLL_CLASS: RefCell<Option<Rc<crate::types::TypeObject>>> = const { RefCell::new(None) };
+    static POLL_CLASS: crate::gil::ReleaseUnderGil<RefCell<Option<Rc<crate::types::TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(RefCell::new(None)) };
 }
 
 #[cfg(unix)]
@@ -925,10 +925,8 @@ mod kqueue_impl {
     }
 
     thread_local! {
-        static KQUEUE_CLASS: crate::sync::RefCell<Option<Rc<TypeObject>>> =
-            const { crate::sync::RefCell::new(None) };
-        static KEVENT_CLASS: crate::sync::RefCell<Option<Rc<TypeObject>>> =
-            const { crate::sync::RefCell::new(None) };
+        static KQUEUE_CLASS: crate::gil::ReleaseUnderGil<crate::sync::RefCell<Option<Rc<TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(crate::sync::RefCell::new(None)) };
+        static KEVENT_CLASS: crate::gil::ReleaseUnderGil<crate::sync::RefCell<Option<Rc<TypeObject>>>> = const { crate::gil::ReleaseUnderGil::new(crate::sync::RefCell::new(None)) };
     }
 
     pub(super) fn install(d: &mut DictData) {

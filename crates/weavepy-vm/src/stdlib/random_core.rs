@@ -32,6 +32,23 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("Random")),
             Object::Type(random_type()),
         );
+        for (name, f) in [
+            (
+                "_int_methods",
+                int_methods as fn(&[Object]) -> Result<Object, RuntimeError>,
+            ),
+            ("_seal_int_methods", seal_int_methods),
+        ] {
+            d.insert(
+                DictKey(Object::from_static(name)),
+                Object::Builtin(Rc::new(BuiltinFn {
+                    name,
+                    binds_instance: false,
+                    call: Box::new(f),
+                    call_kw: None,
+                })),
+            );
+        }
     }
     Rc::new(PyModule {
         name: "_random".to_owned(),
@@ -456,6 +473,215 @@ fn random_getrandbits(args: &[Object]) -> Result<Object, RuntimeError> {
         Sign::Plus,
         big,
     )))
+}
+
+/// The `random.Random` class whose integer methods [`int_methods`]
+/// replaced, and its attribute version then.
+static PY_RANDOM_CLASS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static PY_RANDOM_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `_int_methods(Random)`: native `randint`, `randrange`, `choice` and
+/// `shuffle` for
+/// `random.py`'s `Random` class, as `(name, method)` pairs for the module
+/// to assign. Each serves an instance of the class itself, unchanged since,
+/// whose `_randbelow` and `getrandbits` are the class's, with plain int
+/// arguments, by `_randbelow_with_getrandbits`'s own draws (the same
+/// numbers from the same state); anything else calls the Python method it
+/// replaces.
+fn int_methods(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Type(cls)] = args else {
+        return Err(type_error("_int_methods() expects the Random class"));
+    };
+    let mut out = Vec::new();
+    for (name, fast) in [
+        ("randint", randint_fast as crate::stdlib::struct_mod::Fast),
+        ("randrange", randrange_fast),
+        ("choice", choice_fast),
+        ("shuffle", shuffle_fast),
+    ] {
+        let orig = cls
+            .dict
+            .borrow()
+            .get(&crate::object::StrKey(name))
+            .cloned()
+            .ok_or_else(|| type_error(format!("_int_methods(): no {name} to replace")))?;
+        out.push(Object::new_tuple(vec![
+            Object::from_static(name),
+            crate::stdlib::struct_mod::fast_method(cls, name, fast, orig, false),
+        ]));
+    }
+    Ok(Object::new_list(out))
+}
+
+/// `_seal_int_methods(Random)`, once the module has assigned what
+/// [`int_methods`] made: the class and its version as they now stand,
+/// which the methods' native halves require.
+fn seal_int_methods(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Type(cls)] = args else {
+        return Err(type_error("_seal_int_methods() expects the Random class"));
+    };
+    PY_RANDOM_CLASS.store(
+        Rc::as_ptr(cls) as usize,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    PY_RANDOM_VERSION.store(cls.attr_version.get(), std::sync::atomic::Ordering::Relaxed);
+    Ok(Object::None)
+}
+
+/// The instance at `recv` when it is a plain `random.Random` (see
+/// [`int_methods`]) and no trace or profile hook is watching.
+fn plain_random(recv: &Object) -> Option<&Rc<PyInstance>> {
+    let Object::Instance(inst) = recv else {
+        return None;
+    };
+    let cls = inst.cls_raw();
+    // (A trace or profile hook sees the Python methods' frames, as a
+    // debugger stepping into `randint` expects.)
+    if crate::trace::any_observers_active()
+        || std::ptr::from_ref(cls) as usize
+            != PY_RANDOM_CLASS.load(std::sync::atomic::Ordering::Relaxed)
+        || cls.attr_version.get() != PY_RANDOM_VERSION.load(std::sync::atomic::Ordering::Relaxed)
+        || shadowed(inst)
+    {
+        return None;
+    }
+    Some(inst)
+}
+
+/// Whether the instance holds its own `_randbelow` or `getrandbits` (which
+/// the methods would call): the names' hashes computed once, so a miss is
+/// settled from the layout's filter.
+fn shadowed(inst: &PyInstance) -> bool {
+    struct Name {
+        name: &'static str,
+        hash: i64,
+        memo: crate::inst_dict::PosMemo,
+    }
+    static NAMES: std::sync::OnceLock<[Name; 2]> = std::sync::OnceLock::new();
+    NAMES
+        .get_or_init(|| {
+            ["_randbelow", "getrandbits"].map(|name| Name {
+                name,
+                hash: crate::object::py_str_hash(name),
+                memo: crate::inst_dict::PosMemo::new(),
+            })
+        })
+        .iter()
+        .any(|n| match inst.dict.published() {
+            // (A dict it can't read counts as holding the name.)
+            Some(d) => d.try_borrow().map_or(true, |d| {
+                d.get(&crate::object::StrKeyHashed {
+                    s: n.name,
+                    hash: n.hash,
+                })
+                .is_some()
+            }),
+            None => inst
+                .dict
+                .split_cell()
+                .try_borrow()
+                .map_or(true, |s| s.get_memo(n.name, n.hash, &n.memo).is_some()),
+        })
+}
+
+/// `_randbelow_with_getrandbits(n)` for `0 < n < 2**63`: draws of
+/// `n.bit_length()` bits, as `getrandbits` assembles them, until one is
+/// below `n`.
+fn randbelow(inst: &Rc<PyInstance>, n: u64) -> u64 {
+    let k = 64 - n.leading_zeros();
+    with_mt(inst, |mt| loop {
+        let r = if k <= 32 {
+            u64::from(mt.genrand_u32() >> (32 - k))
+        } else {
+            let lo = u64::from(mt.genrand_u32());
+            let hi = u64::from(mt.genrand_u32() >> (64 - k));
+            lo | (hi << 32)
+        };
+        if r < n {
+            break r;
+        }
+    })
+}
+
+/// A plain int argument's value (`_index` of an `int` or `bool`).
+fn plain_int(o: &Object) -> Option<i64> {
+    match *o {
+        Object::Int(i) => Some(i),
+        Object::Bool(b) => Some(i64::from(b)),
+        _ => None,
+    }
+}
+
+/// `randint(a, b)` of a plain `Random` (see [`int_methods`]).
+fn randint_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [recv, a, b] = args else {
+        return None;
+    };
+    let inst = plain_random(recv)?;
+    let (a, b) = (plain_int(a)?, plain_int(b)?);
+    let width = u64::try_from(b.checked_sub(a)?.checked_add(1)?).ok()?;
+    if width == 0 {
+        return None;
+    }
+    Some(Ok(Object::Int(a + randbelow(inst, width) as i64)))
+}
+
+/// `randrange(stop)`, `randrange(start, stop)` and a step of one, of a
+/// plain `Random` (see [`int_methods`]).
+fn randrange_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let (recv, start, stop) = match args {
+        [recv, stop] => (recv, 0, plain_int(stop)?),
+        [recv, start, stop] => (recv, plain_int(start)?, plain_int(stop)?),
+        [recv, start, stop, Object::Int(1)] => (recv, plain_int(start)?, plain_int(stop)?),
+        _ => return None,
+    };
+    let inst = plain_random(recv)?;
+    let width = u64::try_from(stop.checked_sub(start)?).ok()?;
+    if width == 0 {
+        return None;
+    }
+    Some(Ok(Object::Int(start + randbelow(inst, width) as i64)))
+}
+
+/// `choice(seq)` of a non-empty list or tuple, or an ASCII string, of a
+/// plain `Random` (see [`int_methods`]).
+fn choice_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [recv, seq] = args else {
+        return None;
+    };
+    let inst = plain_random(recv)?;
+    let n = match seq {
+        Object::List(l) => l.try_borrow().ok()?.len(),
+        Object::Tuple(t) => t.len(),
+        Object::Str(s) if crate::shared_value::SharedStr::is_ascii(s) => s.len(),
+        _ => return None,
+    };
+    if n == 0 {
+        return None;
+    }
+    let i = randbelow(inst, n as u64) as usize;
+    Some(Ok(match seq {
+        Object::List(l) => l.try_borrow().ok()?.get(i)?.clone(),
+        Object::Tuple(t) => t.get(i)?.clone(),
+        Object::Str(s) => Object::from_str(&s[i..=i]),
+        _ => return None,
+    }))
+}
+
+/// `shuffle(x)` of a list, of a plain `Random` (see [`int_methods`]):
+/// `random.py`'s Fisher-Yates walk from the end, each swap partner drawn as
+/// `_randbelow(i + 1)` draws it. (Swapping items runs no code.)
+fn shuffle_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [recv, Object::List(l)] = args else {
+        return None;
+    };
+    let inst = plain_random(recv)?;
+    let mut xs = l.try_borrow_mut().ok()?;
+    for i in (1..xs.len()).rev() {
+        let j = randbelow(inst, i as u64 + 1) as usize;
+        xs.swap(i, j);
+    }
+    Some(Ok(Object::None))
 }
 
 /// `getrandbits`'s leaf half: an exact `int` or `bool` count never runs

@@ -374,6 +374,16 @@ impl JitHint {
         true
     }
 
+    /// Whether a back edge of the code's loops has been counted (by
+    /// [`Self::backedge_tick`] or [`Self::backedge_pending`]): the
+    /// countdown starts at zero and never returns to it.
+    #[inline]
+    pub fn backedges_seen(&self) -> bool {
+        self.backedge_countdown
+            .load(std::sync::atomic::Ordering::Relaxed)
+            != 0
+    }
+
     /// Whether the tier-2 state has no further interest in this code's
     /// back edges (see [`Self::set_backedge_quiet`]).
     #[inline]
@@ -1090,7 +1100,13 @@ struct LazyTable<T> {
 
 /// The encoding of a module in the code cache's native form (see
 /// `native_code`): its own bytes, or, say, a mapping of the cache file.
-pub struct TableBuffer(Box<dyn CodeBytes>, std::sync::atomic::AtomicU8);
+pub struct TableBuffer(
+    Box<dyn CodeBytes>,
+    std::sync::atomic::AtomicU8,
+    /// The module's identifiers as pooled names, by number, each made on
+    /// its first read (see [`TableBuffer::name`]).
+    std::sync::OnceLock<Box<[std::sync::OnceLock<crate::name::Name>]>>,
+);
 
 /// Where a [`TableBuffer`] gets its bytes.
 pub trait CodeBytes: Send + Sync + 'static {
@@ -1113,7 +1129,11 @@ impl CodeBytes for Box<[u8]> {
 
 impl TableBuffer {
     pub fn new(bytes: impl CodeBytes) -> Self {
-        TableBuffer(Box::new(bytes), std::sync::atomic::AtomicU8::new(0))
+        TableBuffer(
+            Box::new(bytes),
+            std::sync::atomic::AtomicU8::new(0),
+            std::sync::OnceLock::new(),
+        )
     }
 
     /// Whether the module's identifier text is UTF-8, as its first read
@@ -1121,6 +1141,28 @@ impl TableBuffer {
     /// rather than at each identifier's every read.
     pub(crate) fn names_utf8(&self) -> u8 {
         self.1.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The pooled name for identifier `i` of the `count` the module has,
+    /// made from its `text` on its first read: a name the module's code objects
+    /// share (`self`, `append`) goes through the pool once.
+    pub(crate) fn name<'t>(
+        &self,
+        i: usize,
+        count: usize,
+        text: impl FnOnce() -> Option<&'t str>,
+    ) -> Option<crate::name::Name> {
+        let memo = self
+            .2
+            .get_or_init(|| (0..count).map(|_| std::sync::OnceLock::new()).collect());
+        let Some(slot) = memo.get(i) else {
+            return Some(crate::name::Name::new(text()?));
+        };
+        if let Some(name) = slot.get() {
+            return Some(name.clone());
+        }
+        let name = crate::name::Name::new(text()?);
+        Some(slot.get_or_init(|| name).clone())
     }
 
     pub(crate) fn set_names_utf8(&self, ok: bool) {
@@ -2001,6 +2043,33 @@ impl Drop for Pep563Guard {
     }
 }
 
+/// A nested `def`'s free names (see [`function_free_names`]) by the
+/// addresses of its parameters and body, kept for one compilation: every
+/// enclosing scope asks for them, and a function nested `d` deep was
+/// walked `d` times at each of `d` levels (a module of 80 nested closures
+/// took 47 ms to compile, CPython 2).
+type FreeNamesMemo = fxhash::HashMap<(usize, usize, usize), HashSet<String>>;
+
+thread_local! {
+    static FREE_NAMES_MEMO: std::cell::RefCell<Option<FreeNamesMemo>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Installs the free-names memo for one compilation of a (folded, so no
+/// longer changing) AST, and puts back what was there when it ends.
+struct FreeNamesMemoGuard(Option<FreeNamesMemo>);
+
+impl FreeNamesMemoGuard {
+    fn install() -> Self {
+        FreeNamesMemoGuard(FREE_NAMES_MEMO.with(|m| m.replace(Some(FreeNamesMemo::default()))))
+    }
+}
+
+impl Drop for FreeNamesMemoGuard {
+    fn drop(&mut self) {
+        FREE_NAMES_MEMO.with(|m| *m.borrow_mut() = self.0.take());
+    }
+}
+
 /// Build the shared per-compilation parameters from caller options +
 /// the module's own `__future__` imports.
 fn make_params(module: &Module, opts: CompileOptions) -> CompileParams {
@@ -2351,6 +2420,7 @@ fn compile_module_cow(
     let _pep563 = Pep563Guard::install(params.future_annotations);
     validate::validate_module(&module, source, params.future_annotations)?;
     ast_opt::fold_module(module.to_mut(), params.future_annotations);
+    let _free_names = FreeNamesMemoGuard::install();
     let line_index = LineIndex::new(source);
     let mut top = Compiler::new(
         "<module>".to_owned(),
@@ -2408,6 +2478,7 @@ fn compile_interactive_cow(
     let _pep563 = Pep563Guard::install(params.future_annotations);
     validate::validate_module(&module, source, params.future_annotations)?;
     ast_opt::fold_module(module.to_mut(), params.future_annotations);
+    let _free_names = FreeNamesMemoGuard::install();
     let line_index = LineIndex::new(source);
     let mut top = Compiler::new(
         "<module>".to_owned(),
@@ -2496,6 +2567,7 @@ fn compile_eval_cow(
     let _pep563 = Pep563Guard::install(params.future_annotations);
     validate::validate_module(&module, source, params.future_annotations)?;
     ast_opt::fold_module(module.to_mut(), params.future_annotations);
+    let _free_names = FreeNamesMemoGuard::install();
     let line_index = LineIndex::new(source);
     let mut top = Compiler::new(
         "<module>".to_owned(),
@@ -2641,6 +2713,10 @@ struct Compiler {
     co: CodeObject,
     constant_index: intern::InternIndex,
     name_index: intern::InternIndex,
+    /// The same for `co.varnames`: a function with many locals (generated
+    /// code, a `namedtuple`'s constructor of a few thousand fields) looks
+    /// each one up by name at every use.
+    var_index: intern::InternIndex,
     kind: CodeKind,
     /// Which comprehension form this scope lowers (`None` outside
     /// comprehensions). Drives CPython's "'yield' inside list
@@ -3097,6 +3173,7 @@ impl Compiler {
             co,
             constant_index: intern::InternIndex::default(),
             name_index: intern::InternIndex::default(),
+            var_index: intern::InternIndex::default(),
             kind,
             comp_kind: None,
             bindings: IndexMap::default(),
@@ -9968,11 +10045,7 @@ impl Compiler {
     }
 
     fn var_index_or_add(&mut self, name: &str) -> u32 {
-        if let Some(i) = self.co.varnames.iter().position(|n| n == name) {
-            return i as u32;
-        }
-        self.co.varnames.push(Name::from(name.to_owned()));
-        (self.co.varnames.len() - 1) as u32
+        self.var_index.intern_name(&mut self.co.varnames, name)
     }
 
     fn classify_for_store(&mut self, name: &str) -> Binding {
@@ -16545,6 +16618,25 @@ fn class_nested_scope_reads(body: &[Stmt], out: &mut HashSet<String>) {
 /// reach up even when only written). Decorators, defaults and
 /// annotations are the enclosing scope's business.
 fn function_free_names(args: &AstArguments, body: &[Stmt]) -> HashSet<String> {
+    let key = (
+        std::ptr::from_ref(args) as usize,
+        body.as_ptr() as usize,
+        body.len(),
+    );
+    let hit = FREE_NAMES_MEMO.with(|m| m.borrow().as_ref().and_then(|m| m.get(&key).cloned()));
+    if let Some(names) = hit {
+        return names;
+    }
+    let names = function_free_names_uncached(args, body);
+    FREE_NAMES_MEMO.with(|m| {
+        if let Some(m) = m.borrow_mut().as_mut() {
+            m.insert(key, names.clone());
+        }
+    });
+    names
+}
+
+fn function_free_names_uncached(args: &AstArguments, body: &[Stmt]) -> HashSet<String> {
     let mut nested_reads = HashSet::default();
     for s in body {
         collect_reads_stmt_in(s, &mut nested_reads, true);

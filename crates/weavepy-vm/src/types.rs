@@ -184,7 +184,9 @@ pub(crate) enum Verdict {
     /// A value of the builtin class (one whose attributes all come from
     /// the class, see `builtin_value_class`) answered `name` with
     /// `AttributeError`: enum asks `hasattr(value, '__get__')` of every
-    /// member value. Recorded like [`Self::TypeAttrMissing`].
+    /// member value. On the function type, a function storing nothing
+    /// under `name` did (`inspect` asks `getattr(func, '__signature__',
+    /// None)`). Recorded like [`Self::TypeAttrMissing`].
     ValueAttrMissing = 7,
     /// The class's instances finalize through the native asyncio `__del__`
     /// `name` names (`"Future"` or `"Task"`): a Python subclass of the
@@ -203,6 +205,59 @@ pub(crate) enum Verdict {
     /// lookup finds first, under `object`'s own `__getattribute__` (see
     /// `slot_member_unset`).
     SlotMember = 11,
+    /// The class is `re.Pattern` and still answers `__hash__` with its
+    /// native method (see `stdlib::sre_objects::native_hash`); `name`
+    /// unused.
+    NativePatternHash = 12,
+    /// The class answers `str(x)` of its instances with their `str`
+    /// payload: no `__str__` that dispatch reaches (see
+    /// `Interpreter::str_payload_class`); `name` unused.
+    StrPayload = 13,
+    /// An instance store of `name` is a `__slots__` member's store: the
+    /// default `__setattr__`, and a writable member without a default
+    /// that the lookup finds first (see `Interpreter::leaf_slot_store`).
+    SlotStore = 14,
+    /// The class, an `int`, `float` or `str` subclass, answers `str(x)` of
+    /// its instances with their payload's text: its `__str__` is the
+    /// base's own method stored in a Python class (an `IntEnum`'s or
+    /// `StrEnum`'s), or a number's `__str__` and `__repr__` both come from
+    /// the base (see `Interpreter::num_str_payload_class`); `name` unused.
+    NumStrPayload = 15,
+    /// The class's `__format__` is its payload type's own, which formats
+    /// the payload (an empty spec is `str(x)`); `name` unused.
+    FormatPayload = 16,
+    /// The class answers `str(x)` with `enum`'s own `Enum.__str__` under
+    /// the default attribute access (see `Interpreter::enum_str`); `name`
+    /// unused.
+    EnumStr = 17,
+    /// The class's `__format__` is `enum`'s own `Enum.__format__`; `name`
+    /// unused.
+    EnumFormat = 18,
+    /// The class hashes with `enum`'s own `Enum.__hash__` under the default
+    /// attribute access (see `Interpreter::enum_hash`); `name` unused.
+    EnumHash = 19,
+    /// The class (`enum.property`) keeps `enum`'s own `property.__get__`
+    /// (see `Interpreter::enum_property_value`); `name` unused.
+    EnumPropertyGet = 20,
+    /// The class reads `_name_` and `_value_` of its instances from their
+    /// dicts under the default attribute access; `name` unused.
+    EnumFields = 21,
+    /// The class (`array.array`) keeps its module's own `__new__` and
+    /// `__init__` (see `stdlib::struct_mod::array_pure_new`); `name`
+    /// unused.
+    ArrayPlainNew = 22,
+    /// The class reads `self._core` from the instance dict: the default
+    /// attribute access, and no `_core` on the class (see
+    /// `stdlib::itertools_mod::core_next_fast`); `name` unused.
+    CoreInDict = 23,
+    /// The class (`weakref.KeyedRef`) keeps its module's own `__new__`
+    /// and `__init__` (see `stdlib::weakref_real::keyedref_pure_new`);
+    /// `name` unused.
+    KeyedRefPlainNew = 24,
+    /// The class (a `defaultdict` or a subclass) keeps the native
+    /// `__missing__` (see `stdlib::collections_native::dd_missing_pure`);
+    /// `name` unused.
+    DefaultDictMissing = 25,
 }
 
 pub struct AttrVersion(std::sync::atomic::AtomicU64);
@@ -346,13 +401,6 @@ pub(crate) mod type_cache {
         dict_idx: u32,
     }
 
-    const EMPTY: Entry = Entry {
-        name: None,
-        ver: 0,
-        mro_idx: ABSENT,
-        dict_idx: 0,
-    };
-
     thread_local! {
         /// This thread's table (`SIZE` entries), or null before the first
         /// fill. A plain pointer in a constant-initialized cell with no
@@ -377,17 +425,46 @@ pub(crate) mod type_cache {
             // (`TABLE` and `HASH_MEMO` have no destructor, so they are
             // still readable here.)
             let table = TABLE.with(|t| t.replace(std::ptr::null_mut()));
-            if !table.is_null() {
+            if !table.is_null() && !park(&TABLES, table as usize) {
                 // SAFETY: allocated by `alloc_table` as a boxed slice of
                 // `SIZE` entries, and no longer reachable through `TABLE`.
                 drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(table, SIZE)) });
             }
             let memo = HASH_MEMO.with(|t| t.replace(std::ptr::null_mut()));
-            if !memo.is_null() {
+            if !memo.is_null() && !park(&MEMOS, memo as usize) {
                 // SAFETY: as above, `HASHES` entries from `alloc_memo`.
                 drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(memo, HASHES)) });
             }
         }
+    }
+
+    /// Tables (and name-hash memos) of threads that have exited, for the
+    /// next threads to start with instead of zeroing and later dropping
+    /// their own (a thread's start and join paid both). An entry stays
+    /// valid on any thread: it names its class by the class's version,
+    /// which is unique for the process, and its name is its own. Each
+    /// pointer is one exited thread's, owned by the pool until taken.
+    static TABLES: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+    static MEMOS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+    /// How many of each the pool keeps.
+    const POOLED: usize = 4;
+
+    /// Give an exited thread's table to the pool: `false` when it is full.
+    fn park(pool: &std::sync::Mutex<Vec<usize>>, p: usize) -> bool {
+        let Ok(mut v) = pool.lock() else {
+            return false;
+        };
+        if v.len() >= POOLED {
+            return false;
+        }
+        v.push(p);
+        true
+    }
+
+    /// A table an exited thread left in the pool, if any.
+    fn unpark(pool: &std::sync::Mutex<Vec<usize>>) -> Option<usize> {
+        pool.lock().ok()?.pop()
     }
 
     /// Entries of a thread's name-hash memo.
@@ -404,11 +481,10 @@ pub(crate) mod type_cache {
     #[cold]
     #[inline(never)]
     fn alloc_memo() -> *mut NameHash {
-        let empty = NameHash {
-            name: None,
-            hash: 0,
+        let memo = match unpark(&MEMOS) {
+            Some(p) => p as *mut NameHash,
+            None => zeroed_slice::<NameHash>(HASHES),
         };
-        let memo = Box::into_raw(vec![empty; HASHES].into_boxed_slice()).cast::<NameHash>();
         HASH_MEMO.with(|t| t.set(memo));
         let _ = OWNER.try_with(|_| ());
         memo
@@ -437,11 +513,32 @@ pub(crate) mod type_cache {
         hash
     }
 
+    /// `n` empty entries (each a `None` name and zeros, which is all-zero
+    /// bytes) as a leaked boxed slice: zeroed memory comes from the
+    /// allocator's fresh pages without a store per entry, which a short
+    /// thread would otherwise pay for its whole table.
+    fn zeroed_slice<T>(n: usize) -> *mut T {
+        let layout = std::alloc::Layout::array::<T>(n).expect("small table");
+        // SAFETY: a nonzero layout; an all-zero `T` here is a `None` name
+        // (`Option<Rc<str>>`'s null niche) and zero integers, a valid value,
+        // and the boxed slice `Box::from_raw` rebuilds uses this layout.
+        unsafe {
+            let p = std::alloc::alloc_zeroed(layout).cast::<T>();
+            if p.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+            p
+        }
+    }
+
     /// This thread's table, allocated on first use.
     #[cold]
     #[inline(never)]
     fn alloc_table() -> *mut Entry {
-        let table = Box::into_raw(vec![EMPTY; SIZE].into_boxed_slice()).cast::<Entry>();
+        let table = match unpark(&TABLES) {
+            Some(p) => p as *mut Entry,
+            None => zeroed_slice::<Entry>(SIZE),
+        };
         TABLE.with(|t| t.set(table));
         // (Registers the owner's destructor; a thread already past its
         // destructors keeps the table until the process exits.)
@@ -496,8 +593,9 @@ pub(crate) mod type_cache {
         }
     }
 
-    /// `a == b` for attribute names, in line for the short ones (most
-    /// dunders and identifiers fit in sixteen bytes).
+    /// `a == b` for attribute names, in line up to 32 bytes (identifiers
+    /// and dunders, `__subclasscheck__` and `__init_subclass__` among
+    /// them, with overlapping word loads).
     #[inline]
     pub(crate) fn name_eq(a: &str, b: &str) -> bool {
         let (a, b) = (a.as_bytes(), b.as_bytes());
@@ -505,10 +603,16 @@ pub(crate) mod type_cache {
         if n != b.len() {
             return false;
         }
-        if n > 16 {
+        if n > 32 {
             return a == b;
         }
         let w = |s: &[u8], at: usize| u64::from_le_bytes(s[at..at + 8].try_into().expect("8"));
+        if n > 16 {
+            return w(a, 0) == w(b, 0)
+                && w(a, 8) == w(b, 8)
+                && w(a, n - 16) == w(b, n - 16)
+                && w(a, n - 8) == w(b, n - 8);
+        }
         if n >= 8 {
             return w(a, 0) == w(b, 0) && w(a, n - 8) == w(b, n - 8);
         }
@@ -736,6 +840,15 @@ pub(crate) mod vm_key {
     pub(crate) const ABC_CLASS: u32 = 20;
     pub(crate) const CHAINMAP_MAPS: u32 = 21;
     pub(crate) const NATIVE_GETITEM_ANY: u32 = 22;
+    pub(crate) const EQ_FN: u32 = 23;
+    pub(crate) const LT_FN: u32 = 24;
+    pub(crate) const NEXT_FN: u32 = 25;
+    pub(crate) const FORMAT_LACKS: u32 = 26;
+    pub(crate) const ITER_FN: u32 = 27;
+    pub(crate) const FLOAT_FN: u32 = 28;
+    pub(crate) const INT_FN: u32 = 29;
+    pub(crate) const SETITEM_LEAF: u32 = 30;
+    pub(crate) const INSTANCECHECK_FN: u32 = 31;
     /// Per comparison (eight).
     pub(crate) const CMP: u32 = 32;
     /// Per binary operator (sixteen each): its method, and whether the
@@ -743,7 +856,74 @@ pub(crate) mod vm_key {
     pub(crate) const BINOP: u32 = 48;
     pub(crate) const RBINOP: u32 = 64;
     pub(crate) const IBINOP: u32 = 80;
+    /// Whether `__len__` / `__contains__` is a built-in base's own over the
+    /// instance's native payload.
+    pub(crate) const NATIVE_LEN: u32 = 96;
+    pub(crate) const NATIVE_CONTAINS: u32 = 97;
+    pub(crate) const SUBCLASSCHECK_FN: u32 = 98;
+    /// Whether a metaclass's `__subclasscheck__` / `__instancecheck__`
+    /// is `type`'s own.
+    pub(crate) const TYPE_SUBCLASSCHECK: u32 = 99;
+    pub(crate) const TYPE_INSTANCECHECK: u32 = 100;
+    /// A class's native `__next__` that runs no Python code.
+    pub(crate) const NEXT_NATIVE: u32 = 101;
+    /// Whether nothing on the MRO supplies `__str__`.
+    pub(crate) const STR_ABSENT: u32 = 102;
+    /// Per comparison (eight): whether the class's method for it is
+    /// `object`'s own.
+    pub(crate) const CMP_OBJECT: u32 = 104;
+    /// The native `__len__` / `__next__` a class resolves (any owner), for
+    /// the leaf calls of an instance's dunder.
+    pub(crate) const LEAF_LEN: u32 = 112;
+    pub(crate) const LEAF_NEXT: u32 = 113;
+    /// The leaf half of the native `__getitem__` a plain Python class
+    /// resolves (the `array` class's), for compiled subscripts.
+    pub(crate) const GETITEM_LEAF: u32 = 114;
+    /// Likewise its `__add__` (an `array`'s concatenation).
+    pub(crate) const ADD_LEAF: u32 = 115;
+    /// A class's own Python `__setattr__`, for the inline stores.
+    pub(crate) const SETATTR_FN: u32 = 116;
+    /// Its native `__setattr__` (a `threading.local`'s hook).
+    pub(crate) const SETATTR_NATIVE: u32 = 117;
+    /// The leaf half of a class's native `__call__` (an `itemgetter`'s),
+    /// for callbacks that call its instances (`map`, a sort's key).
+    pub(crate) const CALL_LEAF: u32 = 118;
+    /// A logger class's `isEnabledFor`, for the native log methods.
+    pub(crate) const LOG_ENABLED_FOR: u32 = 119;
+    /// Its native `__str__` that runs no Python code of its own (an
+    /// exception's), called with the instance, no bound method built.
+    pub(crate) const STR_NATIVE: u32 = 120;
+    /// Its native `__repr__` likewise (an exception's, `object`'s).
+    pub(crate) const REPR_NATIVE: u32 = 121;
+    /// Per binary operator (sixteen), then per comparison (eight):
+    /// whether an `int` or `float` subclass takes the operator's methods
+    /// (forward and reflected, and no in-place one) from its built-in
+    /// base unchanged.
+    pub(crate) const NUM_BINOP: u32 = 128;
+    pub(crate) const NUM_CMP: u32 = 144;
+    /// Whether nothing on the MRO supplies `__length_hint__` / `__len__`
+    /// (a container built from an instance probes both).
+    pub(crate) const LENGTH_HINT_ABSENT: u32 = 152;
+    pub(crate) const LEN_ABSENT: u32 = 153;
+    /// A class's Python `__getattr__` hook, for the frameless hook calls.
+    pub(crate) const GETATTR_FN: u32 = 154;
+    /// Its Python `__format__`, for frameless `format(obj, spec)` calls.
+    pub(crate) const FORMAT_FN: u32 = 155;
+    /// Its Python `__bool__`, for compiled truth tests' direct calls.
+    pub(crate) const BOOL_FN: u32 = 156;
+    /// Its Python `__delitem__`, for compiled deletions' direct calls.
+    pub(crate) const DELITEM_FN: u32 = 157;
+    /// A data descriptor's Python `__set__`, for compiled stores' direct
+    /// calls.
+    pub(crate) const SET_FN: u32 = 158;
+    /// A class's Python in-place operator methods (`__iadd__`, …), one per
+    /// `BinOpKind` from here, for compiled augmented assignments' direct
+    /// calls (`IBINOP`'s keys cache whether the class lacks one).
+    pub(crate) const IBINOP_FN: u32 = 160;
 }
+
+/// A builtin type's pure constructor (see [`TypeObject::pure_new`]).
+pub type PureNew = fn(&Rc<TypeObject>, &[Object]) -> Option<Object>;
 
 /// The cached answer (see [`LeafAttrCache`]).
 #[derive(Clone, Debug)]
@@ -782,15 +962,21 @@ pub enum LeafAttrKind {
     /// MRO, reading this index of the instance's tuple (the descriptor's
     /// index is fixed for its life).
     TupleField(u32),
-    /// An instance of a Python data descriptor class (a plain-function
-    /// `__get__`, and `__set__` or `__delete__`) on the MRO: it wins over
-    /// the instance dict, and a read calls its `__get__`. Valid while its
-    /// class's attribute version is `dver`; both held weakly.
+    /// An instance of a Python descriptor class (a plain-function
+    /// `__get__`) on the MRO, whose read calls its `__get__`: a data
+    /// descriptor (`__set__` or `__delete__` too, `data`) wins over the
+    /// instance dict, any other yields to the instance's own entry. Valid
+    /// while its class's attribute version is `dver`; both held weakly.
     DataDescr {
         descr: crate::sync::Weak<PyInstance>,
         get: crate::sync::Weak<crate::object::PyFunction>,
         dver: u64,
+        data: bool,
     },
+    /// A built-in base's own special method with a registered leaf half
+    /// (see `leaf_builtins::register_fast`): the half, which runs no Python
+    /// code.
+    LeafFast(crate::leaf_builtins::Fast),
     /// Anything else: the full path decides.
     Other,
 }
@@ -1173,6 +1359,14 @@ pub struct TypeObject {
     /// `tp_name` it was computed under, the qualified name, and whether
     /// the module is `__main__`.
     display_name_memo: RefCell<Option<(u64, u64, usize, String, bool)>>,
+    /// The interned `str` objects `cls.__name__` and `cls.__qualname__`
+    /// read as (see [`Self::interned_names`]), the second with the text
+    /// it was made from.
+    name_objs: RefCell<(Option<Object>, Option<Object>)>,
+    /// The tuples `cls.__mro__` and `cls.__bases__` read as (see
+    /// [`Self::links_tuple`]). The collector visits and clears them with
+    /// the class's other links.
+    pub(crate) link_tuples: RefCell<(Option<Object>, Option<Object>)>,
     /// The most attributes an instance's `__dict__` was seen to hold
     /// (capped): new instances' dicts are presized to it, so `__init__`'s
     /// stores do not regrow them.
@@ -1189,6 +1383,12 @@ pub struct TypeObject {
     /// native adapter directly (see `stdlib::itertools_mod::native_new`):
     /// the adapter's kind. A subclass has its own (zero) value.
     pub lazy_ctor: Cell<u8>,
+    /// For an exact builtin type whose call, for some arguments, runs no
+    /// Python code and has no effect beyond building the object
+    /// (`io.BytesIO()`, `threading.Lock()`, `object()`): that call, or
+    /// `None` for arguments it leaves to the full constructor (see
+    /// `seqiter::builtin_ctor_pure`). A subclass has its own (empty) one.
+    pub pure_new: Cell<Option<PureNew>>,
     /// Non-zero for an exact `_collections` class the interpreter serves
     /// natively: `_tuplegetter`, whose instances the attribute paths read
     /// as tuple items (`stdlib::collections_native::DESCR_TUPLEGETTER`),
@@ -1649,10 +1849,13 @@ impl TypeObject {
             metaclass: RefCell::new(None),
             leaf_attrs: LeafAttrCache::new(),
             display_name_memo: RefCell::new(None),
+            name_objs: RefCell::new((None, None)),
+            link_tuples: RefCell::new((None, None)),
             inst_dict_hint: std::sync::atomic::AtomicU32::new(0),
             shared_keys: crate::sync::LazyArc::new(),
             native_kind: Cell::new(0),
             lazy_ctor: Cell::new(0),
+            pure_new: Cell::new(None),
             collections_kind: Cell::new(0),
             native_ext: std::sync::OnceLock::new(),
             abc_state: std::sync::OnceLock::new(),
@@ -1771,6 +1974,11 @@ impl TypeObject {
 
     /// [`Self::slot_layout`], decided now if it isn't yet.
     #[inline]
+    /// The class's member layout (see [`Self::fresh_slots`]), if it has one.
+    pub(crate) fn own_slot_layout(&self) -> Option<&SharedSlice<DictKey>> {
+        self.slot_layout_init()
+    }
+
     fn slot_layout_init(&self) -> Option<&SharedSlice<DictKey>> {
         self.slot_layout
             .get_or_init(|| {
@@ -1810,7 +2018,14 @@ impl TypeObject {
         let mut names: Vec<String> = Vec::new();
         for t in self.mro.borrow().iter().rev() {
             if t.flags.is_builtin {
-                if t.name == "object" {
+                // (A value type's payload lives apart from the slots, and
+                // nothing native adds slots of its own to its subclasses'
+                // instances, as `OrderedDict`'s order does to a dict's:
+                // `configparser`'s `_Line(str)` reads its members compiled.)
+                if matches!(
+                    t.name.as_str(),
+                    "object" | "str" | "int" | "float" | "complex" | "bytes" | "tuple"
+                ) {
                     continue;
                 }
                 return None;
@@ -2127,6 +2342,69 @@ impl TypeObject {
     /// subclass. Call after any class-dict mutation or MRO reshaping that
     /// can change what an attribute name resolves to; specialised
     /// LOAD_ATTR/STORE_ATTR sites guard on the version and deopt.
+    /// `cls.__name__` (`qualified` false) or `cls.__qualname__` as the
+    /// class's own string, the interned object `Object::interned_str`
+    /// makes, remembered on the class: reading a class's name doesn't take
+    /// the intern table's lock each time. (A class dict entry for the name,
+    /// which a read finds first, is the caller's.)
+    pub(crate) fn interned_names(&self, qualified: bool) -> Object {
+        let qual = if qualified {
+            self.qualname.borrow().clone()
+        } else {
+            None
+        };
+        let text: &str = qual.as_deref().unwrap_or(&self.name);
+        if let Ok(memo) = self.name_objs.try_borrow() {
+            let slot = if qualified { &memo.1 } else { &memo.0 };
+            if let Some(Object::Str(s)) = slot {
+                if &**s == text {
+                    return Object::Str(s.clone());
+                }
+            }
+        }
+        let obj = Object::interned_str(text);
+        if let Ok(mut memo) = self.name_objs.try_borrow_mut() {
+            let slot = if qualified { &mut memo.1 } else { &mut memo.0 };
+            *slot = Some(obj.clone());
+        }
+        obj
+    }
+
+    /// `cls.__mro__` (`bases` false) or `cls.__bases__` as one tuple
+    /// for as long as the links stay what they are, as CPython's
+    /// `tp_mro` and `tp_bases` are (`C.__mro__ is C.__mro__`): the tuple
+    /// made at the first read, while its items are still the class's
+    /// links, else a new one. `None` for an empty MRO (a class mid-
+    /// creation, which the full path answers).
+    pub(crate) fn links_tuple(&self, bases: bool) -> Option<Object> {
+        let current = if bases {
+            self.bases.try_borrow().ok()?
+        } else {
+            self.mro.try_borrow().ok()?
+        };
+        if !bases && current.is_empty() {
+            return None;
+        }
+        if let Ok(memo) = self.link_tuples.try_borrow() {
+            if let Some(Object::Tuple(t)) = if bases { &memo.1 } else { &memo.0 } {
+                if t.len() == current.len()
+                    && t.iter()
+                        .zip(current.iter())
+                        .all(|(o, c)| matches!(o, Object::Type(x) if Rc::ptr_eq(x, c)))
+                {
+                    return Some(Object::Tuple(t.clone()));
+                }
+            }
+        }
+        let tuple = Object::new_tuple(current.iter().map(|b| Object::Type(b.clone())).collect());
+        drop(current);
+        crate::gc_trace::track_built(&tuple);
+        if let Ok(mut memo) = self.link_tuples.try_borrow_mut() {
+            *(if bases { &mut memo.1 } else { &mut memo.0 }) = Some(tuple.clone());
+        }
+        Some(tuple)
+    }
+
     pub fn bump_attr_version(&self) {
         use std::sync::atomic::Ordering::Relaxed;
         self.attr_version.bump();
@@ -2428,6 +2706,20 @@ impl TypeObject {
             && self.dunder(Dunder::GetAttribute).object_owner()
     }
 
+    /// Whether `x.__class__` of an instance (with no native body) of this
+    /// class is just the class: [`Self::class_attr_is_plain`], of a class
+    /// that isn't builtin (a builtin's instances, weak proxies among them,
+    /// may answer otherwise), or of `super` itself, whose `super_getattro`
+    /// serves `__class__` as the proxy's own class.
+    pub fn class_read_is_plain(&self) -> bool {
+        (!self.flags.is_builtin
+            || std::ptr::eq(
+                self,
+                Rc::as_ptr(&crate::builtin_types::builtin_types().super_),
+            ))
+            && self.class_attr_is_plain()
+    }
+
     pub fn lookup_with_owner(&self, name: &str) -> Option<(Object, Rc<TypeObject>)> {
         // Fast pass — see `lookup` for the gate rationale.
         if !crate::object::exotic_str_keys_possible() {
@@ -2548,7 +2840,7 @@ impl TypeObject {
                 if let Some(owner) = mro.get(mro_idx as usize) {
                     let d = owner.dict.borrow();
                     if let Some((k, v)) = d.get_index(dict_idx as usize) {
-                        if matches!(&k.0, Object::Str(s) if s.as_ref() == name) {
+                        if matches!(&k.0, Object::Str(s) if type_cache::name_eq(s, name)) {
                             return Some((v.clone(), mro_idx as usize));
                         }
                     }
@@ -2748,10 +3040,22 @@ fn compute_c3(
     bases: &[Rc<TypeObject>],
     name: &str,
 ) -> Result<Vec<Rc<TypeObject>>, RuntimeError> {
+    // One base (most classes, and `email`'s header classes made per
+    // header): the class, then the base's MRO, which the merge below
+    // would give one head at a time.
+    if let [base] = bases {
+        let mro = base.mro.borrow();
+        let mut merged = Vec::with_capacity(mro.len() + 1);
+        merged.push(self_ty.clone());
+        merged.extend(mro.iter().cloned());
+        return Ok(merged);
+    }
     let mut lists: Vec<Vec<Rc<TypeObject>>> =
         bases.iter().map(|b| b.mro.borrow().clone()).collect();
     lists.push(bases.to_vec());
-    let mut merged: Vec<Rc<TypeObject>> = vec![self_ty.clone()];
+    let mut merged: Vec<Rc<TypeObject>> =
+        Vec::with_capacity(1 + lists.iter().map(Vec::len).sum::<usize>());
+    merged.push(self_ty.clone());
     loop {
         lists.retain(|l| !l.is_empty());
         if lists.is_empty() {
@@ -3294,6 +3598,17 @@ pub(crate) enum ExcTail {
 }
 
 impl ExcTail {
+    /// The pseudo-slot named `name`, if one is.
+    pub(crate) fn of_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "__traceback__" => Self::Traceback,
+            "__context__" => Self::Context,
+            "__cause__" => Self::Cause,
+            "__suppress_context__" => Self::SuppressContext,
+            _ => return None,
+        })
+    }
+
     /// The slot's name.
     pub(crate) fn name(self) -> &'static str {
         COMMON_SLOT_NAMES[1 + self as usize]
@@ -3994,6 +4309,25 @@ impl SlotStorage {
         self.leading_interned(names)
     }
 
+    /// [`Self::leading_memo`]'s hit alone: the leading `N` values when the
+    /// store's layout is the one `memo` remembers, which a caller can try
+    /// before it has the names at hand. `None` otherwise (the caller then
+    /// asks [`Self::leading_memo`] with them).
+    #[inline(always)]
+    pub fn leading_memo_hit<const N: usize>(&self, memo: &LayoutMemo) -> Option<[&Object; N]> {
+        let SlotsRef::Fixed(layout, values) = self.view() else {
+            return None;
+        };
+        if SharedSlice::word(layout) != memo.word() {
+            return None;
+        }
+        let values = values.get(..N)?;
+        if values.iter().any(|v| matches!(v, Object::Unbound)) {
+            return None;
+        }
+        Some(std::array::from_fn(|i| &values[i]))
+    }
+
     /// [`Self::leading_memo`], mutably.
     #[inline(always)]
     pub fn leading_memo_mut<const N: usize>(
@@ -4151,6 +4485,23 @@ impl SlotStorage {
             }
         }
         self.get(which.name())
+    }
+
+    /// [`Self::get`] of an exception's `args`: the first laid-out place
+    /// when the storage has an exception layout (see [`Self::exception`]),
+    /// without comparing names.
+    #[inline]
+    pub(crate) fn exc_args_get(&self) -> Option<&Object> {
+        if let SlotsRef::Fixed(layout, values) = self.view() {
+            if let (Some(DictKey(Object::Str(laid))), Object::Str(key)) =
+                (layout.first(), &common_slot_keys()[0])
+            {
+                if crate::shared_value::SharedStr::ptr_eq(laid, key) {
+                    return values.first().filter(|v| !matches!(v, Object::Unbound));
+                }
+            }
+        }
+        self.get("args")
     }
 
     /// [`Self::place_mut`] of the exception pseudo-slot `which`, by
@@ -4482,6 +4833,12 @@ impl SlotStorage {
         self.get(which.name())
     }
 
+    /// The populated `args` (see the 64-bit variant).
+    #[inline]
+    pub(crate) fn exc_args_get(&self) -> Option<&Object> {
+        self.get("args")
+    }
+
     pub fn insert(&mut self, name: &str, value: Object) -> Option<Object> {
         self.insert_with_key(name, value, || slot_key(name))
     }
@@ -4621,8 +4978,7 @@ pub struct PyInstance {
 const INSTANCE_POOL_CAP: usize = 128;
 
 thread_local! {
-    static INSTANCE_POOL: std::cell::RefCell<Vec<Rc<PyInstance>>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    static INSTANCE_POOL: crate::gil::ReleaseUnderGil<std::cell::RefCell<Vec<Rc<PyInstance>>>> = const { crate::gil::ReleaseUnderGil::new(std::cell::RefCell::new(Vec::new())) };
 }
 
 impl PyInstance {
@@ -5025,6 +5381,16 @@ impl PyInstance {
         self.slots.borrow().exc_tail_get(which).cloned()
     }
 
+    /// [`Self::slot_get`] of an exception's `args` (see
+    /// `SlotStorage::exc_args_get`).
+    pub(crate) fn exc_args_get(&self) -> Option<Object> {
+        // SAFETY: the view ends with the clone, before anything runs.
+        if let Some(slots) = unsafe { self.slots.peek() } {
+            return slots.exc_args_get().cloned();
+        }
+        self.slots.borrow().exc_args_get().cloned()
+    }
+
     /// Write slot `name` into the side table.
     pub fn slot_set(&self, name: &str, value: Object) {
         self.note_slot_store(&value);
@@ -5098,6 +5464,10 @@ impl Drop for PyInstance {
         }
         // A finalizer, if the class has one, already ran: `rc::Rc`'s `Drop`
         // queued this instance for it at its last release.
+        // A native state this instance owns goes with it. (The class
+        // read needs no borrow: nothing else holds a dying instance.)
+        let cls_addr = Rc::as_ptr(self.class.get_mut()) as usize;
+        crate::stdlib::handle_table::on_instance_death(self, cls_addr);
         let id = std::ptr::from_ref(self) as usize as u64;
         crate::weakref_registry::on_death(id);
         // A collector registry entry's weak handle would keep this

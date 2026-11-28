@@ -146,6 +146,17 @@ impl<T: ?Sized + ThinPayload> ThinArc<T> {
         }
     }
 
+    /// The payload of a handle that is its allocation's only owner.
+    ///
+    /// # Safety
+    ///
+    /// No other strong or weak owner of the allocation exists.
+    #[inline]
+    pub(crate) unsafe fn get_mut_unchecked(this: &mut Self) -> &mut T {
+        // SAFETY: the caller's contract; this owner keeps it alive.
+        unsafe { &mut *this.raw().cast_mut() }
+    }
+
     pub fn get_mut(this: &mut Self) -> Option<&mut T> {
         if crate::rc::refcounts_biased() {
             // `Arc::get_mut` locks the weak count against another thread's
@@ -396,8 +407,17 @@ impl<T> SharedSlice<T> {
             ptr::addr_of_mut!((*raw).len).write(len);
             ptr::addr_of_mut!((*raw).hash).write(AtomicI64::new(-1));
             let dst = ptr::addr_of_mut!((*raw).items).cast::<T>();
-            for (i, value) in items.into_iter().enumerate() {
-                dst.add(i).write(value);
+            if std::mem::needs_drop::<T>() {
+                for (i, value) in items.into_iter().enumerate() {
+                    dst.add(i).write(value);
+                }
+            } else {
+                // (Elements with no drop glue move as one bulk copy: the
+                // `Vec` then frees only its buffer.)
+                let mut items = std::mem::ManuallyDrop::new(items);
+                ptr::copy_nonoverlapping(items.as_ptr(), dst, len);
+                items.set_len(0);
+                std::mem::ManuallyDrop::drop(&mut items);
             }
             Self::from_arc(Arc::from_raw(raw))
         }
@@ -432,6 +452,42 @@ impl<T> SharedSlice<T> {
             ptr::addr_of_mut!((*raw).hash).write(AtomicI64::new(-1));
             let dst = ptr::addr_of_mut!((*raw).items).cast::<T>();
             ptr::copy_nonoverlapping(items.as_ptr(), dst, len);
+            Self::from_arc(Arc::from_raw(raw))
+        }
+    }
+}
+impl<T: Copy> SharedSlice<T> {
+    /// A slice of `len` elements that `fill` writes in place through the
+    /// pointer to its first element: one allocation, no copy.
+    ///
+    /// # Safety
+    ///
+    /// `fill` must initialize all `len` elements.
+    pub unsafe fn build_uninit(len: usize, fill: impl FnOnce(*mut T)) -> Self {
+        let layout = Self::layout(len);
+        macro_rules! allocate {
+            ($($word:ty),*) => { $(if layout.align() == align_of::<$word>() && layout.size() % size_of::<$word>() == 0 {
+                // SAFETY: the caller's contract.
+                return unsafe { Self::fill_aligned::<$word>(len, layout, fill) };
+            })* };
+        }
+        allocate!(u8, u16, u32, usize, u64, AtomicU64, u128);
+        panic!("unsupported shared slice alignment: {}", layout.align());
+    }
+
+    /// # Safety
+    ///
+    /// As [`Self::build_uninit`]'s.
+    unsafe fn fill_aligned<Word>(len: usize, layout: Layout, fill: impl FnOnce(*mut T)) -> Self {
+        let storage = Arc::<[Word]>::new_uninit_slice(layout.size() / size_of::<Word>());
+        let data = Arc::into_raw(storage).cast::<T>().cast_mut();
+        let raw = ptr::slice_from_raw_parts_mut(data, len) as *mut SliceStorage<T>;
+        // SAFETY: as in `from_copy_aligned`; `fill` initializes the
+        // elements (the caller's word) before any Arc can read them.
+        unsafe {
+            ptr::addr_of_mut!((*raw).len).write(len);
+            ptr::addr_of_mut!((*raw).hash).write(AtomicI64::new(-1));
+            fill(ptr::addr_of_mut!((*raw).items).cast::<T>());
             Self::from_arc(Arc::from_raw(raw))
         }
     }
@@ -635,6 +691,11 @@ pub struct SharedStr(ThinArc<StrStorage>);
 #[derive(Debug)]
 pub struct WeakStr(ThinWeak<StrStorage>);
 impl SharedStr {
+    /// The text, as a `&str`.
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        self
+    }
     /// The allocation's address: equal for every strong and weak owner of
     /// the same string, and never reused while one exists.
     pub fn addr(this: &Self) -> usize {

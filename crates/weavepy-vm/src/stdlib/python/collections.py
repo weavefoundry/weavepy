@@ -61,6 +61,11 @@ except ImportError:
 
 heapq = None  # Lazily imported
 
+try:
+    from _weave_collections import _most_common_plain
+except ImportError:
+    _most_common_plain = None
+
 
 ################################################################################
 ### OrderedDict
@@ -666,6 +671,12 @@ class Counter(dict):
         # Emulate Bag.sortedByCount from Smalltalk
         if n is None:
             return sorted(self.items(), key=_itemgetter(1), reverse=True)
+
+        # Plain int counts, natively (in `nlargest`'s order).
+        if type(self) is Counter and type(n) is int and _most_common_plain is not None:
+            r = _most_common_plain(self, n)
+            if r is not None:
+                return r
 
         # Lazy import to speedup Python startup time
         global heapq

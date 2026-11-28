@@ -1262,6 +1262,30 @@ fn note_materialize(at: &'static std::panic::Location<'static>) {
 }
 
 impl crate::types::PyInstance {
+    /// The value at position `i` of the instance's published dictionary
+    /// (one its `__dict__` made), when the key there is still `name`.
+    ///
+    /// # Safety
+    ///
+    /// As [`crate::sync::GilCell::peek`]: the view ends before anything
+    /// that could store an attribute runs.
+    #[inline]
+    pub unsafe fn published_field(&self, i: usize, name: &Object) -> Option<&Object> {
+        let Object::Str(name) = name else {
+            return None;
+        };
+        // SAFETY: forwarded contract.
+        let d = unsafe { self.dict.published()?.peek() }?;
+        match d.get_index(i)? {
+            (DictKey(Object::Str(k)), v)
+                if std::ptr::eq(k.as_ptr(), name.as_ptr()) || **k == **name =>
+            {
+                Some(v)
+            }
+            _ => None,
+        }
+    }
+
     /// The attribute at position `i` of the class's shared names, while
     /// this instance's values are still split over its own class's names:
     /// the name there is fixed for as long as the class lives, so a
@@ -1536,6 +1560,45 @@ impl crate::types::PyInstance {
                 let s = unsafe { self.dict.split_cell().peek() }?;
                 Some(s.position_hashed(name, hash).is_some())
             }
+        }
+    }
+
+    /// [`Self::attr_get_str`] of a name whose Python hash is `hash`: the
+    /// split layout finds it by the hash first, a name no instance of the
+    /// class set answering without a comparison.
+    pub fn attr_get_hashed(&self, name: &str, hash: i64) -> Option<Object> {
+        match self.dict.published() {
+            Some(d) => d
+                .try_borrow()
+                .ok()?
+                .get(&crate::object::StrKeyHashed { s: name, hash })
+                .cloned(),
+            None => {
+                let s = self.dict.split_cell().try_borrow().ok()?;
+                let i = s.position_hashed(name, hash)?;
+                s.get_index(i).map(|(_, v)| v.clone())
+            }
+        }
+    }
+
+    /// Attribute `name` (Python hash `hash`) read in place from either
+    /// layout, with no code run: a published dict probed by the hash, a
+    /// split layout at the position `memo` last found it (see
+    /// [`SplitValues::get_memo`]). `None` when absent or borrowed.
+    pub fn attr_get_memo(&self, name: &str, hash: i64, memo: &PosMemo) -> Option<Object> {
+        match self.dict.published() {
+            Some(d) => d
+                .try_borrow()
+                .ok()?
+                .get(&crate::object::StrKeyHashed { s: name, hash })
+                .cloned(),
+            None => self
+                .dict
+                .split_cell()
+                .try_borrow()
+                .ok()?
+                .get_memo(name, hash, memo)
+                .cloned(),
         }
     }
 

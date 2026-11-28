@@ -2559,6 +2559,7 @@ dependencies = [
  "parking_lot",
  "pkcs8",
  "regex",
+ "ring",
  "rusqlite",
  "rust_decimal",
  "rustls",

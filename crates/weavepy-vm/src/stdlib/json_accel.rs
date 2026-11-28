@@ -226,8 +226,7 @@ thread_local! {
     /// without memoisation each call re-decodes the whole document to code
     /// points — O(n) per call, O(n^2) over a parse. Keyed on the string's
     /// heap identity (holding the object so the pointer can't be reused).
-    static SCANSTRING_CACHE: std::cell::RefCell<Option<(usize, Object, Rc<Vec<u32>>)>> =
-        const { std::cell::RefCell::new(None) };
+    static SCANSTRING_CACHE: crate::gil::ReleaseUnderGil<std::cell::RefCell<Option<(usize, Object, Rc<Vec<u32>>)>>> = const { crate::gil::ReleaseUnderGil::new(std::cell::RefCell::new(None)) };
 }
 
 /// Code points of `o`, reusing the thread-local cache when the same
@@ -1136,11 +1135,14 @@ fn finish_object(
                 .map(|(k, v)| Object::new_tuple_array([k, v]))
                 .collect();
             let arg = Object::new_list(pair_objs);
+            crate::gc_trace::track_built(&arg);
             return interp.call_object(cfg.object_pairs_hook.clone(), &[arg], &[]);
         }
         DecodedObject::Dict(dict) => dict,
     };
     let dict_obj = Object::Dict(Rc::new(RefCell::new(d)));
+    // (Deferred without scanning, as every built container's.)
+    crate::gc_trace::track_built(&dict_obj);
     if is_set(&cfg.object_hook) {
         return interp.call_object(cfg.object_hook.clone(), &[dict_obj], &[]);
     }
@@ -1170,7 +1172,7 @@ fn parse_array<C: JsonChar>(
     }
     if nextchar == Some(0x5d) {
         // ']'
-        return Ok((Object::new_list(values), end + 1));
+        return Ok((built_list(values), end + 1));
     }
     loop {
         let (value, new_end) = match scan_once(interp, cfg, doc, cps, end, memo) {
@@ -1233,7 +1235,14 @@ fn parse_array<C: JsonChar>(
             )));
         }
     }
-    Ok((Object::new_list(values), end))
+    Ok((built_list(values), end))
+}
+
+/// A decoded array: a new list, its tracking deferred without a scan.
+fn built_list(values: Vec<Object>) -> Object {
+    let list = Object::new_list(values);
+    crate::gc_trace::track_built(&list);
+    list
 }
 
 // ---------------------------------------------------------------------------
@@ -1554,7 +1563,7 @@ fn encoder_call(cfg: &EncoderCfg, args: &[Object]) -> Result<Object, RuntimeErro
     };
     with_interp(|interp| {
         let mut out = JsonWriter::default();
-        let mut cycle: HashSet<usize> = HashSet::new();
+        let mut cycle: crate::fasthash::FxHashSet<usize> = crate::fasthash::FxHashSet::default();
         let track = !matches!(cfg.markers, Object::None);
         encode_value(
             interp,
@@ -1790,7 +1799,7 @@ fn encode_value(
     level: usize,
     out: &mut JsonWriter,
     track: bool,
-    cycle: &mut HashSet<usize>,
+    cycle: &mut crate::fasthash::FxHashSet<usize>,
 ) -> Result<(), RuntimeError> {
     let _depth_guard = match crate::recursion::enter() {
         crate::recursion::Enter::Ok(g) => g,
@@ -1816,7 +1825,7 @@ fn encode_value_impl(
     level: usize,
     out: &mut JsonWriter,
     track: bool,
-    cycle: &mut HashSet<usize>,
+    cycle: &mut crate::fasthash::FxHashSet<usize>,
 ) -> Result<(), RuntimeError> {
     match json_kind(o) {
         Kind::Str => write_encoded_string(interp, cfg, o, out)?,
@@ -1880,7 +1889,7 @@ fn encode_list(
     level: usize,
     out: &mut JsonWriter,
     track: bool,
-    cycle: &mut HashSet<usize>,
+    cycle: &mut crate::fasthash::FxHashSet<usize>,
 ) -> Result<(), RuntimeError> {
     // A native `list` is indexed *live* each iteration (re-reading its
     // current length), exactly like `_json.c`'s `PyList_GET_SIZE` loop, so a
@@ -1956,7 +1965,7 @@ fn encode_dict(
     level: usize,
     out: &mut JsonWriter,
     track: bool,
-    cycle: &mut HashSet<usize>,
+    cycle: &mut crate::fasthash::FxHashSet<usize>,
 ) -> Result<(), RuntimeError> {
     if items.is_empty() {
         out.push_str("{}");
@@ -2035,8 +2044,18 @@ fn encode_dict(
 /// (`test_speedups.test_unsortable_keys`).
 fn sort_items(
     interp: &mut Interpreter,
-    items: Vec<(Object, Object)>,
+    mut items: Vec<(Object, Object)>,
 ) -> Result<Vec<(Object, Object)>, RuntimeError> {
+    // All `str` keys (a dict's are distinct, so no two items ever compare
+    // their values): the keys' code-point order, which their UTF-8 bytes
+    // sort in, with no tuples built and no `list.sort` call.
+    if items.iter().all(|(k, _)| matches!(k, Object::Str(_))) {
+        items.sort_unstable_by(|(a, _), (b, _)| match (a, b) {
+            (Object::Str(a), Object::Str(b)) => a.as_bytes().cmp(b.as_bytes()),
+            _ => std::cmp::Ordering::Equal,
+        });
+        return Ok(items);
+    }
     let tuples: Vec<Object> = items
         .into_iter()
         .map(|(k, v)| Object::new_tuple_array([k, v]))

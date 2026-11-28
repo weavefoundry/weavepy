@@ -471,7 +471,8 @@ pub(crate) struct Direct {
 struct CheckedClasses(FxHashMap<u64, Checked>);
 
 thread_local! {
-    static CHECKED: std::cell::RefCell<CheckedClasses> = std::cell::RefCell::default();
+    static CHECKED: crate::gil::ReleaseUnderGil<std::cell::RefCell<CheckedClasses>> =
+        crate::gil::ReleaseUnderGil::new(std::cell::RefCell::default());
 }
 
 struct Checked {

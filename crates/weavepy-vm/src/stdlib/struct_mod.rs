@@ -79,6 +79,8 @@ struct CompiledFormat {
     endian: Endian,
     fields: Vec<Field>,
     size: usize,
+    /// How many values an unpack yields (padding none, a string one).
+    values: usize,
 }
 
 impl CompiledFormat {
@@ -172,10 +174,19 @@ impl CompiledFormat {
                 .filter(|s| *s <= MAX_STRUCT_SIZE)
                 .ok_or_else(|| struct_error("total struct size too long"))?;
         }
+        let values = fields
+            .iter()
+            .map(|f| match f.code {
+                'x' => 0,
+                's' | 'p' => 1,
+                _ => f.count,
+            })
+            .sum();
         Ok(Self {
             endian,
             fields,
             size,
+            values,
         })
     }
 
@@ -278,6 +289,17 @@ impl CompiledFormat {
         self.unpack_from_offset(buf, 0).map(|(v, _)| v)
     }
 
+    /// [`Self::unpack`] as a tuple (see [`Self::unpack_tuple_at`]).
+    fn unpack_tuple(&self, buf: &[u8]) -> Result<Object, RuntimeError> {
+        if buf.len() != self.size {
+            return Err(struct_error(format!(
+                "unpack requires a buffer of {} bytes",
+                self.size
+            )));
+        }
+        self.unpack_tuple_at(buf, 0)
+    }
+
     fn iter_unpack(&self, buf: &[u8]) -> Result<Vec<Vec<Object>>, RuntimeError> {
         if !buf.len().is_multiple_of(self.size) {
             return Err(struct_error(format!(
@@ -300,16 +322,7 @@ impl CompiledFormat {
         buf: &[u8],
         start: usize,
     ) -> Result<(Vec<Object>, usize), RuntimeError> {
-        let values = self
-            .fields
-            .iter()
-            .map(|f| match f.code {
-                'x' => 0,
-                's' | 'p' => 1,
-                _ => f.count,
-            })
-            .sum();
-        let mut out = Vec::with_capacity(values);
+        let mut out = Vec::with_capacity(self.values);
         let mut pos = start;
         for f in &self.fields {
             match f.code {
@@ -318,7 +331,7 @@ impl CompiledFormat {
                 }
                 's' => {
                     let bytes = &buf[pos..pos + f.count];
-                    out.push(Object::new_bytes(bytes.to_vec()));
+                    out.push(Object::new_bytes(bytes));
                     pos += f.count;
                 }
                 'p' => {
@@ -329,7 +342,7 @@ impl CompiledFormat {
                     let len = buf[pos] as usize;
                     let take = len.min(f.count - 1);
                     let bytes = &buf[pos + 1..pos + 1 + take];
-                    out.push(Object::new_bytes(bytes.to_vec()));
+                    out.push(Object::new_bytes(bytes));
                     pos += f.count;
                 }
                 code => {
@@ -342,6 +355,23 @@ impl CompiledFormat {
             }
         }
         Ok((out, pos - start))
+    }
+
+    /// [`Self::unpack_from_offset`]'s values as a tuple: one or two
+    /// numbers of a single field built in place, with no list between.
+    fn unpack_tuple_at(&self, buf: &[u8], start: usize) -> Result<Object, RuntimeError> {
+        if let [f] = self.fields.as_slice() {
+            if !matches!(f.code, 'x' | 's' | 'p') && matches!(f.count, 1 | 2) {
+                let (a, n) = decode_one(f.code, self.endian, &buf[start..])?;
+                if f.count == 1 {
+                    return Ok(Object::new_tuple_array([a]));
+                }
+                let (b, _) = decode_one(f.code, self.endian, &buf[start + n..])?;
+                return Ok(Object::new_tuple_array([a, b]));
+            }
+        }
+        self.unpack_from_offset(buf, start)
+            .map(|(vals, _)| Object::new_tuple(vals))
     }
 }
 
@@ -922,6 +952,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         register(&mut d, "_value_codes", b_value_codes);
         register(&mut d, "pack", b_pack);
         register(&mut d, "_pack_plain", b_pack_plain);
+        register(&mut d, "_native_pack", b_native_pack);
+        register(&mut d, "_native_unpack", b_native_unpack);
+        register(&mut d, "_native_unpack_from", b_native_unpack_from);
+        register(&mut d, "_native_pack_into", b_native_pack_into);
         register(&mut d, "_clearcache", b_clearcache);
         register(&mut d, "unpack", b_unpack);
         register(&mut d, "pack_into", b_pack_into);
@@ -937,6 +971,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("_install_struct")),
             Object::Builtin(install),
         );
+        register(&mut d, "_array_methods", array_methods);
+        register(&mut d, "_unpack_iterator_methods", unpack_iterator_methods);
+        register(&mut d, "_native_iter_unpack", b_native_iter_unpack);
+        register(&mut d, "_all_exact", all_exact);
     }
     Rc::new(PyModule {
         name: "_struct".to_owned(),
@@ -966,8 +1004,7 @@ fn register(
 thread_local! {
     /// Compiled formats by their text (CPython's `_struct` cache, flushed
     /// by `_clearcache` and bounded as CPython bounds its own).
-    static FORMATS: std::cell::RefCell<std::collections::HashMap<String, std::rc::Rc<CompiledFormat>>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
+    static FORMATS: std::cell::RefCell<std::collections::HashMap<String, std::rc::Rc<CompiledFormat>>> = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// How many compiled formats [`FORMATS`] keeps before starting over.
@@ -1004,8 +1041,7 @@ thread_local! {
     /// Compiled formats by the identity of a `Struct`'s format string
     /// (each held here, so an address names one string), most recent
     /// first: a `Struct` hands its methods the same string every call.
-    static BY_STRING: std::cell::RefCell<Vec<(crate::shared_value::SharedStr, std::rc::Rc<CompiledFormat>)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    static BY_STRING: crate::gil::ReleaseUnderGil<std::cell::RefCell<Vec<(crate::shared_value::SharedStr, std::rc::Rc<CompiledFormat>)>>> = const { crate::gil::ReleaseUnderGil::new(std::cell::RefCell::new(Vec::new())) };
 }
 
 /// How many format strings [`BY_STRING`] remembers.
@@ -1045,7 +1081,17 @@ fn struct_format(recv: &Object) -> Option<std::rc::Rc<CompiledFormat>> {
     if class != STRUCT_CLASS.load(std::sync::atomic::Ordering::Relaxed) {
         return None;
     }
-    match inst.attr_get_str("_fmt")? {
+    // (The name's hash computed once, its position remembered.)
+    struct FmtName {
+        hash: i64,
+        memo: crate::inst_dict::PosMemo,
+    }
+    static NAME: std::sync::OnceLock<FmtName> = std::sync::OnceLock::new();
+    let n = NAME.get_or_init(|| FmtName {
+        hash: crate::object::py_str_hash("_fmt"),
+        memo: crate::inst_dict::PosMemo::new(),
+    });
+    match inst.attr_get_memo("_fmt", n.hash, &n.memo)? {
         Object::Str(fmt) => compiled_for(&fmt),
         _ => None,
     }
@@ -1083,8 +1129,844 @@ fn struct_unpack_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
         return None;
     };
     let cf = struct_format(recv)?;
-    let vals = cf.unpack(buf).ok()?;
-    Some(Ok(Object::new_tuple(vals)))
+    Some(Ok(cf.unpack_tuple(buf).ok()?))
+}
+
+pub(crate) type Fast = fn(&[Object]) -> Option<Result<Object, RuntimeError>>;
+
+/// A native method `name` for `cls`: it serves what `fast` takes and
+/// calls the Python method `orig` (the one it replaces) for everything
+/// else. With `keywords` it takes keyword arguments (for `orig`); without,
+/// it is positional only, as a special method's slot is (the subscript
+/// lanes take only such methods).
+pub(crate) fn fast_method(
+    cls: &Rc<crate::types::TypeObject>,
+    name: &'static str,
+    fast: Fast,
+    orig: Object,
+    keywords: bool,
+) -> Object {
+    // (The native keeps the class alive: its address stays its own.)
+    let class = cls.clone();
+    let fallback = move |a: &[Object], kw: &[(String, Object)]| {
+        let _ = &class;
+        let f = orig.clone();
+        let ptr = crate::vm_singletons::current_interpreter_ptr()
+            .ok_or_else(|| type_error("no active interpreter"))?;
+        // SAFETY: published by the enclosing VM frame on this thread.
+        unsafe { &mut *ptr }.call_object(f, a, kw)
+    };
+    let fallback = Rc::new(fallback);
+    let fallback_kw = fallback.clone();
+    let b = Rc::new(BuiltinFn {
+        name,
+        binds_instance: true,
+        call: Box::new(move |a: &[Object]| match fast(a) {
+            Some(r) => r,
+            None => fallback(a, &[]),
+        }),
+        call_kw: keywords.then(|| -> KwCall {
+            Box::new(move |a: &[Object], kw: &[(String, Object)]| {
+                if kw.is_empty() {
+                    if let Some(r) = fast(a) {
+                        return r;
+                    }
+                }
+                fallback_kw(a, kw)
+            })
+        }),
+    });
+    crate::leaf_builtins::register_fast(&b, fast);
+    Object::Builtin(b)
+}
+
+type KwCall =
+    Box<dyn Fn(&[Object], &[(String, Object)]) -> Result<Object, RuntimeError> + Send + Sync>;
+
+/// Put a [`fast_method`] in `cls`'s dictionary for each `(name, fast,
+/// original)`.
+pub(crate) fn install_fast_methods<const N: usize>(
+    cls: &Rc<crate::types::TypeObject>,
+    methods: [(&'static str, Fast, Object); N],
+) {
+    for (name, fast, orig) in methods {
+        let method = fast_method(cls, name, fast, orig, true);
+        cls.dict
+            .borrow_mut()
+            .insert(DictKey(Object::from_static(name)), method);
+    }
+    cls.bump_attr_version();
+}
+
+// ---------------------------------------------------------------------
+// `array.array` item access. The class is Python (`array_mod.py`, over a
+// `bytearray` of packed items); its item methods are served here for the
+// plain cases, as CPython's C type serves them, and fall back to the
+// Python methods for everything else (other index and value types, every
+// error).
+
+/// An `array.array` instance's typecode and buffer.
+fn array_parts(recv: &Object) -> Option<(u8, Rc<RefCell<Vec<u8>>>)> {
+    with_array(recv, |typecode, buf| Some((typecode, buf.clone())))
+}
+
+/// The slot layouts of the `array` class and its iterator class (their
+/// addresses), set when `_array_methods` serves them: an instance laid out
+/// over one of these has its slots at known places.
+static ARRAY_LAYOUT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ARRAY_ITER_LAYOUT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static UNPACK_ITER_LAYOUT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `inst`'s slot values when it is laid out over the layout `known` names.
+fn known_slots<'a>(
+    inst: &crate::types::PyInstance,
+    slots: &'a crate::types::SlotStorage,
+    known: &std::sync::atomic::AtomicUsize,
+) -> Option<&'a [Object]> {
+    let layout = inst.cls_raw().own_slot_layout()?;
+    if crate::shared_value::SharedSlice::word(layout)
+        != known.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return None;
+    }
+    slots.values_for_layout(layout)
+}
+
+/// `f` on an `array.array` instance's typecode and buffer, the slots read
+/// in place.
+fn with_array<R>(
+    recv: &Object,
+    f: impl FnOnce(u8, &Rc<RefCell<Vec<u8>>>) -> Option<R>,
+) -> Option<R> {
+    let Object::Instance(inst) = recv else {
+        return None;
+    };
+    let slots = inst.slots.try_borrow().ok()?;
+    let (code, buf) = match known_slots(inst, &slots, &ARRAY_LAYOUT) {
+        Some(values) => (values.first()?, values.get(3)?),
+        None => (
+            slots.get_hinted(0, "_typecode")?,
+            slots.get_hinted(3, "_buf")?,
+        ),
+    };
+    match (code, buf) {
+        (Object::Str(s), Object::ByteArray(b)) if s.len() == 1 => f(s.as_bytes()[0], b),
+        _ => None,
+    }
+}
+
+/// The size in bytes of a numeric typecode's items (the unicode arrays,
+/// whose items are characters, are the Python methods').
+fn array_item_size(typecode: u8) -> Option<usize> {
+    Some(match typecode {
+        b'b' | b'B' => 1,
+        b'h' | b'H' => 2,
+        b'i' | b'I' | b'f' => 4,
+        b'l' | b'L' => std::mem::size_of::<std::ffi::c_long>(),
+        b'q' | b'Q' | b'd' => 8,
+        _ => return None,
+    })
+}
+
+/// The item packed in `raw` (its typecode's size, native order), when it
+/// is a machine int or a float.
+fn array_item_read(typecode: u8, raw: &[u8]) -> Option<Object> {
+    let signed = |raw: &[u8]| match raw.len() {
+        4 => Some(i64::from(i32::from_ne_bytes(raw.try_into().ok()?))),
+        8 => Some(i64::from_ne_bytes(raw.try_into().ok()?)),
+        _ => None,
+    };
+    let unsigned = |raw: &[u8]| match raw.len() {
+        4 => Some(i64::from(u32::from_ne_bytes(raw.try_into().ok()?))),
+        // (One past the machine range is a big int: the Python method's.)
+        8 => i64::try_from(u64::from_ne_bytes(raw.try_into().ok()?)).ok(),
+        _ => None,
+    };
+    Some(match typecode {
+        b'b' => Object::Int(i64::from(raw[0] as i8)),
+        b'B' => Object::Int(i64::from(raw[0])),
+        b'h' => Object::Int(i64::from(i16::from_ne_bytes(raw.try_into().ok()?))),
+        b'H' => Object::Int(i64::from(u16::from_ne_bytes(raw.try_into().ok()?))),
+        b'i' | b'l' | b'q' => Object::Int(signed(raw)?),
+        b'I' | b'L' | b'Q' => Object::Int(unsigned(raw)?),
+        b'f' => Object::Float(f64::from(f32::from_ne_bytes(raw.try_into().ok()?))),
+        b'd' => Object::Float(f64::from_ne_bytes(raw.try_into().ok()?)),
+        _ => return None,
+    })
+}
+
+/// `value` packed as an item of `typecode` into `out`: its size, for a
+/// plain `int` in the item's range or a `float` the item holds (a `float`
+/// too large for an `'f'` item, like every other value, is the Python
+/// method's, which converts or refuses it as CPython's setters do).
+fn array_item_write(typecode: u8, value: &Object, out: &mut [u8; 8]) -> Option<usize> {
+    let size = array_item_size(typecode)?;
+    match (typecode, value) {
+        (b'f', Object::Float(v)) => {
+            let narrow = *v as f32;
+            if narrow.is_infinite() && v.is_finite() {
+                return None;
+            }
+            out[..4].copy_from_slice(&narrow.to_ne_bytes());
+        }
+        (b'd', Object::Float(v)) => out.copy_from_slice(&v.to_ne_bytes()),
+        (b'b' | b'h' | b'i' | b'l' | b'q', Object::Int(v)) => {
+            let bits = 8 * size as u32;
+            if bits < 64 && !(-(1i64 << (bits - 1))..(1i64 << (bits - 1))).contains(v) {
+                return None;
+            }
+            out[..size].copy_from_slice(low_bytes(&v.to_ne_bytes(), size));
+        }
+        (b'B' | b'H' | b'I' | b'L' | b'Q', Object::Int(v)) => {
+            let bits = 8 * size as u32;
+            if *v < 0 || (bits < 64 && *v >= (1i64 << bits)) {
+                return None;
+            }
+            out[..size].copy_from_slice(low_bytes(&v.to_ne_bytes(), size));
+        }
+        _ => return None,
+    }
+    Some(size)
+}
+
+/// The `size` low-order bytes of a native-order 64-bit value, in native
+/// order.
+fn low_bytes(bytes: &[u8; 8], size: usize) -> &[u8] {
+    if cfg!(target_endian = "big") {
+        &bytes[8 - size..]
+    } else {
+        &bytes[..size]
+    }
+}
+
+/// The class `_array_methods` served last (its address): slices of its own
+/// instances are built natively.
+static ARRAY_CLASS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The byte range `sl` names in an array of `size`-byte items holding
+/// `len` bytes, for a slice with plain bounds and a step of one.
+fn array_byte_run(sl: &crate::object::PySlice, len: usize, size: usize) -> Option<(usize, usize)> {
+    if ![&sl.start, &sl.stop, &sl.step]
+        .iter()
+        .all(|v| matches!(v, Object::None | Object::Int(_)))
+    {
+        return None;
+    }
+    let (start, stop, step, _) = crate::adjust_slice((len / size) as i64, sl).ok()?;
+    if step != 1 {
+        return None;
+    }
+    let lo = start as usize * size;
+    Some((lo, (stop as usize * size).max(lo)))
+}
+
+/// The seven slot values of an instance of the `array` class itself
+/// (`_typecode`, `_fmt`, `_itemsize`, `_buf`, `_kind`, `_lo`, `_hi`), read
+/// in place when it is laid out over the class's layout with all of them
+/// set.
+fn array_values<'a>(
+    inst: &crate::types::PyInstance,
+    slots: &'a crate::types::SlotStorage,
+) -> Option<&'a [Object; 7]> {
+    if std::ptr::from_ref(inst.cls_raw()) as usize
+        != ARRAY_CLASS.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return None;
+    }
+    let values: &[Object; 7] = known_slots(inst, slots, &ARRAY_LAYOUT)?.try_into().ok()?;
+    (!values.iter().any(|v| matches!(v, Object::Unbound))).then_some(values)
+}
+
+/// A new instance of the `array` class with `values`' fields (see
+/// [`array_values`]) over the bytes `run`, laid out as `_make_array` lays
+/// one out (its slots written at once, in the class's layout).
+fn array_over(
+    inst: &crate::types::PyInstance,
+    values: &[Object; 7],
+    run: Object,
+) -> Option<Object> {
+    let layout = inst.cls_raw().own_slot_layout()?;
+    let out = [
+        values[0].clone(),
+        values[1].clone(),
+        values[2].clone(),
+        run,
+        values[4].clone(),
+        values[5].clone(),
+        values[6].clone(),
+    ];
+    Some(Object::Instance(Rc::new(
+        crate::types::PyInstance::with_slots(
+            inst.cls(),
+            crate::types::SlotStorage::from_layout_array(layout.clone(), out),
+        ),
+    )))
+}
+
+/// The numeric typecode and buffer among [`array_values`]' fields.
+fn array_code_buf(values: &[Object; 7]) -> Option<(u8, &Rc<RefCell<Vec<u8>>>)> {
+    match (&values[0], &values[3]) {
+        (Object::Str(code), Object::ByteArray(buf)) => match code.as_bytes() {
+            [typecode] if array_item_size(*typecode).is_some() => Some((*typecode, buf)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `a[i:j]` of an instance of the `array` class itself: a new array over
+/// a copy of the run's bytes.
+fn array_slice_fast(recv: &Object, sl: &crate::object::PySlice) -> Option<Object> {
+    let Object::Instance(inst) = recv else {
+        return None;
+    };
+    let slots = inst.slots.try_borrow().ok()?;
+    let values = array_values(inst, &slots)?;
+    let (typecode, buf) = array_code_buf(values)?;
+    let size = array_item_size(typecode)?;
+    let run = {
+        let buf = buf.try_borrow().ok()?;
+        let (lo, hi) = array_byte_run(sl, buf.len(), size)?;
+        Object::new_bytearray(&buf[lo..hi])
+    };
+    array_over(inst, values, run)
+}
+
+/// `array(typecode)` or `array(typecode, items)` of a list of plain ints
+/// or floats that the typecode holds, for a numeric typecode and the
+/// `array` class itself while its `__new__` and `__init__` are the
+/// module's own (a verdict kept per class version): the instance laid
+/// out as `_setup` lays one out, over the packed items, as `__new__`
+/// leaves it. `None` for any other call (a `'u'` or `'w'` array, which
+/// may warn, another initializer, a value out of range), or while a
+/// tracer or profiler would see the methods.
+fn array_pure_new(cls: &Rc<crate::types::TypeObject>, args: &[Object]) -> Option<Object> {
+    let (code, items) = match args {
+        [Object::Str(code)] => (code, None),
+        [Object::Str(code), Object::List(items)] => (code, Some(items)),
+        _ => return None,
+    };
+    let [typecode] = *code.as_bytes() else {
+        return None;
+    };
+    let size = array_item_size(typecode)?;
+    if Rc::as_ptr(cls) as usize != ARRAY_CLASS.load(std::sync::atomic::Ordering::Relaxed)
+        || crate::trace::any_observers_active()
+    {
+        return None;
+    }
+    let own = |name: &str| match cls.dict.borrow().get(&crate::object::StrKey(name)) {
+        Some(Object::Function(f)) => f.code().qualname == format!("array.{name}"),
+        Some(Object::StaticMethod(m)) => {
+            matches!(m.func(), Object::Function(f) if f.code().qualname == format!("array.{name}"))
+        }
+        _ => false,
+    };
+    if !cls.memo_verdict(crate::types::Verdict::ArrayPlainNew, "", || {
+        own("__new__") && own("__init__")
+    }) {
+        return None;
+    }
+    let layout = cls.own_slot_layout()?;
+    if crate::shared_value::SharedSlice::word(layout)
+        != ARRAY_LAYOUT.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return None;
+    }
+    let mut buf = Vec::new();
+    if let Some(items) = items {
+        let items = items.try_borrow().ok()?;
+        buf.reserve(items.len() * size);
+        let mut packed = [0u8; 8];
+        for v in items.iter() {
+            let n = array_item_write(typecode, v, &mut packed)?;
+            buf.extend_from_slice(&packed[..n]);
+        }
+    }
+    // (`_KINDS` and `_INT_RANGES`: an int's range by width and sign.)
+    let (kind, lo, hi) = match typecode {
+        b'f' | b'd' => (1, Object::Int(0), Object::Int(0)),
+        _ => {
+            let shift = 64 - 8 * size as u32;
+            if typecode.is_ascii_lowercase() {
+                (
+                    0,
+                    Object::Int(i64::MIN >> shift),
+                    Object::Int(i64::MAX >> shift),
+                )
+            } else if shift == 0 {
+                (
+                    0,
+                    Object::Int(0),
+                    Object::Long(Rc::new(num_bigint::BigInt::from(u64::MAX))),
+                )
+            } else {
+                (0, Object::Int(0), Object::Int((1i64 << (8 * size)) - 1))
+            }
+        }
+    };
+    let values = [
+        Object::Str(code.clone()),
+        Object::Str(code.clone()),
+        Object::Int(size as i64),
+        Object::new_bytearray(buf),
+        Object::Int(kind),
+        lo,
+        hi,
+    ];
+    Some(Object::Instance(Rc::new(
+        crate::types::PyInstance::with_slots(
+            cls.clone(),
+            crate::types::SlotStorage::from_layout_array(layout.clone(), values),
+        ),
+    )))
+}
+
+/// `a.__copy__()` (`copy.copy(a)`) of an instance of the `array` class
+/// itself with a numeric typecode: a new array over a copy of its bytes.
+fn array_copy_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Instance(inst)] = args else {
+        return None;
+    };
+    let slots = inst.slots.try_borrow().ok()?;
+    let values = array_values(inst, &slots)?;
+    let (_, buf) = array_code_buf(values)?;
+    let run = Object::new_bytearray(buf.try_borrow().ok()?.as_slice());
+    array_over(inst, values, run).map(Ok)
+}
+
+/// `a + b` of two instances of the `array` class itself with one numeric
+/// typecode: a new array over both runs of bytes. (Anything else is the
+/// Python method's, which raises for another typecode or type.)
+fn array_add_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Instance(a), Object::Instance(b)] = args else {
+        return None;
+    };
+    let (sa, sb) = (a.slots.try_borrow().ok()?, b.slots.try_borrow().ok()?);
+    let (va, vb) = (array_values(a, &sa)?, array_values(b, &sb)?);
+    let ((ca, ba), (cb, bb)) = (array_code_buf(va)?, array_code_buf(vb)?);
+    if ca != cb {
+        return None;
+    }
+    let run = {
+        let (x, y) = (ba.try_borrow().ok()?, bb.try_borrow().ok()?);
+        let mut joined = Vec::with_capacity(x.len() + y.len());
+        joined.extend_from_slice(&x);
+        joined.extend_from_slice(&y);
+        Object::new_bytearray(joined)
+    };
+    array_over(a, va, run).map(Ok)
+}
+
+/// The items of an instance of the `array` class itself (whose `__iter__`
+/// is its own), as iterating it would give them, for the containers that
+/// collect an iterable (`list(a)`, `tuple(a)`, `sorted(a)`).
+pub(crate) fn array_items(recv: &Object) -> Option<Vec<Object>> {
+    let Object::Instance(inst) = recv else {
+        return None;
+    };
+    if std::ptr::from_ref(inst.cls_raw()) as usize
+        != ARRAY_CLASS.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return None;
+    }
+    // (Its own `__iter__`, which nothing has replaced.)
+    match inst.cls_raw().lookup("__iter__") {
+        Some(Object::Function(f)) if f.code().qualname == "array.__iter__" => {}
+        _ => return None,
+    }
+    with_array(recv, |typecode, buf| {
+        let size = array_item_size(typecode)?;
+        let buf = buf.try_borrow().ok()?;
+        buf.chunks_exact(size)
+            .map(|raw| array_item_read(typecode, raw))
+            .collect()
+    })
+}
+
+/// `a[i]` for a plain index in range, and `a[i:j]` (see
+/// [`array_slice_fast`]).
+fn array_getitem_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    if let [recv, Object::Slice(sl)] = args {
+        return array_slice_fast(recv, sl).map(Ok);
+    }
+    let [recv, Object::Int(index)] = args else {
+        return None;
+    };
+    let (typecode, buf) = array_parts(recv)?;
+    let size = array_item_size(typecode)?;
+    let buf = buf.try_borrow().ok()?;
+    let n = (buf.len() / size) as i64;
+    let at = if *index < 0 { *index + n } else { *index };
+    if !(0..n).contains(&at) {
+        return None;
+    }
+    let off = at as usize * size;
+    array_item_read(typecode, &buf[off..off + size]).map(Ok)
+}
+
+/// `a[i:j] = b` for another array of the same typecode: the run's bytes
+/// replaced by `b`'s, in place when the lengths match, and otherwise only
+/// while no view of `a` is exported.
+fn array_store_run_fast(recv: &Object, sl: &crate::object::PySlice, value: &Object) -> Option<()> {
+    let (typecode, buf) = array_parts(recv)?;
+    let (other_code, other) = array_parts(value)?;
+    if typecode != other_code || Rc::ptr_eq(&buf, &other) {
+        return None;
+    }
+    let size = array_item_size(typecode)?;
+    let source = other.try_borrow().ok()?;
+    let mut target = buf.try_borrow_mut().ok()?;
+    let (lo, hi) = array_byte_run(sl, target.len(), size)?;
+    if hi - lo == source.len() {
+        target[lo..hi].copy_from_slice(&source);
+    } else {
+        // (The export registry doesn't read the buffer: checking under the
+        // borrow is safe.)
+        if crate::object::bytearray_is_exported(&buf) {
+            return None;
+        }
+        target.splice(lo..hi, source.iter().copied());
+    }
+    Some(())
+}
+
+/// `a[i] = v` for a plain index in range and a plain value the item
+/// holds: written where it goes. And `a[i:j] = b` (see
+/// [`array_store_run_fast`]).
+fn array_setitem_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    if let [recv, Object::Slice(sl), value @ Object::Instance(_)] = args {
+        return array_store_run_fast(recv, sl, value).map(|()| Ok(Object::None));
+    }
+    let [recv, Object::Int(index), value] = args else {
+        return None;
+    };
+    let (typecode, buf) = array_parts(recv)?;
+    let mut packed = [0u8; 8];
+    let size = array_item_write(typecode, value, &mut packed)?;
+    let mut buf = buf.try_borrow_mut().ok()?;
+    let n = (buf.len() / size) as i64;
+    let at = if *index < 0 { *index + n } else { *index };
+    if !(0..n).contains(&at) {
+        return None;
+    }
+    let off = at as usize * size;
+    buf[off..off + size].copy_from_slice(&packed[..size]);
+    Some(Ok(Object::None))
+}
+
+/// `a.append(v)` for a plain value the item holds, while no view of the
+/// array is exported (a resize under one is refused by the Python method).
+fn array_append_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [recv, value] = args else {
+        return None;
+    };
+    let (typecode, buf) = array_parts(recv)?;
+    let mut packed = [0u8; 8];
+    let size = array_item_write(typecode, value, &mut packed)?;
+    if crate::object::bytearray_is_exported(&buf) {
+        return None;
+    }
+    buf.try_borrow_mut()
+        .ok()?
+        .extend_from_slice(&packed[..size]);
+    Some(Ok(Object::None))
+}
+
+/// `len(a)`.
+fn array_len_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [recv] = args else {
+        return None;
+    };
+    let (typecode, buf) = array_parts(recv)?;
+    let size = array_item_size(typecode)?;
+    let n = buf.try_borrow().ok()?.len() / size;
+    Some(Ok(Object::Int(n as i64)))
+}
+
+/// An array iterator's next item while it has one (its end, and an
+/// iterator already finished, are the Python method's).
+fn array_next_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Instance(it)] = args else {
+        return None;
+    };
+    let read = |array: &Object, index: i64| {
+        with_array(array, |typecode, buf| {
+            let size = array_item_size(typecode)?;
+            let buf = buf.try_borrow().ok()?;
+            let off = usize::try_from(index).ok()?.checked_mul(size)?;
+            array_item_read(typecode, buf.get(off..off + size)?)
+        })
+    };
+    let mut slots = it.slots.try_borrow_mut().ok()?;
+    // (Laid out as the class declares them: read and advanced in place.)
+    let layout = it.cls_raw().own_slot_layout()?;
+    if crate::shared_value::SharedSlice::word(layout)
+        == ARRAY_ITER_LAYOUT.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        let values = slots.values_for_layout_mut(layout)?;
+        let [array, index @ Object::Int(_), ..] = values else {
+            return None;
+        };
+        let Object::Int(i) = *index else {
+            return None;
+        };
+        let item = read(array, i)?;
+        *index = Object::Int(i + 1);
+        return Some(Ok(item));
+    }
+    let Object::Int(i) = *slots.get_hinted(1, "_index")? else {
+        return None;
+    };
+    let item = read(slots.get_hinted(0, "_ao")?, i)?;
+    *slots.get_hinted_mut(1, "_index")? = Object::Int(i + 1);
+    Some(Ok(item))
+}
+
+/// An `unpack_iterator`'s next tuple while it has one, or its end's
+/// `StopIteration`: the format's fields read at the iterator's offset,
+/// which then moves on by the format's size.
+fn unpack_iter_next_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Instance(it)] = args else {
+        return None;
+    };
+    // The class's own layout, `_fmt, _buffer, _size, _offset, _len`: the
+    // slots read and the offset moved in place, under one borrow (nothing
+    // below runs code).
+    let laid = it.cls_raw().own_slot_layout().filter(|layout| {
+        crate::shared_value::SharedSlice::word(layout)
+            == UNPACK_ITER_LAYOUT.load(std::sync::atomic::Ordering::Relaxed)
+    });
+    let Some(layout) = laid else {
+        return unpack_iter_next_named(it);
+    };
+    let mut slots = it.slots.try_borrow_mut().ok()?;
+    let [Object::Str(fmt), buffer, _, Object::Int(offset), Object::Int(len)] =
+        slots.values_for_layout_mut(layout)?
+    else {
+        return None;
+    };
+    if *offset >= *len {
+        // (The end raises natively: the Python method's raise is a frame
+        // and an exception unwound through it.)
+        return Some(Err(crate::error::stop_iteration()));
+    }
+    let cf = compiled_for(fmt)?;
+    let off = usize::try_from(*offset).ok()?;
+    let read = |buf: &[u8]| {
+        if off.checked_add(cf.size)? > buf.len() {
+            return None;
+        }
+        cf.unpack_tuple_at(buf, off).ok()
+    };
+    let vals = match &*buffer {
+        Object::Bytes(b) => read(b)?,
+        Object::ByteArray(b) => read(&b.try_borrow().ok()?)?,
+        Object::MemoryView(mv) if !mv.released.get() && mv.is_c_contiguous() => {
+            mv.with_bytes(read)?
+        }
+        _ => return None,
+    };
+    *offset += cf.size as i64;
+    Some(Ok(vals))
+}
+
+/// [`unpack_iter_next_fast`] for an iterator whose class isn't laid out as
+/// the module's own: its slots by name.
+fn unpack_iter_next_named(it: &crate::types::PyInstance) -> Option<Result<Object, RuntimeError>> {
+    // (The class's own layout, `_fmt, _buffer, _size, _offset, _len`, is
+    // read at its places; anything else by name.)
+    let (fmt, buffer, offset) = {
+        let slots = it.slots.try_borrow().ok()?;
+        let laid = known_slots(it, &slots, &UNPACK_ITER_LAYOUT);
+        let (fmt, offset, len) = match laid {
+            Some([f, _, _, o, l]) => (f, o, l),
+            _ => (
+                slots.get_hinted(0, "_fmt")?,
+                slots.get_hinted(3, "_offset")?,
+                slots.get_hinted(4, "_len")?,
+            ),
+        };
+        let (Object::Str(fmt), Object::Int(offset), Object::Int(len)) = (fmt, offset, len) else {
+            return None;
+        };
+        if offset >= len {
+            return Some(Err(crate::error::stop_iteration()));
+        }
+        let buffer = match laid {
+            Some([_, b, ..]) => b,
+            _ => slots.get_hinted(1, "_buffer")?,
+        };
+        (fmt.clone(), buffer.clone(), *offset)
+    };
+    let cf = compiled_for(&fmt)?;
+    let read = |buf: &[u8]| {
+        let off = usize::try_from(offset).ok()?;
+        if off.checked_add(cf.size)? > buf.len() {
+            return None;
+        }
+        cf.unpack_tuple_at(buf, off).ok()
+    };
+    let vals = match &buffer {
+        Object::Bytes(b) => read(b)?,
+        Object::ByteArray(b) => read(&b.try_borrow().ok()?)?,
+        Object::MemoryView(mv) if !mv.released.get() && mv.is_c_contiguous() => {
+            mv.with_bytes(read)?
+        }
+        _ => return None,
+    };
+    let next = Object::Int(offset + cf.size as i64);
+    let mut slots = it.slots.try_borrow_mut().ok()?;
+    let laid = it.cls_raw().own_slot_layout().filter(|layout| {
+        crate::shared_value::SharedSlice::word(layout)
+            == UNPACK_ITER_LAYOUT.load(std::sync::atomic::Ordering::Relaxed)
+    });
+    let at = match laid {
+        Some(layout) => slots.values_for_layout_mut(layout)?.get_mut(3)?,
+        None => slots.get_hinted_mut(3, "_offset")?,
+    };
+    *at = next;
+    drop(slots);
+    Some(Ok(vals))
+}
+
+/// `_all_exact(items, cls)`: whether every item of the list is exactly of
+/// the builtin class `cls` (`int` or `float`: `array.fromlist` packs such
+/// a list in one call). `False` for any other class or argument.
+fn all_exact(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::List(items), Object::Type(cls)] = args else {
+        return Ok(Object::Bool(false));
+    };
+    let bt = crate::builtin_types::builtin_types();
+    let items = items.borrow();
+    let all = if Rc::ptr_eq(cls, &bt.int_) {
+        items
+            .iter()
+            .all(|v| matches!(v, Object::Int(_) | Object::Long(_)))
+    } else if Rc::ptr_eq(cls, &bt.float_) {
+        items.iter().all(|v| matches!(v, Object::Float(_)))
+    } else {
+        false
+    };
+    Ok(Object::Bool(all))
+}
+
+/// `_unpack_iterator_methods(unpack_iterator)`: the iterator's native
+/// step, as `(class, name, method)` triples for the module to assign.
+fn unpack_iterator_methods(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Type(cls)] = args else {
+        return Err(type_error(
+            "_unpack_iterator_methods() expects the iterator class",
+        ));
+    };
+    let orig = cls
+        .dict
+        .borrow()
+        .get(&crate::object::StrKey("__next__"))
+        .cloned()
+        .ok_or_else(|| type_error("_unpack_iterator_methods(): no __next__ to replace"))?;
+    if let Some(layout) = cls.own_slot_layout() {
+        UNPACK_ITER_LAYOUT.store(
+            crate::shared_value::SharedSlice::word(layout),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+    let mut out = vec![Object::new_tuple(vec![
+        Object::Type(cls.clone()),
+        Object::from_static("__next__"),
+        fast_method(cls, "__next__", unpack_iter_next_fast, orig, false),
+    ])];
+    let hint = cls
+        .dict
+        .borrow()
+        .get(&crate::object::StrKey("__length_hint__"))
+        .cloned();
+    if let Some(hint) = hint {
+        out.push(Object::new_tuple(vec![
+            Object::Type(cls.clone()),
+            Object::from_static("__length_hint__"),
+            fast_method(
+                cls,
+                "__length_hint__",
+                unpack_iter_length_hint_fast,
+                hint,
+                false,
+            ),
+        ]));
+    }
+    Ok(Object::new_list(out))
+}
+
+/// An `unpack_iterator`'s `__length_hint__`, the chunks still to come, from
+/// its own layout's slots (anything else is the Python method's).
+fn unpack_iter_length_hint_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Instance(it)] = args else {
+        return None;
+    };
+    let layout = it.cls_raw().own_slot_layout().filter(|layout| {
+        crate::shared_value::SharedSlice::word(layout)
+            == UNPACK_ITER_LAYOUT.load(std::sync::atomic::Ordering::Relaxed)
+    })?;
+    let slots = it.slots.try_borrow().ok()?;
+    let [_, _, Object::Int(size), Object::Int(offset), Object::Int(len)] =
+        slots.values_for_layout(layout)?
+    else {
+        return None;
+    };
+    if *size <= 0 {
+        return None;
+    }
+    Some(Ok(Object::Int((len - offset).div_euclid(*size))))
+}
+
+/// `_array_methods(array, array_iterator)`: the native item methods of
+/// the `array` class and its iterator's native step, as `(class, name,
+/// method)` triples for the module to assign (a class attribute
+/// assignment keeps the special-method caches right).
+fn array_methods(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Type(cls), Object::Type(iter_cls)] = args else {
+        return Err(type_error(
+            "_array_methods() expects the array class and its iterator's",
+        ));
+    };
+    let table: [(&Rc<crate::types::TypeObject>, &'static str, Fast); 7] = [
+        (cls, "__getitem__", array_getitem_fast),
+        (cls, "__add__", array_add_fast),
+        (cls, "__copy__", array_copy_fast),
+        (cls, "__setitem__", array_setitem_fast),
+        (cls, "__len__", array_len_fast),
+        (cls, "append", array_append_fast),
+        (iter_cls, "__next__", array_next_fast),
+    ];
+    ARRAY_CLASS.store(
+        Rc::as_ptr(cls) as usize,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    // (Plain constructions build in place: see `array_pure_new`.)
+    cls.pure_new.set(Some(array_pure_new));
+    for (owner, known) in [(cls, &ARRAY_LAYOUT), (iter_cls, &ARRAY_ITER_LAYOUT)] {
+        if let Some(layout) = owner.own_slot_layout() {
+            known.store(
+                crate::shared_value::SharedSlice::word(layout),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+    let mut out = Vec::with_capacity(table.len());
+    for (owner, name, fast) in table {
+        let orig = owner
+            .dict
+            .borrow()
+            .get(&crate::object::StrKey(name))
+            .cloned()
+            .ok_or_else(|| type_error(format!("_array_methods(): no {name} to replace")))?;
+        out.push(Object::new_tuple(vec![
+            Object::Type(owner.clone()),
+            Object::from_static(name),
+            fast_method(owner, name, fast, orig, false),
+        ]));
+    }
+    Ok(Object::new_list(out))
 }
 
 /// `_install_struct(Struct)`: serve the exact class's `pack` and
@@ -1098,44 +1980,13 @@ fn install_struct(args: &[Object]) -> Result<Object, RuntimeError> {
     let (Some(pack), Some(unpack)) = (own("pack"), own("unpack")) else {
         return Err(type_error("_install_struct(): Struct lacks pack/unpack"));
     };
-    type Fast = fn(&[Object]) -> Option<Result<Object, RuntimeError>>;
-    for (name, fast, orig) in [
-        ("pack", struct_pack_fast as Fast, pack),
-        ("unpack", struct_unpack_fast as Fast, unpack),
-    ] {
-        // (The natives keep the class alive: its address stays its own.)
-        let class = cls.clone();
-        let fallback = move |a: &[Object], kw: &[(String, Object)]| {
-            let _ = &class;
-            let f = orig.clone();
-            let ptr = crate::vm_singletons::current_interpreter_ptr()
-                .ok_or_else(|| type_error("struct: no active interpreter"))?;
-            // SAFETY: published by the enclosing VM frame on this thread.
-            unsafe { &mut *ptr }.call_object(f, a, kw)
-        };
-        let fallback = Rc::new(fallback);
-        let fallback_kw = fallback.clone();
-        let b = Rc::new(BuiltinFn {
-            name,
-            binds_instance: true,
-            call: Box::new(move |a: &[Object]| match fast(a) {
-                Some(r) => r,
-                None => fallback(a, &[]),
-            }),
-            call_kw: Some(Box::new(move |a: &[Object], kw: &[(String, Object)]| {
-                if kw.is_empty() {
-                    if let Some(r) = fast(a) {
-                        return r;
-                    }
-                }
-                fallback_kw(a, kw)
-            })),
-        });
-        crate::leaf_builtins::register_fast(&b, fast);
-        cls.dict
-            .borrow_mut()
-            .insert(DictKey(Object::from_static(name)), Object::Builtin(b));
-    }
+    install_fast_methods(
+        cls,
+        [
+            ("pack", struct_pack_fast as Fast, pack),
+            ("unpack", struct_unpack_fast as Fast, unpack),
+        ],
+    );
     cls.bump_attr_version();
     STRUCT_CLASS.store(
         Rc::as_ptr(cls) as usize,
@@ -1174,8 +2025,24 @@ fn fmt_arg(args: &[Object], idx: usize) -> Result<String, RuntimeError> {
     }
 }
 
-fn buffer_arg(o: &Object) -> Result<Vec<u8>, RuntimeError> {
-    o.as_bytes_view()
+/// `f` on the bytes of the bytes-like argument `o`, read where they are
+/// (unpacking a few bytes of a large buffer copies none of it).
+fn with_buffer<R>(o: &Object, f: impl FnOnce(&[u8]) -> R) -> Result<R, RuntimeError> {
+    // (CPython asks for a C-contiguous buffer: a strided view is refused,
+    // not gathered.)
+    if let Object::MemoryView(mv) = o {
+        if mv.released.get() {
+            return Err(value_error(
+                "operation forbidden on released memoryview object",
+            ));
+        }
+        if !mv.is_c_contiguous() {
+            return Err(crate::error::buffer_error(
+                "memoryview: underlying buffer is not C-contiguous",
+            ));
+        }
+    }
+    o.with_bytes_view(f)
         .ok_or_else(|| type_error("argument must be bytes-like".to_owned()))
 }
 
@@ -1211,19 +2078,124 @@ fn b_value_codes(args: &[Object]) -> Result<Object, RuntimeError> {
 }
 
 fn b_pack(args: &[Object]) -> Result<Object, RuntimeError> {
-    let fmt = fmt_arg(args, 0)?;
-    let cf = compiled(&fmt)?;
+    let cf = format_of(args)?;
     let bytes = cf.pack(&args[1..])?;
     Ok(Object::new_bytes(bytes))
 }
 
+/// The compiled format `args[0]` names: a `str` by its identity (a call
+/// site's literal is one string every call), a bytes-like one by text.
+fn format_of(args: &[Object]) -> Result<std::rc::Rc<CompiledFormat>, RuntimeError> {
+    if let Some(Object::Str(s)) = args.first() {
+        if let Some(cf) = compiled_for(s) {
+            return Ok(cf);
+        }
+    }
+    compiled(&fmt_arg(args, 0)?)
+}
+
+/// `struct.pack(format, *v)`'s fast half: a `str` format and plain values
+/// packed at once; `None` (nothing done) for anything else or any error,
+/// which the Python function raises as `struct.error`.
+fn pack_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let (Some(Object::Str(fmt)), Some(values)) = (args.first(), args.get(1..)) else {
+        return None;
+    };
+    let plain = values.iter().all(|v| {
+        matches!(
+            v,
+            Object::Int(_)
+                | Object::Long(_)
+                | Object::Bool(_)
+                | Object::Float(_)
+                | Object::Complex(_)
+                | Object::Str(_)
+                | Object::Bytes(_)
+                | Object::ByteArray(_)
+        )
+    });
+    if !plain {
+        return None;
+    }
+    let bytes = compiled_for(fmt)?.pack(values).ok()?;
+    Some(Ok(Object::new_bytes(bytes)))
+}
+
+/// `_native_pack(python_pack)`: the public `struct.pack`, which packs
+/// plain values in place (see [`pack_fast`]) and calls the Python
+/// function `python_pack` for anything else.
+fn b_native_pack(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [fallback] = args else {
+        return Err(type_error("_native_pack() takes the Python pack"));
+    };
+    let fallback = fallback.clone();
+    let b = Rc::new(BuiltinFn {
+        name: "pack",
+        binds_instance: false,
+        call: Box::new(move |a: &[Object]| match pack_fast(a) {
+            Some(r) => r,
+            None => {
+                let interp = crate::builtins::reentrant_interp()?;
+                let globals = interp.builtins_dict();
+                interp.call(&fallback, a, &[], &globals)
+            }
+        }),
+        call_kw: None,
+    });
+    crate::leaf_builtins::register_fast(&b, pack_fast);
+    Ok(Object::Builtin(b))
+}
+
+/// `struct.unpack(format, buffer)`'s fast half: a `str` format over a
+/// `bytes` or `bytearray` buffer, read at once; `None` (nothing done) for anything else
+/// or any error, which the Python function raises as `struct.error`.
+fn unpack_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Str(fmt), buffer] = args else {
+        return None;
+    };
+    let vals = match buffer {
+        Object::Bytes(b) => compiled_for(fmt)?.unpack_tuple(b).ok()?,
+        Object::ByteArray(b) => compiled_for(fmt)?
+            .unpack_tuple(&b.try_borrow().ok()?)
+            .ok()?,
+        _ => return None,
+    };
+    Some(Ok(vals))
+}
+
+/// `_native_unpack(python_unpack)`: the public `struct.unpack`, which
+/// reads a `bytes` buffer in place (see [`unpack_fast`]) and calls the
+/// Python function `python_unpack` for anything else.
+fn b_native_unpack(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [fallback] = args else {
+        return Err(type_error("_native_unpack() takes the Python unpack"));
+    };
+    let fallback = fallback.clone();
+    let b = Rc::new(BuiltinFn {
+        name: "unpack",
+        binds_instance: false,
+        call: Box::new(move |a: &[Object]| match unpack_fast(a) {
+            Some(r) => r,
+            None => {
+                let interp = crate::builtins::reentrant_interp()?;
+                let globals = interp.builtins_dict();
+                interp.call(&fallback, a, &[], &globals)
+            }
+        }),
+        call_kw: None,
+    });
+    crate::leaf_builtins::register_fast(&b, unpack_fast);
+    let obj = Object::Builtin(b);
+    crate::descr_registry::register_text_signature(&obj, "(format, buffer, /)");
+    Ok(obj)
+}
+
 fn b_unpack(args: &[Object]) -> Result<Object, RuntimeError> {
-    let fmt = fmt_arg(args, 0)?;
-    let cf = compiled(&fmt)?;
+    let cf = format_of(args)?;
     // (A `bytes` buffer is read in place.)
     let vals = match &args[1] {
         Object::Bytes(b) => cf.unpack(b)?,
-        other => cf.unpack(&buffer_arg(other)?)?,
+        other => with_buffer(other, |buf| cf.unpack(buf))??,
     };
     Ok(Object::new_tuple(vals))
 }
@@ -1239,10 +2211,9 @@ fn ssize_offset(o: &Object) -> Result<i64, RuntimeError> {
         Object::Long(_) => Err(overflow_error(
             "Python int too large to convert to C ssize_t",
         )),
-        other => Err(type_error(format!(
-            "'{}' object cannot be interpreted as an integer",
-            other.type_name()
-        ))),
+        // (Anything else through `__index__`, as CPython's `n` converter
+        // takes it; an object without one is a `TypeError`.)
+        other => crate::builtins::coerce_index_i64(other),
     }
 }
 
@@ -1337,18 +2308,219 @@ fn b_unpack_from(args: &[Object]) -> Result<Object, RuntimeError> {
     }
     let fmt = fmt_arg(args, 0)?;
     let cf = compiled(&fmt)?;
-    let buf = buffer_arg(&args[1])?;
-    let offset = args.get(2).and_then(|o| o.as_i64()).unwrap_or(0);
-    let off = resolve_buffer_offset(offset, buf.len(), cf.size, "unpack_from", false)?;
-    let (vals, _) = cf.unpack_from_offset(&buf, off)?;
+    let offset = match args.get(2) {
+        Some(o) => ssize_offset(o)?,
+        None => 0,
+    };
+    let vals = with_buffer(&args[1], |buf| {
+        let off = resolve_buffer_offset(offset, buf.len(), cf.size, "unpack_from", false)?;
+        cf.unpack_from_offset(buf, off).map(|(vals, _)| vals)
+    })??;
     Ok(Object::new_tuple(vals))
+}
+
+/// `struct.unpack_from(format, buffer, offset=0)`'s fast half: a `str`
+/// format over a `bytes`, `bytearray` or live contiguous `memoryview`
+/// with a plain `int` offset, read where the bytes are; `None` (nothing
+/// done) for anything else or any error, which the Python function raises
+/// as `struct.error`.
+fn unpack_from_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let (fmt, buffer, offset) = match args {
+        [Object::Str(fmt), buffer] => (fmt, buffer, 0),
+        [Object::Str(fmt), buffer, Object::Int(offset)] => (fmt, buffer, *offset),
+        _ => return None,
+    };
+    let read = |buf: &[u8]| {
+        let cf = compiled_for(fmt)?;
+        let off = resolve_buffer_offset(offset, buf.len(), cf.size, "unpack_from", false).ok()?;
+        cf.unpack_tuple_at(buf, off).ok()
+    };
+    let vals = match buffer {
+        Object::Bytes(b) => read(b)?,
+        Object::ByteArray(b) => read(&b.try_borrow().ok()?)?,
+        Object::MemoryView(mv) if !mv.released.get() && mv.is_c_contiguous() => {
+            mv.with_bytes(read)?
+        }
+        _ => return None,
+    };
+    Some(Ok(vals))
+}
+
+/// `struct.pack_into(format, buffer, offset, *v)`'s fast half: a `str`
+/// format and plain values written into a `bytearray` or a live, writable,
+/// contiguous `memoryview` at a plain `int` offset; `None` (nothing done)
+/// for anything else or any error.
+fn pack_into_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Str(fmt), target, Object::Int(offset), values @ ..] = args else {
+        return None;
+    };
+    if !values
+        .iter()
+        .all(|v| matches!(v, Object::Int(_) | Object::Bool(_) | Object::Float(_)))
+    {
+        return None;
+    }
+    let cf = compiled_for(fmt)?;
+    let bytes = cf.pack(values).ok()?;
+    let write = |buf: &mut [u8]| {
+        let off = resolve_buffer_offset(*offset, buf.len(), cf.size, "pack_into", true).ok()?;
+        buf[off..off + bytes.len()].copy_from_slice(&bytes);
+        Some(())
+    };
+    match target {
+        Object::ByteArray(b) => write(&mut b.try_borrow_mut().ok()?)?,
+        Object::MemoryView(mv)
+            if !mv.released.get() && !mv.readonly.get() && mv.is_c_contiguous() =>
+        {
+            let (start, len) = (mv.start.get(), mv.len.get());
+            mv.buffer
+                .with_write(|all| write(all.get_mut(start..start + len)?))??;
+        }
+        _ => return None,
+    }
+    Some(Ok(Object::None))
+}
+
+/// A module function `name` that tries `fast` and calls the Python
+/// function `fallback` (with the same arguments) for anything `fast`
+/// leaves: the public `struct.unpack_from` and `struct.pack_into`.
+fn native_with_fallback(
+    name: &'static str,
+    fast: fn(&[Object]) -> Option<Result<Object, RuntimeError>>,
+    fallback: &Object,
+) -> Object {
+    let (plain, keyed) = (fallback.clone(), fallback.clone());
+    let b = Rc::new(BuiltinFn {
+        name,
+        binds_instance: false,
+        call: Box::new(move |a: &[Object]| match fast(a) {
+            Some(r) => r,
+            None => {
+                let interp = crate::builtins::reentrant_interp()?;
+                let globals = interp.builtins_dict();
+                interp.call(&plain, a, &[], &globals)
+            }
+        }),
+        call_kw: Some(Box::new(move |a: &[Object], kw: &[(String, Object)]| {
+            if kw.is_empty() {
+                if let Some(r) = fast(a) {
+                    return r;
+                }
+            }
+            let interp = crate::builtins::reentrant_interp()?;
+            let globals = interp.builtins_dict();
+            interp.call(&keyed, a, kw, &globals)
+        })),
+    });
+    crate::leaf_builtins::register_fast(&b, fast);
+    Object::Builtin(b)
+}
+
+/// `_native_unpack_from(python_unpack_from)`: the public
+/// `struct.unpack_from` (see [`unpack_from_fast`]).
+fn b_native_unpack_from(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [fallback] = args else {
+        return Err(type_error(
+            "_native_unpack_from() takes the Python unpack_from",
+        ));
+    };
+    let obj = native_with_fallback("unpack_from", unpack_from_fast, fallback);
+    crate::descr_registry::register_text_signature(&obj, "(format, /, buffer, offset=0)");
+    Ok(obj)
+}
+
+/// `_native_pack_into(python_pack_into)`: the public `struct.pack_into`
+/// (see [`pack_into_fast`]).
+fn b_native_pack_into(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [fallback] = args else {
+        return Err(type_error("_native_pack_into() takes the Python pack_into"));
+    };
+    let obj = native_with_fallback("pack_into", pack_into_fast, fallback);
+    crate::descr_registry::register_text_signature(&obj, "(format, buffer, offset, /, *v)");
+    Ok(obj)
+}
+
+thread_local! {
+    /// Each interpreter's `unpack_iterator` class and its slot layout, by
+    /// the interpreter's address (see [`b_native_iter_unpack`]); the class
+    /// held weakly, so a torn-down interpreter's entry never answers.
+    static UNPACK_ITER_CLASSES: std::cell::RefCell<
+        Vec<(
+            usize,
+            crate::sync::Weak<crate::types::TypeObject>,
+            crate::shared_value::SharedSlice<DictKey>,
+        )>,
+    > = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `_native_iter_unpack(python_iter_unpack, unpack_iterator)`: the public
+/// `struct.iter_unpack` (see [`iter_unpack_fast`]), with the running
+/// interpreter's iterator class noted for it.
+fn b_native_iter_unpack(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [fallback, Object::Type(cls)] = args else {
+        return Err(type_error(
+            "_native_iter_unpack() takes the Python iter_unpack and the iterator class",
+        ));
+    };
+    let (Some(layout), Some(interp)) = (
+        cls.own_slot_layout().cloned(),
+        crate::vm_singletons::current_interpreter_ptr(),
+    ) else {
+        return Ok(fallback.clone());
+    };
+    UNPACK_ITER_CLASSES.with(|c| {
+        let mut c = c.borrow_mut();
+        c.retain(|(p, w, _)| *p != interp as usize && w.strong_count() > 0);
+        c.push((interp as usize, Rc::downgrade(cls), layout));
+    });
+    let obj = native_with_fallback("iter_unpack", iter_unpack_fast, fallback);
+    crate::descr_registry::register_text_signature(&obj, "(format, buffer, /)");
+    Ok(obj)
+}
+
+/// `iter_unpack(format, buffer)` over an exact `bytes` or `bytearray`
+/// whose length the format's size divides: the iterator built in place, as
+/// the Python function's `_make_unpack_iterator` builds it. Anything else
+/// (a view, another buffer, an error to raise) is the Python function's.
+fn iter_unpack_fast(a: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Str(fmt), buffer @ (Object::Bytes(_) | Object::ByteArray(_))] = a else {
+        return None;
+    };
+    let len = match buffer {
+        Object::Bytes(b) => b.len(),
+        Object::ByteArray(b) => b.try_borrow().ok()?.len(),
+        _ => return None,
+    };
+    let size = compiled_for(fmt)?.size;
+    if size == 0 || len % size != 0 {
+        return None;
+    }
+    let interp = crate::vm_singletons::current_interpreter_ptr()? as usize;
+    let (cls, layout) = UNPACK_ITER_CLASSES.with(|c| {
+        let c = c.try_borrow().ok()?;
+        let (_, w, layout) = c.iter().find(|(p, _, _)| *p == interp)?;
+        Some((w.upgrade()?, layout.clone()))
+    })?;
+    if layout.len() != 5 {
+        return None;
+    }
+    let values = vec![
+        Object::Str(fmt.clone()),
+        buffer.clone(),
+        Object::Int(i64::try_from(size).ok()?),
+        Object::Int(0),
+        Object::Int(i64::try_from(len).ok()?),
+    ];
+    let slots = crate::types::SlotStorage::from_layout(layout, values);
+    Some(Ok(Object::Instance(Rc::new(
+        crate::types::PyInstance::with_slots(cls, slots),
+    ))))
 }
 
 fn b_iter_unpack(args: &[Object]) -> Result<Object, RuntimeError> {
     let fmt = fmt_arg(args, 0)?;
     let cf = compiled(&fmt)?;
-    let buf = buffer_arg(&args[1])?;
-    let groups = cf.iter_unpack(&buf)?;
+    let groups = with_buffer(&args[1], |buf| cf.iter_unpack(buf))??;
     let items: Vec<Object> = groups.into_iter().map(Object::new_tuple).collect();
     // Frozen wrapper turns this into an iterator; for now we hand
     // back a list so the Python side can `iter(...)` over it.

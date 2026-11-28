@@ -17,10 +17,11 @@ import sys as _sys
 # Re-export every name the underlying ``os`` module advertises so that
 # code written against CPython's ``posix`` finds what it expects.
 _names = []
+_globals = globals()
 for _name in dir(_os):
     if _name.startswith("_"):
         continue
-    globals()[_name] = getattr(_os, _name)
+    _globals[_name] = getattr(_os, _name)
     _names.append(_name)
 
 
@@ -85,9 +86,10 @@ for _candidate in ("fork", "forkpty", "wait", "waitpid", "wait3", "wait4",
                    "execv", "execve", "execvp", "execvpe", "spawnv", "spawnvp",
                    "spawnvpe", "spawnve", "kill", "killpg", "setsid", "setpgid",
                    "tcgetpgrp", "tcsetpgrp"):
-    if _candidate not in globals():
-        globals()[_candidate] = _missing(_candidate)
+    if _candidate not in _globals:
+        _globals[_candidate] = _missing(_candidate)
         _names.append(_candidate)
+del _globals
 
 
 # CPython's ``posix.environ`` is a plain ``dict`` with *bytes* keys and values

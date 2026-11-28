@@ -147,6 +147,10 @@ def RLock(*args, **kwargs):
         )
     if _CRLock is None:
         return _PyRLock(*args, **kwargs)
+    # WeavePy: a plain call when there's nothing to forward (forwarding an
+    # empty `*args, **kwargs` cost several times the lock).
+    if not args and not kwargs:
+        return _CRLock()
     return _CRLock(*args, **kwargs)
 
 class _RLock:

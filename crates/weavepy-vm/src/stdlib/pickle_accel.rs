@@ -29,6 +29,19 @@ struct FunctionGuard {
     code: Weak<CodeObject>,
 }
 
+/// Whether a guard that last proved all its functions at `proven` (a
+/// [`crate::rare_events::func_edits`] count) still has them unchanged: no
+/// function's code or defaults changed since. Such a guard checks only
+/// which functions its classes and tables hold, not each one's code.
+#[inline]
+fn proven_edits(proven: &std::sync::atomic::AtomicU64) -> (bool, u64) {
+    let edits = crate::rare_events::func_edits();
+    (
+        proven.load(std::sync::atomic::Ordering::Relaxed) == edits,
+        edits,
+    )
+}
+
 impl FunctionGuard {
     fn new(value: &Object) -> Option<Self> {
         let Object::Function(function) = value else {
@@ -46,6 +59,15 @@ impl FunctionGuard {
             return false;
         };
         Rc::as_ptr(function) == self.function.as_ptr() && self.holds_function(function)
+    }
+
+    /// Whether `value` is the guarded function, for a guard that proved
+    /// every function unchanged since the last function edit (see
+    /// [`proven_edits`]). (The guard's weak reference keeps the function's
+    /// allocation, so no other function can live at its address.)
+    #[inline]
+    fn is_same(&self, value: &Object) -> bool {
+        matches!(value, Object::Function(function) if Rc::as_ptr(function) == self.function.as_ptr())
     }
 
     /// Whether the guarded function is still alive and unchanged.
@@ -257,6 +279,10 @@ struct UnpicklerGuard {
     find_class: Option<FunctionGuard>,
     dispatch: Weak<RefCell<DictData>>,
     entries: Vec<(u8, FunctionGuard)>,
+    /// The function-edit count at which every guarded function last held.
+    proven: std::sync::atomic::AtomicU64,
+    /// The dispatch table's mutation stamp when its entries last matched.
+    dispatch_stamp: std::sync::atomic::AtomicU64,
 }
 
 impl UnpicklerGuard {
@@ -286,6 +312,8 @@ impl UnpicklerGuard {
                 .and_then(|function| FunctionGuard::new(&function)),
             dispatch: Rc::downgrade(&dispatch),
             entries,
+            proven: std::sync::atomic::AtomicU64::new(u64::MAX),
+            dispatch_stamp: std::sync::atomic::AtomicU64::new(u64::MAX),
         })
     }
 
@@ -300,6 +328,69 @@ impl UnpicklerGuard {
     /// bases advances) proves that `__init__`, `load`, and `find_class`
     /// still resolve to the guarded functions.
     fn holds(&self, opcodes: &Opcodes) -> bool {
+        // (STACK_GLOBAL needs a guarded `find_class` either way.)
+        if opcodes.contains(STACK_GLOBAL) && self.find_class.is_none() {
+            return false;
+        }
+        let (proven, edits) = proven_edits(&self.proven);
+        // (A table whose entries changed may still hold every function
+        // this stream runs.)
+        if proven && self.same_dispatch(true, |guard, value| guard.is_same(value)) {
+            return true;
+        }
+        // Every function checked at once proves them all until the next
+        // function edit; otherwise only the ones this stream runs count.
+        if self.init.holds_live()
+            && self.load.holds_live()
+            && self
+                .find_class
+                .as_ref()
+                .is_none_or(FunctionGuard::holds_live)
+            && self.same_dispatch(false, FunctionGuard::holds)
+        {
+            self.proven
+                .store(edits, std::sync::atomic::Ordering::Relaxed);
+            return true;
+        }
+        self.holds_for(opcodes)
+    }
+
+    /// The dispatch table still maps the guarded opcodes, in order, to
+    /// functions `same` accepts. With `proven`, an unchanged table (its
+    /// mutation stamp the one it had when its entries last matched) is
+    /// taken as it is.
+    fn same_dispatch(&self, proven: bool, same: impl Fn(&FunctionGuard, &Object) -> bool) -> bool {
+        let Some(dispatch) = self.dispatch.upgrade() else {
+            return false;
+        };
+        let dispatch = dispatch.borrow();
+        let stamp = dispatch.mutation_stamp();
+        if proven
+            && stamp
+                == self
+                    .dispatch_stamp
+                    .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return true;
+        }
+        let holds = dispatch.len() == self.entries.len()
+            && dispatch
+                .iter()
+                .zip(&self.entries)
+                .all(|((key, value), (opcode, guard))| {
+                    matches!(key.0, Object::Int(current) if current == i64::from(*opcode))
+                        && same(guard, value)
+                });
+        if holds {
+            self.dispatch_stamp
+                .store(stamp, std::sync::atomic::Ordering::Relaxed);
+        }
+        holds
+    }
+
+    /// [`Self::holds`] checked for only the functions a stream of
+    /// `opcodes` runs.
+    fn holds_for(&self, opcodes: &Opcodes) -> bool {
         if !self.init.holds_live() || !self.load.holds_live() {
             return false;
         }
@@ -354,11 +445,174 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     }));
     crate::descr_registry::register_module(&factory, "_weave_pickle");
     dict.insert(DictKey(Object::from_static("make_dumps")), factory);
+    let factory = Object::Builtin(Rc::new(BuiltinFn {
+        name: "make_front",
+        binds_instance: false,
+        call: Box::new(make_front),
+        call_kw: None,
+    }));
+    crate::descr_registry::register_module(&factory, "_weave_pickle");
+    dict.insert(DictKey(Object::from_static("make_front")), factory);
     Rc::new(PyModule {
         name: "_weave_pickle".to_owned(),
         filename: None,
         dict: Rc::new(RefCell::new(dict)),
     })
+}
+
+/// `make_front(kind, native, cls, full, rest)`: `_pickle.dumps` (`kind`
+/// "dumps") or `_pickle.loads` ("loads") as a built-in function, as
+/// CPython's are. A call the native `try_dumps`/`try_loads` (`native`, made
+/// for the pickler or unpickler class `cls`) encodes or decodes returns its
+/// result with no Python frame; one it declines runs the Python function
+/// `rest` (the same signature, without the native attempt), and a call it
+/// can't read the arguments of runs `full` (which reports them). The
+/// functions are held weakly, as the guards hold theirs, so no reference
+/// cycle hides in the closure; the module keeps them.
+fn make_front(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Str(kind), Object::Builtin(native), Object::Type(cls), Object::Function(full), Object::Function(rest)] =
+        args
+    else {
+        return Ok(Object::None);
+    };
+    let loads = match kind.as_ref() {
+        "dumps" => false,
+        "loads" => true,
+        _ => return Ok(Object::None),
+    };
+    let front = Rc::new(Front {
+        loads,
+        ascii: Object::from_static("ASCII"),
+        strict: Object::from_static("strict"),
+        native: native.clone(),
+        cls: Rc::downgrade(cls),
+        full: Rc::downgrade(full),
+        rest: Rc::downgrade(rest),
+    });
+    let kw = front.clone();
+    let b = Object::Builtin(Rc::new(BuiltinFn {
+        name: if loads { "loads" } else { "dumps" },
+        binds_instance: false,
+        call: Box::new(move |a: &[Object]| front.call(a, &[])),
+        call_kw: Some(Box::new(move |a: &[Object], k: &[(String, Object)]| {
+            kw.call(a, k)
+        })),
+    }));
+    crate::descr_registry::register_module(&b, "_pickle");
+    Ok(b)
+}
+
+struct Front {
+    loads: bool,
+    /// `loads`'s default `encoding` and `errors`, made once.
+    ascii: Object,
+    strict: Object,
+    native: Rc<BuiltinFn>,
+    cls: Weak<TypeObject>,
+    full: Weak<PyFunction>,
+    rest: Weak<PyFunction>,
+}
+
+impl Front {
+    fn call(&self, args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
+        let Some(cls) = self.cls.upgrade() else {
+            return self.fall_back(&self.full, args, kwargs);
+        };
+        let result = if self.loads {
+            self.loads_args(args, kwargs, cls)
+                .map(|a| (self.native.call)(&a))
+        } else {
+            Self::dumps_args(args, kwargs, cls).map(|a| (self.native.call)(&a))
+        };
+        let Some(result) = result else {
+            return self.fall_back(&self.full, args, kwargs);
+        };
+        match (result?, self.loads) {
+            (Object::None, _) => self.fall_back(&self.rest, args, kwargs),
+            (Object::Tuple(t), true) if t.len() == 1 => Ok(t[0].clone()),
+            (Object::Tuple(_), true) => self.fall_back(&self.rest, args, kwargs),
+            (encoded, _) => Ok(encoded),
+        }
+    }
+
+    /// `try_dumps`'s arguments for `dumps(obj, protocol=None, *,
+    /// fix_imports=True, buffer_callback=None)`: a `bool` flag and no
+    /// buffer callback only.
+    fn dumps_args(
+        args: &[Object],
+        kwargs: &[(String, Object)],
+        cls: Rc<TypeObject>,
+    ) -> Option<[Object; 5]> {
+        let (obj, mut protocol) = match args {
+            [obj] => (obj, None),
+            [obj, protocol] => (obj, Some(protocol.clone())),
+            _ => return None,
+        };
+        let mut fix_imports = Object::Bool(true);
+        for (name, value) in kwargs {
+            match name.as_str() {
+                "protocol" if protocol.is_none() => protocol = Some(value.clone()),
+                "fix_imports" if matches!(value, Object::Bool(_)) => fix_imports = value.clone(),
+                "buffer_callback" if matches!(value, Object::None) => {}
+                _ => return None,
+            }
+        }
+        Some([
+            obj.clone(),
+            Object::Type(cls),
+            protocol.unwrap_or(Object::None),
+            fix_imports,
+            Object::None,
+        ])
+    }
+
+    /// `try_loads`'s arguments for `loads(data, /, *, fix_imports=True,
+    /// encoding="ASCII", errors="strict", buffers=None)`.
+    fn loads_args(
+        &self,
+        args: &[Object],
+        kwargs: &[(String, Object)],
+        cls: Rc<TypeObject>,
+    ) -> Option<[Object; 6]> {
+        let [data] = args else {
+            return None;
+        };
+        let mut fix_imports = Object::Bool(true);
+        let mut encoding = self.ascii.clone();
+        let mut errors = self.strict.clone();
+        for (name, value) in kwargs {
+            match (name.as_str(), value) {
+                ("fix_imports", Object::Bool(_)) => fix_imports = value.clone(),
+                ("encoding", Object::Str(_)) => encoding = value.clone(),
+                ("errors", Object::Str(_)) => errors = value.clone(),
+                ("buffers", Object::None) => {}
+                _ => return None,
+            }
+        }
+        Some([
+            data.clone(),
+            Object::Type(cls),
+            fix_imports,
+            encoding,
+            errors,
+            Object::None,
+        ])
+    }
+
+    fn fall_back(
+        &self,
+        f: &Weak<PyFunction>,
+        args: &[Object],
+        kwargs: &[(String, Object)],
+    ) -> Result<Object, RuntimeError> {
+        let f = f
+            .upgrade()
+            .ok_or_else(|| crate::error::type_error("the pickle module was torn down"))?;
+        let ptr = crate::vm_singletons::current_interpreter_ptr()
+            .ok_or_else(|| crate::error::type_error("no active interpreter"))?;
+        // SAFETY: published by the enclosing VM frame on this thread.
+        unsafe { &mut *ptr }.call_object(Object::Function(f), args, kwargs)
+    }
 }
 
 #[allow(clippy::unnecessary_wraps)]
@@ -428,13 +682,15 @@ impl ClassFunctionsGuard {
         })
     }
 
-    fn holds(&self) -> bool {
+    /// The class is unchanged; with `proven` (see [`proven_edits`]) its
+    /// functions' code and defaults are taken as unchanged too.
+    fn holds_with(&self, proven: bool) -> bool {
         // An unchanged version proves the class holds the same functions;
         // each one's code and defaults can still change in place.
         self.class.strong_count() > 0
             // SAFETY: a live strong count keeps the class allocated.
             && unsafe { &*self.class.as_ptr() }.attr_version.get() == self.version
-            && self.functions.iter().all(FunctionGuard::holds_live)
+            && (proven || self.functions.iter().all(FunctionGuard::holds_live))
     }
 }
 
@@ -456,16 +712,20 @@ impl DumpDescriptorGuard {
         })
     }
 
-    fn holds(&self, value: &Object) -> bool {
+    fn holds(&self, value: &Object, proven: bool) -> bool {
         let Object::Instance(instance) = value else {
             return false;
         };
         Rc::as_ptr(instance) == self.instance.as_ptr()
             && Rc::as_ptr(&instance.class.borrow()) == self.class.class.as_ptr()
-            && self.class.holds()
-            && instance
-                .slot_get("_func")
-                .is_some_and(|f| self.function.holds(&f))
+            && self.class.holds_with(proven)
+            && instance.slot_get("_func").is_some_and(|f| {
+                if proven {
+                    self.function.is_same(&f)
+                } else {
+                    self.function.holds(&f)
+                }
+            })
     }
 }
 
@@ -475,6 +735,10 @@ struct PicklerGuard {
     dump: DumpDescriptorGuard,
     dispatch: Weak<RefCell<DictData>>,
     entries: Vec<(Weak<TypeObject>, FunctionGuard)>,
+    /// The function-edit count at which every guarded function last held.
+    proven: std::sync::atomic::AtomicU64,
+    /// The dispatch table's mutation stamp when its entries last matched.
+    dispatch_stamp: std::sync::atomic::AtomicU64,
 }
 
 impl PicklerGuard {
@@ -504,30 +768,62 @@ impl PicklerGuard {
             dump: DumpDescriptorGuard::new(&class.lookup("dump")?)?,
             dispatch: Rc::downgrade(&dispatch),
             entries,
+            proven: std::sync::atomic::AtomicU64::new(u64::MAX),
+            dispatch_stamp: std::sync::atomic::AtomicU64::new(u64::MAX),
         })
     }
 
     fn holds(&self, class: &Rc<TypeObject>) -> bool {
+        let (proven, edits) = proven_edits(&self.proven);
         if Rc::as_ptr(class) != self.class.as_ptr()
-            || !self.hierarchy.iter().all(ClassFunctionsGuard::holds)
-            || !class
-                .lookup("dump")
-                .is_some_and(|value| self.dump.holds(&value))
+            || !self.hierarchy.iter().all(|guard| guard.holds_with(proven))
         {
+            return false;
+        }
+        // (With the whole hierarchy unchanged, `dump` resolves to the
+        // guarded descriptor; its `_func` can still be reassigned.)
+        let dump = if proven {
+            self.dump.instance.upgrade().map(Object::Instance)
+        } else {
+            class.lookup("dump")
+        };
+        if !dump.is_some_and(|value| self.dump.holds(&value, proven)) {
             return false;
         }
         let Some(dispatch) = self.dispatch.upgrade() else {
             return false;
         };
         let dispatch = dispatch.borrow();
-        dispatch.len() == self.entries.len()
+        let stamp = dispatch.mutation_stamp();
+        if proven
+            && stamp
+                == self
+                    .dispatch_stamp
+                    .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return true;
+        }
+        let holds = dispatch.len() == self.entries.len()
             && dispatch
                 .iter()
                 .zip(&self.entries)
                 .all(|((key, value), (kind, function))| {
                     matches!(&key.0, Object::Type(current) if Rc::as_ptr(current) == kind.as_ptr())
-                        && function.holds(value)
-                })
+                        && if proven {
+                            function.is_same(value)
+                        } else {
+                            function.holds(value)
+                        }
+                });
+        if holds {
+            self.dispatch_stamp
+                .store(stamp, std::sync::atomic::Ordering::Relaxed);
+            if !proven {
+                self.proven
+                    .store(edits, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        holds
     }
 }
 
@@ -1547,6 +1843,13 @@ impl<'c> Decoder<'c> {
                         _ => reader.size64()?,
                     };
                     let value = Object::new_bytes(reader.read(size)?);
+                    push_entry!(stack, value);
+                    self.memoize_next(&mut reader, stack)?;
+                }
+                // BYTEARRAY8: a new bytearray of the bytes.
+                0x96 => {
+                    let size = reader.size64()?;
+                    let value = Object::new_bytearray(reader.read(size)?);
                     push_entry!(stack, value);
                     self.memoize_next(&mut reader, stack)?;
                 }

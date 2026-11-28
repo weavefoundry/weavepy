@@ -302,7 +302,7 @@ pub(crate) fn fast_op(op: u8, recv: &Object, arg: Option<&Object>) -> Option<Obj
             let mut h = f.head().min(f.d.len());
             if h == 0 {
                 h = std::cmp::max(8, f.d.len() / 2);
-                f.d.splice(0..0, std::iter::repeat_n(Object::None, h));
+                grow_front(f.d, h);
             }
             h -= 1;
             f.d[h] = x.clone();
@@ -385,6 +385,157 @@ fn popleft_locked(st: &mut DequeState<'_>, d: &mut Vec<Object>) -> Result<Object
     Ok(x)
 }
 
+/// Room for `slack` more items before the deque's backing list: the list
+/// rebuilt with that many empty slots first and its items moved in after
+/// them (a splice at the front wrote and moved each item one at a time).
+fn grow_front(d: &mut Vec<Object>, slack: usize) {
+    let mut grown = Vec::with_capacity(slack + d.len());
+    grown.resize(slack, Object::None);
+    grown.append(d);
+    *d = grown;
+}
+
+/// `_extend_items(d, items, left)`: `d.extend(items)` (or `extendleft`)
+/// for a list or tuple of items, all at once, with the trimming `maxlen`
+/// calls for; `False`, having done nothing, for any other source (the
+/// Python method iterates it).
+fn deque_extend_items(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [_, src, left] = args else {
+        return Err(type_error(
+            "_extend_items() takes a deque, items and a side",
+        ));
+    };
+    let left = left.is_truthy();
+    let items: Vec<Object> = match src {
+        Object::List(l) => crate::object::cloned_vec(&l.borrow()),
+        Object::Tuple(t) => crate::object::cloned_vec(t),
+        _ => return Ok(Object::Bool(false)),
+    };
+    let mut st = receiver(&args[..1], "extend")?;
+    let data = st.data.clone();
+    let mut trimmed = Vec::new();
+    {
+        let mut d = data.borrow_mut();
+        st.bump_state();
+        let mut h = st.head().min(d.len());
+        if left {
+            let need = items.len();
+            if h < need {
+                let slack = need.max((d.len() - h) / 2).max(8) - h;
+                grow_front(&mut d, slack);
+                h += slack;
+            }
+            for item in items {
+                h -= 1;
+                trimmed.push(std::mem::replace(&mut d[h], item));
+            }
+            st.set_head(h);
+            if let Some(m) = st.maxlen() {
+                while d.len() - h > m {
+                    trimmed.extend(d.pop());
+                }
+            }
+        } else {
+            d.extend(items);
+            if let Some(m) = st.maxlen() {
+                while d.len() - st.head() > m {
+                    trimmed.push(popleft_locked(&mut st, &mut d)?);
+                }
+            }
+        }
+    }
+    drop(st);
+    drop(trimmed);
+    Ok(Object::Bool(true))
+}
+
+/// Whether `item == x` is settled without Python code: `Some(eq)` when
+/// both are plain values (`int`, `float`, `bool`, `None`, `str`, `bytes`)
+/// or the same object, `None` when an `__eq__` might run.
+fn plain_eq(item: &Object, x: &Object) -> Option<bool> {
+    fn plain(o: &Object) -> bool {
+        matches!(
+            o,
+            Object::Int(_)
+                | Object::Float(_)
+                | Object::Bool(_)
+                | Object::None
+                | Object::Str(_)
+                | Object::Bytes(_)
+        )
+    }
+    if item.is_same(x) {
+        return Some(true);
+    }
+    (plain(item) && plain(x)).then(|| item.eq_value(x))
+}
+
+/// `_plain_find(items, x, start, stop)`: the first index in
+/// `items[start:stop]` of an item equal to `x`, `-1` for none, when every
+/// comparison is settled natively ([`plain_eq`]); `None` (the Python
+/// loop's to answer) otherwise.
+fn deque_plain_find(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::List(items), x, Object::Int(start), Object::Int(stop)] = args else {
+        return Ok(Object::None);
+    };
+    let items = items.borrow();
+    let stop = usize::try_from(*stop).unwrap_or(0).min(items.len());
+    let start = usize::try_from(*start).unwrap_or(0).min(stop);
+    for (i, item) in items[start..stop].iter().enumerate() {
+        match plain_eq(item, x) {
+            Some(true) => return Ok(Object::Int((start + i) as i64)),
+            Some(false) => {}
+            None => return Ok(Object::None),
+        }
+    }
+    Ok(Object::Int(-1))
+}
+
+/// `_plain_count(items, x)`: how many items equal `x`, when every
+/// comparison is settled natively; `None` otherwise.
+fn deque_plain_count(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::List(items), x] = args else {
+        return Ok(Object::None);
+    };
+    let mut n = 0;
+    for item in items.borrow().iter() {
+        match plain_eq(item, x) {
+            Some(hit) => n += i64::from(hit),
+            None => return Ok(Object::None),
+        }
+    }
+    Ok(Object::Int(n))
+}
+
+/// `_extend_method(fallback, left)`: a deque's `extend` (or
+/// `extendleft`), which takes a list or tuple in at once (see
+/// [`deque_extend_items`]) and calls the Python function `fallback` with
+/// the same arguments for anything else.
+fn deque_extend_method(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [fallback, left] = args else {
+        return Err(type_error("_extend_method() takes a fallback and a side"));
+    };
+    let (fallback, left) = (fallback.clone(), left.is_truthy());
+    let name = if left { "extendleft" } else { "extend" };
+    Ok(Object::Builtin(Rc::new(BuiltinFn {
+        name,
+        binds_instance: true,
+        call: Box::new(move |a: &[Object]| {
+            if let [recv, src @ (Object::List(_) | Object::Tuple(_))] = a {
+                let side = Object::Bool(left);
+                if let Object::Bool(true) = deque_extend_items(&[recv.clone(), src.clone(), side])?
+                {
+                    return Ok(Object::None);
+                }
+            }
+            let interp = crate::builtins::reentrant_interp()?;
+            let globals = interp.builtins_dict();
+            interp.call(&fallback, a, &[], &globals)
+        }),
+        call_kw: None,
+    })))
+}
+
 pub(crate) fn deque_append(args: &[Object]) -> Result<Object, RuntimeError> {
     if let [recv, x] = args {
         if let Some(v) = fast_op(OP_APPEND, recv, Some(x)) {
@@ -446,7 +597,7 @@ fn deque_appendleft(args: &[Object]) -> Result<Object, RuntimeError> {
         let mut h = st.head();
         if h == 0 {
             h = std::cmp::max(8, d.len() / 2);
-            d.splice(0..0, std::iter::repeat_n(Object::None, h));
+            grow_front(&mut d, h);
         }
         h -= 1;
         d[h] = x;
@@ -570,46 +721,72 @@ fn deque_rotate(args: &[Object]) -> Result<Object, RuntimeError> {
             return Err(type_error("deque.rotate() takes at most one argument"));
         }
     };
+    // The unguarded parts, found in one pass over the slots (see
+    // `fast_parts`); the guarded ones otherwise.
+    if let Some(mut f) = fast_parts(args) {
+        let h = f.head();
+        if let Some(h) = rotate_in(f.d, h, n) {
+            f.bump_state();
+            f.set_head(h);
+        }
+        return Ok(Object::None);
+    }
     let mut st = receiver(args, "rotate")?;
     let data = st.data.clone();
     let mut d = data.borrow_mut();
-    let mut h = st.head().min(d.len());
+    let h = st.head();
+    if let Some(h) = rotate_in(&mut d, h, n) {
+        st.bump_state();
+        st.set_head(h);
+    }
+    Ok(Object::None)
+}
+
+/// Rotate the deque whose items are `d[h..]` right by `n`: the new head,
+/// or `None` when there was nothing to move (fewer than two items; the
+/// state counter moves only otherwise, though a whole turn changes
+/// nothing).
+fn rotate_in(d: &mut Vec<Object>, h: usize, n: i64) -> Option<usize> {
+    let mut h = h.min(d.len());
     let len = d.len() - h;
     if len <= 1 {
-        return Ok(Object::None);
+        return None;
     }
-    st.bump_state();
     let right = n.rem_euclid(len as i64) as usize;
     if right == 0 {
-        return Ok(Object::None);
+        return Some(h);
     }
     if right <= len / 2 {
         if h < right {
-            let slack = right.max(len / 2).max(8);
-            d.splice(0..0, std::iter::repeat_n(Object::None, slack));
+            // (Room for as many items again as the deque holds, so the
+            // next rotations find it there: a gap the size of one rotation
+            // moved the whole deque on every other call.)
+            let slack = right.max(len).max(8);
+            grow_front(d, slack);
             h += slack;
         }
         let end = d.len();
-        for i in 0..right {
-            d.swap(h - right + i, end - right + i);
-        }
+        // (The last `right` items trade places, as one block, with the
+        // free slots just before the head.)
+        let (front, back) = d.split_at_mut(end - right);
+        front[h - right..h].swap_with_slice(back);
         d.truncate(end - right);
-        st.set_head(h - right);
+        Some(h - right)
     } else {
         let left = len - right;
-        d.reserve(left);
-        for i in 0..left {
-            let value = std::mem::replace(&mut d[h + i], Object::None);
-            d.push(value);
-        }
+        // (The first `left` items trade places, as one block, with free
+        // slots added at the end.)
+        let end = d.len();
+        d.resize(end + left, Object::None);
+        let (front, back) = d.split_at_mut(end);
+        front[h..h + left].swap_with_slice(back);
         h += left;
         if h >= 32 && h * 2 >= d.len() {
             d.drain(..h);
             h = 0;
         }
-        st.set_head(h);
+        Some(h)
     }
-    Ok(Object::None)
 }
 
 /// `iter(d)` / `reversed(d)`: a fresh `_deque_iterator` (or reverse
@@ -735,6 +912,94 @@ fn deque_next_fast(iterator: &crate::types::PyInstance, reverse: bool) -> Option
     let v = d[slot].clone();
     *i = index + 1;
     Some(v)
+}
+
+/// The deque iterators' native `__next__` builtins (their addresses), for
+/// [`deque_iter_rest`]'s check.
+static ITER_NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static RITER_NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The rest of a deque iterator's items at once (`list(dq)`), when its
+/// class keeps the native `__next__` and the deque is unchanged since the
+/// iterator was made: the items in order (reversed for `reversed(dq)`'s),
+/// the iterator moved to its end as stepping it would leave it. `None`,
+/// nothing changed, for anything else.
+pub(crate) fn deque_iter_rest(iterator: &crate::types::PyInstance) -> Option<Vec<Object>> {
+    use std::sync::atomic::Ordering;
+    let reverse = match iterator.cls_raw().lookup("__next__") {
+        Some(Object::Builtin(b)) => {
+            let p = Rc::as_ptr(&b) as usize;
+            if p == ITER_NEXT.load(Ordering::Relaxed) {
+                false
+            } else if p == RITER_NEXT.load(Ordering::Relaxed) {
+                true
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+    // SAFETY: as in `deque_next_fast`: no guard is live on the cells, no
+    // Python runs before the last use, and the two objects are distinct.
+    let its = unsafe { iterator.slots.peek_mut() }?;
+    let n = names();
+    let [deque, index, it_state] =
+        its.leading_memo_mut(&ITER_LAYOUT, [&n.deq, &n.index, &n.deq_state])?;
+    let Object::Instance(deque) = deque else {
+        return None;
+    };
+    let deque: *const crate::types::PyInstance = Rc::as_ptr(deque);
+    let Object::Int(i) = index else {
+        return None;
+    };
+    // SAFETY: as above.
+    let ds = unsafe { (*deque).slots.peek() }?;
+    let [data, head, _, state] =
+        ds.leading_memo(&DEQUE_LAYOUT, [&n.data, &n.head, &n.maxlen, &n.state])?;
+    let Object::List(data) = data else {
+        return None;
+    };
+    match (state, &*it_state) {
+        (Object::Int(a), Object::Int(b)) if a == b => {}
+        _ => return None,
+    }
+    let h = match *head {
+        Object::Int(h) if h >= 0 => h as usize,
+        _ => 0,
+    };
+    // SAFETY: as above.
+    let d = unsafe { data.peek() }?;
+    let h = h.min(d.len());
+    let total = d.len() - h;
+    let at = usize::try_from(*i).ok()?;
+    if at > total {
+        return None;
+    }
+    let out = if reverse {
+        (at..total).map(|k| d[d.len() - 1 - k].clone()).collect()
+    } else {
+        d[h + at..].to_vec()
+    };
+    *i = total as i64;
+    Some(out)
+}
+
+/// A deque iterator's `__next__` leaf half: the next item read in place
+/// while the deque is unchanged (see [`deque_next_fast`]). `None` (the
+/// end, a change, or anything unusual) for the full body.
+fn deque_iterator_next_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Instance(it)] = args else {
+        return None;
+    };
+    deque_next_fast(it, false).map(Ok)
+}
+
+/// [`deque_iterator_next_leaf`] for `reversed(deque)`'s iterator.
+fn deque_reverse_iterator_next_leaf(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Instance(it)] = args else {
+        return None;
+    };
+    deque_next_fast(it, true).map(Ok)
 }
 
 fn deque_next(args: &[Object], reverse: bool) -> Result<Object, RuntimeError> {
@@ -1215,6 +1480,50 @@ fn chainmap_maps_of(inst: &crate::types::PyInstance) -> Option<Rc<RefCell<Vec<Ob
     }
 }
 
+/// The native `ChainMap.__contains__` builtin's address, for
+/// [`chainmap_contains_fast`]'s check.
+static CHAINMAP_CONTAINS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `key in chainmap` when the class keeps the native `__contains__`, its
+/// `maps` is the instance's own list of exact dicts, and the key settles by
+/// native equality (see `LeafProbe`): found in any map. `None` (nothing
+/// decided) for anything else, which the full path answers.
+pub(crate) fn chainmap_contains_fast(
+    inst: &crate::types::PyInstance,
+    key: &Object,
+) -> Option<bool> {
+    let want = CHAINMAP_CONTAINS.load(std::sync::atomic::Ordering::Relaxed);
+    if want == 0 {
+        return None;
+    }
+    let cls = inst.cls_raw();
+    match cls.lookup("__contains__") {
+        Some(Object::Builtin(b)) if Rc::as_ptr(&b) as usize == want => {}
+        _ => return None,
+    }
+    if cls.lookup("maps").is_some() {
+        return None;
+    }
+    let maps = chainmap_maps_of(inst)?;
+    let probe = crate::object::LeafProbe::new(key)?;
+    // SAFETY: views that run no code (native probes), ending with this call.
+    let ms = unsafe { maps.peek() }?;
+    for m in ms.iter() {
+        let Object::Dict(d) = m else {
+            return None;
+        };
+        // SAFETY: as above.
+        let dd = unsafe { d.peek() }?;
+        if dd.get_index_of(&probe).is_some() {
+            return Some(true);
+        }
+        if !probe.miss_is_exact() {
+            return None;
+        }
+    }
+    Some(false)
+}
+
 /// [`chainmap_getitem`]'s leaf half (see `leaf_builtins::Fast`): a plain
 /// key found by exact native equality in a list of exact dicts held in
 /// the instance's own `maps` attribute. A key no map holds (the
@@ -1335,7 +1644,80 @@ fn install_defaultdict(args: &[Object]) -> Result<Object, RuntimeError> {
         d.shift_remove(&DictKey(Object::from_static("__slots__")));
     }
     cls.bump_attr_version();
+    // (The exact class's plain calls build in place; a subclass has its
+    // own, empty, constructor hook.)
+    cls.pure_new.set(Some(dd_pure_new));
     Ok(Object::None)
+}
+
+/// `install_deque(deque)`: the class's plain constructions build in place
+/// (see [`deque_pure_new`]).
+fn install_deque(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Type(cls)] = args else {
+        return Err(type_error("install_deque() expects a class"));
+    };
+    cls.pure_new.set(Some(deque_pure_new));
+    Ok(Object::None)
+}
+
+/// `deque()` or `deque(xs)` of a list or tuple, of the exact class while
+/// its `__init__` is `_collections`' own and its slots are laid out as
+/// that `__init__` stores them: the instance over a copy of the items, as
+/// `__init__` (no `maxlen`) leaves it. `None` for any other call.
+fn deque_pure_new(cls: &Rc<crate::types::TypeObject>, args: &[Object]) -> Option<Object> {
+    const SLOTS: [&str; 4] = ["_data", "_head", "_maxlen", "_state"];
+    let items: Vec<Object> = match args {
+        [] => Vec::new(),
+        [Object::List(l)] => l.try_borrow().ok()?.clone(),
+        [Object::Tuple(t)] => t.to_vec(),
+        _ => return None,
+    };
+    match cls.lookup("__init__") {
+        Some(Object::Function(f)) if f.code().qualname == "deque.__init__" => {}
+        _ => return None,
+    }
+    let layout = cls.own_slot_layout()?;
+    if layout.len() != SLOTS.len()
+        || !layout
+            .iter()
+            .zip(SLOTS)
+            .all(|(k, n)| matches!(&k.0, Object::Str(s) if s.as_ref() == n))
+    {
+        return None;
+    }
+    let data = Object::new_list(items);
+    crate::gc_trace::track_built(&data);
+    let values = [data, Object::Int(0), Object::None, Object::Int(0)];
+    let inst = crate::types::PyInstance::with_slots(
+        cls.clone(),
+        crate::types::SlotStorage::from_layout_array(layout.clone(), values),
+    );
+    let obj = Object::Instance(Rc::new(inst));
+    crate::gc_trace::track(&obj);
+    Some(obj)
+}
+
+/// `defaultdict()` or `defaultdict(factory)` of the exact class, with the
+/// factory `None`, a class, a builtin or a function (callable, as
+/// `defdict_init` requires): the instance over an empty dict, its
+/// `default_factory` set, as `__new__` and `__init__` leave it. `None`
+/// for any other call.
+fn dd_pure_new(cls: &Rc<crate::types::TypeObject>, args: &[Object]) -> Option<Object> {
+    let factory = match args {
+        [] => Object::None,
+        [f @ (Object::None | Object::Type(_) | Object::Builtin(_) | Object::Function(_))] => {
+            f.clone()
+        }
+        _ => return None,
+    };
+    let inst = Rc::new(crate::types::PyInstance::with_native(
+        cls.clone(),
+        Object::new_dict(),
+    ));
+    inst.slot_set("default_factory", factory);
+    let obj = Object::Instance(inst);
+    crate::gc_trace::track(&obj);
+    Some(obj)
 }
 
 /// `defaultdict.__init__(self, default_factory=None, /, *args, **kwds)`,
@@ -1426,6 +1808,63 @@ fn dd_missing(args: &[Object]) -> Result<Object, RuntimeError> {
     crate::builtins::dict_setdefault(&[recv.clone(), key.clone(), value])
 }
 
+/// The native `defaultdict.__missing__` the module installs, by address
+/// (the class's entry is it while the class keeps it).
+static DD_MISSING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `d[key]` of a `defaultdict` (`inst`, over its payload `d`) missing
+/// `key`, where the class keeps the native `__missing__` and the factory
+/// is one whose value builds natively (`list`, `int`, `dict`, ...): the
+/// new value, stored under the key as `__missing__` stores it. `None`,
+/// touching nothing, for anything else (a key only Python code compares,
+/// any other factory).
+pub(crate) fn dd_missing_pure(
+    inst: &crate::types::PyInstance,
+    d: &Rc<RefCell<DictData>>,
+    key: &Object,
+) -> Option<Object> {
+    let ours = DD_MISSING.load(std::sync::atomic::Ordering::Relaxed);
+    // (The class's `__missing__` is the native one, remembered per class
+    // version.)
+    let cls = inst.cls_raw();
+    if ours == 0
+        || !cls.memo_verdict(crate::types::Verdict::DefaultDictMissing, "", || {
+            matches!(
+                cls.lookup("__missing__"),
+                Some(Object::Builtin(b)) if Rc::as_ptr(&b) as usize == ours
+            )
+        })
+    {
+        return None;
+    }
+    if crate::capi_watchers::dicts_active() {
+        return None;
+    }
+    let factory = inst
+        .slots
+        .try_borrow()
+        .ok()?
+        .get("default_factory")
+        .cloned()?;
+    let value = builtin_factory_value(&factory)?;
+    let probe = crate::object::LeafProbe::new(key)?;
+    {
+        let mut m = d.try_borrow_mut().ok()?;
+        match m.probe_entry(&probe) {
+            crate::dictmap::ProbeEntry::Vacant(e) if probe.miss_is_exact() => {
+                e.insert(DictKey(key.clone()), value.clone());
+            }
+            _ => return None,
+        }
+    }
+    if matches!(value, Object::List(_) | Object::Dict(_) | Object::Set(_)) {
+        crate::gc_trace::track(&value);
+    }
+    crate::object::dict_watch_bump(d);
+    crate::object::dict_mutation_event(d);
+    Some(value)
+}
+
 // ---------------------------------------------------------------------
 // `_count_elements`.
 
@@ -1457,6 +1896,46 @@ fn tally_dict(mapping: &Object) -> Option<Rc<RefCell<DictData>>> {
         }
         _ => None,
     }
+}
+
+/// Count the leading run of `items` whose keys probe natively and whose
+/// counts are machine ints into `d`, under one view of it (nothing runs
+/// code, so one change notice covers the run): how many were counted.
+/// The first item it can't take, and the rest, are the caller's.
+fn tally_run(d: &Rc<RefCell<DictData>>, items: &[Object]) -> usize {
+    if crate::capi_watchers::dicts_active() {
+        return 0;
+    }
+    // SAFETY: native probes and int counts run no code; the view ends
+    // before the notices below.
+    let Some(m) = (unsafe { d.peek_mut() }) else {
+        return 0;
+    };
+    let (mut done, mut added) = (0, false);
+    for key in items {
+        let Some(probe) = crate::object::LeafProbe::new(key) else {
+            break;
+        };
+        match m.probe_entry(&probe) {
+            crate::dictmap::ProbeEntry::Occupied(e) => match e.into_mut() {
+                Object::Int(n) if *n < i64::MAX => *n += 1,
+                _ => break,
+            },
+            crate::dictmap::ProbeEntry::Vacant(e) if probe.miss_is_exact() => {
+                e.insert(DictKey(key.clone()), Object::Int(1));
+                added = true;
+            }
+            crate::dictmap::ProbeEntry::Vacant(_) => break,
+        }
+        done += 1;
+    }
+    if done > 0 {
+        if added {
+            crate::object::dict_watch_bump(d);
+        }
+        crate::object::dict_mutation_event(d);
+    }
+    done
 }
 
 /// Count one element into `d` (`d[key] = d.get(key, 0) + 1`).
@@ -1524,8 +2003,10 @@ fn count_elements(args: &[Object]) -> Result<Object, RuntimeError> {
             }
         }
         Object::List(items) => {
+            // (The leading plain keys under one view: see `tally_run`.)
+            // SAFETY: a view that runs no code, ending with the statement.
+            let mut i = unsafe { items.peek() }.map_or(0, |xs| tally_run(&d, xs));
             // Snapshot-free: the list may change under a key's `__eq__`.
-            let mut i = 0;
             loop {
                 let item = items.borrow().get(i).cloned();
                 let Some(item) = item else { break };
@@ -1534,7 +2015,8 @@ fn count_elements(args: &[Object]) -> Result<Object, RuntimeError> {
             }
         }
         Object::Tuple(items) => {
-            for item in items.iter() {
+            let done = tally_run(&d, items);
+            for item in items.iter().skip(done) {
                 tally_one(interp, &d, item)?;
             }
         }
@@ -1549,6 +2031,406 @@ fn count_elements(args: &[Object]) -> Result<Object, RuntimeError> {
     Ok(Object::Bool(true))
 }
 
+/// `_deepcopy_plain(x)`: `copy.deepcopy(x)` (no memo given) for a tree of
+/// exact dicts, lists and tuples over `None`, bools, ints, floats, strings
+/// and bytes, which `copy`'s own table copies the same way: what the
+/// original shares, the copy shares (by identity, cycles included), and a
+/// tuple whose items all copy to themselves is itself. `None` for anything
+/// else, a tree deeper than the native walk goes, or any call a trace or
+/// profile hook watches, which the Python function then copies.
+fn deepcopy_plain(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [x] = args else {
+        return Err(type_error("_deepcopy_plain() takes one argument"));
+    };
+    // (A trace or profile hook sees `copy`'s Python frames, as CPython's.)
+    if crate::trace::any_observers_active() {
+        return Ok(Object::None);
+    }
+    let mut memo = crate::fasthash::FxHashMap::default();
+    Ok(deep_plain(x, &mut memo, 0).unwrap_or(Object::None))
+}
+
+/// `_asdict_plain(obj, field_marker)`: `dataclasses.asdict(obj)` with the
+/// default `dict` factory, for a tree of plain dataclass instances, exact
+/// lists, tuples and dicts, and `None`, bools, numbers, strings and bytes:
+/// the copy `_asdict_inner` makes, read with no code run. `field_marker`
+/// is `dataclasses._FIELD` (the kind of field `fields()` keeps). `None`
+/// for anything else (another value, a field read through a descriptor,
+/// a tree too deep), which the Python path copies, or while a trace or
+/// profile hook watches.
+fn asdict_plain(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [obj @ Object::Instance(_), Object::Instance(marker)] = args else {
+        return Ok(Object::None);
+    };
+    if crate::trace::any_observers_active() || crate::object::exotic_str_keys_possible() {
+        return Ok(Object::None);
+    }
+    Ok(asdict_value(obj, marker, 0).unwrap_or(Object::None))
+}
+
+/// [`asdict_plain`]'s copy of `x`, `depth` levels down.
+fn asdict_value(x: &Object, marker: &Rc<crate::types::PyInstance>, depth: u32) -> Option<Object> {
+    if depth >= DEEPCOPY_DEPTH {
+        return None;
+    }
+    match x {
+        Object::None
+        | Object::Bool(_)
+        | Object::Int(_)
+        | Object::Long(_)
+        | Object::Float(_)
+        | Object::Complex(_)
+        | Object::Str(_)
+        | Object::Bytes(_) => Some(x.clone()),
+        Object::List(l) => {
+            let items = l.try_borrow().ok()?.clone();
+            let out = items
+                .iter()
+                .map(|v| asdict_value(v, marker, depth + 1))
+                .collect::<Option<Vec<_>>>()?;
+            let y = Object::new_list(out);
+            crate::gc_trace::track(&y);
+            Some(y)
+        }
+        Object::Tuple(t) => {
+            let out = t
+                .iter()
+                .map(|v| asdict_value(v, marker, depth + 1))
+                .collect::<Option<Vec<_>>>()?;
+            Some(Object::new_tuple(out))
+        }
+        Object::Dict(d) => {
+            let entries: Vec<(Object, Object)> = d
+                .try_borrow()
+                .ok()?
+                .iter()
+                .map(|(k, v)| (k.0.clone(), v.clone()))
+                .collect();
+            let mut out =
+                DictData::with_capacity_and_hasher(entries.len(), crate::fasthash::FxBuildHasher);
+            for (k, v) in &entries {
+                let (k, v) = (
+                    asdict_value(k, marker, depth + 1)?,
+                    asdict_value(v, marker, depth + 1)?,
+                );
+                // (Keys of these kinds hash natively.)
+                out.insert(DictKey(k), v);
+            }
+            let y = Object::Dict(Rc::new(RefCell::new(out)));
+            crate::gc_trace::track(&y);
+            Some(y)
+        }
+        Object::Instance(inst) => asdict_instance(inst, marker, depth),
+        _ => None,
+    }
+}
+
+/// [`asdict_value`] of a plain dataclass instance: its fields (the
+/// `__dataclass_fields__` entries whose `_field_type` is `marker`), in
+/// order, each read from its dict under the default attribute access with
+/// no descriptor of the name on the class.
+fn asdict_instance(
+    inst: &Rc<crate::types::PyInstance>,
+    marker: &Rc<crate::types::PyInstance>,
+    depth: u32,
+) -> Option<Object> {
+    let cls = inst.cls_raw();
+    if inst.native.get().is_some()
+        || cls.native_kind.get() != 0
+        || cls.c_ext_ptr.get() != 0
+        || !cls
+            .dunder(crate::types::Dunder::GetAttribute)
+            .object_owner()
+    {
+        return None;
+    }
+    let Some(Object::Dict(fields)) = cls.lookup("__dataclass_fields__") else {
+        return None;
+    };
+    let fields: Vec<Object> = fields.try_borrow().ok()?.values().cloned().collect();
+    let mut out = DictData::with_capacity_and_hasher(fields.len(), crate::fasthash::FxBuildHasher);
+    for f in &fields {
+        let Object::Instance(fi) = f else {
+            return None;
+        };
+        let (name, kind) = {
+            let slots = fi.slots.try_borrow().ok()?;
+            (
+                slots.get("name")?.clone(),
+                slots.get("_field_type")?.clone(),
+            )
+        };
+        // (A class variable or init-only pseudo-field: not a field.)
+        match &kind {
+            Object::Instance(k) if Rc::ptr_eq(k, marker) => {}
+            Object::Instance(_) => continue,
+            _ => return None,
+        }
+        let Object::Str(name) = name else {
+            return None;
+        };
+        // (A class attribute of the name may only be a plain default.)
+        match cls.lookup(&name) {
+            None
+            | Some(
+                Object::None
+                | Object::Bool(_)
+                | Object::Int(_)
+                | Object::Float(_)
+                | Object::Str(_)
+                | Object::Bytes(_),
+            ) => {}
+            Some(_) => return None,
+        }
+        let v = match inst.dict.published() {
+            Some(d) => d
+                .try_borrow()
+                .ok()?
+                .get(&crate::object::StrKey(&name))
+                .cloned(),
+            None => inst
+                .dict
+                .split_cell()
+                .try_borrow()
+                .ok()?
+                .get_str(&name)
+                .cloned(),
+        }?;
+        let v = asdict_value(&v, marker, depth + 1)?;
+        out.insert(DictKey(Object::Str(name)), v);
+    }
+    let y = Object::Dict(Rc::new(RefCell::new(out)));
+    crate::gc_trace::track(&y);
+    Some(y)
+}
+
+/// `_most_common_plain(counter, n)`: `Counter.most_common(n)` of an exact
+/// `Counter` (the caller checks) whose counts are all plain ints: the `n`
+/// largest `(key, count)` pairs, ties in insertion order, as
+/// `heapq.nlargest(n, self.items(), key=itemgetter(1))` gives them. `None`
+/// for anything else, or while a trace or profile hook watches.
+fn most_common_plain(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Instance(inst), Object::Int(n)] = args else {
+        return Ok(Object::None);
+    };
+    if crate::trace::any_observers_active() {
+        return Ok(Object::None);
+    }
+    let Some(Object::Dict(d)) = inst.native.get() else {
+        return Ok(Object::None);
+    };
+    let Ok(d) = d.try_borrow() else {
+        return Ok(Object::None);
+    };
+    let mut items = Vec::with_capacity(d.len());
+    for (k, v) in d.iter() {
+        let count = match *v {
+            Object::Int(i) => i,
+            Object::Bool(b) => i64::from(b),
+            _ => return Ok(Object::None),
+        };
+        items.push((count, k, v));
+    }
+    // (A stable sort: equal counts keep insertion order, as `nlargest`'s
+    // decreasing tie-break index keeps it.)
+    items.sort_by_key(|item| std::cmp::Reverse(item.0));
+    let take = usize::try_from(*n).unwrap_or(0).min(items.len());
+    let out: Vec<Object> = items[..take]
+        .iter()
+        .map(|(_, k, v)| Object::new_tuple_array([k.0.clone(), (*v).clone()]))
+        .collect();
+    drop(d);
+    let list = Object::new_list(out);
+    crate::gc_trace::track(&list);
+    Ok(list)
+}
+
+/// The original `Logger.isEnabledFor` the native log methods require of a
+/// logger's class (see [`log_methods`]).
+static LOG_IS_ENABLED_FOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `_log_methods(Logger)`: native `debug`, `info`, `warning`, `error` and
+/// `critical` for `logging.Logger`, as `(name, method)` pairs for the
+/// module to assign. A call on a logger that is disabled for the level, as
+/// its class's own `isEnabledFor` would find it (`disabled`, or `False`
+/// cached for the level), with no keywords and no trace or profile hook
+/// set, returns `None` at once; anything else calls the Python method.
+fn log_methods(args: &[Object]) -> Result<Object, RuntimeError> {
+    let [Object::Type(cls)] = args else {
+        return Err(type_error("_log_methods() expects the Logger class"));
+    };
+    let dict = cls.dict.borrow();
+    let Some(Object::Function(enabled)) = dict.get(&crate::object::StrKey("isEnabledFor")) else {
+        return Err(type_error("_log_methods(): no isEnabledFor"));
+    };
+    LOG_IS_ENABLED_FOR.store(
+        Rc::as_ptr(enabled) as usize,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let table: [(&'static str, crate::stdlib::struct_mod::Fast); 5] = [
+        ("debug", |a| log_disabled(a, 10)),
+        ("info", |a| log_disabled(a, 20)),
+        ("warning", |a| log_disabled(a, 30)),
+        ("error", |a| log_disabled(a, 40)),
+        ("critical", |a| log_disabled(a, 50)),
+    ];
+    let mut out = Vec::with_capacity(table.len());
+    for (name, fast) in table {
+        let orig = dict
+            .get(&crate::object::StrKey(name))
+            .cloned()
+            .ok_or_else(|| type_error(format!("_log_methods(): no {name} to replace")))?;
+        out.push(Object::new_tuple(vec![
+            Object::from_static(name),
+            crate::stdlib::struct_mod::fast_method(cls, name, fast, orig, true),
+        ]));
+    }
+    Ok(Object::new_list(out))
+}
+
+/// A log method's leaf half: `None` for a call at `level` on a logger the
+/// level is disabled for (see [`log_methods`]); `None`, the call left to
+/// the Python method, for anything else.
+fn log_disabled(args: &[Object], level: i64) -> Option<Result<Object, RuntimeError>> {
+    let [Object::Instance(inst), _msg, ..] = args else {
+        return None;
+    };
+    if crate::trace::any_observers_active() {
+        return None;
+    }
+    let enabled = crate::Interpreter::instance_dunder_function(
+        inst,
+        crate::types::AttrKey::vm(crate::types::vm_key::LOG_ENABLED_FOR),
+        "isEnabledFor",
+    )?;
+    if Rc::as_ptr(&enabled) as usize
+        != LOG_IS_ENABLED_FOR.load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return None;
+    }
+    // (The two names' hashes, once per process.)
+    static HASHES: std::sync::OnceLock<(i64, i64)> = std::sync::OnceLock::new();
+    let &(disabled, cache) = HASHES.get_or_init(|| {
+        (
+            crate::object::py_str_hash("disabled"),
+            crate::object::py_str_hash("_cache"),
+        )
+    });
+    match inst.attr_get_hashed("disabled", disabled)? {
+        Object::Bool(true) => return Some(Ok(Object::None)),
+        Object::Bool(false) => {}
+        _ => return None,
+    }
+    let Object::Dict(cache) = inst.attr_get_hashed("_cache", cache)? else {
+        return None;
+    };
+    let cached = cache
+        .try_borrow()
+        .ok()?
+        .get(&crate::object::LeafProbe::new(&Object::Int(level))?)
+        .cloned();
+    matches!(cached, Some(Object::Bool(false))).then_some(Ok(Object::None))
+}
+
+/// How deep [`deep_plain`] nests before leaving the copy to Python.
+const DEEPCOPY_DEPTH: u32 = 200;
+
+fn deep_plain(
+    x: &Object,
+    memo: &mut crate::fasthash::FxHashMap<usize, Object>,
+    depth: u32,
+) -> Option<Object> {
+    let id = |o: &Object| o.strong_word().map(|w| w as usize);
+    match x {
+        Object::None
+        | Object::Bool(_)
+        | Object::Int(_)
+        | Object::Long(_)
+        | Object::Float(_)
+        | Object::Str(_)
+        | Object::Bytes(_) => Some(x.clone()),
+        Object::List(l) => {
+            let key = id(x)?;
+            if let Some(y) = memo.get(&key) {
+                return Some(y.clone());
+            }
+            if depth >= DEEPCOPY_DEPTH {
+                return None;
+            }
+            // (A snapshot: copying the items runs no code.)
+            let items = l.try_borrow().ok()?.clone();
+            let y = Object::new_list(Vec::with_capacity(items.len()));
+            crate::gc_trace::track(&y);
+            memo.insert(key, y.clone());
+            let Object::List(out) = &y else {
+                unreachable!("made a list")
+            };
+            for item in &items {
+                let c = deep_plain(item, memo, depth + 1)?;
+                out.try_borrow_mut().ok()?.push(c);
+            }
+            Some(y)
+        }
+        Object::Dict(d) => {
+            let key = id(x)?;
+            if let Some(y) = memo.get(&key) {
+                return Some(y.clone());
+            }
+            if depth >= DEEPCOPY_DEPTH {
+                return None;
+            }
+            let entries: Vec<(Object, Object)> = d
+                .try_borrow()
+                .ok()?
+                .iter()
+                .map(|(k, v)| (k.0.clone(), v.clone()))
+                .collect();
+            let out = Rc::new(RefCell::new(DictData::with_capacity_and_hasher(
+                entries.len(),
+                crate::fasthash::FxBuildHasher,
+            )));
+            let y = Object::Dict(out.clone());
+            crate::gc_trace::track(&y);
+            memo.insert(key, y.clone());
+            for (k, v) in &entries {
+                let (k, v) = (
+                    deep_plain(k, memo, depth + 1)?,
+                    deep_plain(v, memo, depth + 1)?,
+                );
+                // (Keys of these kinds hash natively.)
+                out.try_borrow_mut().ok()?.insert(DictKey(k), v);
+            }
+            Some(y)
+        }
+        Object::Tuple(t) => {
+            let key = id(x)?;
+            if let Some(y) = memo.get(&key) {
+                return Some(y.clone());
+            }
+            if depth >= DEEPCOPY_DEPTH {
+                return None;
+            }
+            let mut ys = Vec::with_capacity(t.len());
+            for item in t.iter() {
+                ys.push(deep_plain(item, memo, depth + 1)?);
+            }
+            // (A tuple reached again through its own items is the copy
+            // made there, as `_deepcopy_tuple` finds it.)
+            if let Some(y) = memo.get(&key) {
+                return Some(y.clone());
+            }
+            let y = if ys.iter().zip(t.iter()).all(|(a, b)| a.is_same(b)) {
+                x.clone()
+            } else {
+                Object::new_tuple(ys)
+            };
+            memo.insert(key, y.clone());
+            Some(y)
+        }
+        _ => None,
+    }
+}
+
 pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
     let dict = Rc::new(RefCell::new(DictData::default()));
     {
@@ -1557,6 +2439,29 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             DictKey(Object::from_static("__name__")),
             Object::from_static("_weave_collections"),
         );
+        for (name, f) in [
+            (
+                "_deepcopy_plain",
+                deepcopy_plain as fn(&[Object]) -> Result<Object, RuntimeError>,
+            ),
+            ("_most_common_plain", most_common_plain),
+            ("_asdict_plain", asdict_plain),
+            ("_log_methods", log_methods),
+        ] {
+            let b = Rc::new(BuiltinFn {
+                name,
+                binds_instance: false,
+                call: Box::new(f),
+                call_kw: None,
+            });
+            // The copy and the count ranking read plain values and decline
+            // anything else: their bodies run no code, so compiled callers
+            // call them in place (`copy.deepcopy`, `most_common(n)`).
+            if name != "_log_methods" {
+                crate::leaf_builtins::register(&b);
+            }
+            d.insert(DictKey(Object::from_static(name)), Object::Builtin(b));
+        }
         let mut reg = |export: &'static str,
                        name: &'static str,
                        f: fn(&[Object]) -> Result<Object, RuntimeError>| {
@@ -1578,6 +2483,10 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
         reg("__bool__", "__bool__", deque_bool);
         reg("__getitem__", "__getitem__", deque_getitem);
         reg("rotate", "rotate", deque_rotate);
+        reg("_extend_items", "_extend_items", deque_extend_items);
+        reg("_extend_method", "_extend_method", deque_extend_method);
+        reg("_plain_find", "_plain_find", deque_plain_find);
+        reg("_plain_count", "_plain_count", deque_plain_count);
         reg("__iter__", "__iter__", deque_iter);
         reg("__reversed__", "__reversed__", deque_reversed);
         reg("iterator_index", "iterator_index", deque_iterator_index);
@@ -1599,6 +2508,7 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             install_defaultdict,
         );
         reg("dd_missing", "__missing__", dd_missing);
+        reg("install_deque", "install_deque", install_deque);
         reg("count_elements", "count_elements", count_elements);
         reg(
             "namedtuple_register",
@@ -1633,6 +2543,31 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 call_kw: Some(Box::new(dd_init)),
             })),
         );
+        if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static("dd_missing"))) {
+            DD_MISSING.store(Rc::as_ptr(b) as usize, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static("chainmap_contains")))
+        {
+            CHAINMAP_CONTAINS.store(Rc::as_ptr(b) as usize, std::sync::atomic::Ordering::Relaxed);
+        }
+        // The deque iterators' steps, as leaves (`list(dq)`, `for x in dq`).
+        for (key, fast) in [
+            (
+                "iterator_next",
+                deque_iterator_next_leaf as crate::leaf_builtins::Fast,
+            ),
+            ("reverse_iterator_next", deque_reverse_iterator_next_leaf),
+        ] {
+            if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static(key))) {
+                crate::leaf_builtins::register_fast(b, fast);
+                let slot = if key == "iterator_next" {
+                    &ITER_NEXT
+                } else {
+                    &RITER_NEXT
+                };
+                slot.store(Rc::as_ptr(b) as usize, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         // The `OrderedDict` methods (see `collections_odict`).
         for (export, name, body, kw) in super::collections_odict::exports() {
             d.insert(
@@ -1656,6 +2591,19 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 })),
             );
         }
+        for (i, name) in [
+            "od_iter",
+            "odv_keys_iter",
+            "odv_values_iter",
+            "odv_items_iter",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static(name))) {
+                super::collections_odict::note_iter_builtin(i, b);
+            }
+        }
         for name in super::collections_odict::LEAVES {
             if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static(name))) {
                 crate::leaf_builtins::register(b);
@@ -1672,8 +2620,8 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
                 }
             }
         }
-        // The end operations, length, truth, iterator construction, and
-        // iterator steps run no Python code. Indexing and rotation require
+        // The end operations, length, truth and iterator construction run
+        // no Python code (the iterator steps have leaf halves, above). Indexing and rotation require
         // an argument guard because index coercion can invoke Python's
         // __index__ protocol.
         for name in [
@@ -1685,8 +2633,6 @@ pub fn build(_cache: &ModuleCache) -> Rc<PyModule> {
             "__bool__",
             "__iter__",
             "__reversed__",
-            "iterator_next",
-            "reverse_iterator_next",
             "tuplegetter_get",
         ] {
             if let Some(Object::Builtin(b)) = d.get(&DictKey(Object::from_static(name))) {

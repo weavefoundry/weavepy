@@ -723,6 +723,406 @@ pub unsafe extern "C" fn PyUnicode_DecodeLatin1(
     crate::object::into_owned(Object::from_str(out))
 }
 
+/// `(s, size)` as a byte slice (`None`: a NULL pointer with a nonzero
+/// size, which CPython would read through).
+unsafe fn raw_bytes<'a>(s: *const c_char, size: PySsizeT) -> Option<&'a [u8]> {
+    if s.is_null() {
+        return (size == 0).then_some(&[][..]);
+    }
+    Some(unsafe { std::slice::from_raw_parts(s as *const u8, size.max(0) as usize) })
+}
+
+/// An engine decode's result as an owned `str` (or NULL with the error
+/// pending).
+fn decoded_or_null(r: Result<Object, weavepy_vm::error::RuntimeError>) -> *mut PyObject {
+    match r {
+        Ok(o) => crate::object::into_owned(o),
+        Err(e) => {
+            crate::errors::set_pending_from_runtime(e);
+            ptr::null_mut()
+        }
+    }
+}
+
+type UtfDecode =
+    fn(&[u8], &str, i32, bool) -> Result<(Object, usize, i32), weavepy_vm::error::RuntimeError>;
+
+/// The UTF-16/UTF-32 decoders' shared protocol: `*byteorder` (NULL means
+/// 0) picks the order, 0 sniffing a BOM, and gets the order in effect at
+/// the end; with `consumed` NULL the input must end on a whole unit.
+unsafe fn decode_utf_wide(
+    decode: UtfDecode,
+    s: *const c_char,
+    size: PySsizeT,
+    errors: *const c_char,
+    byteorder: *mut c_int,
+    consumed: *mut PySsizeT,
+) -> *mut PyObject {
+    let Some(data) = (unsafe { raw_bytes(s, size) }) else {
+        crate::errors::set_type_error("NULL data with a nonzero size");
+        return ptr::null_mut();
+    };
+    let err = unsafe { cstr_or(errors, "strict") };
+    let bo = if byteorder.is_null() {
+        0
+    } else {
+        unsafe { *byteorder }
+    };
+    let r = decode(data, &err, bo, consumed.is_null()).map(|(text, used, bo)| {
+        if !byteorder.is_null() {
+            unsafe { *byteorder = bo };
+        }
+        if !consumed.is_null() {
+            unsafe { *consumed = used as PySsizeT };
+        }
+        text
+    });
+    decoded_or_null(r)
+}
+
+/// `PyUnicode_DecodeUTF16(s, size, errors, byteorder)`.
+#[no_mangle]
+pub unsafe extern "C" fn PyUnicode_DecodeUTF16(
+    s: *const c_char,
+    size: PySsizeT,
+    errors: *const c_char,
+    byteorder: *mut c_int,
+) -> *mut PyObject {
+    use weavepy_vm::stdlib::codecs_engine::utf16_decode;
+    unsafe { decode_utf_wide(utf16_decode, s, size, errors, byteorder, ptr::null_mut()) }
+}
+
+/// `PyUnicode_DecodeUTF16Stateful(s, size, errors, byteorder, consumed)`.
+#[no_mangle]
+pub unsafe extern "C" fn PyUnicode_DecodeUTF16Stateful(
+    s: *const c_char,
+    size: PySsizeT,
+    errors: *const c_char,
+    byteorder: *mut c_int,
+    consumed: *mut PySsizeT,
+) -> *mut PyObject {
+    use weavepy_vm::stdlib::codecs_engine::utf16_decode;
+    unsafe { decode_utf_wide(utf16_decode, s, size, errors, byteorder, consumed) }
+}
+
+/// `PyUnicode_DecodeUTF32(s, size, errors, byteorder)`.
+#[no_mangle]
+pub unsafe extern "C" fn PyUnicode_DecodeUTF32(
+    s: *const c_char,
+    size: PySsizeT,
+    errors: *const c_char,
+    byteorder: *mut c_int,
+) -> *mut PyObject {
+    use weavepy_vm::stdlib::codecs_engine::utf32_decode;
+    unsafe { decode_utf_wide(utf32_decode, s, size, errors, byteorder, ptr::null_mut()) }
+}
+
+/// `PyUnicode_DecodeUTF32Stateful(s, size, errors, byteorder, consumed)`.
+#[no_mangle]
+pub unsafe extern "C" fn PyUnicode_DecodeUTF32Stateful(
+    s: *const c_char,
+    size: PySsizeT,
+    errors: *const c_char,
+    byteorder: *mut c_int,
+    consumed: *mut PySsizeT,
+) -> *mut PyObject {
+    use weavepy_vm::stdlib::codecs_engine::utf32_decode;
+    unsafe { decode_utf_wide(utf32_decode, s, size, errors, byteorder, consumed) }
+}
+
+/// `PyUnicode_DecodeUTF7Stateful(s, size, errors, consumed)`.
+#[no_mangle]
+pub unsafe extern "C" fn PyUnicode_DecodeUTF7Stateful(
+    s: *const c_char,
+    size: PySsizeT,
+    errors: *const c_char,
+    consumed: *mut PySsizeT,
+) -> *mut PyObject {
+    let Some(data) = (unsafe { raw_bytes(s, size) }) else {
+        crate::errors::set_type_error("NULL data with a nonzero size");
+        return ptr::null_mut();
+    };
+    let err = unsafe { cstr_or(errors, "strict") };
+    let r = weavepy_vm::stdlib::codecs_engine::utf7_decode(data, &err, consumed.is_null()).map(
+        |(text, used)| {
+            if !consumed.is_null() {
+                unsafe { *consumed = used as PySsizeT };
+            }
+            text
+        },
+    );
+    decoded_or_null(r)
+}
+
+/// `PyUnicode_DecodeUTF7(s, size, errors)`.
+#[no_mangle]
+pub unsafe extern "C" fn PyUnicode_DecodeUTF7(
+    s: *const c_char,
+    size: PySsizeT,
+    errors: *const c_char,
+) -> *mut PyObject {
+    unsafe { PyUnicode_DecodeUTF7Stateful(s, size, errors, ptr::null_mut()) }
+}
+
+/// `PyUnicode_DecodeUnicodeEscape(s, size, errors)`.
+#[no_mangle]
+pub unsafe extern "C" fn PyUnicode_DecodeUnicodeEscape(
+    s: *const c_char,
+    size: PySsizeT,
+    errors: *const c_char,
+) -> *mut PyObject {
+    let Some(data) = (unsafe { raw_bytes(s, size) }) else {
+        crate::errors::set_type_error("NULL data with a nonzero size");
+        return ptr::null_mut();
+    };
+    let err = unsafe { cstr_or(errors, "strict") };
+    decode_capi(data, "unicode_escape", &err)
+}
+
+/// `PyUnicode_DecodeRawUnicodeEscape(s, size, errors)`.
+#[no_mangle]
+pub unsafe extern "C" fn PyUnicode_DecodeRawUnicodeEscape(
+    s: *const c_char,
+    size: PySsizeT,
+    errors: *const c_char,
+) -> *mut PyObject {
+    let Some(data) = (unsafe { raw_bytes(s, size) }) else {
+        crate::errors::set_type_error("NULL data with a nonzero size");
+        return ptr::null_mut();
+    };
+    let err = unsafe { cstr_or(errors, "strict") };
+    decode_capi(data, "raw_unicode_escape", &err)
+}
+
+/// `PyUnicode_AsUTF16String(unicode)`: with a BOM, in native order.
+#[no_mangle]
+pub unsafe extern "C" fn PyUnicode_AsUTF16String(o: *mut PyObject) -> *mut PyObject {
+    unsafe { PyUnicode_AsEncodedString(o, c"utf-16".as_ptr(), ptr::null()) }
+}
+
+/// `PyUnicode_AsUTF32String(unicode)`: with a BOM, in native order.
+#[no_mangle]
+pub unsafe extern "C" fn PyUnicode_AsUTF32String(o: *mut PyObject) -> *mut PyObject {
+    unsafe { PyUnicode_AsEncodedString(o, c"utf-32".as_ptr(), ptr::null()) }
+}
+
+/// `PyUnicode_AsUnicodeEscapeString(unicode)`.
+#[no_mangle]
+pub unsafe extern "C" fn PyUnicode_AsUnicodeEscapeString(o: *mut PyObject) -> *mut PyObject {
+    unsafe { PyUnicode_AsEncodedString(o, c"unicode_escape".as_ptr(), ptr::null()) }
+}
+
+/// `PyUnicode_AsRawUnicodeEscapeString(unicode)`.
+#[no_mangle]
+pub unsafe extern "C" fn PyUnicode_AsRawUnicodeEscapeString(o: *mut PyObject) -> *mut PyObject {
+    unsafe { PyUnicode_AsEncodedString(o, c"raw_unicode_escape".as_ptr(), ptr::null()) }
+}
+
+/// `PyUnicode_GetDefaultEncoding()`.
+#[no_mangle]
+pub extern "C" fn PyUnicode_GetDefaultEncoding() -> *const c_char {
+    c"utf-8".as_ptr()
+}
+
+/// The code points of the `str` at `o` as `wchar_t` units (UTF-16 where
+/// `wchar_t` is 16 bits), or NULL-and-`TypeError` for anything else.
+unsafe fn wide_units(o: *mut PyObject) -> Option<Vec<libc::wchar_t>> {
+    if o.is_null() {
+        crate::errors::set_type_error("bad argument to internal function");
+        return None;
+    }
+    let obj = unsafe { crate::object::clone_object_value(o) };
+    let Some(cps) = weavepy_vm::stdlib::codecs_engine::str_codepoints(&obj) else {
+        crate::errors::set_type_error("expected str");
+        return None;
+    };
+    let mut out: Vec<libc::wchar_t> = Vec::with_capacity(cps.len() + 1);
+    if std::mem::size_of::<libc::wchar_t>() == 2 {
+        for cp in cps {
+            if cp >= 0x10000 {
+                let v = cp - 0x10000;
+                out.push((0xD800 + (v >> 10)) as libc::wchar_t);
+                out.push((0xDC00 + (v & 0x3FF)) as libc::wchar_t);
+            } else {
+                out.push(cp as libc::wchar_t);
+            }
+        }
+    } else {
+        out.extend(cps.into_iter().map(|cp| cp as libc::wchar_t));
+    }
+    Some(out)
+}
+
+/// `PyUnicode_AsWideChar(unicode, w, size)`: copies at most `size` units
+/// (a terminating NUL only if it fits) and returns how many it copied, or
+/// with `w` NULL, the size the whole string needs, NUL included.
+#[no_mangle]
+pub unsafe extern "C" fn PyUnicode_AsWideChar(
+    o: *mut PyObject,
+    w: *mut libc::wchar_t,
+    size: PySsizeT,
+) -> PySsizeT {
+    let Some(units) = (unsafe { wide_units(o) }) else {
+        return -1;
+    };
+    if w.is_null() {
+        return units.len() as PySsizeT + 1;
+    }
+    let size = size.max(0) as usize;
+    let n = units.len().min(size);
+    unsafe {
+        ptr::copy_nonoverlapping(units.as_ptr(), w, n);
+        if n < size {
+            *w.add(n) = 0;
+        }
+    }
+    n as PySsizeT
+}
+
+/// `PyUnicode_AsWideCharString(unicode, size)`: a NUL-terminated copy
+/// from `PyMem_Malloc`, its length (NUL excluded) stored through `size`;
+/// with `size` NULL an embedded NUL is a `ValueError`.
+#[no_mangle]
+pub unsafe extern "C" fn PyUnicode_AsWideCharString(
+    o: *mut PyObject,
+    size: *mut PySsizeT,
+) -> *mut libc::wchar_t {
+    let Some(mut units) = (unsafe { wide_units(o) }) else {
+        return ptr::null_mut();
+    };
+    if size.is_null() && units.contains(&0) {
+        crate::errors::set_value_error("embedded null character");
+        return ptr::null_mut();
+    }
+    let len = units.len();
+    units.push(0);
+    let bytes = units.len() * std::mem::size_of::<libc::wchar_t>();
+    let buf = unsafe { crate::memory::PyMem_Malloc(bytes) } as *mut libc::wchar_t;
+    if buf.is_null() {
+        unsafe { crate::errors::PyErr_NoMemory() };
+        return ptr::null_mut();
+    }
+    unsafe { ptr::copy_nonoverlapping(units.as_ptr(), buf, units.len()) };
+    if !size.is_null() {
+        unsafe { *size = len as PySsizeT };
+    }
+    buf
+}
+
+/// What a `PyArg_Parse` converter returns to ask for a cleanup call.
+const PY_CLEANUP_SUPPORTED: c_int = 0x20000;
+
+/// The shared shape of `PyUnicode_FSConverter`/`PyUnicode_FSDecoder`:
+/// NULL `arg` releases `*addr`; otherwise `os.fspath(arg)` is turned into
+/// the wanted type by `convert` and stored in `*addr`.
+unsafe fn fs_convert(
+    arg: *mut PyObject,
+    addr: *mut std::ffi::c_void,
+    convert: impl FnOnce(Object) -> Result<Object, ()>,
+) -> c_int {
+    let slot = addr as *mut *mut PyObject;
+    if arg.is_null() {
+        unsafe {
+            crate::object::Py_DecRef(*slot);
+            *slot = ptr::null_mut();
+        }
+        return 1;
+    }
+    let path = unsafe { crate::wave4::PyOS_FSPath(arg) };
+    if path.is_null() {
+        return 0;
+    }
+    let value = unsafe { crate::object::clone_object_value(path) };
+    unsafe { crate::object::Py_DecRef(path) };
+    match convert(value) {
+        Ok(out) => {
+            unsafe { *slot = crate::object::into_owned(out) };
+            PY_CLEANUP_SUPPORTED
+        }
+        Err(()) => 0,
+    }
+}
+
+/// `PyUnicode_FSConverter(arg, addr)`: a path as `bytes` (str paths are
+/// encoded with the filesystem encoding).
+#[no_mangle]
+pub unsafe extern "C" fn PyUnicode_FSConverter(
+    arg: *mut PyObject,
+    addr: *mut std::ffi::c_void,
+) -> c_int {
+    unsafe {
+        fs_convert(arg, addr, |value| {
+            let bytes = match &value {
+                Object::Bytes(b) => b.to_vec(),
+                Object::Str(_) | Object::WStr(_) => {
+                    match weavepy_vm::stdlib::codecs_mod::encode_obj(
+                        &value,
+                        "utf-8",
+                        "surrogateescape",
+                    ) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            crate::errors::set_pending_from_runtime(e);
+                            return Err(());
+                        }
+                    }
+                }
+                _ => {
+                    crate::errors::set_type_error("expected str, bytes or os.PathLike object");
+                    return Err(());
+                }
+            };
+            if bytes.contains(&0) {
+                crate::errors::set_value_error("embedded null byte");
+                return Err(());
+            }
+            Ok(Object::Bytes(bytes.into()))
+        })
+    }
+}
+
+/// `PyUnicode_FSDecoder(arg, addr)`: a path as `str` (bytes paths are
+/// decoded with the filesystem encoding).
+#[no_mangle]
+pub unsafe extern "C" fn PyUnicode_FSDecoder(
+    arg: *mut PyObject,
+    addr: *mut std::ffi::c_void,
+) -> c_int {
+    unsafe {
+        fs_convert(arg, addr, |value| {
+            let text = match &value {
+                Object::Str(_) | Object::WStr(_) => value,
+                Object::Bytes(b) => {
+                    match weavepy_vm::stdlib::codecs_mod::decode_bytes_obj(
+                        b,
+                        "utf-8",
+                        "surrogateescape",
+                    ) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            crate::errors::set_pending_from_runtime(e);
+                            return Err(());
+                        }
+                    }
+                }
+                _ => {
+                    crate::errors::set_type_error("expected str, bytes or os.PathLike object");
+                    return Err(());
+                }
+            };
+            let has_nul = match weavepy_vm::stdlib::codecs_engine::str_codepoints(&text) {
+                Some(cps) => cps.contains(&0),
+                None => false,
+            };
+            if has_nul {
+                crate::errors::set_value_error("embedded null character");
+                return Err(());
+            }
+            Ok(text)
+        })
+    }
+}
+
 /// `PyUnicode_FromEncodedObject(obj, encoding, errors)` — accept
 /// a bytes object or buffer-protocol exporter and decode it.
 #[no_mangle]

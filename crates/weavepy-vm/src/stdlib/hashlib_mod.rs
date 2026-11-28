@@ -17,14 +17,13 @@
 
 use crate::sync::Rc;
 use crate::sync::RefCell;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use digest::Digest;
 use md5::Md5;
 use sha1::Sha1;
-use sha2::{Sha224, Sha256, Sha384, Sha512};
+use sha2::{Sha224, Sha256, Sha512};
 use sha3::digest::{ExtendableOutput, XofReader};
 use sha3::{Sha3_224, Sha3_256, Sha3_384, Sha3_512, Shake128, Shake256};
 
@@ -39,13 +38,24 @@ use crate::types::{PyInstance, TypeObject};
 /// unlike RustCrypto's `blake2`, exposes the `salt`/`person`/tree
 /// parameters CPython's `_blake2` surfaces). The trailing `usize` on the
 /// BLAKE2 variants is the configured digest length.
+/// A running `ring` digest (see [`AnyHasher::Sha256`]).
+type RingHash = ring::digest::Context;
+
+fn ring_hash(algorithm: &'static ring::digest::Algorithm) -> RingHash {
+    ring::digest::Context::new(algorithm)
+}
+
 enum AnyHasher {
     Md5(Md5),
     Sha1(Sha1),
+    // (SHA-256, SHA-384 and SHA-512 through `ring`, whose compression
+    // functions are assembly that takes the CPU's SHA or vector
+    // extensions: up to twice the portable code's speed. Its SHA-1 is
+    // slower than the portable one, and it has no SHA-224.)
     Sha224(Sha224),
-    Sha256(Sha256),
-    Sha384(Sha384),
-    Sha512(Sha512),
+    Sha256(RingHash),
+    Sha384(RingHash),
+    Sha512(RingHash),
     Sha3_224(Sha3_224),
     Sha3_256(Sha3_256),
     Sha3_384(Sha3_384),
@@ -62,10 +72,8 @@ impl AnyHasher {
         match self {
             Self::Md5(h) => Update::update(h, data),
             Self::Sha1(h) => Update::update(h, data),
+            Self::Sha256(h) | Self::Sha384(h) | Self::Sha512(h) => h.update(data),
             Self::Sha224(h) => Update::update(h, data),
-            Self::Sha256(h) => Update::update(h, data),
-            Self::Sha384(h) => Update::update(h, data),
-            Self::Sha512(h) => Update::update(h, data),
             Self::Sha3_224(h) => Update::update(h, data),
             Self::Sha3_256(h) => Update::update(h, data),
             Self::Sha3_384(h) => Update::update(h, data),
@@ -91,10 +99,10 @@ impl AnyHasher {
         match self {
             Self::Md5(h) => h.clone().finalize().to_vec(),
             Self::Sha1(h) => h.clone().finalize().to_vec(),
+            Self::Sha256(h) | Self::Sha384(h) | Self::Sha512(h) => {
+                h.clone().finish().as_ref().to_vec()
+            }
             Self::Sha224(h) => h.clone().finalize().to_vec(),
-            Self::Sha256(h) => h.clone().finalize().to_vec(),
-            Self::Sha384(h) => h.clone().finalize().to_vec(),
-            Self::Sha512(h) => h.clone().finalize().to_vec(),
             Self::Sha3_224(h) => h.clone().finalize().to_vec(),
             Self::Sha3_256(h) => h.clone().finalize().to_vec(),
             Self::Sha3_384(h) => h.clone().finalize().to_vec(),
@@ -201,12 +209,13 @@ impl AnyHasher {
 // Process-global state (mirrors the `bz2`/`lzma` streaming objects):
 // hashers live in a registry keyed by an integer handle stored on the
 // instance, so a hasher created on one thread can be updated from
-// another under the GIL (test_hashlib.test_threaded_hashing).
-type HasherReg = Mutex<HashMap<i64, Rc<RefCell<AnyHasher>>>>;
+// another under the GIL (test_hashlib.test_threaded_hashing). The table
+// lets the states of dead hashers go (see `handle_table`).
+type HasherReg = Mutex<super::handle_table::HandleTable<AnyHasher>>;
 
 fn hasher_reg() -> &'static HasherReg {
     static REG: OnceLock<HasherReg> = OnceLock::new();
-    REG.get_or_init(|| Mutex::new(HashMap::new()))
+    REG.get_or_init(Mutex::default)
 }
 
 static HASHER_NEXT_ID: AtomicI64 = AtomicI64::new(1);
@@ -219,21 +228,26 @@ static HASHER_CLASS: Mutex<Option<Rc<TypeObject>>> = Mutex::new(None);
 /// We share one `dict` object between the module attribute and `new`.
 static CTOR_CACHE: Mutex<Option<Rc<RefCell<DictData>>>> = Mutex::new(None);
 
-fn register_hasher(state: AnyHasher) -> i64 {
+fn register_hasher(owner: &Rc<PyInstance>, state: AnyHasher) -> i64 {
     let id = HASHER_NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    hasher_reg()
-        .lock()
-        .unwrap()
-        .insert(id, Rc::new(RefCell::new(state)));
+    hasher_reg().lock().unwrap().insert(id, owner, state);
     id
+}
+
+/// A hasher instance's state goes with it (see `handle_table`).
+fn hasher_died(inst: &PyInstance) {
+    if let Some(id) = super::handle_table::handle_of(inst) {
+        if let Ok(mut reg) = hasher_reg().try_lock() {
+            reg.remove(id);
+        }
+    }
 }
 
 fn lookup_hasher(id: i64) -> Result<Rc<RefCell<AnyHasher>>, RuntimeError> {
     hasher_reg()
         .lock()
         .unwrap()
-        .get(&id)
-        .cloned()
+        .get(id)
         .ok_or_else(|| value_error("hashlib: stale hasher handle"))
 }
 
@@ -265,7 +279,7 @@ fn make_hasher_instance(state: AnyHasher) -> Object {
 fn fill_hasher_instance(inst: &Rc<PyInstance>, state: AnyHasher) {
     let (name, digest_size, block_size) = (state.name(), state.digest_size(), state.block_size());
     let sha3 = state.sha3_params();
-    let id = register_hasher(state);
+    let id = register_hasher(inst, state);
     {
         let mut d = inst.dict_cell().borrow_mut();
         d.insert(DictKey(Object::from_static("_handle")), Object::Int(id));
@@ -324,6 +338,16 @@ fn hasher_class() -> Rc<TypeObject> {
         method!("digest", hasher_digest);
         method!("hexdigest", hasher_hexdigest);
         method!("copy", hasher_copy);
+        let halves: [(&str, crate::leaf_builtins::Fast); 3] = [
+            ("update", hasher_update_fast),
+            ("digest", hasher_digest_fast),
+            ("hexdigest", hasher_hexdigest_fast),
+        ];
+        for (name, fast) in halves {
+            if let Some(Object::Builtin(b)) = dict.get(&DictKey(Object::from_static(name))) {
+                crate::leaf_builtins::register_fast(b, fast);
+            }
+        }
         // Built-in (immutable) like CPython's HASH types: setting a class
         // attribute raises "cannot set … attribute of immutable type"
         // (test_hashlib.test_readonly_types).
@@ -336,6 +360,7 @@ fn hasher_class() -> Rc<TypeObject> {
                 is_builtin: true,
             },
         )
+        .inspect(|cls| super::handle_table::watch_owner_class(cls, hasher_died))
         .expect("hasher class must linearise");
         *slot = Some(cls.clone());
         cls
@@ -359,8 +384,20 @@ fn hasher_update(args: &[Object]) -> Result<Object, RuntimeError> {
     let data = args
         .get(1)
         .ok_or_else(|| type_error("update: missing data"))?;
-    let bytes = bytes_of(data)?;
     let state = lookup_hasher(id)?;
+    data.check_simple_buffer()?;
+    // (A `bytearray`'s or a live `memoryview`'s bytes hashed where they
+    // are: hashing runs no code while it reads.)
+    if matches!(
+        data,
+        Object::Bytes(_) | Object::ByteArray(_) | Object::MemoryView(_)
+    ) {
+        let mut hasher = state.borrow_mut();
+        if data.with_bytes_view(|d| hasher.update(d)).is_some() {
+            return Ok(Object::None);
+        }
+    }
+    let bytes = bytes_of(data)?;
     state.borrow_mut().update(&bytes);
     Ok(Object::None)
 }
@@ -401,12 +438,59 @@ fn hasher_hexdigest(args: &[Object]) -> Result<Object, RuntimeError> {
     let st = state.borrow();
     let length = digest_length(&st, args)?;
     let bytes = st.digest(length);
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        use std::fmt::Write;
-        write!(out, "{b:02x}").unwrap();
-    }
-    Ok(Object::from_str(out))
+    Ok(Object::from_str(crate::object::hex_lower(&bytes)))
+}
+
+/// The state of a hasher instance, for a leaf half: `None` for anything
+/// the full method must see (another object, a missing or stale handle).
+fn hasher_state_fast(recv: &Object) -> Option<Rc<RefCell<AnyHasher>>> {
+    let Object::Instance(inst) = recv else {
+        return None;
+    };
+    let id = match inst
+        .dict_cell()
+        .try_borrow()
+        .ok()?
+        .get(&DictKey(Object::from_static("_handle")))?
+    {
+        Object::Int(v) => *v,
+        _ => return None,
+    };
+    lookup_hasher(id).ok()
+}
+
+/// `h.update(data)` of a `bytes`, `bytearray` or simple `memoryview`, hashed
+/// where the bytes are. A leaf half: hashing runs no code.
+fn hasher_update_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [recv, data @ (Object::Bytes(_) | Object::ByteArray(_) | Object::MemoryView(_))] = args
+    else {
+        return None;
+    };
+    data.check_simple_buffer().ok()?;
+    let state = hasher_state_fast(recv)?;
+    let mut hasher = state.try_borrow_mut().ok()?;
+    data.with_bytes_view(|d| hasher.update(d))?;
+    Some(Ok(Object::None))
+}
+
+/// `h.digest()` of a fixed-size digest. A leaf half.
+fn hasher_digest_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [recv] = args else {
+        return None;
+    };
+    let state = hasher_state_fast(recv)?;
+    let st = state.try_borrow().ok()?;
+    (!st.is_xof()).then(|| Ok(Object::new_bytes(st.digest(None))))
+}
+
+/// `h.hexdigest()` of a fixed-size digest. A leaf half.
+fn hasher_hexdigest_fast(args: &[Object]) -> Option<Result<Object, RuntimeError>> {
+    let [recv] = args else {
+        return None;
+    };
+    let state = hasher_state_fast(recv)?;
+    let st = state.try_borrow().ok()?;
+    (!st.is_xof()).then(|| Ok(Object::from_str(crate::object::hex_lower(&st.digest(None)))))
 }
 
 fn hasher_copy(args: &[Object]) -> Result<Object, RuntimeError> {
@@ -670,21 +754,6 @@ fn seed_arg_checked(
         .cloned())
 }
 
-/// The digest seed passed to a constructor: positional index 0, or the
-/// `data=`/`string=` keyword, validated with clinic precedence.
-/// `usedforsecurity=` is accepted and ignored (we never link OpenSSL, so
-/// FIPS mode is moot).
-fn seed_arg(
-    fname: &str,
-    args: &[Object],
-    kwargs: &[(String, Object)],
-) -> Result<Option<Vec<u8>>, RuntimeError> {
-    match seed_arg_checked(fname, 0, args, kwargs, &[])? {
-        None => Ok(None),
-        Some(o) => Ok(Some(bytes_of(&o)?)),
-    }
-}
-
 fn algos_set() -> Object {
     Object::new_set_from(
         [
@@ -870,9 +939,9 @@ fn make_by_name(name: &str) -> Result<AnyHasher, RuntimeError> {
         "md5" => AnyHasher::Md5(Md5::new()),
         "sha1" => AnyHasher::Sha1(Sha1::new()),
         "sha224" => AnyHasher::Sha224(Sha224::new()),
-        "sha256" => AnyHasher::Sha256(Sha256::new()),
-        "sha384" => AnyHasher::Sha384(Sha384::new()),
-        "sha512" => AnyHasher::Sha512(Sha512::new()),
+        "sha256" => AnyHasher::Sha256(ring_hash(&ring::digest::SHA256)),
+        "sha384" => AnyHasher::Sha384(ring_hash(&ring::digest::SHA384)),
+        "sha512" => AnyHasher::Sha512(ring_hash(&ring::digest::SHA512)),
         "sha3_224" => AnyHasher::Sha3_224(Sha3_224::default()),
         "sha3_256" => AnyHasher::Sha3_256(Sha3_256::default()),
         "sha3_384" => AnyHasher::Sha3_384(Sha3_384::default()),
@@ -939,7 +1008,7 @@ fn parse_blake2_params(
             "last_node",
         ],
     )?
-    .map(|o| bytes_of(&o))
+    .map(|o| bytes_of(&o).map(std::borrow::Cow::into_owned))
     .transpose()?;
     // Integer parameter with clinic-style range enforcement. `hard_max`
     // distinguishes a *representation* overflow (leaf_size ≥ 2**32,
@@ -971,7 +1040,7 @@ fn parse_blake2_params(
     let bytes_kw = |name: &str| -> Result<Vec<u8>, RuntimeError> {
         match kw(kwargs, name) {
             None => Ok(Vec::new()),
-            Some(o) => bytes_of(o),
+            Some(o) => bytes_of(o).map(std::borrow::Cow::into_owned),
         }
     };
 
@@ -1151,6 +1220,7 @@ fn blake2_class(
             is_builtin: true,
         },
     )
+    .inspect(|cls| super::handle_table::watch_owner_class(cls, hasher_died))
     .expect("blake2 class must linearise")
 }
 
@@ -1232,37 +1302,70 @@ fn make_sha224(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, R
 }
 
 fn make_sha256(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
-    seeded(AnyHasher::Sha256(Sha256::new()), args, kwargs)
+    seeded(
+        AnyHasher::Sha256(ring_hash(&ring::digest::SHA256)),
+        args,
+        kwargs,
+    )
 }
 
 fn make_sha384(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
-    seeded(AnyHasher::Sha384(Sha384::new()), args, kwargs)
+    seeded(
+        AnyHasher::Sha384(ring_hash(&ring::digest::SHA384)),
+        args,
+        kwargs,
+    )
 }
 
 fn make_sha512(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, RuntimeError> {
-    seeded(AnyHasher::Sha512(Sha512::new()), args, kwargs)
+    seeded(
+        AnyHasher::Sha512(ring_hash(&ring::digest::SHA512)),
+        args,
+        kwargs,
+    )
 }
 
+/// A constructor's hasher, fed its seed: positional index 0, or the
+/// `data=`/`string=` keyword, validated with clinic precedence.
+/// `usedforsecurity=` is accepted and ignored (we never link OpenSSL, so
+/// FIPS mode is moot).
 fn seeded(
     mut hasher: AnyHasher,
     args: &[Object],
     kwargs: &[(String, Object)],
 ) -> Result<Object, RuntimeError> {
-    if let Some(bytes) = seed_arg(hasher.name(), args, kwargs)? {
-        hasher.update(&bytes);
+    match seed_arg_checked(hasher.name(), 0, args, kwargs, &[])? {
+        None => {}
+        // (A `bytes`, `bytearray` or contiguous `memoryview` hashed where
+        // it is.)
+        Some(o)
+            if matches!(
+                o,
+                Object::Bytes(_) | Object::ByteArray(_) | Object::MemoryView(_)
+            ) =>
+        {
+            o.check_simple_buffer()?;
+            if o.with_bytes_view(|d| hasher.update(d)).is_none() {
+                hasher.update(&bytes_of(&o)?);
+            }
+        }
+        Some(o) => hasher.update(&bytes_of(&o)?),
     }
     Ok(make_hasher_instance(hasher))
 }
 
-fn bytes_of(obj: &Object) -> Result<Vec<u8>, RuntimeError> {
+fn bytes_of(obj: &Object) -> Result<std::borrow::Cow<'_, [u8]>, RuntimeError> {
+    use std::borrow::Cow;
+    obj.check_simple_buffer()?;
     // Hashers consume the buffer protocol only: `bytes`, `bytearray`,
     // `memoryview` (and their subclasses). A `str` is rejected with
     // CPython's exact message — `test_hmac` asserts `update("…")` raises.
-    if let Some(v) = obj.as_bytes_view() {
+    // (A `bytes` object's bytes are hashed where they are.)
+    if let Some(v) = obj.bytes_cow() {
         return Ok(v);
     }
     if let Some(v) = obj.native_value().as_ref().and_then(Object::as_bytes_view) {
-        return Ok(v);
+        return Ok(Cow::Owned(v));
     }
     // Buffer-protocol fallback for objects that expose memory but aren't
     // bytes/bytearray/memoryview themselves (`array.array`, `mmap`, …):
@@ -1283,7 +1386,7 @@ fn bytes_of(obj: &Object) -> Result<Vec<u8>, RuntimeError> {
             if let Some(mv_ctor) = mv_ctor {
                 if let Ok(mv) = interp.call_object(mv_ctor, &[obj.clone()], &[]) {
                     if let Some(v) = mv.as_bytes_view() {
-                        return Ok(v);
+                        return Ok(Cow::Owned(v));
                     }
                 }
             }
@@ -1362,7 +1465,7 @@ fn file_digest(args: &[Object], kwargs: &[(String, Object)]) -> Result<Object, R
         };
         let chunk = {
             let all = buf.as_bytes_view().unwrap_or_default();
-            Object::new_bytes(all[..n.min(all.len())].to_vec())
+            Object::new_bytes(&all[..n.min(all.len())])
         };
         interp.call_object(update.clone(), &[chunk], &[])?;
     }

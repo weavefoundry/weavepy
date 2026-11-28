@@ -41,6 +41,9 @@ from _collections_abc import (
     ValuesView as _ValuesView,
 )
 from _weave_collections import iterator_index as _deque_iterator_index
+from _weave_collections import _extend_method as _deque_extend_method
+from _weave_collections import _plain_find as _deque_plain_find
+from _weave_collections import _plain_count as _deque_plain_count
 from _weave_collections import (
     install_tuplegetter as _install_tuplegetter,
     tuplegetter_get as _tuplegetter_get,
@@ -66,6 +69,7 @@ from _weave_collections import (
     dd_init as _dd_init,
     dd_missing as _dd_missing,
     install_defaultdict as _install_defaultdict,
+    install_deque as _install_deque,
 )
 # The native `OrderedDict` operations (`stdlib/collections_odict.rs`).
 from _weave_collections import (
@@ -301,6 +305,11 @@ class deque:
         for item in iterable:
             self.appendleft(item)
 
+    # (Native for a list or tuple, which goes in at once; the methods
+    # above for anything else.)
+    extend = _deque_extend_method(extend, False)
+    extendleft = _deque_extend_method(extendleft, True)
+
     def clear(self):
         self._state += 1
         del self._data[:]
@@ -315,6 +324,10 @@ class deque:
         # CPython `deque_count`: per-comparison mutation trip-wire — an
         # `__eq__` that mutates the deque raises RuntimeError.
         data = self._flat()
+        # (Plain items and value: counted natively.)
+        result = _deque_plain_count(data, value)
+        if result is not None:
+            return result
         state = self._state
         n = len(data)
         result = 0
@@ -338,6 +351,13 @@ class deque:
             start = max(0, start + n)
         if stop < 0:
             stop += n
+        # (Plain items and value: found natively.)
+        if type(start) is int and type(stop) is int:
+            found = _deque_plain_find(data, value, start, stop)
+            if found is not None:
+                if found >= 0:
+                    return found
+                raise ValueError("deque.index(x): x not in deque")
         for i in range(start, min(stop, n)):
             item = data[i]
             hit = item is value or item == value
@@ -345,7 +365,7 @@ class deque:
                 raise RuntimeError("deque mutated during iteration")
             if hit:
                 return i
-        raise ValueError(f"{value!r} is not in deque")
+        raise ValueError("deque.index(x): x not in deque")
 
     def insert(self, i, x):
         if self._maxlen is not None and len(self) >= self._maxlen:
@@ -378,6 +398,10 @@ class deque:
     def __contains__(self, x):
         # CPython `deque_contains`: mutation during a comparison raises.
         data = self._flat()
+        # (Plain items and value: searched natively.)
+        found = _deque_plain_find(data, x, 0, len(data))
+        if found is not None:
+            return found >= 0
         state = self._state
         i = 0
         while i < len(data):
@@ -535,6 +559,10 @@ class deque:
             _repr_running.discard(k)
 
 
+# (`deque()` and `deque(list_or_tuple)` build natively while its
+# `__init__` is this one.)
+_install_deque(deque)
+
 _repr_running = set()
 
 
@@ -637,7 +665,10 @@ class OrderedDict(dict):
     pop = _od_pop
     clear = _od_clear
 
-    def __init__(self, other=(), /, **kwds):
+    def __init__(self, other=_NO_ITEMS, /, **kwds):
+        # (Nothing to add: the order dict starts on first use.)
+        if other is _NO_ITEMS and not kwds:
+            return
         self.__update(other, kwds)
 
     def __update(self, other, kwds):
@@ -669,6 +700,12 @@ class OrderedDict(dict):
         if items is not None:
             other = items()
         for pair in other:
+            # (A 2-tuple, the common pair, unpacks as the steps below
+            # would; anything else goes through them for their errors.)
+            if type(pair) is tuple and len(pair) == 2:
+                key, value = pair
+                self[key] = value
+                continue
             it = iter(pair)
             try:
                 key = next(it)
@@ -756,6 +793,17 @@ class OrderedDict(dict):
         '''Create a new ordered dictionary with keys from iterable and values set to value.
         '''
         self = cls()
+        # WeavePy: an exact OrderedDict takes the keys of a list, tuple or
+        # str in one native pass (`dict.fromkeys` keeps the first
+        # occurrence's order, as the loop below does); a subclass may
+        # override `__setitem__`, and an unhashable key raises from the
+        # loop, which words the error as CPython's OrderedDict does.
+        if type(self) is OrderedDict and type(iterable) in (list, tuple, str):
+            try:
+                self.update(dict.fromkeys(iterable, value))
+                return self
+            except TypeError:
+                self.clear()
         for key in iterable:
             self[key] = value
         return self

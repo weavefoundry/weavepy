@@ -93,10 +93,46 @@ pub(crate) fn compare(a: V, b: V, kind: CompareKind) -> Option<bool> {
         // the evaluator's scratch; no Python runs.
         (V::R(p), V::R(q)) => match (unsafe { &*p }, unsafe { &*q }) {
             (Object::Str(s), Object::Str(t)) => (**s).cmp(&**t),
+            (Object::Tuple(s), Object::Tuple(t)) => return tuple_compare(s, t, kind),
             _ => return None,
         },
         _ => return None,
     };
+    Some(match kind {
+        CompareKind::Lt => ord.is_lt(),
+        CompareKind::LtE => ord.is_le(),
+        CompareKind::Eq => ord.is_eq(),
+        CompareKind::NotEq => ord.is_ne(),
+        CompareKind::Gt => ord.is_gt(),
+        CompareKind::GtE => ord.is_ge(),
+    })
+}
+
+/// `s <op> t` for two tuples, as CPython's tuple comparison takes it: the
+/// first pair of items that differ (identity first, then `==`) decides,
+/// else the lengths do. Only items [`compare`] settles take part (scalars
+/// and strings, a nested tuple declining), so nothing runs.
+fn tuple_compare(s: &[Object], t: &[Object], kind: CompareKind) -> Option<bool> {
+    for (x, y) in s.iter().zip(t) {
+        if std::ptr::eq(x, y) {
+            continue;
+        }
+        let (vx, vy) = (norm(x), norm(y));
+        if let (V::R(px), V::R(py)) = (vx, vy) {
+            // SAFETY: items of live tuples, with nothing running.
+            if !matches!(unsafe { (&*px, &*py) }, (Object::Str(_), Object::Str(_))) {
+                return None;
+            }
+        }
+        if !compare(vx, vy, CompareKind::Eq)? {
+            return match kind {
+                CompareKind::Eq => Some(false),
+                CompareKind::NotEq => Some(true),
+                _ => compare(vx, vy, kind),
+            };
+        }
+    }
+    let ord = s.len().cmp(&t.len());
     Some(match kind {
         CompareKind::Lt => ord.is_lt(),
         CompareKind::LtE => ord.is_le(),
@@ -179,6 +215,14 @@ enum Op {
         b: u8,
         kind: u8,
     },
+    /// `regs[dst] = (regs[item] in regs[cont]) != invert` (see
+    /// [`contains`]).
+    Contains {
+        dst: u8,
+        item: u8,
+        cont: u8,
+        invert: bool,
+    },
     /// `regs[dst] = regs[a][regs[b]]` (see [`subscr`]).
     Subscr {
         dst: u8,
@@ -189,6 +233,15 @@ enum Op {
     /// `regs[a]`, `regs[b]`, `regs[c]`, held by the owned scratch (see
     /// [`new_tuple`]).
     Tuple {
+        dst: u8,
+        a: u8,
+        b: u8,
+        c: u8,
+        n: u8,
+    },
+    /// `slice(regs[a], regs[b][, regs[c]])` (`n` bounds), its bounds
+    /// plain ints or `None`, held by the owned scratch.
+    Slice {
         dst: u8,
         a: u8,
         b: u8,
@@ -234,6 +287,12 @@ enum Op {
     /// Abandon the evaluation: the path reached an instruction the plan
     /// can't run.
     Decline,
+    /// `raise X` (`RAISE_VARARGS 1`): declines, unless this is the step
+    /// `Interpreter::leaf_python_step` asked for (see [`stop_ends_step`]),
+    /// where a bare `raise StopIteration` ends it as exhausted.
+    StopIter {
+        src: u8,
+    },
     /// An effect leaf's buffered `recv.name = val`.
     StoreAttr {
         recv: u8,
@@ -241,6 +300,112 @@ enum Op {
         pc: u16,
         name: u16,
     },
+    /// `regs[a].__class__ is regs[b].__class__` (`is not` with `invert`),
+    /// the two reads (at `pa` and `pb`, of name `name`) fused with the
+    /// test: two instances whose classes keep `object`'s `__class__`
+    /// compare their classes, building no class objects (a dataclass's
+    /// `__eq__`); anything else reads both and tests them as the three ops
+    /// would.
+    SameClass {
+        dst: u8,
+        a: u8,
+        b: u8,
+        invert: bool,
+        pa: u16,
+        pb: u16,
+        name: u16,
+    },
+    /// `hash((regs[a], regs[b], regs[c]))` of the first `n` (see
+    /// [`hash_items`]) with `regs[at]` the builtin `hash`, its result in
+    /// `regs[at]`, building no tuple: a `Call` of a global named `hash` on
+    /// the tuple the op before built. Any other callee declines.
+    HashItems {
+        at: u8,
+        a: u8,
+        b: u8,
+        c: u8,
+        n: u8,
+    },
+}
+
+impl Op {
+    /// The registers this op writes (at most two).
+    fn writes(self) -> [Option<u8>; 2] {
+        match self {
+            Op::Move { dst, .. }
+            | Op::Const { dst, .. }
+            | Op::Global { dst, .. }
+            | Op::Deref { dst, .. }
+            | Op::Attr { dst, .. }
+            | Op::Compare { dst, .. }
+            | Op::Is { dst, .. }
+            | Op::Truth { dst, .. }
+            | Op::Unary { dst, .. }
+            | Op::Binary { dst, .. }
+            | Op::Contains { dst, .. }
+            | Op::Subscr { dst, .. }
+            | Op::Tuple { dst, .. }
+            | Op::Slice { dst, .. }
+            | Op::New { dst, .. }
+            | Op::SameClass { dst, .. } => [Some(dst), None],
+            Op::Method { dst, .. } => [Some(dst), dst.checked_add(1)],
+            Op::Swap { a, b } => [Some(a), Some(b)],
+            Op::Call { at, .. } | Op::HashItems { at, .. } => [Some(at), None],
+            Op::BranchIf { .. }
+            | Op::BranchNone { .. }
+            | Op::Jump { .. }
+            | Op::Return { .. }
+            | Op::Decline
+            | Op::StopIter { .. }
+            | Op::StoreAttr { .. } => [None, None],
+        }
+    }
+}
+
+impl Interpreter {
+    /// Whether plan value `v` is the builtin `hash`.
+    #[inline]
+    pub(super) fn is_builtin_hash(&self, v: V) -> bool {
+        // SAFETY: as `norm`.
+        matches!(v, V::R(p) if self.is_builtin_hash_obj(unsafe { &*p }))
+    }
+}
+
+/// The Python hash of a tuple of the first `n` of `items` when each item
+/// hashes natively, running no code (see [`hash_item`]); `None` otherwise.
+#[inline]
+pub(super) fn hash_items(items: [V; 3], n: u8) -> Option<i64> {
+    let mut h = crate::object::TupleHasher::new();
+    for v in &items[..usize::from(n)] {
+        h.push(hash_item(*v)?);
+    }
+    Some(h.finish(usize::from(n)))
+}
+
+/// One tuple item's hash, when it runs no code and can't fail: a native
+/// scalar (not a NaN, which hashes by identity), a `str` or `bytes`, a
+/// tuple of such ([`crate::seqiter::plain_hashable`]), or an instance
+/// hashed by identity.
+#[inline]
+pub(super) fn hash_item(v: V) -> Option<i64> {
+    match v {
+        V::I(i) => Some(crate::object::py_hash_long_i64(i)),
+        V::B(b) => Some(i64::from(b)),
+        V::N => crate::object::py_hash_value(&Object::None),
+        V::F(x) if !x.is_nan() => Some(crate::object::py_hash_double(x)),
+        // SAFETY: as `norm` (a register's borrowed object outlives the
+        // evaluation).
+        V::R(p) => match unsafe { &*p } {
+            Object::Int(i) => Some(crate::object::py_hash_long_i64(*i)),
+            Object::Str(s) => Some(crate::shared_value::SharedStr::hash_cached(s)),
+            o @ Object::Instance(i) => (i.native.get().is_none()
+                && i.class_dunder(crate::types::Dunder::Hash).object_owner())
+            .then(|| crate::object::identity_hash(o)),
+            o if crate::seqiter::plain_hashable(o, 1) => crate::object::py_hash_value(o),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// A leaf body, translated (see the module docs).
@@ -407,6 +572,94 @@ impl Builder<'_> {
         Some(())
     }
 
+    /// At an `IS_OP`: the two ops just emitted, when they read `__class__`
+    /// of two locals into the two operands (`other.__class__ is
+    /// self.__class__`), as `(a, b, pa, pb, name)` for a `SameClass`.
+    fn class_reads(&self) -> Option<(u8, u8, u16, u16, u16)> {
+        let n = self.ops.len();
+        let depth = self.stack.len();
+        if n < 2 || depth < 2 {
+            return None;
+        }
+        let (
+            Op::Attr {
+                dst: d1,
+                src: s1,
+                pc: p1,
+                name: n1,
+            },
+            Op::Attr {
+                dst: d2,
+                src: s2,
+                pc: p2,
+                name: n2,
+            },
+        ) = (self.ops[n - 2], self.ops[n - 1])
+        else {
+            return None;
+        };
+        let locals = usize::from(s1) < self.nl && usize::from(s2) < self.nl;
+        let operands = self.stack[depth - 2] == d1 && self.stack[depth - 1] == d2;
+        let class = n1 == n2
+            && self
+                .code
+                .names
+                .get(usize::from(n1))
+                .is_some_and(|n| n.as_str() == "__class__");
+        (locals && operands && class).then_some((s1, s2, p1, p2, n1))
+    }
+
+    /// At a one-argument `CALL` (bytecode `pc`): the `Tuple` op just
+    /// emitted, when it built the argument and the callee is the global
+    /// `hash` loaded (with its empty self slot) in straight-line code since
+    /// (no jump, branch or jump target between), so the two fuse into a
+    /// `HashItems`.
+    fn hash_of_tuple(&self, pc: usize) -> Option<Op> {
+        let depth = self.stack.len();
+        let tuple = *self.ops.last()?;
+        let Op::Tuple { dst, .. } = tuple else {
+            return None;
+        };
+        if self.stack.last() != Some(&dst) || depth < 3 {
+            return None;
+        }
+        let callee = self.stack[depth - 3];
+        let body = &self.ops[..self.ops.len() - 1];
+        let gi = body
+            .iter()
+            .rposition(|op| op.writes().contains(&Some(callee)))?;
+        let Op::Global { pc: gpc, .. } = body[gi] else {
+            return None;
+        };
+        let gpc = usize::from(gpc);
+        let ins = self.code.instructions.get(gpc)?;
+        let straight = body[gi..].iter().all(|op| {
+            !matches!(
+                op,
+                Op::Jump { .. } | Op::BranchIf { .. } | Op::BranchNone { .. }
+            )
+        }) && !self.targets.keys().any(|&t| gpc < t && t <= pc);
+        // (The self slot the empty one: `PUSH_NULL`'s constant, or the one
+        // a `LOAD_GLOBAL` pushed with its null.)
+        let null_slot = self.stack[depth - 2];
+        let null = body
+            .iter()
+            .rposition(|op| op.writes().contains(&Some(null_slot)))
+            .is_some_and(|i| {
+                matches!(body[i], Op::Const { k, .. }
+                    if matches!(self.consts.get(usize::from(k)), Some(V::Null)))
+            });
+        (matches!(ins.op, OpCode::LoadGlobal | OpCode::LoadGlobalPushNull)
+            && self
+                .code
+                .names
+                .get(ins.arg as usize)
+                .is_some_and(|n| n.as_str() == "hash")
+            && straight
+            && null)
+            .then_some(tuple)
+    }
+
     /// Translate the instruction at `pc`: whether control falls through
     /// to the next one. `None` for one the plan can't express (the
     /// caller rolls back what it emitted and declines on that path).
@@ -496,7 +749,35 @@ impl Builder<'_> {
                 }
                 self.ops.push(Op::Compare { dst, a, b, kind });
             }
+            // (`x in self.items`, a `__contains__`'s body.)
+            OpCode::ContainsOp => {
+                let cont = self.pop()?;
+                let item = self.pop()?;
+                let dst = self.push_new()?;
+                self.ops.push(Op::Contains {
+                    dst,
+                    item,
+                    cont,
+                    invert: arg == 1,
+                });
+            }
             OpCode::IsOp => {
+                if let Some((a, b, pa, pb, name)) = self.class_reads() {
+                    self.ops.truncate(self.ops.len() - 2);
+                    self.pop()?;
+                    self.pop()?;
+                    let dst = self.push_new()?;
+                    self.ops.push(Op::SameClass {
+                        dst,
+                        a,
+                        b,
+                        invert: arg == 1,
+                        pa,
+                        pb,
+                        name,
+                    });
+                    return Some(true);
+                }
                 let b = self.pop()?;
                 let a = self.pop()?;
                 let dst = self.push_new()?;
@@ -550,6 +831,22 @@ impl Builder<'_> {
                 let dst = self.push_new()?;
                 let item = |k: usize| items.get(k).copied().unwrap_or(items[0]);
                 self.ops.push(Op::Tuple {
+                    dst,
+                    a: item(0),
+                    b: item(1),
+                    c: item(2),
+                    n: n as u8,
+                });
+            }
+            // (`w[::-1]`, a key function's reversal.)
+            OpCode::BuildSlice if matches!(arg, 2 | 3) => {
+                let n = arg as usize;
+                let at = self.stack.len().checked_sub(n)?;
+                let items: Vec<Opnd> = self.stack[at..].to_vec();
+                self.stack.truncate(at);
+                let dst = self.push_new()?;
+                let item = |k: usize| items.get(k).copied().unwrap_or(items[0]);
+                self.ops.push(Op::Slice {
                     dst,
                     a: item(0),
                     b: item(1),
@@ -640,6 +937,16 @@ impl Builder<'_> {
                 if depth < argc + 2 {
                     return None;
                 }
+                if argc == 1 {
+                    if let Some(Op::Tuple { a, b, c, n, .. }) = self.hash_of_tuple(pc) {
+                        self.ops.pop();
+                        self.canonicalize()?;
+                        self.stack.truncate(depth - 3);
+                        let at = self.push_new()?;
+                        self.ops.push(Op::HashItems { at, a, b, c, n });
+                        return Some(true);
+                    }
+                }
                 self.canonicalize()?;
                 let at = depth - argc - 2;
                 self.stack.truncate(at);
@@ -653,6 +960,11 @@ impl Builder<'_> {
             OpCode::ReturnValue => {
                 let src = self.pop()?;
                 self.ops.push(Op::Return { src });
+                return Some(false);
+            }
+            OpCode::RaiseVarargs if arg == 1 => {
+                let src = self.pop()?;
+                self.ops.push(Op::StopIter { src });
                 return Some(false);
             }
             OpCode::StoreAttr => {
@@ -954,6 +1266,37 @@ pub(crate) enum LeafRet {
     Owned(Object),
 }
 
+/// Whether a `raise` of `v` at the top of an evaluation of `code` (at
+/// call nesting `nest`, on `args`) ends the frameless iterator step
+/// [`Interpreter::leaf_python_step`] is running as exhausted: `v` is the
+/// builtin `StopIteration` class, and the evaluation is that step's own.
+/// Its caller then answers as the exception's catcher would, the
+/// exception never built (nothing could observe it: the step is
+/// frameless), once the stores buffered ahead of the raise have landed.
+pub(super) fn stop_ends_step(
+    interp: &Interpreter,
+    code: &CodeObject,
+    nest: u8,
+    args: &[*const Object],
+    v: V,
+) -> bool {
+    let (want_code, want_it, _) = interp.leaf_stop.get();
+    if nest != 0
+        || want_code != std::ptr::from_ref(code) as usize
+        || args.first().map(|&a| a as usize) != Some(want_it)
+    {
+        return false;
+    }
+    let V::R(p) = v else {
+        return false;
+    };
+    // SAFETY: as `norm`.
+    // (A legacy sequence's `__getitem__` ends at `IndexError` too.)
+    matches!(unsafe { &*p }, Object::Type(t)
+        if t.flags.is_builtin && (t.name.as_str() == "StopIteration"
+            || (interp.leaf_stop_index.get() && t.name.as_str() == "IndexError")))
+}
+
 /// The value of `f`'s closure cell `idx`, borrowed: nothing an evaluation
 /// runs can rebind a cell (a leaf has no `STORE_DEREF`), and the function
 /// holds its closure. `None` for an empty cell (the read raises).
@@ -1169,12 +1512,63 @@ impl Interpreter {
                 Op::Is { dst, a, b, invert } => {
                     set!(dst, V::B(is_same(get!(a), get!(b)) != invert))
                 }
+                Op::SameClass {
+                    dst,
+                    a,
+                    b,
+                    invert,
+                    pa,
+                    pb,
+                    name,
+                } => {
+                    let (x, y) = (get!(a), get!(b));
+                    let fast = if EFFECT && pend.n > 0 {
+                        None
+                    } else {
+                        same_plain_class(x, y)
+                    };
+                    let same = match fast {
+                        Some(same) => same,
+                        None => {
+                            let nest = nest + depth as u8;
+                            let cx = self.plan_attr::<GETTER, EFFECT>(
+                                code, ext, stamps, &mut owned, &pend, x, pa, name, nest,
+                            )?;
+                            let cy = self.plan_attr::<GETTER, EFFECT>(
+                                code, ext, stamps, &mut owned, &pend, y, pb, name, nest,
+                            )?;
+                            is_same(cx, cy)
+                        }
+                    };
+                    set!(dst, V::B(same != invert));
+                }
                 Op::Truth { dst, src } => set!(dst, V::B(truth(get!(src))?)),
                 Op::Unary { dst, src, kind } => set!(dst, unary(get!(src), kind)?),
-                Op::Binary { dst, a, b, kind } => set!(dst, binary(get!(a), get!(b), kind)?),
+                Op::Binary { dst, a, b, kind } => {
+                    let (x, y) = (get!(a), get!(b));
+                    match binary(x, y, kind) {
+                        Some(v) => set!(dst, v),
+                        None => set!(dst, str_add(&mut owned, x, y, kind)?),
+                    }
+                }
+                Op::Contains {
+                    dst,
+                    item,
+                    cont,
+                    invert,
+                } => set!(dst, V::B(contains(get!(item), get!(cont))? != invert)),
                 Op::Subscr { dst, a, b } => set!(dst, subscr(&mut owned, get!(a), get!(b))?),
                 Op::Tuple { dst, a, b, c, n } => {
                     set!(dst, new_tuple(&mut owned, [get!(a), get!(b), get!(c)], n)?)
+                }
+                Op::HashItems { at, a, b, c, n } => {
+                    if !self.is_builtin_hash(get!(at)) {
+                        return None;
+                    }
+                    set!(at, V::I(hash_items([get!(a), get!(b), get!(c)], n)?))
+                }
+                Op::Slice { dst, a, b, c, n } => {
+                    set!(dst, new_slice(&mut owned, [get!(a), get!(b), get!(c)], n)?)
                 }
                 Op::Swap { a, b } => {
                     let (x, y) = (get!(a), get!(b));
@@ -1194,6 +1588,22 @@ impl Interpreter {
                 Op::Jump { target } => ip = usize::from(target),
                 Op::New { dst, dict } => set!(dst, new_container(&mut owned, dict)?),
                 Op::Decline => return None,
+                Op::StopIter { src } => {
+                    if depth == 0 && !FRESH && stop_ends_step(self, code, nest, args, get!(src)) {
+                        // The stores made before the raise land first, as
+                        // a return lands them (`self.i += 1` ahead of the
+                        // exhaustion test); one that can't declines with
+                        // nothing done.
+                        if pend.n > 0 {
+                            if !self.leaf_stop.get().2 {
+                                return None;
+                            }
+                            self.plan_finish::<EFFECT>(code, ext, plan, &owned, &mut pend, V::N)?;
+                        }
+                        return Some(LeafRet::Owned(Object::Unbound));
+                    }
+                    return None;
+                }
                 Op::Call { at, argc, pc } => {
                     // A pure-leaf callee, evaluated in place: only while
                     // no store is buffered (it would not see one).
@@ -1220,6 +1630,17 @@ impl Interpreter {
                     let n = usize::from(at + 2 + argc - first);
                     if n > 8 {
                         return None;
+                    }
+                    // `hash(x)` of a value that hashes natively (a
+                    // `__hash__`'s `return hash(self.a)`): its hash, with no
+                    // call.
+                    if let Callee::Native(b, _) = callee {
+                        if n == 1 && self.is_builtin_hash_fn(b) {
+                            if let Some(h) = hash_item(get!(first)) {
+                                set!(at, V::I(h));
+                                continue;
+                            }
+                        }
                     }
                     let fp = match callee {
                         Callee::Py(fp) => fp,
@@ -1416,6 +1837,28 @@ impl Interpreter {
     }
 }
 
+/// `a.__class__ is b.__class__` for two instances whose classes keep
+/// `object`'s `__class__` and `__getattribute__` (so each read is just the
+/// class): whether the classes are one. `None` for anything else.
+#[inline]
+pub(super) fn same_plain_class(a: V, b: V) -> Option<bool> {
+    let (V::R(p), V::R(q)) = (a, b) else {
+        return None;
+    };
+    if crate::gil::free_threading_enabled() {
+        return None;
+    }
+    // SAFETY: as `norm`.
+    let (Object::Instance(x), Object::Instance(y)) = (unsafe { &*p }, unsafe { &*q }) else {
+        return None;
+    };
+    let (cx, cy) = (x.cls_raw(), y.cls_raw());
+    if std::ptr::eq(cx, cy) {
+        return cx.class_attr_is_plain().then_some(true);
+    }
+    (cx.class_attr_is_plain() && cy.class_attr_is_plain()).then_some(false)
+}
+
 /// `a is b` on two leaf values.
 #[inline(always)]
 pub(crate) fn is_same(a: V, b: V) -> bool {
@@ -1456,8 +1899,34 @@ pub(crate) fn unary(v: V, kind: u8) -> Option<V> {
 /// result the interpreter must produce (an overflow, a negative operand
 /// of a floor division).
 #[inline(always)]
+/// `a + b` of two strings (what [`binary`] leaves): a new string, held
+/// by `owned`. `None` for anything else.
+fn str_add(owned: &mut Owned, a: V, b: V, kind: u8) -> Option<V> {
+    if kind != BinOpKind::Add as u8 {
+        return None;
+    }
+    let (V::R(p), V::R(q)) = (a, b) else {
+        return None;
+    };
+    // SAFETY: as `norm`.
+    let (Object::Str(x), Object::Str(y)) = (unsafe { &*p }, unsafe { &*q }) else {
+        return None;
+    };
+    owned.own(Object::Str(crate::shared_value::SharedStr::concat(&[x, y])))
+}
+
 pub(crate) fn binary(a: V, b: V, kind: u8) -> Option<V> {
     Some(match (a, b) {
+        // `int / int` of operands a double holds exactly (at most `2**53`
+        // in magnitude): their quotient is correctly rounded, as CPython's
+        // `long_true_divide` gives it (`Fraction.__float__`).
+        (V::I(a), V::I(b)) if kind == BinOpKind::Div as u8 => {
+            const EXACT: i64 = 1 << 53;
+            if b == 0 || !(-EXACT..=EXACT).contains(&a) || !(-EXACT..=EXACT).contains(&b) {
+                return None;
+            }
+            V::F(a as f64 / b as f64)
+        }
         (V::I(a), V::I(b)) => V::I(match kind {
             k if k == BinOpKind::Add as u8 => a.checked_add(b)?,
             k if k == BinOpKind::Sub as u8 => a.checked_sub(b)?,
@@ -1471,6 +1940,8 @@ pub(crate) fn binary(a: V, b: V, kind: u8) -> Option<V> {
             }
             k if k == BinOpKind::FloorDiv as u8 && b > 0 && a >= 0 => a / b,
             k if k == BinOpKind::Mod as u8 && b > 0 && a >= 0 => a % b,
+            // (A negative exponent gives a float: the full arm's.)
+            k if k == BinOpKind::Pow as u8 && (0..64).contains(&b) => a.checked_pow(b as u32)?,
             _ => return None,
         }),
         (x, y) => {
@@ -1497,9 +1968,53 @@ pub(crate) fn binary(a: V, b: V, kind: u8) -> Option<V> {
 /// key type), or an ASCII string's character (held by `owned`). Anything
 /// else, a miss included, declines.
 #[inline]
+/// `item in cont` when the test runs no code (see
+/// `Interpreter::leaf_contains`): a native container, never an instance,
+/// whose own `__contains__` could reach this evaluation again. `None`
+/// declines.
+pub(super) fn contains(item: V, cont: V) -> Option<bool> {
+    let V::R(c) = cont else {
+        return None;
+    };
+    // SAFETY: as `norm`.
+    let c = unsafe { &*c };
+    if matches!(c, Object::Instance(_)) {
+        return None;
+    }
+    let scalar;
+    let item: &Object = match item {
+        // SAFETY: as above.
+        V::R(p) => unsafe { &*p },
+        V::I(i) => {
+            scalar = Object::Int(i);
+            &scalar
+        }
+        V::B(b) => {
+            scalar = Object::Bool(b);
+            &scalar
+        }
+        V::N => &Object::None,
+        V::F(_) | V::Fn(_) | V::Bi(_) | V::Null => return None,
+    };
+    Interpreter::leaf_contains(c, item)
+}
+
 fn subscr(owned: &mut Owned, a: V, b: V) -> Option<V> {
     let V::R(c) = a else {
         return None;
+    };
+    // An item of a container the evaluation holds itself (the list
+    // `s.split(".")` made): held too, since the container goes with the
+    // scratch and a pointer into it would outlive it (a borrowed result
+    // read after the evaluation, `return s.split(".")[0]`).
+    let held = owned.holds(c);
+    let item = |owned: &mut Owned, p: *const Object| {
+        if held {
+            // SAFETY: an item of a live held container.
+            owned.own(crate::clone_hot(unsafe { &*p }))
+        } else {
+            Some(norm(p))
+        }
     };
     let index = |i: i64, n: usize| {
         let n = n as i64;
@@ -1511,14 +2026,35 @@ fn subscr(owned: &mut Owned, a: V, b: V) -> Option<V> {
     match (unsafe { &*c }, b) {
         (Object::List(l), V::I(i)) => {
             let xs = unsafe { l.peek() }?;
-            Some(norm(&raw const xs[index(i, xs.len())?]))
+            let p = &raw const xs[index(i, xs.len())?];
+            item(owned, p)
         }
-        (Object::Tuple(t), V::I(i)) => Some(norm(&raw const t[index(i, t.len())?])),
+        (Object::Tuple(t), V::I(i)) => {
+            let p = &raw const t[index(i, t.len())?];
+            item(owned, p)
+        }
         (Object::Str(s), V::I(i)) => {
             if crate::object::str_char_len(s) != s.len() {
                 return None;
             }
             owned.own(Object::from_char(s.as_bytes()[index(i, s.len())?] as char))
+        }
+        // A plain sequence sliced by a slice of plain bounds (as the core
+        // loop's container step slices it).
+        (Object::List(_) | Object::Tuple(_) | Object::Str(_) | Object::Bytes(_), V::R(k))
+            if matches!(unsafe { &*k }, Object::Slice(_)) =>
+        {
+            let Object::Slice(sl) = (unsafe { &*k }) else {
+                return None;
+            };
+            if ![&sl.start, &sl.stop, &sl.step]
+                .iter()
+                .all(|v| matches!(v, Object::None | Object::Int(_)))
+                || matches!(sl.step, Object::Int(0))
+            {
+                return None;
+            }
+            owned.own(crate::Interpreter::core_slice(unsafe { &*c }, sl)?)
         }
         (Object::Dict(d), V::I(_) | V::R(_)) => {
             let int;
@@ -1532,8 +2068,8 @@ fn subscr(owned: &mut Owned, a: V, b: V) -> Option<V> {
                 _ => return None,
             };
             let probe = crate::object::LeafProbe::new(key)?;
-            let v = unsafe { d.peek() }?.get(&probe)?;
-            Some(norm(v))
+            let v: *const Object = unsafe { d.peek() }?.get(&probe)?;
+            item(owned, v)
         }
         _ => None,
     }
@@ -1560,6 +2096,21 @@ fn new_tuple(owned: &mut Owned, items: [V; 3], n: u8) -> Option<V> {
         _ => return None,
     };
     owned.own(t)
+}
+
+fn new_slice(owned: &mut Owned, items: [V; 3], n: u8) -> Option<V> {
+    let bound = |v: V| match v {
+        V::I(i) => Some(Object::Int(i)),
+        V::N => Some(Object::None),
+        _ => None,
+    };
+    let [a, b, c] = items;
+    let step = if n == 3 { bound(c)? } else { Object::None };
+    owned.own(Object::Slice(Rc::new(crate::object::PySlice {
+        start: bound(a)?,
+        stop: bound(b)?,
+        step,
+    })))
 }
 
 fn new_container(owned: &mut Owned, dict: bool) -> Option<V> {
@@ -1652,7 +2203,7 @@ impl Interpreter {
                 builtins_id,
                 key_idx,
             } if builtins_id == crate::specialize::rc_id(&f.builtins)
-                && !self.globals_missing_any.get()
+                && !self.globals_missing_gate()
                 && slot.get() == [gid, g_stamp, unsafe { (*bdict).mutation_stamp() }] =>
             unsafe { (*bdict).get_index(key_idx as usize) },
             _ => return None,
@@ -1722,6 +2273,18 @@ impl Interpreter {
                     .and_then(|s| crate::class_attr_hit(s, cls))
                 {
                     Some(v) => owned.own(v),
+                    // An attribute of a class under a Python metaclass the
+                    // site found before (an enum's `_member_map_`): its
+                    // stamp is filled only past the checks below.
+                    None if !Self::plain_metaclass(cls) => {
+                        match crate::meta_entry_hit(code, cls, pc as usize) {
+                            Some(v) => owned.own(v),
+                            None => {
+                                let v = Self::leaf_load_type_attr(code, cls, pc, name)?;
+                                owned.own(v)
+                            }
+                        }
+                    }
                     None => {
                         let v = Self::leaf_load_type_attr(code, cls, pc, name)?;
                         // A scalar is a plain class value (see
