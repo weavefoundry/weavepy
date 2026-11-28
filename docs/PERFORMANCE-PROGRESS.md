@@ -3579,6 +3579,15 @@ branch and pull request.
     of the same hash with the frameless `__eq__` too, as the subscript's
     probe does, and so does compiled `d.get(k)` (`k in d` 2.81 to 1.12
     times CPython, `k in s` 2.99 to 1.14, `d.get(k)` 1.90 to 1.08).
+  - `template % args` whose conversions are all bare `%s`, over plain
+    instances (with `str` and `int` arguments beside them), went through
+    the general `%` engine, which runs each conversion through the full
+    spec formatter, after two fast paths that decline instances. Such a
+    template now renders in one pass, each instance's text as the engine's
+    `%s` takes it (its `__str__` frameless when a pure leaf), and anything
+    else (a count that doesn't match, a tuple subclass, a width) still
+    goes to the engine (`"%s" % k` 2.72 to 1.42 times CPython, with a
+    `__str__` that formats 2.53 to 1.90).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

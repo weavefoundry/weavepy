@@ -58641,6 +58641,10 @@ impl Interpreter {
             if let Some(out) = percent_render_plain_value(t, b) {
                 return Ok(Object::from_str(out));
             }
+            // (Plain instances first: the payloads' path takes none.)
+            if let Some(out) = self.percent_bare_s(t, b, globals) {
+                return out.map(Object::from_str);
+            }
             if let Some(out) = percent_format_payloads_checked(t, b) {
                 return Ok(Object::from_str(out));
             }
@@ -58700,6 +58704,71 @@ impl Interpreter {
             });
         }
         self.bytes_percent_format(a, b, globals)
+    }
+
+    /// `template % args` for a `template` whose conversions are all bare
+    /// `%s` (or a literal `%%`), one for each argument (`args` a tuple of
+    /// them, or one object), each a `str`, an `int`, or a plain instance,
+    /// at least one an instance: the text in one pass, an instance's as the
+    /// general engine renders it ([`Self::stringify`], its `__str__`
+    /// frameless when a pure leaf). `None` for anything else (a count that
+    /// doesn't match, another kind of argument), which the general engine
+    /// formats or raises for.
+    fn percent_bare_s(
+        &mut self,
+        template: &str,
+        args: &Object,
+        globals: &Rc<RefCell<DictData>>,
+    ) -> Option<Result<String, RuntimeError>> {
+        let items: &[Object] = match args {
+            Object::Tuple(t) => &t[..],
+            other => std::slice::from_ref(other),
+        };
+        let plain = |o: &Object| matches!(o, Object::Instance(i) if i.native.get().is_none());
+        if !items.iter().any(plain)
+            || !items
+                .iter()
+                .all(|o| plain(o) || matches!(o, Object::Str(_) | Object::Int(_)))
+        {
+            return None;
+        }
+        let b = template.as_bytes();
+        let (mut n, mut i) = (0, 0);
+        while let Some(at) = memchr::memchr(b'%', &b[i..]) {
+            match b.get(i + at + 1) {
+                Some(b's') => n += 1,
+                Some(b'%') => {}
+                _ => return None,
+            }
+            i += at + 2;
+        }
+        if n != items.len() {
+            return None;
+        }
+        let mut out = String::with_capacity(template.len() + 8 * n);
+        let (mut k, mut i) = (0, 0);
+        while let Some(at) = memchr::memchr(b'%', &b[i..]) {
+            out.push_str(&template[i..i + at]);
+            if b[i + at + 1] == b'%' {
+                out.push('%');
+            } else {
+                match &items[k] {
+                    Object::Str(s) => out.push_str(s),
+                    Object::Int(v) => {
+                        use std::fmt::Write as _;
+                        let _ = write!(out, "{v}");
+                    }
+                    obj => match self.stringify(obj, globals) {
+                        Ok(text) => out.push_str(&text),
+                        Err(e) => return Some(Err(e)),
+                    },
+                }
+                k += 1;
+            }
+            i += at + 2;
+        }
+        out.push_str(&template[i..]);
+        Some(Ok(out))
     }
 
     /// PEP 461 `bytes % args` / `bytearray % args`. The template is decoded
