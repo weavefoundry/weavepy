@@ -16751,7 +16751,8 @@ pub(crate) struct BuiltinSite {
     lane: Option<bool>,
     /// The address of the site's direct-call cache, for `len(obj)` or
     /// `repr(obj)` of an instance whose class's `__len__` or `__repr__` is a
-    /// Python function (see [`len_call`]); `0` none.
+    /// Python function (see [`len_call`]), or `mc(obj)` of a methodcaller
+    /// whose method is (see [`methodcaller_direct`]); `0` none.
     direct: usize,
 }
 
@@ -17009,6 +17010,11 @@ unsafe fn call_leaf_in_place(
                 Some(k) => (*s.interp).leaf_builtin_call(k, b, args),
                 None => None,
             };
+            // `mc(obj)` of an `operator.methodcaller` whose method is a
+            // Python function (see `methodcaller_direct`).
+            if r.is_none() && site.direct != 0 && !hit && b.name == METHODCALLER_CALL {
+                return methodcaller_direct(s, site, pc as usize, start, lenu);
+            }
             if r.is_none() && site.direct != 0 && hit && bound_args.is_none() {
                 let repr = !matches!(site.kind, Some(LeafKind::Len));
                 return len_call(s, site, pc as usize, start, lenu, repr);
@@ -17141,6 +17147,101 @@ unsafe fn len_call(
             }
             Some(r) => {
                 drop(builtin);
+                Some(r)
+            }
+        }
+    }
+}
+
+/// The name of `operator.methodcaller`'s native `__call__` (see
+/// `stdlib::operator_accel`).
+const METHODCALLER_CALL: &str = ".methodcaller.__call__";
+
+/// [`call_leaf_in_place`]'s `mc(obj)` (the `CALL` at `pc`, the
+/// methodcaller at `start` on a `lenu`-deep stack) of an
+/// `operator.methodcaller` whose stored method name names a Python function
+/// of `obj`'s plain class, with at most two stored positional arguments and
+/// no keywords: the function called directly ([`direct_call`]) with `obj`
+/// and those arguments laid over the call's slots, as `obj.name(*args)`
+/// calls it. As [`call_leaf_in_place`]'s, `Some(RELOAD)` too.
+///
+/// # Safety
+///
+/// As [`len_call`]'s (two slots free above the call's).
+#[inline(never)]
+unsafe fn methodcaller_direct(
+    s: &mut State,
+    site: &BuiltinSite,
+    pc: usize,
+    start: usize,
+    lenu: usize,
+) -> Option<u32> {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let at = s.stack.add(start);
+        if lenu != start + 3 || !matches!(&*at.add(1), Object::Unbound) {
+            return None;
+        }
+        let Object::Instance(mc) = &*at else {
+            return None;
+        };
+        if !Interpreter::instance_calls_native(mc, site.f) {
+            return None;
+        }
+        let (f, stored) = crate::stdlib::operator_accel::methodcaller_target(mc, &*at.add(2))?;
+        let Object::Tuple(stored) = &stored else {
+            return None;
+        };
+        let k = stored.len();
+        {
+            // SAFETY: GIL-serialized raw read of the function's code cell.
+            let fc = &*f.code.as_ptr();
+            if k > 2
+                || fc.arg_count as usize != k + 1
+                || fc.kwonly_count != 0
+                || fc.has_varargs
+                || fc.has_varkeywords
+                || fc.is_generator
+                || fc.is_coroutine
+                || fc.is_async_generator
+            {
+                return None;
+            }
+        }
+        // `[mc, NULL, obj]` becomes the method call `[f, obj, *args]`.
+        let mcobj = at.read();
+        at.write(Object::Function(f));
+        at.add(1).write(at.add(2).read());
+        for (j, a) in stored.iter().enumerate() {
+            at.add(2 + j).write(a.clone());
+        }
+        let dsite = &mut *(site.direct as *mut DirectSite);
+        match direct_call_out(s, pc, start, start + 2 + k, dsite, None) {
+            None => {
+                for j in (0..k).rev() {
+                    crate::drop_hot_at(at.add(2 + j));
+                }
+                let f = at.read();
+                at.add(2).write(at.add(1).read());
+                at.add(1).write(Object::Unbound);
+                at.write(mcobj);
+                if let Object::Function(f) = &f {
+                    let fc = f.code();
+                    if let Some(ext) = crate::code_vm_ext(&fc) {
+                        ext.frame_jit
+                            .warm_switched(&fc, ext, fc.varnames.len().max(1));
+                    }
+                }
+                drop(f);
+                None
+            }
+            Some(0) => {
+                drop(mcobj);
+                s.len = start + 1;
+                Some(0)
+            }
+            Some(r) => {
+                drop(mcobj);
                 Some(r)
             }
         }
@@ -17367,6 +17468,13 @@ unsafe extern "C" fn h_call_native(
         let (pcu, lenu) = (pc as usize, len as usize);
         let start = lenu - site.argc - 2;
         let base = s.stack;
+        // `mc(obj)` of an `operator.methodcaller` whose method is a Python
+        // function (see `methodcaller_direct`).
+        if site.direct != 0 && !s.sw.is_null() {
+            if let Some(r) = methodcaller_direct(s, site, pcu, start, lenu) {
+                return r;
+            }
+        }
         // An instance whose class's native `__call__` is the builtin and
         // takes it first (a `methodcaller` whose leaf half declined): the
         // call rewritten as `h_call` rewrites it, the instance in the self
@@ -27239,7 +27347,8 @@ impl<'a> Lower<'a> {
             && (matches!(kind, Some(LeafKind::Len))
                 || (matches!(kind, Some(LeafKind::Fast(_)))
                     && !f.binds_instance
-                    && f.name == "repr"))
+                    && f.name == "repr")
+                || f.name == METHODCALLER_CALL)
         {
             let d: Box<DirectSite> = Box::default();
             let at = std::ptr::from_ref::<DirectSite>(&d) as usize;

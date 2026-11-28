@@ -3606,6 +3606,14 @@ branch and pull request.
     `f"{q}"` 1.96 to 0.74, a frameless `__repr__` 2.35 to 1.49, `"%s" % q`
     1.60 to 1.46). A non-string result's TypeError now says `__str__`, as
     CPython's does.
+  - `mc(obj)` of an `operator.methodcaller` whose method is a Python
+    function of `obj`'s plain class ran the native `__call__`, which made
+    a full call of the method from native code. A compiled call site now
+    lays the call out as `obj.name(*args)` (up to two stored arguments)
+    and calls the method directly, and a native adapter's callback calls
+    it over the item and the stored arguments, frameless when a pure leaf
+    (`mc(q)` 2.21 to 1.65 times CPython, `list(map(mc, qs))` 3.08 to
+    2.60).
   - The bench gate's macOS leg reads `attr_access` 14% to 20% over the
     merge base run after run (and `str_methods` 11% to 22%), at the 15%
     limit, while on x86 both builds execute the same instruction counts

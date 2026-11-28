@@ -213,6 +213,28 @@ impl Interpreter {
                     return self.call(&f, &all, &[], globals);
                 }
             }
+            // An `operator.methodcaller` whose method is a Python function
+            // of `v`'s plain class (`map(methodcaller('area'), shapes)`):
+            // that function over `v` and the stored arguments, as its
+            // native `__call__` calls it, frameless when a pure leaf.
+            Object::Instance(inst) if Self::is_methodcaller(inst) => {
+                if let Some((f, Object::Tuple(stored))) =
+                    crate::stdlib::operator_accel::methodcaller_target(inst, &v)
+                {
+                    let mut args = self.pooled_scratch();
+                    args.push(v);
+                    args.extend(stored.iter().cloned());
+                    let fo = Object::Function(f.clone());
+                    if let Some(r) = self.pure_callback(&fo, &args, true) {
+                        // (Released as the full call releases them.)
+                        for a in args.drain(..).rev() {
+                            self.release(a);
+                        }
+                        return Ok(r);
+                    }
+                    return self.call_python_owned(&f, args, Vec::new());
+                }
+            }
             // An instance whose class's `__call__` is a plain Python
             // function (`map(adder, xs)`): that function over the instance
             // and `v`, as a bound method's is called, with no bound
@@ -240,6 +262,14 @@ impl Interpreter {
         // freelist does: `map(id, ((i, i) for ...))` sees one address).
         self.release(v);
         r
+    }
+
+    /// Whether calling `inst` is `operator.methodcaller`'s own native
+    /// `__call__` (its class is `methodcaller` or a subclass that keeps
+    /// it).
+    fn is_methodcaller(inst: &crate::types::PyInstance) -> bool {
+        matches!(inst.cls_raw().lookup("__call__"),
+            Some(Object::Builtin(b)) if b.name == ".methodcaller.__call__")
     }
 
     /// Whether calling `inst` is `functools.partial`'s own native

@@ -740,6 +740,24 @@ fn methodcaller_parts(inst: &crate::types::PyInstance) -> Option<(Object, Object
     }
 }
 
+/// `methodcaller(name, *args)(obj)` (`slf` the methodcaller) of a plain
+/// instance whose class's method `name` is a Python function (see
+/// `Interpreter::plain_instance_method`), with no stored keywords: the
+/// function and the stored positional arguments, which the compiled call
+/// site calls directly. `None` for anything else.
+pub(crate) fn methodcaller_target(
+    slf: &crate::types::PyInstance,
+    obj: &Object,
+) -> Option<(Rc<crate::object::PyFunction>, Object)> {
+    let (Object::Str(name), stored @ Object::Tuple(_)) = methodcaller_parts(slf)? else {
+        return None;
+    };
+    Some((
+        crate::Interpreter::plain_instance_method(obj, &name)?,
+        stored,
+    ))
+}
+
 /// `methodcaller(name, *args)(obj)`'s leaf half: a native value's method
 /// (`str.lower`, `dict.get`) that is itself a leaf builtin, called with
 /// `obj` and the stored arguments as the core loop's leaf call of
